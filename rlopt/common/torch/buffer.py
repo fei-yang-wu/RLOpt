@@ -8,12 +8,6 @@ import torch as th
 from gymnasium import spaces
 
 from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
-from stable_baselines3.common.type_aliases import (
-    DictReplayBufferSamples,
-    DictRolloutBufferSamples,
-    ReplayBufferSamples,
-    RolloutBufferSamples,
-)
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.vec_env import VecNormalize
 
@@ -22,6 +16,13 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+from rlopt.common.torch.type_aliases import (
+    DictReplayBufferSamples,
+    DictRolloutBufferSamples,
+    ReplayBufferSamples,
+    RolloutBufferSamples,
+)
 
 
 class BaseBuffer(ABC):
@@ -133,8 +134,8 @@ class BaseBuffer(ABC):
         :return:
         """
         if copy:
-            return th.tensor(array, device=self.device)
-        return th.as_tensor(array, device=self.device)
+            return array.clone().detach()
+        return array.detach()
 
     @staticmethod
     def _normalize_obs(
@@ -212,7 +213,7 @@ class ReplayBuffer(BaseBuffer):
 
         self.observations = th.zeros(
             (self.buffer_size, self.n_envs, *self.obs_shape),
-            dtype=self._maybe_cast_dtype(observation_space.dtype),
+            dtype=th.float32,
             device=self.device,
         )  # type: ignore
 
@@ -220,13 +221,13 @@ class ReplayBuffer(BaseBuffer):
             # When optimizing memory, `observations` contains also the next observation
             self.next_observations = th.zeros(
                 (self.buffer_size, self.n_envs, *self.obs_shape),
-                dtype=self._maybe_cast_dtype(observation_space.dtype),
+                dtype=th.float32,
                 device=self.device,
             )  # type: ignore
 
         self.actions = th.zeros(
             (self.buffer_size, self.n_envs, self.action_dim),
-            dtype=self._maybe_cast_dtype(action_space.dtype),
+            dtype=th.float32,
             device=self.device,
         )  # type: ignore
 
@@ -427,19 +428,33 @@ class RolloutBuffer(BaseBuffer):
 
     def reset(self) -> None:
         self.observations = th.zeros(
-            (self.buffer_size, self.n_envs, *self.obs_shape), dtype=th.float32
+            (self.buffer_size, self.n_envs, *self.obs_shape),
+            dtype=th.float32,
+            device=self.device,
         )
         self.actions = th.zeros(
-            (self.buffer_size, self.n_envs, self.action_dim), dtype=th.float32
+            (self.buffer_size, self.n_envs, self.action_dim),
+            dtype=th.float32,
+            device=self.device,
         )
-        self.rewards = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32)
-        self.returns = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32)
+        self.rewards = th.zeros(
+            (self.buffer_size, self.n_envs), dtype=th.float32, device=self.device
+        )
+        self.returns = th.zeros(
+            (self.buffer_size, self.n_envs), dtype=th.float32, device=self.device
+        )
         self.episode_starts = th.zeros(
-            (self.buffer_size, self.n_envs), dtype=th.float32
+            (self.buffer_size, self.n_envs), dtype=th.float32, device=self.device
         )
-        self.values = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32)
-        self.log_probs = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32)
-        self.advantages = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32)
+        self.values = th.zeros(
+            (self.buffer_size, self.n_envs), dtype=th.float32, device=self.device
+        )
+        self.log_probs = th.zeros(
+            (self.buffer_size, self.n_envs), dtype=th.float32, device=self.device
+        )
+        self.advantages = th.zeros(
+            (self.buffer_size, self.n_envs), dtype=th.float32, device=self.device
+        )
         self.generator_ready = False
         super().reset()
 
@@ -515,12 +530,12 @@ class RolloutBuffer(BaseBuffer):
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
         action = action.reshape((self.n_envs, self.action_dim))
 
-        self.observations[self.pos] = th.Tensor(obs)
-        self.actions[self.pos] = th.Tensor(action)
-        self.rewards[self.pos] = th.Tensor(reward)
-        self.episode_starts[self.pos] = th.Tensor(episode_start)
-        self.values[self.pos] = value.clone().cpu().numpy().flatten()
-        self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        self.observations[self.pos] = obs
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.episode_starts[self.pos] = episode_start
+        self.values[self.pos] = value
+        self.log_probs[self.pos] = log_prob
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -562,6 +577,7 @@ class RolloutBuffer(BaseBuffer):
         data = (
             self.observations[batch_inds],
             self.actions[batch_inds],
+            self.rewards[batch_inds],
             self.values[batch_inds].flatten(),
             self.log_probs[batch_inds].flatten(),
             self.advantages[batch_inds].flatten(),
@@ -640,7 +656,7 @@ class DictReplayBuffer(ReplayBuffer):
 
         self.actions = th.zeros(
             (self.buffer_size, self.n_envs, self.action_dim),
-            dtype=self._maybe_cast_dtype(action_space.dtype),
+            dtype=th.float32,
             device=self.device,
         )
         self.rewards = th.zeros(
@@ -698,23 +714,23 @@ class DictReplayBuffer(ReplayBuffer):
             # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
             if isinstance(self.observation_space.spaces[key], spaces.Discrete):
                 obs[key] = obs[key].reshape((self.n_envs,) + self.obs_shape[key])
-            self.observations[key][self.pos] = th.tensor(obs[key], device=self.device)
+            self.observations[key][self.pos] = obs[key].clone().detach().to(self.device)
 
         for key in self.next_observations.keys():
             if isinstance(self.observation_space.spaces[key], spaces.Discrete):
                 next_obs[key] = next_obs[key].reshape(
                     (self.n_envs,) + self.obs_shape[key]
                 )
-            self.next_observations[key][self.pos] = th.tensor(
-                next_obs[key], device=self.device
+            self.next_observations[key][self.pos] = (
+                next_obs[key].clone().detach().to(self.device)
             )
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
         action = action.reshape((self.n_envs, self.action_dim))
 
-        self.actions[self.pos] = th.tensor(action, device=self.device)
-        self.rewards[self.pos] = th.tensor(reward, device=self.device)
-        self.dones[self.pos] = th.tensor(done, device=self.device)
+        self.actions[self.pos] = action.clone().detach().to(self.device)
+        self.rewards[self.pos] = reward.clone().detach().to(self.device)
+        self.dones[self.pos] = done.clone().detach().to(self.device)
 
         if self.handle_timeout_termination:
             self.timeouts[self.pos] = th.tensor(
@@ -771,30 +787,35 @@ class DictReplayBuffer(ReplayBuffer):
         assert isinstance(next_obs_, dict)
         # Convert to torch tensor
         observations = {
-            key: th.tensor(obs, device=self.device) for key, obs in obs_.items()
+            key: obs.clone().detach().to(self.device) for key, obs in obs_.items()
         }
         next_observations = {
-            key: th.tensor(obs, device=self.device) for key, obs in next_obs_.items()
+            key: obs.clone().detach().to(self.device) for key, obs in next_obs_.items()
         }
 
         return DictReplayBufferSamples(
             observations=observations,
-            actions=th.tensor(
-                self.actions[batch_inds, env_indices], device=self.device
-            ),
+            actions=self.actions[batch_inds, env_indices]
+            .clone()
+            .detach()
+            .to(self.device),
             next_observations=next_observations,
             # Only use dones that are not due to timeouts
             # deactivated by default (timeouts is initialized as an array of False)
-            dones=th.tensor(
+            dones=(
                 self.dones[batch_inds, env_indices]
                 * (1 - self.timeouts[batch_inds, env_indices])
-            ).reshape(-1, 1),
-            rewards=th.tensor(
-                self._normalize_reward(
-                    self.rewards[batch_inds, env_indices].reshape(-1, 1), env
-                ),
-                device=self.device,
-            ),
+            )
+            .reshape(-1, 1)
+            .clone()
+            .detach()
+            .to(self.device),
+            rewards=self._normalize_reward(
+                self.rewards[batch_inds, env_indices].reshape(-1, 1), env
+            )
+            .clone()
+            .detach()
+            .to(self.device),
         )
 
 
@@ -892,7 +913,7 @@ class DictRolloutBuffer(RolloutBuffer):
             log_prob = log_prob.reshape(-1, 1)
 
         for key in self.observations.keys():
-            obs_ = th.tensor(obs[key])
+            obs_ = obs[key].clone().detach()
             # Reshape needed when using multiple envs with discrete observations
             # as torch cannot broadcast (n_discrete,) to (n_discrete, 1)
             if isinstance(self.observation_space.spaces[key], spaces.Discrete):
@@ -952,4 +973,5 @@ class DictRolloutBuffer(RolloutBuffer):
             old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
+            rewards=self.to_torch(self.rewards[batch_inds]),
         )
