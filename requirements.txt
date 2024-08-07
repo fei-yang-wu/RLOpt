@@ -1,0 +1,6 @@
+stable-baselines3
+numpy
+gymnasium
+tensordict
+toml
+torch>=2.2.0
