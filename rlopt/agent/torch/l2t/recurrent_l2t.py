@@ -493,6 +493,19 @@ class RecurrentL2T(OnPolicyAlgorithm):
             elif "log" in infos:
                 self.ep_infos.append(infos["log"])
 
+            self.cur_reward_sum += rewards
+            self.cur_episode_length += 1
+            new_ids = (dones > 0).nonzero(as_tuple=False)
+            # record reward and episode length
+            self.rewbuffer.extend(
+                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.lenbuffer.extend(
+                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.cur_reward_sum[new_ids] = 0
+            self.cur_episode_length[new_ids] = 0
+
             # Give access to local variables
             callback.update_locals(locals())
             if not callback.on_step():
@@ -870,6 +883,16 @@ class RecurrentL2T(OnPolicyAlgorithm):
         """
         self.start_time = time.time_ns()
 
+        # store the current number of timesteps
+        self.rewbuffer = deque(maxlen=100)
+        self.lenbuffer = deque(maxlen=100)
+        self.cur_reward_sum = th.zeros(
+            self.env.num_envs, dtype=th.float, device=self.device
+        )
+        self.cur_episode_length = th.zeros(
+            self.env.num_envs, dtype=th.float, device=self.device
+        )
+
         if self.ep_info_buffer is None or reset_num_timesteps:
             # Initialize buffers if they don't exist, or reinitialize if resetting counters
             self.ep_info_buffer = deque(maxlen=self._stats_window_size)
@@ -945,4 +968,16 @@ class RecurrentL2T(OnPolicyAlgorithm):
             "time/collection time per step (s)", locs["collection_time"] / self.n_steps
         )
         self.logger.record("time/training_time (s)", locs["training_time"])
+        self.logger.record(
+            "Episode/average_episodic_reward", statistics.mean(self.rewbuffer)
+        )
+        self.logger.record(
+            "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
+        )
+        self.logger.record(
+            "Episode/episodic_reward", th.max(self.cur_episode_length).item()
+        )
+        self.logger.record(
+            "Episode/episodic_length", th.max(self.cur_reward_sum).item()
+        )
         self.logger.dump(step=self.num_timesteps)
