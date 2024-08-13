@@ -2,7 +2,7 @@ import warnings
 from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple, List
 from collections import deque
 import time
-
+import statistics
 
 import numpy as np
 import torch as th
