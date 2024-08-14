@@ -895,8 +895,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.start_time = time.time_ns()
 
         # store the current number of timesteps
-        self.rewbuffer = deque(maxlen=100)
-        self.lenbuffer = deque(maxlen=100)
+        self.rewbuffer = deque(maxlen=self._stats_window_size)
+        self.lenbuffer = deque(maxlen=self._stats_window_size)
         self.cur_reward_sum = th.zeros(
             self.env.num_envs, dtype=th.float, device=self.device
         )
