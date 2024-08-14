@@ -458,7 +458,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                         # actions, values, log_probs = self.student_policy(
                         #     obs_tensor["student"]
                         # )
-                        actions, values, log_probs, lstm_states = (
+                        actions, values, log_prob, lstm_states = (
                             self.student_policy.forward(
                                 obs_tensor["student"], lstm_states, episode_starts
                             )
