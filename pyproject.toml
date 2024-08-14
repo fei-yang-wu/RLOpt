@@ -16,6 +16,7 @@ tensordict = "*"
 toml = "*"
 gymnasium = "*"
 stable_baselines3 = "*"
+torchrl = "*"
 
 
 
