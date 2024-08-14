@@ -443,26 +443,37 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
 
+            # flag the student agent to be used
+            student_predicted = False
             with th.inference_mode():
+                # prepare for the student agent
+                episode_starts = th.tensor(
+                    self._last_episode_starts, dtype=th.float32, device=self.device
+                )
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = self._last_obs
                 if self.mixture_coeff > 0.0:
                     epsilon = self.mixture_coeff
                     if np.random.uniform() < epsilon and self.num_timesteps > 0:
-                        actions, values, log_probs = self.student_policy(
-                            obs_tensor["student"]
+                        # actions, values, log_probs = self.student_policy(
+                        #     obs_tensor["student"]
+                        # )
+                        actions, values, log_probs, lstm_states = (
+                            self.student_policy.forward(
+                                obs_tensor["student"], lstm_states, episode_starts
+                            )
                         )
+                        student_predicted = True
                     else:
                         actions, values, log_probs = self.policy(obs_tensor["teacher"])
                 else:
                     actions, values, log_probs = self.policy(obs_tensor["teacher"])
-                episode_starts = th.tensor(
-                    self._last_episode_starts, dtype=th.float32, device=self.device
-                )
-                # get the student's lstm states
-                _, _, _, lstm_states = self.student_policy.forward(
-                    obs_tensor["student"], lstm_states, episode_starts
-                )
+
+                if not student_predicted:
+                    # get the student's lstm states
+                    _, _, _, lstm_states = self.student_policy.forward(
+                        obs_tensor["student"], lstm_states, episode_starts
+                    )
 
             # Rescale and perform action
             clipped_actions = actions
