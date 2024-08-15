@@ -18,12 +18,12 @@ from stable_baselines3.common.policies import (
     BasePolicy,
     MultiInputActorCriticPolicy,
 )
-from sb3_contrib.common.recurrent.policies import (
+from sb3_contrib.common.recurrent.policies import (  # type: ignore
     RecurrentActorCriticCnnPolicy,
     RecurrentActorCriticPolicy,
     RecurrentMultiInputActorCriticPolicy,
 )
-from sb3_contrib.common.recurrent.type_aliases import RNNStates
+from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
 
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_schedule_fn
@@ -146,7 +146,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         rollout_buffer_class: Optional[
-            Union[Type[RLOptRolloutBuffer], Type[RLOptDictRolloutBuffer]]
+            Union[
+                Type[RLOptRecurrentRolloutBuffer], Type[RLOptRecurrentDictRolloutBuffer]
+            ]
         ] = None,
         rollout_buffer_kwargs: Optional[Dict[str, Any]] = None,
         target_kl: Optional[float] = None,
@@ -315,6 +317,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         if self.rollout_buffer_class is None:
             if isinstance(self.observation_space, spaces.Dict):
+
                 self.rollout_buffer_class = RecurrentRolloutBuffer
             else:
                 self.rollout_buffer_class = RecurrentDictRolloutBuffer
@@ -324,6 +327,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 self.rollout_buffer_class = RecurrentSequenceRolloutBuffer
             else:
                 self.rollout_buffer_class = RecurrentSequenceDictRolloutBuffer
+
 
         self.policy = self.policy.to(self.device)
 
@@ -350,32 +354,24 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self.student_policy_class = self._get_policy_from_name(student_policy)
         else:
             self.student_policy_class = student_policy
-        self.policy = self.policy_class(  # type: ignore[assignment]
-            self.observation_space["teacher"],  # type: ignore
-            self.action_space,
-            self.lr_schedule,
-            use_sde=self.use_sde,
-            **self.policy_kwargs,
-        )
-        self.student_policy_kwargs = student_policy_kwargs
 
-        # from off_policy_algorithm super()._setup_model()
+        print("student policy kwargs", student_policy_kwargs)
         # partial_obversevation_space is from Environment's partial_observation_space
         self.partial_observation_space = self.observation_space["student"]  # type: ignore
         self.student_policy = self.student_policy_class(  # pytype:disable=not-instantiable
             self.partial_observation_space,
             self.action_space,
             self.lr_schedule,
-            **self.student_policy_kwargs,  # pytype:disable=not-instantiable # type: ignore
+            **student_policy_kwargs,  # pytype:disable=not-instantiable # type: ignore
         )
         self.student_policy = self.student_policy.to(self.device)
 
         # We assume that LSTM for the actor and the critic
         # have the same architecture
-        lstm = self.policy.lstm_actor
+        lstm = self.student_policy.lstm_actor
 
-        if not isinstance(self.policy, RecurrentActorCriticPolicy):
-            raise ValueError("Policy must subclass RecurrentActorCriticPolicy")
+        if not isinstance(self.student_policy, RecurrentActorCriticPolicy):
+            raise ValueError("Student policy must subclass RecurrentActorCriticPolicy")
 
         single_hidden_state_shape = (lstm.num_layers, self.n_envs, lstm.hidden_size)
         # hidden and cell states for actor and critic
@@ -460,8 +456,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
             student_predicted = False
             with th.inference_mode():
                 # prepare for the student agent
-                episode_starts = th.tensor(
-                    self._last_episode_starts, dtype=th.float32, device=self.device
+                self._last_episode_starts: th.Tensor
+                episode_starts = (
+                    self._last_episode_starts.clone().to(self.device).type(th.float32)
                 )
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = self._last_obs
@@ -670,12 +667,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     + self.vf_coef * value_loss
                 )
 
-                # Compute student agent loss
-                student_actions, student_values, student_log_prob = self.student_policy(
-                    rollout_data.observations["student"]  # type: ignore
-                )
-
-                actions, values, log_probs, lstm_states = self.student_policy.forward(
+                student_actions, _, _, _ = self.student_policy.forward(
                     rollout_data.observations["student"],
                     rollout_data.lstm_states,
                     rollout_data.episode_starts,

@@ -1059,15 +1059,23 @@ def pad(
     :return: (n_seq, max_length, *tensor_shape)
     """
     if isinstance(tensor, th.Tensor):
+        # Convert seq_start_indices and seq_end_indices to numpy arrays
+        seq_start_indices = seq_start_indices
+        seq_end_indices = seq_end_indices
+        seq_len = seq_start_indices.shape[0]
         # Create sequences given start and end
         seq = [
-            tensor[start : end + 1]
-            for start, end in zip(seq_start_indices, seq_end_indices)
+            tensor[seq_start_indices[i].item() : seq_end_indices[i].item() + 1].detach()
+            for i in range(seq_len)
         ]
         return th.nn.utils.rnn.pad_sequence(
             seq, batch_first=True, padding_value=padding_value
         )
     elif isinstance(tensor, np.ndarray):
+        # Convert seq_start_indices and seq_end_indices to numpy arrays
+        seq_start_indices = seq_start_indices.cpu().numpy()
+        seq_end_indices = seq_end_indices.cpu().numpy()
+
         # Create sequences given start and end
         seq = [
             th.tensor(tensor[start : end + 1], device=device)
@@ -1121,7 +1129,7 @@ def create_sequencers(
         (sequence starts and ends indices are fixed)
     """
     # Create sequence if env changes too
-    seq_start = np.logical_or(episode_starts, env_change).flatten()
+    seq_start = th.logical_or(episode_starts, env_change).flatten()
     # First index is always the beginning of a sequence
     seq_start[0] = True
     if isinstance(episode_starts, np.ndarray):
@@ -1138,9 +1146,11 @@ def create_sequencers(
         # End of sequence are just before sequence starts
         # Last index is also always end of a sequence
         seq_end_indices = th.cat(
-            [(seq_start_indices - 1)[1:], th.Tensor(len(episode_starts))]
-        )
-
+            [
+                (seq_start_indices - 1)[1:],
+                th.Tensor(np.array([len(episode_starts)])).to(device),
+            ]
+        ).type(th.int)
     # Create padding method for this minibatch
     # to avoid repeating arguments (seq_start_indices, seq_end_indices)
     local_pad = partial(pad, seq_start_indices, seq_end_indices, device)
@@ -1191,19 +1201,27 @@ class RecurrentRolloutBuffer(RolloutBuffer):
 
     def reset(self):
         super().reset()
-        self.hidden_states_pi = th.zeros(self.hidden_state_shape, dtype=np.float32)
-        self.cell_states_pi = th.zeros(self.hidden_state_shape, dtype=np.float32)
-        self.hidden_states_vf = th.zeros(self.hidden_state_shape, dtype=np.float32)
-        self.cell_states_vf = th.zeros(self.hidden_state_shape, dtype=np.float32)
+        self.hidden_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=np.float32, device=self.device
+        )
+        self.cell_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=np.float32, device=self.device
+        )
+        self.hidden_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=np.float32, device=self.device
+        )
+        self.cell_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=np.float32, device=self.device
+        )
 
     def add(self, *args, lstm_states: RNNStates, **kwargs) -> None:
         """
         :param hidden_states: LSTM cell and hidden state
         """
-        self.hidden_states_pi[self.pos] = lstm_states.pi[0]
-        self.cell_states_pi[self.pos] = lstm_states.pi[1]
-        self.hidden_states_vf[self.pos] = lstm_states.vf[0]
-        self.cell_states_vf[self.pos] = lstm_states.vf[1]
+        self.hidden_states_pi[self.pos] = lstm_states.pi[0].detach()
+        self.cell_states_pi[self.pos] = lstm_states.pi[1].detach()
+        self.hidden_states_vf[self.pos] = lstm_states.vf[0].detach()
+        self.cell_states_vf[self.pos] = lstm_states.vf[1].detach()
 
         super().add(*args, **kwargs)
 
@@ -1251,13 +1269,13 @@ class RecurrentRolloutBuffer(RolloutBuffer):
         # more complexity and use of padding
         # Trick to shuffle a bit: keep the sequence order
         # but split the indices in two
-        split_index = th.randint(self.buffer_size * self.n_envs)
-        indices = th.arange(self.buffer_size * self.n_envs)
+        split_index = th.randint(self.buffer_size * self.n_envs, device=self.device)
+        indices = th.arange(self.buffer_size * self.n_envs, device=self.device)
         indices = th.cat((indices[split_index:], indices[:split_index]))
 
-        env_change = th.zeros(self.buffer_size * self.n_envs).reshape(
-            self.buffer_size, self.n_envs
-        )
+        env_change = th.zeros(
+            self.buffer_size * self.n_envs, device=self.device
+        ).reshape(self.buffer_size, self.n_envs)
         # Flag first timestep as change of environment
         env_change[0, :] = 1.0
         env_change = self.swap_and_flatten(env_change)
@@ -1320,7 +1338,7 @@ class RecurrentRolloutBuffer(RolloutBuffer):
             returns=self.pad_and_flatten(self.returns[batch_inds]),
             lstm_states=RNNStates(lstm_states_pi, lstm_states_vf),
             episode_starts=self.pad_and_flatten(self.episode_starts[batch_inds]),
-            mask=self.pad_and_flatten(np.ones_like(self.returns[batch_inds])),
+            mask=self.pad_and_flatten(th.ones_like(self.returns[batch_inds])),
         )
 
 
@@ -1365,19 +1383,27 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
 
     def reset(self):
         super().reset()
-        self.hidden_states_pi = th.zeros(self.hidden_state_shape, dtype=th.float32)
-        self.cell_states_pi = th.zeros(self.hidden_state_shape, dtype=th.float32)
-        self.hidden_states_vf = th.zeros(self.hidden_state_shape, dtype=th.float32)
-        self.cell_states_vf = th.zeros(self.hidden_state_shape, dtype=th.float32)
+        self.hidden_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.cell_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.hidden_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.cell_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
 
     def add(self, *args, lstm_states: RNNStates, **kwargs) -> None:
         """
         :param hidden_states: LSTM cell and hidden state
         """
-        self.hidden_states_pi[self.pos] = lstm_states.pi[0]
-        self.cell_states_pi[self.pos] = lstm_states.pi[1]
-        self.hidden_states_vf[self.pos] = lstm_states.vf[0]
-        self.cell_states_vf[self.pos] = lstm_states.vf[1]
+        self.hidden_states_pi[self.pos] = lstm_states.pi[0].detach()
+        self.cell_states_pi[self.pos] = lstm_states.pi[1].detach()
+        self.hidden_states_vf[self.pos] = lstm_states.vf[0].detach()
+        self.cell_states_vf[self.pos] = lstm_states.vf[1].detach()
 
         super().add(*args, **kwargs)
 
@@ -1425,9 +1451,9 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
         indices = np.arange(self.buffer_size * self.n_envs)
         indices = np.concatenate((indices[split_index:], indices[:split_index]))
 
-        env_change = th.zeros(self.buffer_size * self.n_envs).reshape(
-            self.buffer_size, self.n_envs
-        )
+        env_change = th.zeros(
+            self.buffer_size * self.n_envs, device=self.device
+        ).reshape(self.buffer_size, self.n_envs)
         # Flag first timestep as change of environment
         env_change[0, :] = 1.0
         env_change = self.swap_and_flatten(env_change)
@@ -1472,8 +1498,12 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
             lstm_states_vf[0].contiguous(),
             lstm_states_vf[1].contiguous(),
         )
+        self.observations: TensorDict
 
-        observations = self.pad(self.observations[batch_inds])
+        observations = {
+            key: self.pad(obs[batch_inds]) for (key, obs) in self.observations.items()
+        }
+
         observations = {
             key: obs.reshape((padded_batch_size,) + self.obs_shape[key])
             for (key, obs) in observations.items()
@@ -1490,7 +1520,7 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
             returns=self.pad_and_flatten(self.returns[batch_inds]),
             lstm_states=RNNStates(lstm_states_pi, lstm_states_vf),
             episode_starts=self.pad_and_flatten(self.episode_starts[batch_inds]),
-            mask=self.pad_and_flatten(np.ones_like(self.returns[batch_inds])),
+            mask=self.pad_and_flatten(th.ones_like(self.returns[batch_inds])),
         )
 
 # utility function for creating RecurrentSequenceRolloutBuffer
