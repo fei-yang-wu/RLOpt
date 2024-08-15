@@ -113,3 +113,23 @@ class PolicyPredictor(Protocol):
         :return: the model's action and the next hidden state
             (used in recurrent policies)
         """
+
+
+class RecurrentRolloutBufferSequenceSamples(NamedTuple):
+    observations: th.Tensor
+    actions: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    mask: th.Tensor
+
+
+class RecurrentDictRolloutBufferSequenceSamples(NamedTuple):
+    observations: TensorDict
+    actions: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    mask: th.Tensor

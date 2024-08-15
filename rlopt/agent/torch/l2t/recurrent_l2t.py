@@ -48,12 +48,11 @@ from stable_baselines3.common.vec_env import (
     unwrap_vec_normalize,
 )
 
-from rlopt.common.torch.buffer import (
-    RecurrentRolloutBuffer as RLOptRecurrentRolloutBuffer,
-)
-from rlopt.common.torch.buffer import (
-    RecurrentDictRolloutBuffer as RLOptRecurrentDictRolloutBuffer,
-)
+from rlopt.common.torch.buffer import RecurrentRolloutBuffer
+from rlopt.common.torch.buffer import RecurrentDictRolloutBuffer
+from rlopt.common.torch.buffer import RecurrentSequenceRolloutBuffer
+from rlopt.common.torch.buffer import RecurrentSequenceDictRolloutBuffer
+
 from rlopt.utils.torch.utils import obs_as_tensor, explained_variance
 from rlopt.agent.torch.l2t.policies import (
     MlpLstmPolicy,
@@ -76,6 +75,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         NOTE: n_steps * n_envs must be greater than 1 (because of the advantage normalization)
         See https://github.com/pytorch/pytorch/issues/29372
     :param batch_size: Minibatch size
+    :param whole_squences: Whether to use the whole sequence or not
     :param n_epochs: Number of epoch when optimizing the surrogate loss
     :param gamma: Discount factor
     :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
@@ -133,6 +133,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 64,
+        whole_sequences: bool = False,
         n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -215,6 +216,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             spaces.MultiBinary,
         )
         support_multi_env = True
+        self.whole_sequences = whole_sequences
         # Create and wrap the env if needed
         if env is not None:
             env = maybe_make_env(env, self.verbose)
@@ -315,16 +317,18 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         if self.rollout_buffer_class is None:
             if isinstance(self.observation_space, spaces.Dict):
-                self.rollout_buffer_class = RLOptRecurrentDictRolloutBuffer
+
+                self.rollout_buffer_class = RecurrentRolloutBuffer
             else:
-                self.rollout_buffer_class = RLOptRecurrentRolloutBuffer
-        self.policy = self.policy_class(  # type: ignore[assignment]
-            self.observation_space["teacher"],  # type: ignore
-            self.action_space,
-            self.lr_schedule,
-            use_sde=self.use_sde,
-            **self.policy_kwargs,
-        )
+                self.rollout_buffer_class = RecurrentDictRolloutBuffer
+
+        if self.whole_sequences:
+            if isinstance(self.observation_space, spaces.Dict):
+                self.rollout_buffer_class = RecurrentSequenceRolloutBuffer
+            else:
+                self.rollout_buffer_class = RecurrentSequenceDictRolloutBuffer
+
+
         self.policy = self.policy.to(self.device)
 
         self._init_student_policy(self.student_policy, self.student_policy_kwargs)
@@ -400,6 +404,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             n_envs=self.n_envs,
             **self.rollout_buffer_kwargs,
         )
+        self.rolloutbuffer: RecurrentRolloutBuffer
 
     def collect_rollouts(
         self,
@@ -599,6 +604,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
+
+                # Convert mask from float to bool
+                mask = rollout_data.mask > 1e-8
 
                 # Re-sample the noise matrix because the log_std has changed
                 if self.use_sde:
