@@ -38,6 +38,10 @@ PyTorchObs = Union[th.Tensor, TensorDict]
 # A schedule takes the remaining progress as input
 # and ouputs a scalar (e.g. learning rate, clip range, ...)
 Schedule = Callable[[float], float]
+from sb3_contrib.common.recurrent.type_aliases import (
+    RecurrentRolloutBufferSamples,
+    RecurrentDictRolloutBufferSamples,
+)
 
 
 class RolloutBufferSamples(NamedTuple):

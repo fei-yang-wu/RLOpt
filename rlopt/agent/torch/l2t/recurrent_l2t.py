@@ -48,10 +48,12 @@ from stable_baselines3.common.vec_env import (
     unwrap_vec_normalize,
 )
 
-from rlopt.common.torch.buffer import RecurrentRolloutBuffer
-from rlopt.common.torch.buffer import RecurrentDictRolloutBuffer
-from rlopt.common.torch.buffer import RecurrentSequenceRolloutBuffer
-from rlopt.common.torch.buffer import RecurrentSequenceDictRolloutBuffer
+from rlopt.common.torch.buffer import RLOptDictRecurrentReplayBuffer
+
+from rlopt.common.torch.type_aliases import (
+    RecurrentDictRolloutBufferSamples,
+    RecurrentDictRolloutBufferSequenceSamples,
+)
 
 from rlopt.utils.torch.utils import obs_as_tensor, explained_variance
 from rlopt.agent.torch.l2t.policies import (
@@ -133,7 +135,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 64,
-        whole_sequences: bool = False,
+        whole_sequences: bool = True,
         n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -146,9 +148,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         rollout_buffer_class: Optional[
-            Union[
-                Type[RLOptRecurrentRolloutBuffer], Type[RLOptRecurrentDictRolloutBuffer]
-            ]
+            Union[Type[RLOptDictRecurrentReplayBuffer],]
         ] = None,
         rollout_buffer_kwargs: Optional[Dict[str, Any]] = None,
         target_kl: Optional[float] = None,
@@ -315,20 +315,22 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        if self.rollout_buffer_class is None:
-            if isinstance(self.observation_space, spaces.Dict):
+        # if self.rollout_buffer_class is None:
+        #     if isinstance(self.observation_space, spaces.Dict):
 
-                self.rollout_buffer_class = RecurrentRolloutBuffer
-            else:
-                self.rollout_buffer_class = RecurrentDictRolloutBuffer
+        #         self.rollout_buffer_class = RecurrentRolloutBuffer
+        #     else:
+        #         self.rollout_buffer_class = RecurrentDictRolloutBuffer
 
-        if self.whole_sequences:
-            if isinstance(self.observation_space, spaces.Dict):
-                self.rollout_buffer_class = RecurrentSequenceRolloutBuffer
-            else:
-                self.rollout_buffer_class = RecurrentSequenceDictRolloutBuffer
-
-
+        # if self.whole_sequences:
+        #     if isinstance(self.observation_space, spaces.Dict):
+        #         self.rollout_buffer_class = RecurrentSequenceRolloutBuffer
+        #     else:
+        #         self.rollout_buffer_class = RecurrentSequenceDictRolloutBuffer
+        # self.rollout_buffer_class: (
+        #     RecurrentDictRolloutBuffer | RecurrentSequenceDictRolloutBuffer
+        # )
+        self.rollout_buffer_class = RLOptDictRecurrentReplayBuffer
         self.policy = self.policy.to(self.device)
 
         self._init_student_policy(self.student_policy, self.student_policy_kwargs)
@@ -404,7 +406,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             n_envs=self.n_envs,
             **self.rollout_buffer_kwargs,
         )
-        self.rolloutbuffer: RecurrentRolloutBuffer
+        self.rollout_buffer: RLOptDictRecurrentReplayBuffer
 
     def collect_rollouts(
         self,
@@ -554,6 +556,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 values,
                 log_probs,
                 lstm_states=self._last_lstm_states,
+                dones=dones,
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
@@ -593,123 +596,165 @@ class RecurrentL2T(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
+        student_losses = []
 
         continue_training = True
+
+        generator = self.rollout_buffer.get_generator(num_mini_batches=4, num_epochs=5)
         # train for n_epochs epochs
-        for epoch in range(self.n_epochs):
+        for (
+            obs_batch,
+            actions_batch,
+            values_batch,
+            advantages_batch,
+            returns_batch,
+            old_actions_log_prob_batch,
+            masks_batch,
+        ) in generator:
+            print("obs_batch:", {obs_batch["teacher"].shape})
+            print("obs_batch:", {obs_batch["student"].shape})
+            print(f"actions_batch: {actions_batch.shape}")
+            print(f"values_batch: {values_batch.shape}")
+            print(f"advantages_batch: {advantages_batch.shape}")
+            print(f"returns_batch: {returns_batch.shape}")
+            print(f"old_actions_log_prob_batch: {old_actions_log_prob_batch.shape}")
+            print(f"masks_batch: {masks_batch.shape}")
+
             approx_kl_divs = []
-            # Do a complete pass on the rollout buffer
-            for rollout_data in self.rollout_buffer.get(self.batch_size):
-                actions = rollout_data.actions
-                if isinstance(self.action_space, spaces.Discrete):
-                    # Convert discrete action from float to long
-                    actions = rollout_data.actions.long().flatten()
+            # # Do a complete pass on the rollout buffer
+            # for rollout_data in self.rollout_buffer.get(self.batch_size):
 
-                # Convert mask from float to bool
-                mask = rollout_data.mask > 1e-8
+            actions = actions_batch
+            if isinstance(self.action_space, spaces.Discrete):
+                # Convert discrete action from float to long
+                actions = actions_batch.long().flatten()
 
-                # Re-sample the noise matrix because the log_std has changed
-                if self.use_sde:
-                    self.policy.reset_noise(self.batch_size)
+            # Convert mask from float to bool
+            mask = masks_batch > 1e-8
 
-                values, log_prob, entropy = self.policy.evaluate_actions(
-                    rollout_data.observations["teacher"], actions  # type: ignore
+            # Re-sample the noise matrix because the log_std has changed
+            if self.use_sde:
+                self.policy.reset_noise(self.batch_size)
+
+            if self.whole_sequences:
+                actions = actions["teacher"]
+                observations = obs_batch["teacher"]
+            print("action shape: ", actions.shape)
+            print("observation shape:", observations.shape)
+            # teacher is mlp so no funny business
+            values, log_prob, entropy = self.policy.evaluate_actions(
+                observations, actions  # type: ignore
+            )
+            values = values.flatten()
+
+            # Normalize advantage
+            advantages = advantages_batch
+            # Normalization does not make sense if mini batchsize == 1, see GH issue #325
+            if self.normalize_advantage and len(advantages) > 1:
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8
                 )
-                values = values.flatten()
-                # Normalize advantage
-                advantages = rollout_data.advantages
-                # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-                if self.normalize_advantage and len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (
-                        advantages.std() + 1e-8
+
+            # ratio between old and new policy, should be one at the first iteration
+            ratio = th.exp(log_prob - old_actions_log_prob_batch)
+
+            # clipped surrogate loss
+            policy_loss_1 = advantages * ratio
+            policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+            # Logging
+            pg_losses.append(policy_loss.item())
+            clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+            clip_fractions.append(clip_fraction)
+
+            if self.clip_range_vf is None:
+                # No clipping
+                values_pred = values
+            else:
+                # Clip the difference between old and new value
+                # NOTE: this depends on the reward scaling
+                values_pred = values_batch + th.clamp(
+                    values - values_batch, -clip_range_vf, clip_range_vf  # type: ignore
+                )
+            # Value loss using the TD(gae_lambda) target
+            value_loss = F.mse_loss(returns_batch, values_pred)
+            value_losses.append(value_loss.item())
+
+            # Entropy loss favor exploration
+            if entropy is None:
+                # Approximate entropy when no analytical form
+                entropy_loss = -th.mean(-log_prob)
+            else:
+                entropy_loss = -th.mean(entropy)
+
+            entropy_losses.append(entropy_loss.item())
+
+            loss = (
+                policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+            )
+
+            if self.whole_sequences:
+                student_actions = actions["student"]
+                student_observations = obs_batch["student"]
+                # student obs and action shape is (T, B, feature dim)
+                student_values, student_log_prob, student_entropy = (
+                    self.student_policy.evaluate_actions_whole_sequence(
+                        student_observations, student_actions
                     )
-
-                # ratio between old and new policy, should be one at the first iteration
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
-
-                # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * th.clamp(
-                    ratio, 1 - clip_range, 1 + clip_range
                 )
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
 
-                # Logging
-                pg_losses.append(policy_loss.item())
-                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-                clip_fractions.append(clip_fraction)
+            else:
+                raise NotImplementedError
+            student_log_prob = student_log_prob[mask]
+            student_log_prob_shape = student_log_prob.shape
+            if len(student_log_prob_shape) < 3:
+                student_log_prob_shape = (*student_log_prob_shape, 1)
+            student_log_prob = student_log_prob.transpose(0, 1).reshape(
+                student_log_prob_shape[0] * student_log_prob_shape[1],
+                *student_log_prob_shape[2:],
+            )
+            assert th.allclose(log_prob.shape, student_log_prob.shape)
+            # student_loss = F.mse_loss(student_actions, actions.detach())
+            # calculate approximate kl divergence as student loss
+            student_loss = th.mean(
+                th.exp(student_log_prob - log_prob) - 1 - student_log_prob + log_prob
+            )
+            student_losses.append(student_loss.item())
 
-                if self.clip_range_vf is None:
-                    # No clipping
-                    values_pred = values
-                else:
-                    # Clip the difference between old and new value
-                    # NOTE: this depends on the reward scaling
-                    values_pred = rollout_data.old_values + th.clamp(
-                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf  # type: ignore
+            # Calculate approximate form of reverse KL Divergence for early stopping
+            # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
+            # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
+            # and Schulman blog: http://joschu.net/blog/kl-approx.html
+            with th.no_grad():
+                log_ratio = log_prob - old_actions_log_prob_batch
+                approx_kl_div = (
+                    th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                )
+                approx_kl_divs.append(approx_kl_div)
+
+            if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                continue_training = False
+                if self.verbose >= 1:
+                    print(
+                        f"Early stopping at step {self.num_timesteps} due to reaching max kl: {approx_kl_div:.2f}"
                     )
-                # Value loss using the TD(gae_lambda) target
-                value_loss = F.mse_loss(rollout_data.returns, values_pred)
-                value_losses.append(value_loss.item())
+                break
 
-                # Entropy loss favor exploration
-                if entropy is None:
-                    # Approximate entropy when no analytical form
-                    entropy_loss = -th.mean(-log_prob)
-                else:
-                    entropy_loss = -th.mean(entropy)
+            # Optimization step
+            self.policy.optimizer.zero_grad()
+            loss.backward()
+            # Clip grad norm
+            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.policy.optimizer.step()
 
-                entropy_losses.append(entropy_loss.item())
-
-                loss = (
-                    policy_loss
-                    + self.ent_coef * entropy_loss
-                    + self.vf_coef * value_loss
-                )
-
-                student_actions, _, _, _ = self.student_policy.forward(
-                    rollout_data.observations["student"],
-                    rollout_data.lstm_states,
-                    rollout_data.episode_starts,
-                )
-
-                student_loss = F.mse_loss(student_actions, actions.detach())
-
-                # Calculate approximate form of reverse KL Divergence for early stopping
-                # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
-                # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
-                # and Schulman blog: http://joschu.net/blog/kl-approx.html
-                with th.no_grad():
-                    log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = (
-                        th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                    )
-                    approx_kl_divs.append(approx_kl_div)
-
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                    continue_training = False
-                    if self.verbose >= 1:
-                        print(
-                            f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}"
-                        )
-                    break
-
-                # Optimization step
-                self.policy.optimizer.zero_grad()
-                loss.backward()
-                # Clip grad norm
-                th.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), self.max_grad_norm
-                )
-                self.policy.optimizer.step()
-
-                # Update student agent
-                self.student_policy.optimizer.zero_grad()
-                student_loss.backward()
-                th.nn.utils.clip_grad_norm_(
-                    self.student_policy.parameters(), self.max_grad_norm
-                )
-                self.student_policy.optimizer.step()
+            # Update student agent
+            self.student_policy.optimizer.zero_grad()
+            student_loss.backward()
+            th.nn.utils.clip_grad_norm_(
+                self.student_policy.parameters(), self.max_grad_norm
+            )
+            self.student_policy.optimizer.step()
 
             self._n_updates += 1
             if not continue_training:
@@ -734,6 +779,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+        self.logger.record("train/student_loss", np.mean(student_losses))
 
     def learn(
         self: SelfRecurrentL2T,

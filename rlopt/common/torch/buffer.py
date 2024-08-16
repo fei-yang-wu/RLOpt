@@ -23,8 +23,10 @@ from sb3_contrib.common.recurrent.type_aliases import (
 
 from rlopt.common.torch.type_aliases import (
     RecurrentRolloutBufferSequenceSamples,
-    RecurrentDictRolloutBufferSequenceSamples
+    RecurrentDictRolloutBufferSequenceSamples,
 )
+
+from rlopt.utils.torch.utils import split_and_pad_trajectories, unpad_trajectories
 
 try:
     # Check memory used by replay buffer when possible
@@ -1523,11 +1525,14 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
             mask=self.pad_and_flatten(th.ones_like(self.returns[batch_inds])),
         )
 
+
 # utility function for creating RecurrentSequenceRolloutBuffer
 def create_sequence_slicer(
     episode_start_indices: np.ndarray, device: Union[th.device, str]
-) -> Callable[[np.ndarray| th.Tensor, List[int]], th.Tensor]:
-    def create_sequence_minibatch(tensor: np.ndarray | th.Tensor, seq_indices: List[int]) -> th.Tensor:
+) -> Callable[[np.ndarray | th.Tensor, List[int]], th.Tensor]:
+    def create_sequence_minibatch(
+        tensor: np.ndarray | th.Tensor, seq_indices: List[int]
+    ) -> th.Tensor:
         """
         Create minibatch of whole sequence.
 
@@ -1540,7 +1545,9 @@ def create_sequence_slicer(
 
         return pad_sequence(
             [
-                tensor[episode_start_indices[i] : episode_start_indices[i + 1]].to(device=device)
+                tensor[episode_start_indices[i] : episode_start_indices[i + 1]].to(
+                    device=device
+                )
                 for i in seq_indices
             ]
         )
@@ -1578,10 +1585,19 @@ class RecurrentSequenceRolloutBuffer(RecurrentRolloutBuffer):
         self.hidden_state_shape = hidden_state_shape
         self.seq_start_indices, self.seq_end_indices = None, None
         super().__init__(
-            buffer_size, observation_space, action_space, hidden_state_shape, device, gae_lambda, gamma, n_envs=n_envs
+            buffer_size,
+            observation_space,
+            action_space,
+            hidden_state_shape,
+            device,
+            gae_lambda,
+            gamma,
+            n_envs=n_envs,
         )
 
-    def get(self, batch_size:int) -> Generator[RecurrentRolloutBufferSequenceSamples, None, None]:
+    def get(
+        self, batch_size: int
+    ) -> Generator[RecurrentRolloutBufferSequenceSamples, None, None]:
         assert self.full, "Rollout buffer must be full before sampling from it"
         # Prepare the data
         if not self.generator_ready:
@@ -1605,14 +1621,18 @@ class RecurrentSequenceRolloutBuffer(RecurrentRolloutBuffer):
         # TODO: allow to change that parameter
         batch_sampler = BatchSampler(random_indices, batch_size, drop_last=False)
         # add a dummy index to make the code below simpler
-        episode_start_indices = np.concatenate([self.episode_start_indices, np.array([len(self.episode_starts)])])
+        episode_start_indices = np.concatenate(
+            [self.episode_start_indices, np.array([len(self.episode_starts)])]
+        )
 
         create_minibatch = create_sequence_slicer(episode_start_indices, self.device)
 
         # yields batches of whole sequences, shape: (max_sequence_length, batch_size=n_seq, features_size))
         for indices in batch_sampler:
             returns_batch = create_minibatch(self.returns, indices)
-            masks_batch = pad_sequence([th.ones_like(returns) for returns in th.swapaxes(returns_batch, 0, 1)])
+            masks_batch = pad_sequence(
+                [th.ones_like(returns) for returns in th.swapaxes(returns_batch, 0, 1)]
+            )
 
             yield RecurrentRolloutBufferSequenceSamples(
                 observations=create_minibatch(self.observations, indices),
@@ -1655,10 +1675,19 @@ class RecurrentSequenceDictRolloutBuffer(RecurrentDictRolloutBuffer):
         self.hidden_state_shape = hidden_state_shape
         self.seq_start_indices, self.seq_end_indices = None, None
         super().__init__(
-            buffer_size, observation_space, action_space, hidden_state_shape, device, gae_lambda, gamma, n_envs=n_envs
+            buffer_size,
+            observation_space,
+            action_space,
+            hidden_state_shape,
+            device,
+            gae_lambda,
+            gamma,
+            n_envs=n_envs,
         )
 
-    def get(self, batch_size: int) -> Generator[RecurrentDictRolloutBufferSequenceSamples, None, None]:
+    def get(
+        self, batch_size: int
+    ) -> Generator[RecurrentDictRolloutBufferSequenceSamples, None, None]:
         assert self.full, "Rollout buffer must be full before sampling from it"
         # Prepare the data
         if not self.generator_ready:
@@ -1683,7 +1712,9 @@ class RecurrentSequenceDictRolloutBuffer(RecurrentDictRolloutBuffer):
         # drop last batch to prevent extremely small batches causing spurious updates
         batch_sampler = BatchSampler(random_indices, batch_size, drop_last=True)
         # add a dummy index to make the code below simpler
-        episode_start_indices = np.concatenate([self.episode_start_indices, np.array([len(self.episode_starts)])])
+        episode_start_indices = np.concatenate(
+            [self.episode_start_indices, np.array([len(self.episode_starts)])]
+        )
 
         create_minibatch = create_sequence_slicer(episode_start_indices, self.device)
 
@@ -1693,7 +1724,9 @@ class RecurrentSequenceDictRolloutBuffer(RecurrentDictRolloutBuffer):
             for key in self.observations:
                 obs_batch[key] = create_minibatch(self.observations[key], indices)
             returns_batch = create_minibatch(self.returns, indices)
-            masks_batch = pad_sequence([th.ones_like(returns) for returns in th.swapaxes(returns_batch, 0, 1)])
+            masks_batch = pad_sequence(
+                [th.ones_like(returns) for returns in th.swapaxes(returns_batch, 0, 1)]
+            )
 
             yield RecurrentDictRolloutBufferSequenceSamples(
                 observations=obs_batch,
@@ -1704,3 +1737,282 @@ class RecurrentSequenceDictRolloutBuffer(RecurrentDictRolloutBuffer):
                 returns=returns_batch,
                 mask=masks_batch,
             )
+
+
+class RLOptDictRecurrentReplayBuffer(ABC):
+    observation_space: spaces.Dict
+    obs_shape: Dict[str, Tuple[int, ...]]  # type: ignore[assignment]
+    observations: TensorDict  # type: ignore[assignment]
+    actions: th.Tensor
+    rewards: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    episode_starts: th.Tensor
+    log_probs: th.Tensor
+    values: th.Tensor
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        hidden_state_shape: Tuple[int, int, int, int],
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ) -> None:
+        self.hidden_state_shape = hidden_state_shape
+        self.seq_start_indices, self.seq_end_indices = None, None
+        super().__init__()
+        self.buffer_size = buffer_size
+        self.observation_space = observation_space
+        self.action_space = action_space
+        self.obs_shape = get_obs_shape(observation_space)  # type: ignore[assignment]
+
+        self.action_dim = get_action_dim(action_space)
+        self.pos = 0
+        self.full = False
+        self.device = get_device(device)
+        self.n_envs = n_envs
+        assert isinstance(
+            self.obs_shape, dict
+        ), "DictRolloutBuffer must be used with Dict obs space only"
+
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+
+        self.generator_ready = False
+
+        self.observations = TensorDict(
+            {
+                key: th.zeros(
+                    (self.buffer_size, self.n_envs, *obs_input_shape),
+                    dtype=th.float32,
+                    device=self.device,
+                )
+                for key, obs_input_shape in self.obs_shape.items()
+            },
+            batch_size=[self.buffer_size, self.n_envs],
+        )
+
+        self.actions = th.zeros(
+            (self.buffer_size, self.n_envs, self.action_dim),
+            dtype=th.float32,
+            device=self.device,
+        )
+
+        self.rewards = th.zeros(
+            (self.buffer_size, self.n_envs),
+            dtype=th.float32,
+            device=self.device,
+        )
+        self.returns = th.zeros(
+            (self.buffer_size, self.n_envs),
+            dtype=th.float32,
+            device=self.device,
+        )
+        self.episode_starts = th.zeros(
+            (self.buffer_size, self.n_envs),
+            dtype=th.float32,
+            device=self.device,
+        )
+        self.values = th.zeros(
+            (self.buffer_size, self.n_envs),
+            dtype=th.float32,
+            device=self.device,
+        )
+        self.log_probs = th.zeros(
+            (self.buffer_size, self.n_envs),
+            dtype=th.float32,
+            device=self.device,
+        )
+        self.advantages = th.zeros(
+            (self.buffer_size, self.n_envs),
+            dtype=th.float32,
+            device=self.device,
+        )
+        self.dones = th.zeros(
+            (self.buffer_size, self.n_envs), dtype=th.float32, device=self.device
+        )
+
+        self.hidden_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.cell_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.hidden_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.cell_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+
+        self.reset()
+
+    def extend(self, *args, **kwargs) -> None:
+        """
+        Add a new batch of transitions to the buffer
+        """
+        # Do a for loop along the batch axis
+        for data in zip(*args):
+            self.add(*data)
+
+    @staticmethod
+    def _normalize_obs(
+        obs: Union[th.Tensor, Dict[str, th.Tensor]],
+        env: Optional[VecNormalize] = None,
+    ) -> Union[th.Tensor, Dict[str, th.Tensor]]:
+        if env is not None:
+            return env.normalize_obs(obs)  # type: ignore
+        return obs
+
+    @staticmethod
+    def _normalize_reward(
+        reward: th.Tensor, env: Optional[VecNormalize] = None
+    ) -> th.Tensor:
+        if env is not None:
+            return env.normalize_reward(reward).astype(th.float32)  # type: ignore
+        return reward
+
+    def compute_returns_and_advantage(
+        self, last_values: th.Tensor, dones: th.Tensor
+    ) -> None:
+        """
+        Post-processing step: compute the lambda-return (TD(lambda) estimate)
+        and GAE(lambda) advantage.
+        Uses Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
+        to compute the advantage. To obtain Monte-Carlo advantage estimate (A(s) = R - V(S))
+        where R is the sum of discounted reward with value bootstrap
+        (because we don't always have full episode), set ``gae_lambda=1.0`` during initialization.
+        The TD(lambda) estimator has also two special cases:
+        - TD(1) is Monte-Carlo estimate (sum of discounted rewards)
+        - TD(0) is one-step estimate with bootstrapping (r_t + gamma * v(s_{t+1}))
+        For more information, see discussion in https://github.com/DLR-RM/stable-baselines3/pull/375.
+        :param last_values: state value estimation for the last step (one for each env)
+        :param dones: if the last step was a terminal step (one bool for each env).
+        """
+        # Convert to numpy
+        last_values = last_values.detach().flatten()  # type: ignore[assignment]
+
+        last_gae_lam = 0
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_non_terminal = 1.0 - dones  # .type(th.float32)
+                next_values = last_values
+            else:
+                next_non_terminal = 1.0 - self.episode_starts[step + 1]
+                next_values = self.values[step + 1]
+            delta = (
+                self.rewards[step]
+                + self.gamma * next_values * next_non_terminal
+                - self.values[step]
+            )
+            last_gae_lam = (
+                delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+            )
+            self.advantages[step] = last_gae_lam
+        # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
+        # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
+        self.returns = self.advantages + self.values
+
+    def reset(self):
+
+        self.generator_ready = False
+        self.pos = 0
+        self.full = False
+
+    def add(
+        self,
+        obs: Dict[str, th.Tensor],
+        action: th.Tensor,
+        reward: th.Tensor,
+        episode_start: th.Tensor,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+        lstm_states: RNNStates,
+        dones: th.Tensor,
+    ) -> None:
+        """
+        :param hidden_states: LSTM cell and hidden state
+        """
+        self.hidden_states_pi[self.pos] = lstm_states.pi[0].detach()
+        self.cell_states_pi[self.pos] = lstm_states.pi[1].detach()
+        self.hidden_states_vf[self.pos] = lstm_states.vf[0].detach()
+        self.cell_states_vf[self.pos] = lstm_states.vf[1].detach()
+
+        if len(log_prob.shape) == 0:
+            # Reshape 0-d tensor to avoid error
+            log_prob = log_prob.reshape(-1, 1)
+
+        for key in self.observations.keys():
+            obs_ = obs[key].detach()
+            # Reshape needed when using multiple envs with discrete observations
+            # as torch cannot broadcast (n_discrete,) to (n_discrete, 1)
+            if isinstance(self.observation_space.spaces[key], spaces.Discrete):
+                obs_ = obs_.reshape((self.n_envs,) + self.obs_shape[key])
+            self.observations[key][self.pos] = obs_
+
+        # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        self.actions[self.pos] = action.detach()
+        self.rewards[self.pos] = reward.detach()
+        self.episode_starts[self.pos] = episode_start.detach()
+        self.values[self.pos] = value.detach().flatten()
+        self.log_probs[self.pos] = log_prob.detach()
+        self.dones[self.pos] = dones.detach()
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def get_generator(
+        self, num_mini_batches: int, num_epochs: int = 5
+    ) -> Generator[RecurrentDictRolloutBufferSamples, None, None]:
+        assert self.full, "Rollout buffer must be full before sampling from it"
+
+        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
+            self.observations, self.dones.unsqueeze(-1)
+        )
+
+        mini_batch_size = self.n_envs // num_mini_batches
+        for ep in range(num_epochs):
+            first_traj = 0
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+
+                dones = self.dones
+                last_was_done = th.zeros_like(dones, dtype=th.bool)
+                last_was_done[1:] = dones[:-1]
+                last_was_done[0] = True
+                trajectories_batch_size = th.sum(last_was_done[:, start:stop])
+                last_traj = first_traj + trajectories_batch_size
+
+                masks_batch = trajectory_masks[:, first_traj:last_traj]
+                obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+                actions_batch = self.actions[:, start:stop]
+                returns_batch = self.returns[:, start:stop]
+                advantages_batch = self.advantages[:, start:stop]
+                values_batch = self.values[:, start:stop]
+                old_actions_log_prob_batch = self.log_probs[:, start:stop]
+
+                # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
+                # then take only time steps after dones (flattens num envs and time dimensions),
+                # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
+                last_was_done = last_was_done.permute(1, 0)
+                # hid_batch = [
+                #     saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][
+                #         first_traj:last_traj
+                #     ]
+                #     .transpose(1, 0)
+                #     .contiguous()
+                #     for saved_hidden_states in self.saved_hidden_states_a
+                # ]
+
+                # hid_batch = hid_batch[0] if len(hid_batch) == 1 else hid_batch
+
+                yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, masks_batch
+
+                first_traj = last_traj
