@@ -706,6 +706,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             else:
                 raise NotImplementedError
+
+            # student loss = kl divergence between student and teacher
             student_log_prob = student_log_prob[mask]
             student_log_prob_shape = student_log_prob.shape
             if len(student_log_prob_shape) < 3:
