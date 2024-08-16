@@ -331,6 +331,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
         #     RecurrentDictRolloutBuffer | RecurrentSequenceDictRolloutBuffer
         # )
         self.rollout_buffer_class = RLOptDictRecurrentReplayBuffer
+
+        self.policy = self.policy_class(  # type: ignore[assignment]
+            self.observation_space["teacher"],  # type: ignore
+            self.action_space,
+            self.lr_schedule,
+            use_sde=self.use_sde,
+            **self.policy_kwargs,
+        )
         self.policy = self.policy.to(self.device)
 
         self._init_student_policy(self.student_policy, self.student_policy_kwargs)
