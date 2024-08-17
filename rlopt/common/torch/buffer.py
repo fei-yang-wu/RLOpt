@@ -1972,8 +1972,19 @@ class RLOptDictRecurrentReplayBuffer(ABC):
     ) -> Generator[RecurrentDictRolloutBufferSamples, None, None]:
         assert self.full, "Rollout buffer must be full before sampling from it"
 
-        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
-            self.observations, self.dones.unsqueeze(-1)
+        padded_student_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
+            self.observations["student"], self.dones.unsqueeze(-1)
+        )
+
+        # print("padded_student_obs_trajectories", padded_student_obs_trajectories.shape)
+
+        padded_obs_trajectories = {
+            "student": padded_student_obs_trajectories,
+            "teacher": self.observations["teacher"],
+        }
+
+        padded_action, _ = split_and_pad_trajectories(
+            self.actions, self.dones.unsqueeze(-1)
         )
 
         mini_batch_size = self.n_envs // num_mini_batches
@@ -1991,12 +2002,33 @@ class RLOptDictRecurrentReplayBuffer(ABC):
                 last_traj = first_traj + trajectories_batch_size
 
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
-                obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+                # obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+                obs_batch = {
+                    "teacher": BaseBuffer.swap_and_flatten(
+                        padded_obs_trajectories["teacher"][:, start:stop]
+                    ),
+                    "student": padded_obs_trajectories["student"][
+                        :, first_traj:last_traj
+                    ],
+                }
                 actions_batch = self.actions[:, start:stop]
-                returns_batch = self.returns[:, start:stop]
-                advantages_batch = self.advantages[:, start:stop]
-                values_batch = self.values[:, start:stop]
-                old_actions_log_prob_batch = self.log_probs[:, start:stop]
+                actions_batch = {
+                    "teacher": BaseBuffer.swap_and_flatten(actions_batch),
+                    "student": padded_action[:, first_traj:last_traj],
+                }
+
+                returns_batch = BaseBuffer.swap_and_flatten(
+                    self.returns[:, start:stop]
+                ).squeeze(-1)
+                advantages_batch = BaseBuffer.swap_and_flatten(
+                    self.advantages[:, start:stop]
+                ).squeeze(-1)
+                values_batch = BaseBuffer.swap_and_flatten(
+                    self.values[:, start:stop]
+                ).squeeze(-1)
+                old_actions_log_prob_batch = BaseBuffer.swap_and_flatten(
+                    self.log_probs[:, start:stop]
+                ).squeeze(-1)
 
                 # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),

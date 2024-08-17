@@ -19,6 +19,13 @@ from stable_baselines3.common.vec_env import (
 )
 import wandb
 
+from torch import nn
+
+from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
+from stable_baselines3.common.type_aliases import TensorDict
+from stable_baselines3.common.utils import get_device
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
 
 def obs_as_tensor(
     obs: Union[th.Tensor, np.ndarray, Dict[str, np.ndarray], Any], device: th.device
@@ -910,6 +917,7 @@ def split_and_pad_trajectories(tensor, dones):
 
     Assumes that the inputy has the following dimension order: [time, number of envs, additional dimensions]
     """
+
     dones = dones.clone()
     dones[-1] = 1
     # Permute the buffers to have order (num_envs, num_transitions_per_env, ...), for correct reshaping
@@ -948,3 +956,20 @@ def unpad_trajectories(trajectories, masks):
         .view(-1, trajectories.shape[0], trajectories.shape[-1])
         .transpose(1, 0)
     )
+
+
+class ParallelEnvFlattenExtractor(BaseFeaturesExtractor):
+    """
+    Feature extract that flatten the input.
+    Used as a placeholder when feature extraction is not needed.
+
+    :param observation_space: The observation space of the environment
+    """
+
+    def __init__(self, observation_space: gym.Space) -> None:
+        super().__init__(observation_space, get_flattened_obs_dim(observation_space))
+        self.flatten = nn.Flatten(start_dim=2, end_dim=-1)
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        # return self.flatten(observations)
+        return observations

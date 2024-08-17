@@ -18,10 +18,14 @@ from stable_baselines3.common.policies import (
     BasePolicy,
     MultiInputActorCriticPolicy,
 )
-from sb3_contrib.common.recurrent.policies import (  # type: ignore
-    RecurrentActorCriticCnnPolicy,
-    RecurrentActorCriticPolicy,
-    RecurrentMultiInputActorCriticPolicy,
+
+from stable_baselines3.common.torch_layers import (
+    BaseFeaturesExtractor,
+    CombinedExtractor,
+    FlattenExtractor,
+    MlpExtractor,
+    NatureCNN,
+    create_mlp,
 )
 from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
 
@@ -38,6 +42,7 @@ from stable_baselines3.common.utils import (
     set_random_seed,
     update_learning_rate,
 )
+from stable_baselines3.common.buffers import BaseBuffer
 from stable_baselines3.common.base_class import maybe_make_env
 from stable_baselines3.common.vec_env import (
     DummyVecEnv,
@@ -55,12 +60,19 @@ from rlopt.common.torch.type_aliases import (
     RecurrentDictRolloutBufferSequenceSamples,
 )
 
-from rlopt.utils.torch.utils import obs_as_tensor, explained_variance
+from rlopt.utils.torch.utils import (
+    obs_as_tensor,
+    explained_variance,
+    ParallelEnvFlattenExtractor,
+    unpad_trajectories,
+)
 from rlopt.agent.torch.l2t.policies import (
     MlpLstmPolicy,
     CnnLstmPolicy,
     MultiInputLstmPolicy,
+    RecurrentActorCriticPolicy,
 )
+
 
 SelfRecurrentL2T = TypeVar("SelfRecurrentL2T", bound="RecurrentL2T")
 
@@ -172,7 +184,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             print(f"Using {self.device} device")
 
         self.verbose = verbose
-        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
 
         self.num_timesteps = 0
         # Used for updating schedules
@@ -303,9 +314,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.student_policy = student_policy  # type: ignore
         self.mixture_coeff = mixture_coeff
+
+        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
         self.student_policy_kwargs = (
             {} if student_policy_kwargs is None else student_policy_kwargs
         )
+
         self._last_lstm_states = None
 
         if _init_setup_model:
@@ -315,21 +329,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        # if self.rollout_buffer_class is None:
-        #     if isinstance(self.observation_space, spaces.Dict):
-
-        #         self.rollout_buffer_class = RecurrentRolloutBuffer
-        #     else:
-        #         self.rollout_buffer_class = RecurrentDictRolloutBuffer
-
-        # if self.whole_sequences:
-        #     if isinstance(self.observation_space, spaces.Dict):
-        #         self.rollout_buffer_class = RecurrentSequenceRolloutBuffer
-        #     else:
-        #         self.rollout_buffer_class = RecurrentSequenceDictRolloutBuffer
-        # self.rollout_buffer_class: (
-        #     RecurrentDictRolloutBuffer | RecurrentSequenceDictRolloutBuffer
-        # )
         self.rollout_buffer_class = RLOptDictRecurrentReplayBuffer
 
         self.policy = self.policy_class(  # type: ignore[assignment]
@@ -619,14 +618,21 @@ class RecurrentL2T(OnPolicyAlgorithm):
             old_actions_log_prob_batch,
             masks_batch,
         ) in generator:
-            print("obs_batch:", {obs_batch["teacher"].shape})
-            print("obs_batch:", {obs_batch["student"].shape})
-            print(f"actions_batch: {actions_batch.shape}")
-            print(f"values_batch: {values_batch.shape}")
-            print(f"advantages_batch: {advantages_batch.shape}")
-            print(f"returns_batch: {returns_batch.shape}")
-            print(f"old_actions_log_prob_batch: {old_actions_log_prob_batch.shape}")
-            print(f"masks_batch: {masks_batch.shape}")
+            # print(f"start training")
+            # print(
+            #     "obs_batch:", {obs_batch["teacher"].shape}
+            # )  # (n_steps, n_envs, feature dim)
+            # print(
+            #     "obs_batch:", {obs_batch["student"].shape}
+            # )  # (n_steps, n_envs, feature dim)
+            # print(
+            #     f"actions_batch: {actions_batch['teacher'].shape}, {actions_batch['student'].shape}"
+            # )
+            # print(f"values_batch: {values_batch.shape}")
+            # print(f"advantages_batch: {advantages_batch.shape}")
+            # print(f"returns_batch: {returns_batch.shape}")
+            # print(f"old_actions_log_prob_batch: {old_actions_log_prob_batch.shape}")
+            # print(f"masks_batch: {masks_batch.shape}")
 
             approx_kl_divs = []
             # # Do a complete pass on the rollout buffer
@@ -647,8 +653,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if self.whole_sequences:
                 actions = actions["teacher"]
                 observations = obs_batch["teacher"]
-            print("action shape: ", actions.shape)
-            print("observation shape:", observations.shape)
+            # print("action shape: ", actions.shape)
+            # print("observation shape:", observations.shape)
+
             # teacher is mlp so no funny business
             values, log_prob, entropy = self.policy.evaluate_actions(
                 observations, actions  # type: ignore
@@ -662,6 +669,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
+            # print("after evaluate_actions")
+            # print(f"values: {values.shape}")
+            # print(f"log_prob: {log_prob.shape}")
+            # print(f"entropy: {entropy.shape}")
 
             # ratio between old and new policy, should be one at the first iteration
             ratio = th.exp(log_prob - old_actions_log_prob_batch)
@@ -703,32 +714,44 @@ class RecurrentL2T(OnPolicyAlgorithm):
             )
 
             if self.whole_sequences:
-                student_actions = actions["student"]
+                student_action = actions_batch["student"]
                 student_observations = obs_batch["student"]
-                # student obs and action shape is (T, B, feature dim)
+                # student obs shape is (T, B, feature dim)
                 student_values, student_log_prob, student_entropy = (
                     self.student_policy.evaluate_actions_whole_sequence(
-                        student_observations, student_actions
+                        student_observations, student_action
                     )
                 )
 
             else:
                 raise NotImplementedError
-
+            # print(
+            #     f"student log prob shape: {student_log_prob.shape}, maek shape {mask.shape}"
+            # )
             # student loss = kl divergence between student and teacher
-            student_log_prob = student_log_prob[mask]
+            student_log_prob = unpad_trajectories(student_log_prob, mask)
             student_log_prob_shape = student_log_prob.shape
+            # print(f"student log prob shape after unpadding: {student_log_prob_shape}")
             if len(student_log_prob_shape) < 3:
                 student_log_prob_shape = (*student_log_prob_shape, 1)
-            student_log_prob = student_log_prob.transpose(0, 1).reshape(
-                student_log_prob_shape[0] * student_log_prob_shape[1],
-                *student_log_prob_shape[2:],
+            student_log_prob = (
+                student_log_prob.transpose(0, 1)
+                .reshape(
+                    student_log_prob_shape[0] * student_log_prob_shape[1],
+                    *student_log_prob_shape[2:],
+                )
+                .squeeze(-1)
             )
-            assert th.allclose(log_prob.shape, student_log_prob.shape)
+            # print("check log prob", log_prob.shape, student_log_prob.shape)
+            # assert th.allclose(log_prob.shape, student_log_prob.shape)
             # student_loss = F.mse_loss(student_actions, actions.detach())
             # calculate approximate kl divergence as student loss
+            teacher_log_prob = log_prob.clone().detach()
             student_loss = th.mean(
-                th.exp(student_log_prob - log_prob) - 1 - student_log_prob + log_prob
+                th.exp(student_log_prob - teacher_log_prob)
+                - 1
+                - student_log_prob
+                + teacher_log_prob
             )
             student_losses.append(student_loss.item())
 
@@ -1002,6 +1025,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         # Create eval callback if needed
         callback = self._init_callback(callback, progress_bar)
+
+        print(self.policy)
+
+        print(self.student_policy)
 
         return total_timesteps, callback
 
