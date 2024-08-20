@@ -528,6 +528,53 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         return actions, states
 
+    def predict_whole_sequence(
+        self, obs: th.Tensor, deterministic: bool = False
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Predict actions of batches of whole sequences according to the current policy,
+        given the observations.
+
+        :param obs: Observation (n_steps, n_seq, features_dim)
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: estimated value, actions
+            and entropy of the action distribution.
+        """
+        self.set_training_mode(True)
+
+        # Preprocess the observation if needed
+
+        # temporary fix to disable the flattening that stable_baselines3 feature extractors do by default
+        # flattening will turn the sequences in the batch into 1 long sequence without proper resetting of lstm hidden states
+        if self.features_extractor_class == FlattenExtractor:
+            features = obs
+        else:
+            features = self.extract_features(obs)
+        latent_pi, _ = self.lstm_actor(features)
+
+        if self.lstm_critic is not None:
+            latent_vf, _ = self.lstm_critic(features)
+        elif self.shared_lstm:
+            latent_vf = latent_pi.detach()
+        else:
+            latent_vf = self.critic(features)
+
+        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+
+        # value shape (n_steps, n_seq, 1)
+        values = self.value_net(latent_vf)
+
+        distribution = self._get_action_dist_from_latent(latent_pi)
+
+        # actions shape (n_steps, n_seq, n_actions)
+        actions = distribution.get_actions(deterministic=deterministic)
+
+        entropy = distribution.distribution.entropy().sum(dim=-1)
+        entropy = entropy.unsqueeze(-1)
+
+        return values, actions, entropy
+
 
 class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):
     """

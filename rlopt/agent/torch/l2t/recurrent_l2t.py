@@ -373,6 +373,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self.lr_schedule,
             **student_policy_kwargs,  # pytype:disable=not-instantiable # type: ignore
         )
+        self.student_policy: RecurrentActorCriticPolicy
         self.student_policy = self.student_policy.to(self.device)
 
         # We assume that LSTM for the actor and the critic
@@ -698,51 +699,38 @@ class RecurrentL2T(OnPolicyAlgorithm):
             )
 
             if self.whole_sequences:
-                student_action = actions_batch["student"]
                 student_observations = obs_batch["student"]
                 # student obs shape is (T, B, feature dim)
-                student_values, student_log_prob, student_entropy = (
-                    self.student_policy.evaluate_actions_whole_sequence(
-                        student_observations, student_action
+                student_values, student_action, student_entropy = (
+                    self.student_policy.predict_whole_sequence(
+                        obs=student_observations, deterministic=False
                     )
                 )
             else:
                 raise NotImplementedError
 
             # student loss = kl divergence between student and teacher
-            student_log_prob = unpad_trajectories(student_log_prob, mask)
-            student_log_prob_shape = student_log_prob.shape
+            student_action = unpad_trajectories(student_action, mask)
+            student_action_shape = student_action.shape
             # print(f"student log prob shape after unpadding: {student_log_prob_shape}")
-            if len(student_log_prob_shape) < 3:
-                student_log_prob_shape = (*student_log_prob_shape, 1)
-            student_log_prob = (
-                student_log_prob.transpose(0, 1)
+            if len(student_action_shape) < 3:
+                student_action_shape = (*student_action_shape, 1)
+            student_action = (
+                student_action.transpose(0, 1)
                 .reshape(
-                    student_log_prob_shape[0] * student_log_prob_shape[1],
-                    *student_log_prob_shape[2:],
+                    student_action_shape[0] * student_action_shape[1],
+                    *student_action_shape[2:],
                 )
                 .squeeze(-1)
             )
 
             # student_loss = F.mse_loss(student_actions, actions.detach())
             # calculate approximate kl divergence as student loss
-            teacher_log_prob = log_prob.clone().detach()
+            teacher_action = actions.clone().detach()
 
-            student_loss = th.mean(
-                th.exp(student_log_prob - teacher_log_prob)
-                - 1
-                - student_log_prob
-                + teacher_log_prob
-            )
-            print(f"student loss: {student_loss}")
+            student_loss = F.mse_loss(student_action, teacher_action)
             student_losses.append(student_loss.item())
             assert not th.isnan(student_loss).any()
-
-            # check if I can produce a student action
-            student_obs_test = {"student": student_observations.cpu().numpy()}
-            student_action = self.student_policy.predict(
-                BaseBuffer.swap_and_flatten(student_obs_test["student"]), None, None
-            )
 
             # Calculate approximate form of reverse KL Divergence for early stopping
             # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
