@@ -618,22 +618,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             old_actions_log_prob_batch,
             masks_batch,
         ) in generator:
-            # print(f"start training")
-            # print(
-            #     "obs_batch:", {obs_batch["teacher"].shape}
-            # )  # (n_steps, n_envs, feature dim)
-            # print(
-            #     "obs_batch:", {obs_batch["student"].shape}
-            # )  # (n_steps, n_envs, feature dim)
-            # print(
-            #     f"actions_batch: {actions_batch['teacher'].shape}, {actions_batch['student'].shape}"
-            # )
-            # print(f"values_batch: {values_batch.shape}")
-            # print(f"advantages_batch: {advantages_batch.shape}")
-            # print(f"returns_batch: {returns_batch.shape}")
-            # print(f"old_actions_log_prob_batch: {old_actions_log_prob_batch.shape}")
-            # print(f"masks_batch: {masks_batch.shape}")
-
             approx_kl_divs = []
             # # Do a complete pass on the rollout buffer
             # for rollout_data in self.rollout_buffer.get(self.batch_size):
@@ -722,12 +706,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
                         student_observations, student_action
                     )
                 )
-
             else:
                 raise NotImplementedError
-            # print(
-            #     f"student log prob shape: {student_log_prob.shape}, maek shape {mask.shape}"
-            # )
+
             # student loss = kl divergence between student and teacher
             student_log_prob = unpad_trajectories(student_log_prob, mask)
             student_log_prob_shape = student_log_prob.shape
@@ -742,18 +723,26 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 )
                 .squeeze(-1)
             )
-            # print("check log prob", log_prob.shape, student_log_prob.shape)
-            # assert th.allclose(log_prob.shape, student_log_prob.shape)
+
             # student_loss = F.mse_loss(student_actions, actions.detach())
             # calculate approximate kl divergence as student loss
             teacher_log_prob = log_prob.clone().detach()
+
             student_loss = th.mean(
                 th.exp(student_log_prob - teacher_log_prob)
                 - 1
                 - student_log_prob
                 + teacher_log_prob
             )
+            print(f"student loss: {student_loss}")
             student_losses.append(student_loss.item())
+            assert not th.isnan(student_loss).any()
+
+            # check if I can produce a student action
+            student_obs_test = {"student": student_observations.cpu().numpy()}
+            student_action = self.student_policy.predict(
+                BaseBuffer.swap_and_flatten(student_obs_test["student"]), None, None
+            )
 
             # Calculate approximate form of reverse KL Divergence for early stopping
             # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
