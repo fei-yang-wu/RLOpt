@@ -189,14 +189,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             0, 1
         )
         episode_starts = episode_starts.reshape((n_seq, -1)).swapaxes(0, 1)
-        # print(
-        #     f"LSTM: {features_sequence.shape}, {episode_starts.shape}, {lstm_states[0].shape}, {lstm_states[1].shape}"
-        # )
+
         # If we don't have to reset the state in the middle of a sequence
         # we can avoid the for loop, which speeds up things
         if th.all(episode_starts == 0.0):
             lstm_output, lstm_states = lstm(features_sequence, lstm_states)
-            print(f"lstm_output: {lstm_output}")
             lstm_output = th.flatten(
                 lstm_output.transpose(0, 1), start_dim=0, end_dim=1
             )
@@ -214,7 +211,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 ),
             )
             lstm_output += [hidden]
-            # print(f"lstm_output in for loop: {lstm_output}")
         # Sequence to batch
         # (sequence length, n_seq, lstm_out_dim) -> (batch_size, lstm_out_dim)
         lstm_output = th.flatten(
@@ -447,7 +443,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         distribution, lstm_states = self.get_distribution(
             observation, lstm_states, episode_starts
         )
-        # print(f"distribution before getting actions: {distribution}")
         return distribution.get_actions(deterministic=deterministic), lstm_states
 
     def predict(
@@ -508,8 +503,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         # Convert to numpy
         actions = actions.cpu().numpy()
-
-        # print(f"right after prediction: {actions}")
 
         if isinstance(self.action_space, spaces.Box):
             if self.squash_output:
