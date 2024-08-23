@@ -1054,9 +1054,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
             "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
         )
         self.logger.record(
-            "Episode/episodic_reward", th.max(self.cur_episode_length).item()
+            "Episode/episodic_length", th.max(self.cur_episode_length).item()
         )
         self.logger.record(
-            "Episode/episodic_length", th.max(self.cur_reward_sum).item()
+            "Episode/episodic_reward", th.max(self.cur_reward_sum).item()
         )
         self.logger.dump(step=self.num_timesteps)
