@@ -19,14 +19,6 @@ from stable_baselines3.common.policies import (
     MultiInputActorCriticPolicy,
 )
 
-from stable_baselines3.common.torch_layers import (
-    BaseFeaturesExtractor,
-    CombinedExtractor,
-    FlattenExtractor,
-    MlpExtractor,
-    NatureCNN,
-    create_mlp,
-)
 from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
 
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -35,35 +27,20 @@ from stable_baselines3.common import utils
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.utils import (
-    check_for_correct_spaces,
     get_device,
-    get_schedule_fn,
-    get_system_info,
-    set_random_seed,
-    update_learning_rate,
 )
-from stable_baselines3.common.buffers import BaseBuffer
 from stable_baselines3.common.base_class import maybe_make_env
 from stable_baselines3.common.vec_env import (
-    DummyVecEnv,
     VecEnv,
     VecNormalize,
-    VecTransposeImage,
-    is_vecenv_wrapped,
     unwrap_vec_normalize,
 )
 
 from rlopt.common.torch.buffer import RLOptDictRecurrentReplayBuffer
 
-from rlopt.common.torch.type_aliases import (
-    RecurrentDictRolloutBufferSamples,
-    RecurrentDictRolloutBufferSequenceSamples,
-)
-
 from rlopt.utils.torch.utils import (
     obs_as_tensor,
     explained_variance,
-    ParallelEnvFlattenExtractor,
     unpad_trajectories,
 )
 from rlopt.agent.torch.l2t.policies import (
