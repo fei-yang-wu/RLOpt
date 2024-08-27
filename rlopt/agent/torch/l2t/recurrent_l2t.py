@@ -22,7 +22,7 @@ from stable_baselines3.common.policies import (
 from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
 
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import get_schedule_fn
+from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
 from stable_baselines3.common import utils
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
@@ -559,6 +559,34 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         return True
 
+    def _update_learning_rate(
+        self,
+        optimizers: Union[List[th.optim.Optimizer], th.optim.Optimizer],
+        lr: Optional[float] = None,
+    ) -> None:
+        """
+        Update the optimizers learning rate using the current learning rate schedule
+        and the current progress remaining (from 1 to 0).
+
+        :param optimizers:
+            An optimizer or a list of optimizers.
+        """
+        # Log the current learning rate
+        self.logger.record(
+            "train/learning_rate", self.lr_schedule(self._current_progress_remaining)
+        )
+
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        if lr is not None:
+            for optimizer in optimizers:
+                update_learning_rate(optimizer, lr)
+        else:
+            for optimizer in optimizers:
+                update_learning_rate(
+                    optimizer, self.lr_schedule(self._current_progress_remaining)
+                )
+
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
@@ -568,10 +596,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.student_policy: BasePolicy
         self.policy.set_training_mode(True)
         self.student_policy.set_training_mode(True)
-        # Update optimizer learning rate
-        self._update_learning_rate(
-            [self.policy.optimizer, self.student_policy.optimizer]
-        )
+        # # Update optimizer learning rate
+        # self._update_learning_rate(
+        #     [self.policy.optimizer, self.student_policy.optimizer]
+        # )
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
         # Optional: clip range for the value function
@@ -746,6 +774,22 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self._n_updates += 1
             if not continue_training:
                 break
+
+            adaptive_lr = True
+            if adaptive_lr and self.target_kl is not None:
+                cur_lr = self.lr_schedule(self._current_progress_remaining)
+                if approx_kl_div > self.target_kl * 2.0:
+                    lr = max(1e-5, cur_lr / 1.5)
+                elif approx_kl_div < self.target_kl / 2.0 and approx_kl_div > 0.0:
+                    lr = min(1e-2, cur_lr * 1.5)
+
+                self._update_learning_rate(
+                    [self.policy.optimizer, self.student_policy.optimizer], lr=lr
+                )
+            else:
+                self._update_learning_rate(
+                    [self.policy.optimizer, self.student_policy.optimizer]
+                )
 
         explained_var = explained_variance(
             self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
