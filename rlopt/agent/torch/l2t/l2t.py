@@ -923,3 +923,10 @@ class L2T(OnPolicyAlgorithm):
             "Episode/episodic_length", th.max(self.cur_reward_sum).item()
         )
         self.logger.dump(step=self.num_timesteps)
+
+    def inference(self):
+        # optimize the model for inference
+        self.policy = th.jit.optimize_for_inference(th.jit.script(self.policy.eval()))
+        self.student_policy = th.jit.optimize_for_inference(
+            th.jit.script(self.student_policy.eval())
+        )
