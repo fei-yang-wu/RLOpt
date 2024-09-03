@@ -47,8 +47,8 @@ def obs_as_tensor(
 
 # From stable baselines
 def explained_variance(
-    y_pred: np.ndarray | th.Tensor, y_true: np.ndarray | th.Tensor
-) -> Union[float, np.floating[Any], np.ndarray, th.Tensor]:
+    y_pred: Union[np.ndarray, th.Tensor], y_true: Union[np.ndarray, th.Tensor]
+) -> Union[float, np.ndarray, th.Tensor]:
     """
     Computes fraction of variance that ypred explains about y.
     Returns 1 - Var[y-ypred] / Var[y]

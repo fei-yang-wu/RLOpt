@@ -77,7 +77,9 @@ class BaseBuffer(ABC):
         self.n_envs = n_envs
 
     @staticmethod
-    def swap_and_flatten(arr: th.Tensor | TensorDict) -> th.Tensor | TensorDict:
+    def swap_and_flatten(
+        arr: Union[th.Tensor, TensorDict]
+    ) -> Union[th.Tensor, TensorDict]:
         """
         Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
         to convert shape from [n_steps, n_envs, ...] (when ... is the shape of the features)
@@ -1043,10 +1045,10 @@ class DictRolloutBuffer(RolloutBuffer):
 
 
 def pad(
-    seq_start_indices: np.ndarray | th.Tensor,
-    seq_end_indices: np.ndarray | th.Tensor,
+    seq_start_indices: Union[np.ndarray, th.Tensor],
+    seq_end_indices: Union[np.ndarray, th.Tensor],
     device: th.device,
-    tensor: np.ndarray | th.Tensor,
+    tensor: Union[np.ndarray, th.Tensor],
     padding_value: float = 0.0,
 ) -> th.Tensor:
     """
@@ -1089,10 +1091,10 @@ def pad(
 
 
 def pad_and_flatten(
-    seq_start_indices: np.ndarray | th.Tensor,
-    seq_end_indices: np.ndarray | th.Tensor,
+    seq_start_indices: Union[np.ndarray, th.Tensor],
+    seq_end_indices: Union[np.ndarray, th.Tensor],
     device: th.device,
-    tensor: np.ndarray | th.Tensor,
+    tensor: Union[np.ndarray, th.Tensor],
     padding_value: float = 0.0,
 ) -> th.Tensor:
     """
@@ -1114,8 +1116,8 @@ def pad_and_flatten(
 
 
 def create_sequencers(
-    episode_starts: np.ndarray | th.Tensor,
-    env_change: np.ndarray | th.Tensor,
+    episode_starts: Union[np.ndarray, th.Tensor],
+    env_change: Union[np.ndarray, th.Tensor],
     device: th.device,
 ) -> Tuple[np.ndarray, Callable, Callable]:
     """
@@ -1529,7 +1531,7 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
 # utility function for creating RecurrentSequenceRolloutBuffer
 def create_sequence_slicer(
     episode_start_indices: np.ndarray, device: Union[th.device, str]
-) -> Callable[[np.ndarray | th.Tensor, List[int]], th.Tensor]:
+) -> Callable[[Union[np.ndarray, th.Tensor], List[int]], th.Tensor]:
     def create_sequence_minibatch(
         tensor: np.ndarray | th.Tensor, seq_indices: List[int]
     ) -> th.Tensor:
