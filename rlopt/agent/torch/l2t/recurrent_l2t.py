@@ -782,6 +782,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     lr = max(1e-5, cur_lr / 1.5)
                 elif approx_kl_div < self.target_kl / 2.0 and approx_kl_div > 0.0:
                     lr = min(1e-2, cur_lr * 1.5)
+                else:
+                    lr = cur_lr
 
                 self._update_learning_rate(
                     [self.policy.optimizer, self.student_policy.optimizer], lr=lr
