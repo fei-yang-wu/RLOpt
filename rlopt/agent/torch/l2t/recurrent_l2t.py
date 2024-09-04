@@ -774,13 +774,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self._n_updates += 1
             if not continue_training:
                 break
-
+            
+            target_kl_temp = 1
             adaptive_lr = True
-            if adaptive_lr and self.target_kl is not None:
+            if adaptive_lr and target_kl_temp is not None:
                 cur_lr = self.lr_schedule(self._current_progress_remaining)
-                if approx_kl_div > self.target_kl * 2.0:
+                if approx_kl_div > target_kl_temp * 2.0:
                     lr = max(1e-5, cur_lr / 1.5)
-                elif approx_kl_div < self.target_kl / 2.0 and approx_kl_div > 0.0:
+                elif approx_kl_div < target_kl_temp / 2.0 and approx_kl_div > 0.0:
                     lr = min(1e-2, cur_lr * 1.5)
                 else:
                     lr = cur_lr
