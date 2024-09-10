@@ -465,7 +465,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                         # actions, values, log_probs = self.student_policy(
                         #     obs_tensor["student"]
                         # )
-                        actions, values, log_prob, lstm_states = (
+                        actions, values, log_probs, lstm_states = (
                             self.student_policy.forward(
                                 obs_tensor["student"], lstm_states, episode_starts
                             )
@@ -620,6 +620,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         clip_fractions = []
         student_losses = []
+        student_policy_losses = []
 
         continue_training = True
 
@@ -716,14 +717,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if self.whole_sequences:
                 student_observations = obs_batch["student"]
                 # student obs shape is (T, B, feature dim)
-                student_values, student_action, student_entropy = (
+                student_values, student_action, student_entropy, student_log_prob = (
                     self.student_policy.predict_whole_sequence(
                         obs=student_observations, deterministic=False
                     )
                 )
             else:
                 raise NotImplementedError
-
+            # print(f"student values shape: {student_action.shape}")
             # student loss = kl divergence between student and teacher
             student_action = unpad_trajectories(student_action, mask)
             student_action_shape = student_action.shape
@@ -739,13 +740,39 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 .squeeze(-1)
             )
 
+            student_log_prob = unpad_trajectories(student_log_prob, mask)
+            student_log_prob_shape = student_log_prob.shape
+            # print(f"student log prob shape after unpadding: {student_log_prob_shape}")
+            if len(student_log_prob_shape) < 3:
+                student_log_prob_shape = (*student_log_prob_shape, 1)
+            student_log_prob = (
+                student_log_prob.transpose(0, 1)
+                .reshape(
+                    student_log_prob_shape[0] * student_log_prob_shape[1],
+                    *student_log_prob_shape[2:],
+                )
+                .squeeze(-1)
+            )
+
+            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+            # clipped surrogate loss
+            student_policy_loss_1 = advantages * student_ratio
+            student_policy_loss_2 = advantages * th.clamp(
+                student_ratio, 1 - clip_range, 1 + clip_range
+            )
+            student_policy_loss = -th.min(
+                student_policy_loss_1, student_policy_loss_2
+            ).mean()
+            student_policy_loss = th.clamp(student_policy_loss, 0, 5)
+            student_policy_losses.append(student_policy_loss.item())
+
             # student_loss = F.mse_loss(student_actions, actions.detach())
             # calculate approximate kl divergence as student loss
             teacher_action = actions.clone().detach()
 
             student_loss = F.mse_loss(student_action, teacher_action)
             # clamp student loss to prevent exploding gradients
-            student_loss = th.clamp(student_loss, 0, 5)
+            student_loss = th.clamp(student_loss, 0, 5) + student_policy_loss
             student_losses.append(student_loss.item())
             # assert not th.isnan(student_loss).any()
 
@@ -826,6 +853,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self.logger.record("train/student_loss", np.mean(student_losses))
+        self.logger.record(
+            "train/student_policy_loss", statistics.mean(student_policy_losses)
+        )
 
     def learn(
         self: SelfRecurrentL2T,
@@ -1090,10 +1120,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
             "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
         )
         self.logger.record(
-            "Episode/episodic_length", th.max(self.cur_episode_length).item()
+            "Episode/max_episodic_length", th.max(self.cur_episode_length).item()
         )
         self.logger.record(
-            "Episode/episodic_reward", th.max(self.cur_reward_sum).item()
+            "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
         )
         self.logger.dump(step=self.num_timesteps)
 

@@ -562,11 +562,13 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         # actions shape (n_steps, n_seq, n_actions)
         actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.distribution.log_prob(actions).sum(dim=-1)
+        log_prob = log_prob.reshape((*log_prob.shape, 1))
 
         entropy = distribution.distribution.entropy().sum(dim=-1)
         entropy = entropy.unsqueeze(-1)
 
-        return values, actions, entropy
+        return values, actions, entropy, log_prob
 
 
 class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):
