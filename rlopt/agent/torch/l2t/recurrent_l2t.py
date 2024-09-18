@@ -754,17 +754,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 .squeeze(-1)
             )
 
-            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
-            # clipped surrogate loss
-            student_policy_loss_1 = advantages * student_ratio
-            student_policy_loss_2 = advantages * th.clamp(
-                student_ratio, 1 - clip_range, 1 + clip_range
-            )
-            student_policy_loss = -th.min(
-                student_policy_loss_1, student_policy_loss_2
-            ).mean()
-            student_policy_loss = th.clamp(student_policy_loss, 0, 5)
-            student_policy_losses.append(student_policy_loss.item())
+            # student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+            # # clipped surrogate loss
+            # student_policy_loss_1 = advantages * student_ratio
+            # student_policy_loss_2 = advantages * th.clamp(
+            #     student_ratio, 1 - clip_range, 1 + clip_range
+            # )
+            # student_policy_loss = -th.min(
+            #     student_policy_loss_1, student_policy_loss_2
+            # ).mean()
+            # student_policy_loss = th.clamp(student_policy_loss, 0, 5)
+            # student_policy_losses.append(student_policy_loss.item())
 
             # student_loss = F.mse_loss(student_actions, actions.detach())
             # calculate approximate kl divergence as student loss
@@ -772,7 +772,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             student_loss = F.mse_loss(student_action, teacher_action)
             # clamp student loss to prevent exploding gradients
-            student_loss = th.clamp(student_loss, 0, 5) + student_policy_loss
+            student_loss = th.clamp(student_loss, 0, 5)  # + student_policy_loss
             student_losses.append(student_loss.item())
             # assert not th.isnan(student_loss).any()
 
@@ -853,9 +853,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self.logger.record("train/student_loss", np.mean(student_losses))
-        self.logger.record(
-            "train/student_policy_loss", statistics.mean(student_policy_losses)
-        )
+        # self.logger.record(
+        #     "train/student_policy_loss", statistics.mean(student_policy_losses)
+        # )
 
     def learn(
         self: SelfRecurrentL2T,
