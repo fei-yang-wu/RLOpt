@@ -558,15 +558,22 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # value shape (n_steps, n_seq, 1)
         values = self.value_net(latent_vf)
 
+        # need to reshape actions to (n_steps * n_seq, n_actions)
+        n_steps, n_seq, _ = latent_pi.shape
+        # latent_pi = latent_pi.reshape((n_steps * n_seq, latent_pi.shape[-1]))
         distribution = self._get_action_dist_from_latent(latent_pi)
 
-        # actions shape (n_steps, n_seq, n_actions)
+        # actions shape (n_steps * n_seq, n_actions)
         actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.distribution.log_prob(actions).sum(dim=-1)
-        log_prob = log_prob.reshape((*log_prob.shape, 1))
+        # print("actions shape", actions.shape)
+        log_prob = distribution.distribution.log_prob(actions).sum(-1)
+        log_prob = log_prob.unsqueeze(-1)
+        # print("log prob shape", log_prob.shape)
+        # log_prob = log_prob.reshape((n_steps, n_seq, 1))
 
-        entropy = distribution.distribution.entropy().sum(dim=-1)
-        entropy = entropy.unsqueeze(-1)
+        entropy = distribution.distribution.entropy().sum(-1)
+        # entropy = entropy.reshape((n_steps, n_seq, 1))
+        # actions = actions.reshape((n_steps, n_seq, -1))
 
         return values, actions, entropy, log_prob
 
