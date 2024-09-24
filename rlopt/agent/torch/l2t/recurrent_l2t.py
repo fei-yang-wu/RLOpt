@@ -758,20 +758,20 @@ class RecurrentL2T(OnPolicyAlgorithm):
             # )
             # assert all values in student_log_prob is <0
             # assert (student_log_prob < 0).all()
-            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+            # student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
             # print("student ratio shape: ", student_ratio.max())
             # print("advantages shape: ", advantages.shape)
             # clipped asym loss
             # student_policy_loss_1 = advantages * student_ratio
-            student_policy_loss_2 = advantages * th.clamp(
-                student_ratio, 1 - clip_range, 1 + clip_range
-            )
+            # student_policy_loss_2 = advantages * th.clamp(
+            #     student_ratio, 1 - clip_range, 1 + clip_range
+            # )
             # student_policy_loss = -th.min(
             #     student_policy_loss_1, student_policy_loss_2
             # ).mean()
-            student_policy_loss = -student_policy_loss_2.mean()
+            # student_policy_loss = -student_policy_loss_2.mean()
             # student_policy_loss = th.clamp(student_policy_loss, 0, 5)
-            student_policy_losses.append(student_policy_loss.item())
+            # student_policy_losses.append(student_policy_loss.item())
 
             # student_loss = F.mse_loss(student_actions, actions.detach())
             # calculate approximate kl divergence as student loss
@@ -779,7 +779,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             student_loss = F.mse_loss(student_action, teacher_action)
             # clamp student loss to prevent exploding gradients
-            student_loss = th.clamp(student_loss, 0, 5) + student_policy_loss
+            student_loss = th.clamp(student_loss, 0, 5)  # + student_policy_loss
             student_losses.append(student_loss.item())
             # assert not th.isnan(student_loss).any()
 
