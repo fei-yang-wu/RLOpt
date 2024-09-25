@@ -511,19 +511,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             elif "log" in infos:
                 self.ep_infos.append(infos["log"])
 
-            self.cur_reward_sum += rewards
-            self.cur_episode_length += 1
-            new_ids = (dones > 0).nonzero(as_tuple=False)
-            # record reward and episode length
-            self.rewbuffer.extend(
-                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.lenbuffer.extend(
-                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.cur_reward_sum[new_ids] = 0
-            self.cur_episode_length[new_ids] = 0
-
             # Give access to local variables
             callback.update_locals(locals())
             if not callback.on_step():
@@ -542,6 +529,19 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     values * infos["time_outs"].unsqueeze(1).to(self.device),
                     1,
                 )
+
+            self.cur_reward_sum += rewards
+            self.cur_episode_length += 1
+            new_ids = (dones > 0).nonzero(as_tuple=False)
+            # record reward and episode length
+            self.rewbuffer.extend(
+                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.lenbuffer.extend(
+                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.cur_reward_sum[new_ids] = 0
+            self.cur_episode_length[new_ids] = 0
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
