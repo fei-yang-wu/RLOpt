@@ -860,9 +860,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self.logger.record("train/student_loss", np.mean(student_losses))
-        self.logger.record(
-            "train/student_policy_loss", statistics.mean(student_policy_losses)
-        )
+        # self.logger.record(
+        #     "train/student_policy_loss", statistics.mean(student_policy_losses)
+        # )
 
     def learn(
         self: SelfRecurrentL2T,
@@ -1120,18 +1120,19 @@ class RecurrentL2T(OnPolicyAlgorithm):
             "time/collection time per step (s)", locs["collection_time"] / self.n_steps
         )
         self.logger.record("time/training_time (s)", locs["training_time"])
-        self.logger.record(
-            "Episode/average_episodic_reward", statistics.mean(self.rewbuffer)
-        )
-        self.logger.record(
-            "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
-        )
-        self.logger.record(
-            "Episode/max_episodic_length", th.max(self.cur_episode_length).item()
-        )
-        self.logger.record(
-            "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
-        )
+        if len(self.rewbuffer) > 1:
+            self.logger.record(
+                "Episode/average_episodic_reward", statistics.mean(self.rewbuffer)
+            )
+            self.logger.record(
+                "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
+            )
+            self.logger.record(
+                "Episode/max_episodic_length", th.max(self.cur_episode_length).item()
+            )
+            self.logger.record(
+                "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
+            )
         self.logger.dump(step=self.num_timesteps)
 
     def inference(self):
