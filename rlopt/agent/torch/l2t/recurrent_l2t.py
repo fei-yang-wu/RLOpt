@@ -541,7 +541,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
             )
             self.cur_reward_sum[new_ids] = 0
-            self.cur_episode_length[new_ids] = 0
+            self.cur_episode_length[new_ids] = 1
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
