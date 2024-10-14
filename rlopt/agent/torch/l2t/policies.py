@@ -3,7 +3,10 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import numpy as np
 import torch as th
 from gymnasium import spaces
-from stable_baselines3.common.distributions import Distribution
+from stable_baselines3.common.distributions import (
+    Distribution,
+    DiagGaussianDistribution,
+)
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
@@ -596,7 +599,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         return actions, states
 
     def predict_whole_sequence(
-        self, obs: th.Tensor, deterministic: bool = False
+        self, obs: th.Tensor, deterministic: bool = False, lstm_states: RNNStates = None
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Predict actions of batches of whole sequences according to the current policy,
@@ -609,6 +612,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         """
         self.set_training_mode(True)
 
+        if lstm_states is None:
+            raise ValueError("lstm_states must be provided for recurrent policies")
+
         # Preprocess the observation if needed
 
         # temporary fix to disable the flattening that stable_baselines3 feature extractors do by default
@@ -617,10 +623,12 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             features = obs
         else:
             features = self.extract_features(obs)
-        latent_pi, _ = self.lstm_actor(features)
+        latent_pi, _ = self.lstm_actor(features, (lstm_states.pi[0], lstm_states.pi[1]))
 
         if self.lstm_critic is not None:
-            latent_vf, _ = self.lstm_critic(features)
+            latent_vf, _ = self.lstm_critic(
+                features, (lstm_states.vf[0], lstm_states.vf[1])
+            )
         elif self.shared_lstm:
             latent_vf = latent_pi.detach()
         else:
@@ -636,20 +644,18 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         n_steps, n_seq, _ = latent_pi.shape
         # latent_pi = latent_pi.reshape((n_steps * n_seq, latent_pi.shape[-1]))
         distribution = self._get_action_dist_from_latent(latent_pi)
+        distribution: DiagGaussianDistribution
 
         # actions shape (n_steps * n_seq, n_actions)
         actions = distribution.get_actions(deterministic=deterministic)
-        # print("actions shape", actions.shape)
         log_prob = distribution.distribution.log_prob(actions).sum(-1)
         log_prob = log_prob.unsqueeze(-1)
-        # print("log prob shape", log_prob.shape)
-        # log_prob = log_prob.reshape((n_steps, n_seq, 1))
 
         entropy = distribution.distribution.entropy().sum(-1)
-        # entropy = entropy.reshape((n_steps, n_seq, 1))
-        # actions = actions.reshape((n_steps, n_seq, -1))
 
-        return values, actions, entropy, log_prob
+        mu, sigma = distribution.distribution.mean, distribution.distribution.stddev
+
+        return values, actions, entropy, log_prob, mu, sigma
 
 
 class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):

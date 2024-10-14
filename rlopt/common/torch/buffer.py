@@ -1765,6 +1765,7 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         n_envs: int = 1,
     ) -> None:
         self.hidden_state_shape = hidden_state_shape
+        print(f"hidden state shape {self.hidden_state_shape}")
         self.seq_start_indices, self.seq_end_indices = None, None
         super().__init__()
         self.buffer_size = buffer_size
@@ -2036,17 +2037,83 @@ class RLOptDictRecurrentReplayBuffer(ABC):
                 # then take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
                 last_was_done = last_was_done.permute(1, 0)
-                # hid_batch = [
-                #     saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][
+                hid_batch_hidden_state_pi = [
+                    saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][
+                        first_traj:last_traj
+                    ]
+                    .transpose(1, 0)
+                    .contiguous()
+                    for saved_hidden_states in [
+                        self.hidden_states_pi,
+                        self.cell_states_pi,
+                    ]
+                ]
+
+                # hid_batch_cell_state_pi = [
+                #     saved_cell_states.permute(2, 0, 1, 3)[last_was_done][
                 #         first_traj:last_traj
                 #     ]
                 #     .transpose(1, 0)
                 #     .contiguous()
-                #     for saved_hidden_states in self.saved_hidden_states_a
+                #     for saved_cell_states in self.cell_states_pi
                 # ]
 
-                # hid_batch = hid_batch[0] if len(hid_batch) == 1 else hid_batch
+                hid_batch_hidden_state_vf = [
+                    saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][
+                        first_traj:last_traj
+                    ]
+                    .transpose(1, 0)
+                    .contiguous()
+                    for saved_hidden_states in [
+                        self.hidden_states_vf,
+                        self.cell_states_vf,
+                    ]
+                ]
 
-                yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, masks_batch
+                # hid_batch_cell_state_vf = [
+                #     saved_cell_states.permute(2, 0, 1, 3)[last_was_done][
+                #         first_traj:last_traj
+                #     ]
+                #     .transpose(1, 0)
+                #     .contiguous()
+                #     for saved_cell_states in self.cell_states_vf
+                # ]
+
+                hid_batch_hidden_state_pi = (
+                    hid_batch_hidden_state_pi[0]
+                    if len(hid_batch_hidden_state_pi) == 1
+                    else hid_batch_hidden_state_pi
+                )
+
+                # hid_batch_cell_state_pi = (
+                #     hid_batch_cell_state_pi[0]
+                #     if len(hid_batch_cell_state_pi) == 1
+                #     else hid_batch_cell_state_pi
+                # )
+
+                hid_batch_hidden_state_vf = (
+                    hid_batch_hidden_state_vf[0]
+                    if len(hid_batch_hidden_state_vf) == 1
+                    else hid_batch_hidden_state_vf
+                )
+
+                # hid_batch_cell_state_vf = (
+                #     hid_batch_cell_state_vf[0]
+                #     if len(hid_batch_cell_state_vf) == 1
+                #     else hid_batch_cell_state_vf
+                # )
+
+                hid_batch = RNNStates(
+                    pi=(
+                        hid_batch_hidden_state_pi[0],
+                        hid_batch_hidden_state_pi[1],
+                    ),
+                    vf=(
+                        hid_batch_hidden_state_vf[0],
+                        hid_batch_hidden_state_vf[1],
+                    ),
+                )
+
+                yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, masks_batch, hid_batch
 
                 first_traj = last_traj

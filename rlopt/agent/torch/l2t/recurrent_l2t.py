@@ -459,25 +459,21 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 )
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = self._last_obs
-                if self.mixture_coeff > 0.0:
-                    epsilon = self.mixture_coeff
-                    if np.random.uniform() < epsilon and self.num_timesteps > 0:
-                        # actions, values, log_probs = self.student_policy(
-                        #     obs_tensor["student"]
-                        # )
-                        actions, values, log_probs, lstm_states = (
-                            self.student_policy.forward(
-                                obs_tensor["student"], lstm_states, episode_starts
-                            )
+                if np.random.uniform() < self.mixture_coeff and self.num_timesteps > 0:
+                    # actions, values, log_probs = self.student_policy(
+                    #     obs_tensor["student"]
+                    # )
+                    actions, values, log_probs, lstm_states = (
+                        self.student_policy.forward(
+                            obs_tensor["student"], lstm_states, episode_starts
                         )
-                        student_predicted = True
-                    else:
-                        actions, values, log_probs = self.policy(obs_tensor["teacher"])
+                    )
+                    student_predicted = True
                 else:
                     actions, values, log_probs = self.policy(obs_tensor["teacher"])
 
                 if not student_predicted:
-                    # get the student's lstm states
+                    # get the student's lstm states if student is not used
                     _, _, _, lstm_states = self.student_policy.forward(
                         obs_tensor["student"], lstm_states, episode_starts
                     )
@@ -603,7 +599,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         """
 
         # Switch to train mode (this affects batch norm / dropout)
-        self.student_policy: BasePolicy
+        self.student_policy: RecurrentActorCriticPolicy
         self.policy.set_training_mode(True)
         self.student_policy.set_training_mode(True)
         # # Update optimizer learning rate
@@ -620,7 +616,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         clip_fractions = []
         student_losses = []
-        student_policy_losses = []
+        # student_policy_losses = []
 
         continue_training = True
 
@@ -634,6 +630,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             returns_batch,
             old_actions_log_prob_batch,
             masks_batch,
+            hidden_batch,
         ) in generator:
             approx_kl_divs = []
             # # Do a complete pass on the rollout buffer
@@ -717,10 +714,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if self.whole_sequences:
                 student_observations = obs_batch["student"]
                 # student obs shape is (T, B, feature dim)
-                student_values, student_action, student_entropy, student_log_prob = (
-                    self.student_policy.predict_whole_sequence(
-                        obs=student_observations, deterministic=False
-                    )
+                (
+                    student_values,
+                    student_action,
+                    student_entropy,
+                    student_log_prob,
+                    mu,
+                    sigma,
+                ) = self.student_policy.predict_whole_sequence(
+                    obs=student_observations,
+                    deterministic=False,
+                    lstm_states=hidden_batch,
                 )
             else:
                 raise NotImplementedError
@@ -739,18 +743,18 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 .squeeze(-1)
             )
             # print("student_log_prob shape: ", student_log_prob.shape)
-            student_log_prob = unpad_trajectories(student_log_prob, mask)
-            student_log_prob_shape = student_log_prob.shape
-            if len(student_log_prob_shape) < 3:
-                student_log_prob_shape = (*student_log_prob_shape, 1)
-            student_log_prob = (
-                student_log_prob.transpose(0, 1)
-                .reshape(
-                    student_log_prob_shape[0] * student_log_prob_shape[1],
-                    *student_log_prob_shape[2:],
-                )
-                .squeeze(-1)
-            )
+            # student_log_prob = unpad_trajectories(student_log_prob, mask)
+            # student_log_prob_shape = student_log_prob.shape
+            # if len(student_log_prob_shape) < 3:
+            #     student_log_prob_shape = (*student_log_prob_shape, 1)
+            # student_log_prob = (
+            #     student_log_prob.transpose(0, 1)
+            #     .reshape(
+            #         student_log_prob_shape[0] * student_log_prob_shape[1],
+            #         *student_log_prob_shape[2:],
+            #     )
+            #     .squeeze(-1)
+            # )
             # print(
             #     "student log prob and old action log prob shapes",
             #     student_log_prob.shape,
@@ -779,7 +783,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             student_loss = F.mse_loss(student_action, teacher_action)
             # clamp student loss to prevent exploding gradients
-            student_loss = th.clamp(student_loss, 0, 5)  # + student_policy_loss
+            # student_loss = th.clamp(student_loss, 0, 5)  # + student_policy_loss
             student_losses.append(student_loss.item())
             # assert not th.isnan(student_loss).any()
 
