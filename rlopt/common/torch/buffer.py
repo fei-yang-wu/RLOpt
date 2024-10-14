@@ -2049,15 +2049,6 @@ class RLOptDictRecurrentReplayBuffer(ABC):
                     ]
                 ]
 
-                # hid_batch_cell_state_pi = [
-                #     saved_cell_states.permute(2, 0, 1, 3)[last_was_done][
-                #         first_traj:last_traj
-                #     ]
-                #     .transpose(1, 0)
-                #     .contiguous()
-                #     for saved_cell_states in self.cell_states_pi
-                # ]
-
                 hid_batch_hidden_state_vf = [
                     saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][
                         first_traj:last_traj
@@ -2070,38 +2061,17 @@ class RLOptDictRecurrentReplayBuffer(ABC):
                     ]
                 ]
 
-                # hid_batch_cell_state_vf = [
-                #     saved_cell_states.permute(2, 0, 1, 3)[last_was_done][
-                #         first_traj:last_traj
-                #     ]
-                #     .transpose(1, 0)
-                #     .contiguous()
-                #     for saved_cell_states in self.cell_states_vf
-                # ]
-
                 hid_batch_hidden_state_pi = (
                     hid_batch_hidden_state_pi[0]
                     if len(hid_batch_hidden_state_pi) == 1
                     else hid_batch_hidden_state_pi
                 )
 
-                # hid_batch_cell_state_pi = (
-                #     hid_batch_cell_state_pi[0]
-                #     if len(hid_batch_cell_state_pi) == 1
-                #     else hid_batch_cell_state_pi
-                # )
-
                 hid_batch_hidden_state_vf = (
                     hid_batch_hidden_state_vf[0]
                     if len(hid_batch_hidden_state_vf) == 1
                     else hid_batch_hidden_state_vf
                 )
-
-                # hid_batch_cell_state_vf = (
-                #     hid_batch_cell_state_vf[0]
-                #     if len(hid_batch_cell_state_vf) == 1
-                #     else hid_batch_cell_state_vf
-                # )
 
                 hid_batch = RNNStates(
                     pi=(

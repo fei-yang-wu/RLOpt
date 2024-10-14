@@ -152,6 +152,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
         )
 
+        self.action_space_low = th.Tensor(self.action_space.low)
+        self.action_space_high = th.Tensor(self.action_space.high)
+
     def _build_mlp_extractor(self) -> None:
         """
         Create the policy and value networks.
@@ -526,9 +529,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
     def predict_and_return_tensor(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: Union[th.Tensor, Dict[str, th.Tensor]],
+        state: Optional[Tuple[th.Tensor, ...]] = None,
+        episode_start: Optional[th.Tensor] = None,
         deterministic: bool = False,
     ) -> Tuple[th.Tensor, Optional[Tuple[th.Tensor, ...]]]:
         """
@@ -546,12 +549,17 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # Switch to eval mode (this affects batch norm / dropout)
         self.set_training_mode(False)
 
-        observation, vectorized_env = self.obs_to_tensor(observation)
+        if self.action_space_low.device != self.device:
+            self.action_space_low.to(self.device),
+            self.action_space_high.to(self.device),
 
         if isinstance(observation, dict):
             n_envs = observation[next(iter(observation.keys()))].shape[0]
         else:
             n_envs = observation.shape[0]
+        print(observation.shape)
+        vectorized_env = n_envs > 1
+
         # state : (n_layers, n_envs, dim)
         if state is None:
             # Initialize hidden states to zeros
@@ -588,8 +596,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 # out of bound error (e.g. if sampling from a Gaussian distribution)
                 actions = th.clamp(
                     actions,
-                    th.Tensor(self.action_space.low),
-                    th.Tensor(self.action_space.high),
+                    self.action_space_low.to(self.device),
+                    self.action_space_high.to(self.device),
                 )
 
         # Remove batch dimension if needed
