@@ -274,6 +274,50 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         log_prob = distribution.log_prob(actions)
         return actions, values, log_prob, RNNStates(lstm_states_pi, lstm_states_vf)
 
+    def forward_lstm(
+        self,
+        obs: th.Tensor,
+        lstm_states: RNNStates,
+        episode_starts: th.Tensor,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, RNNStates]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation. Observation
+        :param lstm_states: The last hidden and memory states for the LSTM.
+        :param episode_starts: Whether the observations correspond to new episodes
+            or not (we reset the lstm states in that case).
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            pi_features = vf_features = features  # alis
+        else:
+            pi_features, vf_features = features
+        # latent_pi, latent_vf = self.mlp_extractor(features)
+        latent_pi, lstm_states_pi = self._process_sequence(
+            pi_features, lstm_states.pi, episode_starts, self.lstm_actor
+        )
+        if self.lstm_critic is not None:
+            latent_vf, lstm_states_vf = self._process_sequence(
+                vf_features, lstm_states.vf, episode_starts, self.lstm_critic
+            )
+        elif self.shared_lstm:
+            # Re-use LSTM features but do not backpropagate
+            latent_vf = latent_pi.detach()
+            lstm_states_vf = (lstm_states_pi[0].detach(), lstm_states_pi[1].detach())
+        else:
+            # Critic only has a feedforward network
+            latent_vf = self.critic(vf_features)
+            lstm_states_vf = lstm_states_pi
+
+        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+
+        return RNNStates(lstm_states_pi, lstm_states_vf)
+
     def get_distribution(
         self,
         obs: th.Tensor,

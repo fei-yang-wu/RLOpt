@@ -76,6 +76,7 @@ class BaseBuffer(ABC):
         self.device = get_device(device)
         self.n_envs = n_envs
 
+    @th.compile
     @staticmethod
     def swap_and_flatten(
         arr: Union[th.Tensor, TensorDict]

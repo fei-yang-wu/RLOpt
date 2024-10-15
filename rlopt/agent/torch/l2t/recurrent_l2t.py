@@ -13,7 +13,7 @@ from gymnasium import spaces
 from torch.nn import functional as F
 from copy import deepcopy
 
-from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.buffers import RolloutBuffer, BaseBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import (
     ActorCriticCnnPolicy,
@@ -439,7 +439,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         callback.on_rollout_start()
 
         self.ep_infos = []
-        lstm_states = deepcopy(self._last_lstm_states)
+        # lstm_states = deepcopy(self._last_lstm_states)
         while n_steps < n_rollout_steps:
             if (
                 self.use_sde
@@ -448,34 +448,40 @@ class RecurrentL2T(OnPolicyAlgorithm):
             ):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
+                self.student_policy.reset_noise(env.num_envs)
 
             # flag the student agent to be used
             student_predicted = False
             with th.inference_mode():
                 # prepare for the student agent
                 self._last_episode_starts: th.Tensor
-                episode_starts = (
-                    self._last_episode_starts.clone().to(self.device).type(th.float32)
+                episode_starts = self._last_episode_starts.type(th.float32).to(
+                    self.device
                 )
-                # Convert to pytorch tensor or to TensorDict
+
                 obs_tensor = self._last_obs
-                if np.random.uniform() < self.mixture_coeff and self.num_timesteps > 0:
-                    # actions, values, log_probs = self.student_policy(
-                    #     obs_tensor["student"]
-                    # )
+                if (
+                    th.rand(1)[0]
+                    < self.mixture_coeff * (1 - self._current_progress_remaining)
+                    and self.num_timesteps > 0
+                ):
                     actions, values, log_probs, lstm_states = (
                         self.student_policy.forward(
-                            obs_tensor["student"], lstm_states, episode_starts
+                            obs_tensor["student"],
+                            self._last_lstm_states,
+                            episode_starts,
                         )
                     )
                     student_predicted = True
                 else:
                     actions, values, log_probs = self.policy(obs_tensor["teacher"])
 
+                # get the hidden state of the current student state
                 if not student_predicted:
-                    # get the student's lstm states if student is not used
-                    _, _, _, lstm_states = self.student_policy.forward(
-                        obs_tensor["student"], lstm_states, episode_starts
+                    lstm_states = self.student_policy.forward_lstm(
+                        obs_tensor["student"],
+                        self._last_lstm_states,
+                        episode_starts,
                     )
 
             # Rescale and perform action
@@ -512,7 +518,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if not callback.on_step():
                 return False
 
-            # self._update_info_buffer(infos, dones)
             n_steps += 1
 
             if isinstance(self.action_space, spaces.Discrete):
@@ -529,15 +534,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self.cur_reward_sum += rewards
             self.cur_episode_length += 1
             new_ids = (dones > 0).nonzero(as_tuple=False)
-            # record reward and episode length
-            self.rewbuffer.extend(
-                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.lenbuffer.extend(
-                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.cur_reward_sum[new_ids] = 0
-            self.cur_episode_length[new_ids] = 1
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
@@ -552,6 +548,16 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
             self._last_lstm_states = lstm_states
+
+            # record reward and episode length
+            self.rewbuffer.extend(
+                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.lenbuffer.extend(
+                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.cur_reward_sum[new_ids] = 0
+            self.cur_episode_length[new_ids] = 1
 
         with th.inference_mode():
             # Compute value for the last timestep
@@ -729,19 +735,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
             else:
                 raise NotImplementedError
 
-            # coming from lstm so unpad first
-            student_action = unpad_trajectories(student_action, mask)
-            student_action_shape = student_action.shape
-            if len(student_action_shape) < 3:
-                student_action_shape = (*student_action_shape, 1)
-            student_action = (
-                student_action.transpose(0, 1)
-                .reshape(
-                    student_action_shape[0] * student_action_shape[1],
-                    *student_action_shape[2:],
-                )
-                .squeeze(-1)
+            # align dim with the teacher action
+            student_action = BaseBuffer.swap_and_flatten(
+                unpad_trajectories(student_action, mask)
             )
+
             # print("student_log_prob shape: ", student_log_prob.shape)
             # student_log_prob = unpad_trajectories(student_log_prob, mask)
             # student_log_prob_shape = student_log_prob.shape
@@ -779,7 +777,16 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             # student_loss = F.mse_loss(student_actions, actions.detach())
             # calculate approximate kl divergence as student loss
-            teacher_action = actions.clone().detach()
+
+            teacher_action = actions.detach()
+
+            # print(f"student action shape: {student_action.shape}")
+            # print(f"teacher action shape: {teacher_action.shape}")
+
+            # print("first few examples of student and teacher action")
+            # print(student_action[:5])
+            # print(teacher_action[:5])
+            # print("\n\n\n")
 
             student_loss = F.mse_loss(student_action, teacher_action)
             # clamp student loss to prevent exploding gradients
