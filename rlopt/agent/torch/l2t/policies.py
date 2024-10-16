@@ -607,22 +607,22 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # state : (n_layers, n_envs, dim)
         if state is None:
             # Initialize hidden states to zeros
-            state = np.concatenate(
-                [np.zeros(self.lstm_hidden_state_shape) for _ in range(n_envs)], axis=1
+            state = th.concatenate(
+                [th.zeros(self.lstm_hidden_state_shape) for _ in range(n_envs)], dim=1
             )
             state = (state, state)
 
         if episode_start is None:
-            episode_start = np.array([False for _ in range(n_envs)])
+            episode_start = th.tensor([False for _ in range(n_envs)])
 
         with th.no_grad():
             # Convert to PyTorch tensors
-            states = th.tensor(
-                state[0], dtype=th.float32, device=self.device
-            ), th.tensor(state[1], dtype=th.float32, device=self.device)
-            episode_starts = th.tensor(
-                episode_start, dtype=th.float32, device=self.device
+            states = (
+                state[0].type(th.float32).to(self.device),
+                state[1].type(th.float32).to(self.device),
             )
+
+            episode_starts = episode_start.to(self.device)
 
             actions, states = self._predict(
                 observation,

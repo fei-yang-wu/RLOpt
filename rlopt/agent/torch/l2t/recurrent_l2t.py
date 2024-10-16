@@ -367,8 +367,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # have the same architecture
         lstm = self.student_policy.lstm_actor
 
-        if not isinstance(self.student_policy, RecurrentActorCriticPolicy):
-            raise ValueError("Student policy must subclass RecurrentActorCriticPolicy")
+        # if not isinstance(self.student_policy, RecurrentActorCriticPolicy):
+        #     raise ValueError("Student policy must subclass RecurrentActorCriticPolicy")
 
         single_hidden_state_shape = (lstm.num_layers, self.n_envs, lstm.hidden_size)
         # hidden and cell states for actor and critic
@@ -673,10 +673,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
-            # print("after evaluate_actions")
-            # print(f"values: {values.shape}")
-            # print(f"log_prob: {log_prob.shape}")
-            # print(f"entropy: {entropy.shape}")
 
             # ratio between old and new policy, should be one at the first iteration
             ratio = th.exp(log_prob - old_actions_log_prob_batch)
@@ -779,14 +775,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             # calculate approximate kl divergence as student loss
 
             teacher_action = actions.detach()
-
-            # print(f"student action shape: {student_action.shape}")
-            # print(f"teacher action shape: {teacher_action.shape}")
-
-            # print("first few examples of student and teacher action")
-            # print(student_action[:5])
-            # print(teacher_action[:5])
-            # print("\n\n\n")
 
             student_loss = F.mse_loss(student_action, teacher_action)
             # clamp student loss to prevent exploding gradients
@@ -1111,6 +1099,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Create eval callback if needed
         callback = self._init_callback(callback, progress_bar)
 
+        self.policy = th.compile(self.policy)
+
+        self.student_policy = th.compile(self.student_policy)
+
         print(self.policy)
 
         print(self.student_policy)
@@ -1172,10 +1164,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def inference(self):
         # optimize the model for inference
-        self.policy = th.jit.optimize_for_inference(th.jit.script(self.policy.eval()))
-        self.student_policy = th.jit.optimize_for_inference(
-            th.jit.script(self.student_policy.eval())
-        )
+        self.policy = th.compile(self.policy)
+        self.student_policy = th.compile(self.student_policy)
 
     @classmethod
     def load(  # noqa: C901

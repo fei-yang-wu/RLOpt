@@ -76,8 +76,8 @@ class BaseBuffer(ABC):
         self.device = get_device(device)
         self.n_envs = n_envs
 
-    @th.compile
     @staticmethod
+    @th.compile
     def swap_and_flatten(
         arr: Union[th.Tensor, TensorDict]
     ) -> Union[th.Tensor, TensorDict]:
@@ -1971,6 +1971,7 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         if self.pos == self.buffer_size:
             self.full = True
 
+    @th.compile
     def get_generator(
         self, num_mini_batches: int, num_epochs: int = 5
     ) -> Generator[RecurrentDictRolloutBufferSamples, None, None]:
@@ -2006,7 +2007,7 @@ class RLOptDictRecurrentReplayBuffer(ABC):
                 last_traj = first_traj + trajectories_batch_size
 
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
-                # obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+
                 obs_batch = {
                     "teacher": BaseBuffer.swap_and_flatten(
                         padded_obs_trajectories["teacher"][:, start:stop]
