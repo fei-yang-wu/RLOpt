@@ -717,7 +717,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 student_observations = obs_batch["student"]
                 # student obs shape is (T, B, feature dim)
                 (
-                    student_values,
+                    _,
                     student_action,
                     student_entropy,
                     student_log_prob,
@@ -736,51 +736,26 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 unpad_trajectories(student_action, mask)
             )
 
-            # print("student_log_prob shape: ", student_log_prob.shape)
-            # student_log_prob = unpad_trajectories(student_log_prob, mask)
-            # student_log_prob_shape = student_log_prob.shape
-            # if len(student_log_prob_shape) < 3:
-            #     student_log_prob_shape = (*student_log_prob_shape, 1)
-            # student_log_prob = (
-            #     student_log_prob.transpose(0, 1)
-            #     .reshape(
-            #         student_log_prob_shape[0] * student_log_prob_shape[1],
-            #         *student_log_prob_shape[2:],
-            #     )
-            #     .squeeze(-1)
-            # )
-            # print(
-            #     "student log prob and old action log prob shapes",
-            #     student_log_prob.shape,
-            #     old_actions_log_prob_batch.shape,
-            # )
-            # assert all values in student_log_prob is <0
-            # assert (student_log_prob < 0).all()
-            # student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
-            # print("student ratio shape: ", student_ratio.max())
-            # print("advantages shape: ", advantages.shape)
-            # clipped asym loss
-            # student_policy_loss_1 = advantages * student_ratio
-            # student_policy_loss_2 = advantages * th.clamp(
-            #     student_ratio, 1 - clip_range, 1 + clip_range
-            # )
-            # student_policy_loss = -th.min(
-            #     student_policy_loss_1, student_policy_loss_2
-            # ).mean()
-            # student_policy_loss = -student_policy_loss_2.mean()
-            # student_policy_loss = th.clamp(student_policy_loss, 0, 5)
-            # student_policy_losses.append(student_policy_loss.item())
+            student_log_prob = BaseBuffer.swap_and_flatten(
+                unpad_trajectories(student_log_prob, mask)
+            )
 
-            # student_loss = F.mse_loss(student_actions, actions.detach())
-            # calculate approximate kl divergence as student loss
+            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+
+            # clipped asym loss
+            student_asym_loss_1 = advantages * student_ratio
+            student_asym_loss_2 = advantages * th.clamp(
+                student_ratio, 1 - clip_range, 1 + clip_range
+            )
+            student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
 
             teacher_action = actions.detach()
 
-            student_loss = F.mse_loss(student_action, teacher_action)
-            # clamp student loss to prevent exploding gradients
-            # student_loss = th.clamp(student_loss, 0, 5)  # + student_policy_loss
+            student_loss = F.mse_loss(
+                student_action, teacher_action
+            )  # + student_asym_loss
+
             student_losses.append(student_loss.item())
-            # assert not th.isnan(student_loss).any()
 
             # Calculate approximate form of reverse KL Divergence for early stopping
             # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -793,13 +768,13 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 )
                 approx_kl_divs.append(approx_kl_div)
 
-            if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                continue_training = False
-                if self.verbose >= 1:
-                    print(
-                        f"Early stopping at step {self.num_timesteps} due to reaching max kl: {approx_kl_div:.2f}"
-                    )
-                break
+            # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+            #     continue_training = False
+            #     if self.verbose >= 1:
+            #         print(
+            #             f"Early stopping at step {self.num_timesteps} due to reaching max kl: {approx_kl_div:.2f}"
+            #         )
+            #     break
 
             # Optimization step
             self.policy.optimizer.zero_grad()
@@ -820,13 +795,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if not continue_training:
                 break
 
-            target_kl_temp = 1
             adaptive_lr = True
-            if adaptive_lr and target_kl_temp is not None:
+            if adaptive_lr and self.target_kl is not None:
                 cur_lr = self.lr_schedule(self._current_progress_remaining)
-                if approx_kl_div > target_kl_temp * 2.0:
+                if approx_kl_div > self.target_kl * 2.0:
                     lr = max(1e-5, cur_lr / 1.5)
-                elif approx_kl_div < target_kl_temp / 2.0 and approx_kl_div > 0.0:
+                elif approx_kl_div < self.target_kl / 2.0 and approx_kl_div > 0.0:
                     lr = min(1e-2, cur_lr * 1.5)
                 else:
                     lr = cur_lr
