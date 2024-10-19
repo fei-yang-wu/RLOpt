@@ -743,17 +743,19 @@ class RecurrentL2T(OnPolicyAlgorithm):
             student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
 
             # clipped asym loss
-            student_asym_loss_1 = advantages * student_ratio
-            student_asym_loss_2 = advantages * th.clamp(
-                student_ratio, 1 - clip_range, 1 + clip_range
-            )
-            student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
-
+            # student_asym_loss_1 = advantages * student_ratio
+            # student_asym_loss_2 = advantages * th.clamp(
+            #     student_ratio, 1 - clip_range, 1 + clip_range
+            # )
+            # student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
+            student_asym_loss = -th.mean(
+                advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
+            ).mean()
             teacher_action = actions.detach()
 
-            student_loss = F.mse_loss(
-                student_action, teacher_action
-            )  # + student_asym_loss
+            student_loss = (
+                F.mse_loss(student_action, teacher_action) + student_asym_loss
+            )
 
             student_losses.append(student_loss.item())
 
@@ -1253,6 +1255,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         model.__dict__.update(data)
         model.__dict__.update(kwargs)
         model._setup_model()
+        model.inference()
 
         try:
             # put state_dicts back in place
