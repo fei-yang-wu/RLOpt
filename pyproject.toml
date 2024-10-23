@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.poetry]
 name = "RLOpt"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Reinforcement Learning providing advanced optimization techniques and methods optimized for modern RL applications"
 authors = ["Feiyang Wu <feiyangwu@gatech.edu>"]
 
