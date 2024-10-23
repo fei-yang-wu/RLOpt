@@ -1328,14 +1328,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
             can be used to update only specific parameters.
         :param device: Device on which the code should run.
         """
-        print("????????????????????????????????????????????????")
         params = {}
         if isinstance(load_path_or_dict, dict):
             params = load_path_or_dict
         else:
             _, params, _ = load_from_zip_file(load_path_or_dict, device=device)
 
-        print("loaded params:", params)
         # Keep track which objects were updated.
         # `_get_torch_save_params` returns [params, other_pytorch_variables].
         # We are only interested in former here.
@@ -1373,11 +1371,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # Assume attr is th.nn.Module
                 attr.load_state_dict(params[name], strict=exact_match)
             updated_objects.add(name)
-
+        
         if exact_match and updated_objects != objects_needing_update:
             raise ValueError(
                 "Names of parameters do not match agents' parameters: "
                 f"expected {objects_needing_update}, got {updated_objects}"
             )
 
-        self.inference()
