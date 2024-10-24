@@ -652,7 +652,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             masks_batch,
             hidden_batch,
         ) in generator:
-            approx_kl_divs = []
             # # Do a complete pass on the rollout buffer
             # for rollout_data in self.rollout_buffer.get(self.batch_size):
 
@@ -727,23 +726,20 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
             )
 
-            if self.whole_sequences:
-                student_observations = obs_batch["student"]
-                # student obs shape is (T, B, feature dim)
-                (
-                    _,
-                    student_action,
-                    student_entropy,
-                    student_log_prob,
-                    mu,
-                    sigma,
-                ) = self.compiled_student_policy.predict_whole_sequence(
-                    obs=student_observations,
-                    deterministic=False,
-                    lstm_states=hidden_batch,
-                )
-            else:
-                raise NotImplementedError
+            student_observations = obs_batch["student"]
+            # student obs shape is (T, B, feature dim)
+            (
+                _,
+                student_action,
+                student_entropy,
+                student_log_prob,
+                mu,
+                sigma,
+            ) = self.compiled_student_policy.predict_whole_sequence(
+                obs=student_observations,
+                deterministic=False,
+                lstm_states=hidden_batch,
+            )
 
             # align dim with the teacher action
             student_action = BaseBuffer.swap_and_flatten(
@@ -754,7 +750,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 unpad_trajectories(student_log_prob, mask)
             )
 
-            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+            # student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
 
             # clipped asym loss
             # student_asym_loss_1 = advantages * student_ratio
@@ -762,14 +758,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
             #     student_ratio, 1 - clip_range, 1 + clip_range
             # )
             # student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
-            student_asym_loss = -th.mean(
-                advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
-            ).mean()
+            # student_asym_loss = -th.mean(
+            #     advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
+            # ).mean()
             teacher_action = actions.detach()
 
-            student_loss = (
-                F.mse_loss(student_action, teacher_action) + student_asym_loss
-            )
+            student_loss = F.mse_loss(
+                student_action, teacher_action
+            )  # + student_asym_loss
 
             student_losses.append(student_loss.item())
 
@@ -777,12 +773,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
             # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
             # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
             # and Schulman blog: http://joschu.net/blog/kl-approx.html
-            with th.no_grad():
-                log_ratio = log_prob - old_actions_log_prob_batch
-                approx_kl_div = (
-                    th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                )
-                approx_kl_divs.append(approx_kl_div)
+            # with th.no_grad():
+            #     log_ratio = log_prob - old_actions_log_prob_batch
+            #     approx_kl_div = (
+            #         th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+            #     )
+            #     approx_kl_divs.append(approx_kl_div)
 
             # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
             #     continue_training = False
@@ -813,37 +809,22 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if not continue_training:
                 break
 
-            adaptive_lr = True
-            if adaptive_lr and self.target_kl is not None:
-                cur_lr = self.lr_schedule(self._current_progress_remaining)
-                if approx_kl_div > self.target_kl * 2.0:
-                    lr = max(1e-5, cur_lr / 1.5)
-                elif approx_kl_div < self.target_kl / 2.0 and approx_kl_div > 0.0:
-                    lr = min(1e-2, cur_lr * 1.5)
-                else:
-                    lr = cur_lr
+            self._update_learning_rate(
+                [self.compiled_policy.optimizer, self.student_policy.optimizer]
+            )
 
-                self._update_learning_rate(
-                    [self.compiled_policy.optimizer, self.student_policy.optimizer],
-                    lr=lr,
-                )
-            else:
-                self._update_learning_rate(
-                    [self.compiled_policy.optimizer, self.student_policy.optimizer]
-                )
-
-        explained_var = explained_variance(
-            self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
-        )
+        # explained_var = explained_variance(
+        #     self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
+        # )
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
-        self.logger.record("train/explained_variance", explained_var)
+        # self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.compiled_policy, "log_std"):
             self.logger.record(
                 "train/std", th.exp(self.compiled_policy.log_std).mean().item()
@@ -1371,10 +1352,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # Assume attr is th.nn.Module
                 attr.load_state_dict(params[name], strict=exact_match)
             updated_objects.add(name)
-        
+
         if exact_match and updated_objects != objects_needing_update:
             raise ValueError(
                 "Names of parameters do not match agents' parameters: "
                 f"expected {objects_needing_update}, got {updated_objects}"
             )
-
