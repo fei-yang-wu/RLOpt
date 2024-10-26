@@ -141,7 +141,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         n_steps: int = 2048,
         batch_size: int = 64,
         whole_sequences: bool = True,
-        n_epochs: int = 10,
+        n_epochs: int = 3,
+        n_batches: int = 5,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range: Union[float, Schedule] = 0.2,
@@ -200,6 +201,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Used for gSDE only
         self.use_sde = use_sde
         self.sde_sample_freq = sde_sample_freq
+        # Define number of epoch and batch size for batch generator
+        self.n_epochs = n_epochs
+        self.n_batches = n_batches
         # Track the training progress remaining (from 1 to 0)
         # this is used to update the learning rate
         self._current_progress_remaining = 1.0
@@ -640,7 +644,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         continue_training = True
 
-        generator = self.rollout_buffer.get_generator(num_mini_batches=4, num_epochs=5)
+        generator = self.rollout_buffer.get_generator(
+            num_mini_batches=self.n_batches, num_epochs=self.n_epochs
+        )
         # train for n_epochs epochs
         for (
             obs_batch,
