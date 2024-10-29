@@ -1,0 +1,7 @@
+# environment and task
+env:
+  name: HalfCheetah-v4
+  task: ""
+  library: gymnasium
+  max_episode_steps: 1000
+  seed: 42

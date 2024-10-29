@@ -1,507 +1,412 @@
-import io
-import pathlib
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, Union
+import time
 
+import hydra
 import numpy as np
-import torch as th
-from gymnasium import spaces
-from torch.nn import functional as F
+import torch
+import tqdm
+import torch.cuda
+from tensordict import TensorDict
+from torchrl._utils import logger as torchrl_logger
+from torchrl.envs.utils import ExplorationType, set_exploration_type
+from torchrl.record.loggers import generate_exp_name, get_logger
+from tensordict.nn import InteractionType, TensorDictModule
+from tensordict.nn.distributions import NormalParamExtractor
+from torch import nn, optim
+from torchrl.collectors import SyncDataCollector
+from torchrl.data import TensorDictPrioritizedReplayBuffer, TensorDictReplayBuffer
+from torchrl.data.replay_buffers.storages import LazyMemmapStorage
+from torchrl.modules import MLP, ProbabilisticActor, ValueOperator
+from torchrl.modules.distributions import TanhNormal
+from torchrl.objectives import SoftUpdate
+from torchrl.objectives.sac import SACLoss
 
 
-from stable_baselines3.common.buffers import ReplayBuffer
-from stable_baselines3.common.noise import ActionNoise
-from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
-from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.save_util import load_from_pkl, save_to_pkl
-from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
-from stable_baselines3.sac.policies import (
-    Actor,
-    CnnPolicy,
-    MlpPolicy,
-    MultiInputPolicy,
-    SACPolicy,
+from utils import (
+    dump_video,
+    log_metrics,
+    make_environment,
+    get_activation,
 )
 
+# ====================================================================
+# Collector and replay buffer
+# ---------------------------
 
 
-from inversepolicies import IPMDPolicy, MlpPolicy, CnnPolicy, MultiInputPolicy
+def make_collector(cfg, train_env, actor_model_explore):
+    """Make collector."""
+    collector = SyncDataCollector(
+        train_env,
+        actor_model_explore,
+        init_random_frames=cfg.collector.init_random_frames,
+        frames_per_batch=cfg.collector.frames_per_batch,
+        total_frames=cfg.collector.total_frames,
+        device=cfg.collector.device,
+    )
+    collector.set_seed(cfg.env.seed)
+    return collector
 
-SelfIPMD = TypeVar("SelfIPMD", bound="IPMD")
+
+def make_replay_buffer(
+    batch_size,
+    prb=False,
+    buffer_size=1000000,
+    scratch_dir=None,
+    device="cpu",
+    prefetch=3,
+):
+    if prb:
+        replay_buffer = TensorDictPrioritizedReplayBuffer(
+            alpha=0.7,
+            beta=0.5,
+            pin_memory=False,
+            prefetch=prefetch,
+            storage=LazyMemmapStorage(
+                buffer_size,
+                scratch_dir=scratch_dir,
+                device=device,  # type: ignore
+            ),
+            batch_size=batch_size,
+        )
+    else:
+        replay_buffer = TensorDictReplayBuffer(
+            pin_memory=False,
+            prefetch=prefetch,
+            storage=LazyMemmapStorage(
+                buffer_size,
+                scratch_dir=scratch_dir,
+                device=device,  # type: ignore
+            ),
+            batch_size=batch_size,
+        )
+    return replay_buffer
 
 
-class IPMD(OffPolicyAlgorithm):
-    """
-    Soft Actor-Critic (IPMD)
-    Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor,
-    This implementation borrows code from original implementation (https://github.com/haarnoja/IPMD)
-    from OpenAI Spinning Up (https://github.com/openai/spinningup), from the softlearning repo
-    (https://github.com/rail-berkeley/softlearning/)
-    and from Stable Baselines (https://github.com/hill-a/stable-baselines)
-    Paper: https://arxiv.org/abs/1801.01290
-    Introduction to IPMD: https://spinningup.openai.com/en/latest/algorithms/IPMD.html
+# ====================================================================
+# Model
+# -----
 
-    Note: we use double q target and not value target as discussed
-    in https://github.com/hill-a/stable-baselines/issues/270
 
-    :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
-    :param env: The environment to learn from (if registered in Gym, can be str)
-    :param learning_rate: learning rate for adam optimizer,
-        the same learning rate will be used for all networks (Q-Values, Actor and Value function)
-        it can be a function of the current progress remaining (from 1 to 0)
-    :param buffer_size: size of the replay buffer
-    :param learning_starts: how many steps of the model to collect transitions for before learning starts
-    :param batch_size: Minibatch size for each gradient update
-    :param tau: the soft update coefficient ("Polyak update", between 0 and 1)
-    :param gamma: the discount factor
-    :param train_freq: Update the model every ``train_freq`` steps. Alternatively pass a tuple of frequency and unit
-        like ``(5, "step")`` or ``(2, "episode")``.
-    :param gradient_steps: How many gradient steps to do after each rollout (see ``train_freq``)
-        Set to ``-1`` means to do as many gradient steps as steps done in the environment
-        during the rollout.
-    :param action_noise: the action noise type (None by default), this can help
-        for hard exploration problem. Cf common.noise for the different action noise type.
-    :param replay_buffer_class: Replay buffer class to use (for instance ``HerReplayBuffer``).
-        If ``None``, it will be automatically selected.
-    :param replay_buffer_kwargs: Keyword arguments to pass to the replay buffer on creation.
-    :param optimize_memory_usage: Enable a memory efficient variant of the replay buffer
-        at a cost of more complexity.
-        See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
-    :param ent_coef: Entropy regularization coefficient. (Equivalent to
-        inverse of reward scale in the original SAC paper.)  Controlling exploration/exploitation trade-off.
-        Set it to 'auto' to learn it automatically (and 'auto_0.1' for using 0.1 as initial value)
-    :param target_update_interval: update the target network every ``target_network_update_freq``
-        gradient steps.
-    :param target_entropy: target entropy when learning ``ent_coef`` (``ent_coef = 'auto'``)
-    :param use_sde: Whether to use generalized State Dependent Exploration (gSDE)
-        instead of action noise exploration (default: False)
-    :param sde_sample_freq: Sample a new noise matrix every n steps when using gSDE
-        Default: -1 (only sample at the beginning of the rollout)
-    :param use_sde_at_warmup: Whether to use gSDE instead of uniform sampling
-        during the warm up phase (before learning starts)
-    :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
-        the reported success rate, mean episode length, and mean reward over
-    :param tensorboard_log: the log location for tensorboard (if None, no logging)
-    :param policy_kwargs: additional arguments to be passed to the policy on creation
-    :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
-        debug messages
-    :param seed: Seed for the pseudo random generators
-    :param device: Device (cpu, cuda, ...) on which the code should be run.
-        Setting it to auto, the code will be run on the GPU if possible.
-    :param _init_setup_model: Whether or not to build the network at the creation of the instance
-    """
-
-    policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
-        "MlpPolicy": MlpPolicy,
-        "CnnPolicy": CnnPolicy,
-        "MultiInputPolicy": MultiInputPolicy,
+def make_sac_agent(cfg, train_env, eval_env, device):
+    """Make SAC agent."""
+    # Define Actor Network
+    in_keys = ["observation"]
+    action_spec = train_env.action_spec
+    if train_env.batch_size:
+        action_spec = action_spec[(0,) * len(train_env.batch_size)]
+    actor_net_kwargs = {
+        "num_cells": cfg.network.hidden_sizes,
+        "out_features": 2 * action_spec.shape[-1],
+        "activation_class": get_activation(cfg),
     }
-    policy: IPMDPolicy
-    actor: Actor
-    critic: ContinuousCritic
-    critic_target: ContinuousCritic
 
-    def __init__(
-        self,
-        policy: Union[str, Type[IPMDPolicy]],
-        env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule] = 3e-4,
-        buffer_size: int = 1_000_000,  # 1e6
-        learning_starts: int = 100,
-        batch_size: int = 256,
-        tau: float = 0.005,
-        gamma: float = 0.99,
-        train_freq: Union[int, Tuple[int, str]] = 1,
-        gradient_steps: int = 1,
-        action_noise: Optional[ActionNoise] = None,
-        replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
-        replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
-        optimize_memory_usage: bool = False,
-        ent_coef: Union[str, float] = "auto",
-        target_update_interval: int = 1,
-        target_entropy: Union[str, float] = "auto",
-        use_sde: bool = False,
-        sde_sample_freq: int = -1,
-        use_sde_at_warmup: bool = False,
-        stats_window_size: int = 100,
-        tensorboard_log: Optional[str] = None,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
-        verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
-        _init_setup_model: bool = True,
-        expert_replay_buffer_loc: str = "",
-        expert_traj_size: int = 10000,
-        student_irl_begin_timesteps: int = int(2e6),
-    ):
-        super().__init__(
-            policy,
-            env,
-            learning_rate,
-            buffer_size,
-            learning_starts,
-            batch_size,
-            tau,
-            gamma,
-            train_freq,
-            gradient_steps,
-            action_noise,
-            replay_buffer_class=replay_buffer_class,
-            replay_buffer_kwargs=replay_buffer_kwargs,
-            policy_kwargs=policy_kwargs,
-            stats_window_size=stats_window_size,
-            tensorboard_log=tensorboard_log,
-            verbose=verbose,
-            device=device,
-            seed=seed,
-            use_sde=use_sde,
-            sde_sample_freq=sde_sample_freq,
-            use_sde_at_warmup=use_sde_at_warmup,
-            optimize_memory_usage=optimize_memory_usage,
-            supported_action_spaces=(spaces.Box,),
-            support_multi_env=True,
-        )
+    actor_net = MLP(**actor_net_kwargs)
 
-        self.target_entropy = target_entropy
-        self.log_ent_coef = None  # type: Optional[th.Tensor]
-        # Entropy coefficient / Entropy temperature
-        # Inverse of the reward scale
-        self.ent_coef = ent_coef
-        self.target_update_interval = target_update_interval
-        self.ent_coef_optimizer: Optional[th.optim.Adam] = None
-        self.expert_replay_buffer_loc = expert_replay_buffer_loc
-        self.expert_traj_size = expert_traj_size
-        self.reward_update_iter = 0
-        self.optimize_reward_estimator = True
-        self.estimated_average_reward = 0.0
+    dist_class = TanhNormal
+    dist_kwargs = {
+        "low": action_spec.space.low,
+        "high": action_spec.space.high,
+        "tanh_loc": False,
+    }
 
-        self.student_irl_begin_timesteps = student_irl_begin_timesteps
+    actor_extractor = NormalParamExtractor(
+        scale_mapping=f"biased_softplus_{cfg.network.default_policy_scale}",
+        scale_lb=cfg.network.scale_lb,
+    )
+    actor_net = nn.Sequential(actor_net, actor_extractor)
 
-        if _init_setup_model:
-            self._setup_model()
+    in_keys_actor = in_keys
+    actor_module = TensorDictModule(
+        actor_net,
+        in_keys=in_keys_actor,
+        out_keys=[
+            "loc",
+            "scale",
+        ],
+    )
+    actor = ProbabilisticActor(
+        spec=action_spec,
+        in_keys=["loc", "scale"],
+        module=actor_module,
+        distribution_class=dist_class,
+        distribution_kwargs=dist_kwargs,
+        default_interaction_type=InteractionType.RANDOM,
+        return_log_prob=False,
+    )
 
-    def _setup_model(self) -> None:
-        super()._setup_model()
-        self._create_aliases()
-        # Running mean and running var
-        self.batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
-        self.batch_norm_stats_target = get_parameters_by_name(
-            self.critic_target, ["running_"]
-        )
-        # Target entropy is used when learning the entropy coefficient
-        if self.target_entropy == "auto":
-            # automatically set target entropy if needed
-            self.target_entropy = float(-np.prod(self.env.action_space.shape).astype(np.float32))  # type: ignore
+    # Define Critic Network
+    qvalue_net_kwargs = {
+        "num_cells": cfg.network.hidden_sizes,
+        "out_features": 1,
+        "activation_class": get_activation(cfg),
+    }
+
+    qvalue_net = MLP(
+        **qvalue_net_kwargs,
+    )
+
+    qvalue = ValueOperator(
+        in_keys=["action"] + in_keys,
+        module=qvalue_net,
+    )
+
+    reward_net = MLP(
+        **qvalue_net_kwargs,
+    )
+
+    model = nn.ModuleList([actor, qvalue, reward_net]).to(device)
+
+    # init nets
+    with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):  # type: ignore
+        td = eval_env.fake_tensordict()
+        td = td.to(device)
+        for net in model:
+            net(td)
+    return model, model[0]
+
+
+# ====================================================================
+# SAC Loss
+# ---------
+
+
+def make_loss_module(cfg, model):
+    """Make loss module and target network updater."""
+    # Create SAC loss
+    loss_module = SACLoss(
+        actor_network=model[0],
+        qvalue_network=model[1],
+        num_qvalue_nets=2,
+        loss_function=cfg.optim.loss_function,
+        delay_actor=False,
+        delay_qvalue=True,
+        alpha_init=cfg.optim.alpha_init,
+    )
+    loss_module.make_value_estimator(gamma=cfg.optim.gamma)
+
+    # Define Target Network Updater
+    target_net_updater = SoftUpdate(loss_module, eps=cfg.optim.target_update_polyak)
+    return loss_module, target_net_updater
+
+
+def split_critic_params(critic_params):
+    critic1_params = []
+    critic2_params = []
+
+    for param in critic_params:
+        data1, data2 = param.data.chunk(2, dim=0)
+        critic1_params.append(nn.Parameter(data1))
+        critic2_params.append(nn.Parameter(data2))
+    return critic1_params, critic2_params
+
+
+def make_sac_optimizer(cfg, loss_module):
+    critic_params = list(loss_module.qvalue_network_params.flatten_keys().values())
+    actor_params = list(loss_module.actor_network_params.flatten_keys().values())
+
+    optimizer_actor = optim.Adam(
+        actor_params,
+        lr=cfg.optim.lr,
+        weight_decay=cfg.optim.weight_decay,
+        eps=cfg.optim.adam_eps,
+    )
+    optimizer_critic = optim.Adam(
+        critic_params,
+        lr=cfg.optim.lr,
+        weight_decay=cfg.optim.weight_decay,
+        eps=cfg.optim.adam_eps,
+    )
+    optimizer_alpha = optim.Adam(
+        [loss_module.log_alpha],
+        lr=3.0e-4,
+    )
+    return optimizer_actor, optimizer_critic, optimizer_alpha
+
+
+@hydra.main(version_base="1.1", config_path="", config_name="config")
+def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
+    device = cfg.network.device
+    if device in ("", None):
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
         else:
-            # Force conversion
-            # this will also throw an error for unexpected string
-            self.target_entropy = float(self.target_entropy)
+            device = torch.device("cpu")
+    device = torch.device(device)
 
-        # The entropy coefficient or entropy can be learned automatically
-        # see Automating Entropy Adjustment for Maximum Entropy RL section
-        # of https://arxiv.org/abs/1812.05905
-        if isinstance(self.ent_coef, str) and self.ent_coef.startswith("auto"):
-            # Default initial value of ent_coef when learned
-            init_value = 1.0
-            if "_" in self.ent_coef:
-                init_value = float(self.ent_coef.split("_")[1])
-                assert (
-                    init_value > 0.0
-                ), "The initial value of ent_coef must be greater than 0"
-
-            # Note: we optimize the log of the entropy coeff which is slightly different from the paper
-            # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
-            self.log_ent_coef = th.log(
-                th.ones(1, device=self.device) * init_value
-            ).requires_grad_(True)
-            self.ent_coef_optimizer = th.optim.Adam(
-                [self.log_ent_coef], lr=self.lr_schedule(1)
-            )
-        else:
-            # Force conversion to float
-            # this will throw an error if a malformed string (different from 'auto')
-            # is passed
-            self.ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
-
-        self.expert_replay_buffer = ReplayBuffer(
-            self.expert_traj_size,
-            observation_space=self.env.observation_space,
-            action_space=self.env.action_space,
-            device=self.device,
+    # Create logger
+    exp_name = generate_exp_name("SAC", cfg.logger.exp_name)
+    logger = None
+    if cfg.logger.backend:
+        logger = get_logger(
+            logger_type=cfg.logger.backend,
+            logger_name="sac_logging",
+            experiment_name=exp_name,
+            wandb_kwargs={
+                "mode": cfg.logger.mode,
+                "config": dict(cfg),
+                "project": cfg.logger.project_name,
+                "group": cfg.logger.group_name,
+            },
         )
-        self.load_replay_buffer_to(path=self.expert_replay_buffer_loc)
-        self.expert_replay_data = self.expert_replay_buffer._get_samples(
-            np.arange(0, self.expert_traj_size), env=self._vec_normalize_env
-        )
-        print(self.expert_replay_data.rewards.sum())
 
-    def _create_aliases(self) -> None:
-        self.actor = self.policy.actor
-        self.old_actor = self.policy.old_actor
-        self.critic = self.policy.critic
-        self.critic_target = self.policy.critic_target
-        self.reward_est = self.policy.reward_est
+    torch.manual_seed(cfg.env.seed)
+    np.random.seed(cfg.env.seed)
 
-    def train(self, gradient_steps: int, batch_size: int = 64) -> None:
-        # Switch to train mode (this affects batch norm / dropout)
-        self.policy.set_training_mode(True)
-        # Update optimizers learning rate
-        optimizers = [
-            self.actor.optimizer,
-            self.critic.optimizer,
-        ]
-        if self.ent_coef_optimizer is not None:
-            optimizers += [self.ent_coef_optimizer]
+    # Create environments
+    train_env, eval_env = make_environment(cfg, logger=logger)
 
-        # Update learning rate according to lr schedule
-        self._update_learning_rate(optimizers)
+    # Create agent
+    model, exploration_policy = make_sac_agent(cfg, train_env, eval_env, device)
 
-        ent_coef_losses, ent_coefs = [], []
-        actor_losses, critic_losses = [], []
-        reward_est_losses = []
-        reward_est_eval_losses = []
-        average_reward_list = []
+    # Create SAC loss
+    loss_module, target_net_updater = make_loss_module(cfg, model)
 
-        for gradient_step in range(gradient_steps):
-            # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
-            # self.expert_replay_data = self.expert_replay_buffer.sample(batch_size, env=self._vec_normalize_env)
-            # We need to sample because `log_std` may have changed between two gradient steps
-            if self.use_sde:
-                self.actor.reset_noise()
+    # Create off-policy collector
+    collector = make_collector(cfg, train_env, exploration_policy)
 
-            # Action by the current actor for the sampled state
-            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-            log_prob = log_prob.reshape(-1, 1)
-            actions_copy = actions_pi.detach().clone()
+    # Create replay buffer
+    replay_buffer = make_replay_buffer(
+        batch_size=cfg.optim.batch_size,
+        prb=cfg.replay_buffer.prb,
+        buffer_size=cfg.replay_buffer.size,
+        scratch_dir=cfg.replay_buffer.scratch_dir,
+        device="cpu",
+    )
 
-            ent_coef_loss = None
-            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-                # Important: detach the variable from the graph
-                # so we don't change it with other losses
-                # see https://github.com/rail-berkeley/softlearning/issues/60
-                ent_coef = th.exp(self.log_ent_coef.detach())
-                ent_coef_loss = -(
-                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
-                ).mean()
-                ent_coef_losses.append(ent_coef_loss.item())
-            else:
-                ent_coef = self.ent_coef_tensor
+    # Create optimizers
+    (
+        optimizer_actor,
+        optimizer_critic,
+        optimizer_alpha,
+    ) = make_sac_optimizer(cfg, loss_module)
 
-            ent_coefs.append(ent_coef.item())
+    # Main loop
+    start_time = time.time()
+    collected_frames = 0
+    pbar = tqdm.tqdm(total=cfg.collector.total_frames)
 
-            # Optimize entropy coefficient, also called
-            # entropy temperature or alpha in the paper
-            if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
-                self.ent_coef_optimizer.zero_grad()
-                ent_coef_loss.backward()
-                self.ent_coef_optimizer.step()
+    init_random_frames = cfg.collector.init_random_frames
+    num_updates = int(
+        cfg.collector.env_per_collector
+        * cfg.collector.frames_per_batch
+        * cfg.optim.utd_ratio
+    )
+    # prb = cfg.replay_buffer.prb
+    eval_iter = cfg.logger.eval_iter
+    frames_per_batch = cfg.collector.frames_per_batch
+    eval_rollout_steps = cfg.env.max_episode_steps
 
-            if self.num_timesteps <= int(self.student_irl_begin_timesteps):
-                estimated_rewards_copy = replay_data.rewards
-            else:
-                estimated_rewards = th.cat(
-                    self.reward_est(replay_data.observations, replay_data.actions),
-                    dim=1,
-                )
-                estimated_rewards_copy = estimated_rewards.detach()
-            self.estimated_average_reward = estimated_rewards_copy.mean()
-            average_reward_list.append(self.estimated_average_reward.item())
+    sampling_start = time.time()
+    for i, tensordict in enumerate(collector):
+        sampling_time = time.time() - sampling_start
 
-            with th.no_grad():
-                # Select action according to policy
-                next_actions, next_log_prob = self.actor.action_log_prob(
-                    replay_data.next_observations
-                )
-                # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(
-                    self.critic_target(replay_data.next_observations, next_actions),
-                    dim=1,
-                )
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                # add entropy term
-                next_q_values = next_q_values - (
-                    self.gamma != 1
-                ) * ent_coef * next_log_prob.reshape(-1, 1)
-                # td error + entropy term
-                target_q_values = (
-                    estimated_rewards_copy
-                    + (1 - replay_data.dones) * self.gamma * next_q_values
-                )
-                # handle average reward
-                target_q_values -= (self.gamma == 1) * estimated_rewards_copy.mean()
+        # Update weights of the inference policy
+        collector.update_policy_weights_()
 
-            # Get current Q-values estimates for each critic network
-            # using action from the replay buffer
-            current_q_values = self.critic(
-                replay_data.observations, replay_data.actions
-            )
+        pbar.update(tensordict.numel())
 
-            # Compute critic loss
-            critic_loss = 0.5 * sum(
-                F.mse_loss(current_q, target_q_values) for current_q in current_q_values
-            )
-            assert isinstance(critic_loss, th.Tensor)  # for type checker
-            critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
+        tensordict = tensordict.reshape(-1)
+        current_frames = tensordict.numel()
+        # Add to replay buffer
+        replay_buffer.extend(tensordict.cpu())
+        collected_frames += current_frames
 
-            # Optimize the critic
-            self.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic.optimizer.step()
-
-            # Compute actor loss
-            # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
-            # Min over all critic networks
-            q_values_pi = th.cat(
-                self.critic(replay_data.observations, actions_pi), dim=1
-            )
-            min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
-            actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-            actor_losses.append(actor_loss.item())
-
-            # Optimize the actor
-            self.actor.optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor.optimizer.step()
-
-            # Update target networks
-            if gradient_step % self.target_update_interval == 0:
-                polyak_update(
-                    self.critic.parameters(), self.critic_target.parameters(), self.tau
-                )
-                # Copy running stats, see GH issue #996
-                polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
-
-            self.reward_update_iter += 1
-            reward_est_loss = None
-
-            if self.num_timesteps <= int(self.student_irl_begin_timesteps) and False:
-                estimated_rewards = th.cat(
-                    self.reward_est(replay_data.observations, replay_data.actions),
-                    dim=1,
-                )
-                reward_est_loss = th.linalg.norm(
-                    estimated_rewards - replay_data.rewards
-                )
-            else:
-                # Get expert reward estimation
-                expert_estimated_rewards = th.cat(
-                    self.reward_est(
-                        self.expert_replay_data.observations,
-                        self.expert_replay_data.actions,
-                    ),
-                    dim=1,
-                )
-                estimated_rewards = th.cat(
-                    self.reward_est(replay_data.observations, actions_copy), dim=1
-                )
-                alpha = 0.05
-                beta = 0.1
-                reward_est_loss = (
-                    estimated_rewards.mean()
-                    - expert_estimated_rewards.mean()
-                    + alpha
-                    * (
-                        th.linalg.norm(
-                            th.cat([estimated_rewards, expert_estimated_rewards])
-                        )
+        # Optimization steps
+        training_start = time.time()
+        if collected_frames >= init_random_frames:
+            losses = TensorDict({}, batch_size=[num_updates])
+            for i in range(num_updates):
+                # Sample from replay buffer
+                sampled_tensordict = replay_buffer.sample()
+                if sampled_tensordict.device != device:
+                    sampled_tensordict = sampled_tensordict.to(
+                        device, non_blocking=True
                     )
-                )
-                # reward_est_loss = (estimated_rewards.mean() - expert_estimated_rewards.mean()) ** 2
-                # # can't be too similar to each other
-                # reward_est_loss += alpha * (th.linalg.norm(estimated_rewards) + th.linalg.norm(expert_estimated_rewards))
+                else:
+                    sampled_tensordict = sampled_tensordict.clone()
 
-            reward_est_losses.append(reward_est_loss.item())
+                # Compute loss
+                loss_td = loss_module(sampled_tensordict)
 
-            self.reward_est.optimizer.zero_grad()
-            reward_est_loss.backward()
-            self.reward_est.optimizer.step()
+                actor_loss = loss_td["loss_actor"]
+                q_loss = loss_td["loss_qvalue"]
+                alpha_loss = loss_td["loss_alpha"]
 
-        self._n_updates += gradient_steps
+                # Update actor
+                optimizer_actor.zero_grad()
+                actor_loss.backward()
+                optimizer_actor.step()
 
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/ent_coef", np.mean(ent_coefs))
-        self.logger.record("train/actor_loss", np.mean(actor_losses))
-        self.logger.record("train/critic_loss", np.mean(critic_losses))
-        self.logger.record("train/reward_est_loss", np.mean(reward_est_losses))
-        self.logger.record(
-            "train/estimated_rewards.mean", estimated_rewards.mean().item()
+                # Update critic
+                optimizer_critic.zero_grad()
+                q_loss.backward()
+                optimizer_critic.step()
+
+                # Update alpha
+                optimizer_alpha.zero_grad()
+                alpha_loss.backward()
+                optimizer_alpha.step()
+
+                losses[i] = loss_td.select(
+                    "loss_actor", "loss_qvalue", "loss_alpha"
+                ).detach()
+
+                # Update qnet_target params
+                target_net_updater.step()
+
+                # # Update priority
+                # if prb:
+                #     replay_buffer.update_priority(sampled_tensordict)
+
+        training_time = time.time() - training_start
+        episode_end = (
+            tensordict["next", "done"]
+            if tensordict["next", "done"].any()
+            else tensordict["next", "truncated"]
         )
-        self.logger.record(
-            "train/estimated_rewards.std", estimated_rewards.std().item()
-        )
+        episode_rewards = tensordict["next", "episode_reward"][episode_end]
 
-        self.logger.record(
-            "train/expert_estimated_rewards.mean",
-            expert_estimated_rewards.mean().item(),
-        )
-        self.logger.record(
-            "train/expert_estimated_rewards.std", expert_estimated_rewards.std().item()
-        )
-        if len(ent_coef_losses) > 0:
-            self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
-
-    def learn(
-        self: SelfIPMD,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: int = 4,
-        tb_log_name: str = "IPMD",
-        reset_num_timesteps: bool = True,
-        progress_bar: bool = False,
-    ) -> SelfIPMD:
-        return super().learn(
-            total_timesteps=total_timesteps,
-            callback=callback,
-            log_interval=log_interval,
-            tb_log_name=tb_log_name,
-            reset_num_timesteps=reset_num_timesteps,
-            progress_bar=progress_bar,
-        )
-
-    def _excluded_save_params(self) -> List[str]:
-        return super()._excluded_save_params() + [
-            "actor",
-            "critic",
-            "critic_target",
-        ]  # noqa: RUF005
-
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
-        state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
-        if self.ent_coef_optimizer is not None:
-            saved_pytorch_variables = ["log_ent_coef"]
-            state_dicts.append("ent_coef_optimizer")
-        else:
-            saved_pytorch_variables = ["ent_coef_tensor"]
-        return state_dicts, saved_pytorch_variables
-
-    def load_replay_buffer_to(
-        self,
-        path: Union[str, pathlib.Path, io.BufferedIOBase],
-        truncate_last_traj: bool = True,
-    ):
-        """
-        Load a replay buffer from a pickle file.
-
-        :param path: Path to the pickled replay buffer.
-        :param truncate_last_traj: When using ``HerReplayBuffer`` with online sampling:
-            If set to ``True``, we assume that the last trajectory in the replay buffer was finished
-            (and truncate it).
-            If set to ``False``, we assume that we continue the same trajectory (same episode).
-        """
-        self.expert_replay_buffer = load_from_pkl(path, self.verbose)
-        assert isinstance(
-            self.expert_replay_buffer, ReplayBuffer
-        ), "The replay buffer must inherit from ReplayBuffer class"
-
-        # Backward compatibility with SB3 < 2.1.0 replay buffer
-        # Keep old behavior: do not handle timeout termination separately
-        if not hasattr(
-            self.replay_buffer, "handle_timeout_termination"
-        ):  # pragma: no cover
-            self.expert_replay_buffer.handle_timeout_termination = False
-            self.expert_replay_buffer.timeouts = np.zeros_like(
-                self.expert_replay_buffer.dones
+        # Logging
+        metrics_to_log = {}
+        if len(episode_rewards) > 0:
+            episode_length = tensordict["next", "step_count"][episode_end]
+            metrics_to_log["train/reward"] = episode_rewards.mean().item()
+            metrics_to_log["train/episode_length"] = episode_length.sum().item() / len(
+                episode_length
             )
+        if collected_frames >= init_random_frames:
+            metrics_to_log["train/q_loss"] = losses.get("loss_qvalue").mean().item()
+            metrics_to_log["train/actor_loss"] = losses.get("loss_actor").mean().item()
+            metrics_to_log["train/alpha_loss"] = losses.get("loss_alpha").mean().item()
+            metrics_to_log["train/alpha"] = loss_td["alpha"].item()
+            metrics_to_log["train/entropy"] = loss_td["entropy"].item()
+            metrics_to_log["train/sampling_time"] = sampling_time
+            metrics_to_log["train/training_time"] = training_time
 
-        return self.expert_replay_buffer
+        # Evaluation
+        if abs(collected_frames % eval_iter) < frames_per_batch:
+            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():  # type: ignore
+                eval_start = time.time()
+                eval_rollout = eval_env.rollout(
+                    eval_rollout_steps,
+                    model[0],
+                    auto_cast_to_device=True,
+                    break_when_any_done=True,
+                )
+                eval_env.apply(dump_video)
+                eval_time = time.time() - eval_start
+                eval_reward = eval_rollout["next", "reward"].sum(-2).mean().item()  # type: ignore
+                metrics_to_log["eval/reward"] = eval_reward
+                metrics_to_log["eval/time"] = eval_time
+        if logger is not None:
+            log_metrics(logger, metrics_to_log, collected_frames)
+        sampling_start = time.time()
+
+    collector.shutdown()
+    if not eval_env.is_closed:
+        eval_env.close()
+    if not train_env.is_closed:
+        train_env.close()
+    end_time = time.time()
+    execution_time = end_time - start_time
+    torchrl_logger.info(f"Training took {execution_time:.2f} seconds to finish")
