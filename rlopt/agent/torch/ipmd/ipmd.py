@@ -1,7 +1,9 @@
 import time
 
+from gymnasium import RewardWrapper
 import hydra
 import numpy as np
+from scipy import optimize
 import torch
 import tqdm
 import torch.cuda
@@ -150,11 +152,23 @@ def make_sac_agent(cfg, train_env, eval_env, device):
         module=qvalue_net,
     )
 
+    # Define Reward Network
+    reward_net_kwargs = {
+        "num_cells": cfg.network.hidden_sizes,
+        "out_features": 1,
+        "activation_class": get_activation(cfg),
+    }
+
     reward_net = MLP(
-        **qvalue_net_kwargs,
+        **reward_net_kwargs,
     )
 
-    model = nn.ModuleList([actor, qvalue, reward_net]).to(device)
+    reward_estimate = ValueOperator(
+        in_keys=["action"] + in_keys,
+        module=reward_net,
+    )
+
+    model = nn.ModuleList([actor, qvalue, reward_estimate]).to(device)
 
     # init nets
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):  # type: ignore
@@ -173,6 +187,11 @@ def make_sac_agent(cfg, train_env, eval_env, device):
 def make_loss_module(cfg, model):
     """Make loss module and target network updater."""
     # Create SAC loss
+    # TODO: rewrite the loss module to take reward estimation.
+    # 1. Add reward estimation to the loss module (inherit the SACLoss and modify some functions, put it in the utils.py)
+    # 2. When the loss module takes in data (sampled tensordict), replace the reward with the estimated reward
+    # 3. Takes expoert's sampled tensordict data and compute the rewards for the sampled data
+    # 4. Compute the loss with the estimated reward, i.e., average of the estimated rewards of the current batch minus the estimated rewards of the expert batch, with some regularizer.
     loss_module = SACLoss(
         actor_network=model[0],
         qvalue_network=model[1],
@@ -203,6 +222,7 @@ def split_critic_params(critic_params):
 def make_sac_optimizer(cfg, loss_module):
     critic_params = list(loss_module.qvalue_network_params.flatten_keys().values())
     actor_params = list(loss_module.actor_network_params.flatten_keys().values())
+    reward_params = list(loss_module.reward_network_params.flatten_keys().values())
 
     optimizer_actor = optim.Adam(
         actor_params,
@@ -220,15 +240,23 @@ def make_sac_optimizer(cfg, loss_module):
         [loss_module.log_alpha],
         lr=3.0e-4,
     )
-    return optimizer_actor, optimizer_critic, optimizer_alpha
+    optimizer_reward = optim.Adam(
+        reward_params,
+        lr=cfg.optim.lr,
+        weight_decay=cfg.optim.weight_decay,
+        eps=cfg.optim.adam_eps,
+    )
+    return optimizer_actor, optimizer_critic, optimizer_alpha, optimizer_reward
 
 
-@hydra.main(version_base="1.1", config_path="", config_name="config")
+@hydra.main(version_base=None, config_path="", config_name="config")
 def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
     device = cfg.network.device
     if device in ("", None):
         if torch.cuda.is_available():
             device = torch.device("cuda:0")
+        elif torch.mps.is_available():
+            device = torch.device("mps")
         else:
             device = torch.device("cpu")
     device = torch.device(device)
@@ -278,6 +306,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
         optimizer_actor,
         optimizer_critic,
         optimizer_alpha,
+        optimizer_reward,
     ) = make_sac_optimizer(cfg, loss_module)
 
     # Main loop
@@ -354,10 +383,6 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
                 # Update qnet_target params
                 target_net_updater.step()
 
-                # # Update priority
-                # if prb:
-                #     replay_buffer.update_priority(sampled_tensordict)
-
         training_time = time.time() - training_start
         episode_end = (
             tensordict["next", "done"]
@@ -410,3 +435,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
     end_time = time.time()
     execution_time = end_time - start_time
     torchrl_logger.info(f"Training took {execution_time:.2f} seconds to finish")
+
+
+if __name__ == "__main__":
+    train_ipmd()
