@@ -6,6 +6,8 @@ import numpy as np
 from scipy import optimize
 import torch
 import tqdm
+
+
 import torch.cuda
 from tensordict import TensorDict
 from torchrl._utils import logger as torchrl_logger
@@ -28,6 +30,8 @@ from utils import (
     log_metrics,
     make_environment,
     get_activation,
+    save_model,
+    load_model
 )
 
 # ====================================================================
@@ -83,6 +87,51 @@ def make_replay_buffer(
         )
     return replay_buffer
 
+####### Expert Buffer
+
+def load_expert_data(data_path, device= "cpu", batch_size = None) -> TensorDict:
+    """
+    Load expert demonstrations from a file into a TensorDict.
+    """
+    expert_data = torch.load(data_path, map_location=device)
+
+    # Create Tensor Dict
+    if not isinstance(expert_data, TensorDict):
+        if isinstance(expert_data, dict):
+            expert_data = TensorDict(expert_data, batch_size=[len(next(iter(expert_data.values())))])
+    
+    if batch_size is not None:
+        expert_data = expert_data.reshape(-1)  # 
+        if len(expert_data) < batch_size:
+            # Repeat data if needed
+            num_repeats = (batch_size + len(expert_data) - 1) // len(expert_data)
+            expert_data = expert_data.repeat(num_repeats)
+        expert_data = expert_data[:batch_size]  # Trim to exact batch size
+    
+    return expert_data
+
+def create_expert_replay_buffer(
+    expert_data: TensorDict,
+    buffer_size: int,
+    batch_size: int,
+    device) -> TensorDictReplayBuffer:
+    """
+    Create a replay buffer from expert demonstrations.
+    
+    TensorDictReplayBuffer containing expert demonstrations
+    """
+    expert_buffer = TensorDictReplayBuffer(
+        storage=LazyMemmapStorage(
+            buffer_size,
+            device=device,
+        ),
+        batch_size=batch_size,
+    )
+    
+
+    expert_buffer.extend(expert_data)
+    
+    return expert_buffer
 
 # ====================================================================
 # Model
@@ -435,7 +484,6 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
     end_time = time.time()
     execution_time = end_time - start_time
     torchrl_logger.info(f"Training took {execution_time:.2f} seconds to finish")
-
 
 if __name__ == "__main__":
     train_ipmd()

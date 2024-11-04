@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 import functools
 
+import torch
 from torch import nn
 from torchrl.envs import (
     CatTensors,
@@ -92,6 +93,25 @@ def make_environment(cfg, logger=None):
 # ====================================================================
 # General utils
 # ---------
+
+
+### Saving/loading models
+
+def save_model(model, path):
+    torch.save({
+        "actor": model[0].state_dict(),
+        "critic": model[1].state_dict(),
+        "reward_estimate": model[2].state_dict(),
+    }, path)
+
+
+def load_model(model, path, device):
+    states = torch.load(path, map_location=device)
+    model[0].load_state_dict(states["actor"])
+    model[1].load_state_dict(states["critic"])
+    model[2].load_state_dict(states["reward_estimate"])
+
+
 
 
 def log_metrics(logger, metrics, step):
