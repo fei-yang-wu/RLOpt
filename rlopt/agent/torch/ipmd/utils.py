@@ -21,6 +21,124 @@ from torchrl.envs.transforms import InitTracker, RewardSum, StepCounter
 
 from torchrl.record import VideoRecorder
 
+from torchrl.objectives import SACLoss
+import torch
+import torch.nn.functional as F
+from tensordict.tensordict import TensorDict
+
+
+
+# ====================================================================
+# SAC Class
+# -----------------
+
+
+class SACLossWithRewardEstimation(SACLoss):
+    """SAC loss module with reward estimation for imitation learning."""
+    
+    def __init__(
+        self,
+        actor_network,
+        qvalue_network,
+        reward_network,
+        num_qvalue_nets=2,
+        loss_function="l2",
+        delay_actor=False,
+        delay_qvalue=True,
+        alpha_init=1.0,
+        reward_regularizer=0.01
+    ):
+        super().__init__(
+            actor_network=actor_network,
+            qvalue_network=qvalue_network,
+            num_qvalue_nets=num_qvalue_nets,
+            loss_function=loss_function,
+            delay_actor=delay_actor,
+            delay_qvalue=delay_qvalue,
+            alpha_init=alpha_init,
+        )
+        self.reward_network = reward_network
+        self.reward_regularizer = reward_regularizer
+
+    def forward(self, tensordict: TensorDict, expert_tensordict: TensorDict = None):
+        """
+        Compute the loss with reward estimation.
+        
+        Args:
+            tensordict (TensorDict): Current policy tensordict
+            expert_tensordict (TensorDict, optional): Expert demonstrations tensordict
+        """
+        # Store original rewards
+        original_rewards = tensordict.get("reward").clone()
+        
+        # Estimate rewards for current batch
+        estimated_rewards = self.estimate_rewards(tensordict)
+        tensordict.set("reward", estimated_rewards)
+        
+        # Compute standard SAC loss
+        loss_dict = super().forward(tensordict)
+        
+        # If expert data is provided, compute reward estimation loss
+        if expert_tensordict is not None:
+            expert_rewards = self.estimate_rewards(expert_tensordict)
+            reward_loss = self.compute_reward_loss(estimated_rewards, expert_rewards)
+            loss_dict["reward_loss"] = reward_loss
+            
+            # Add reward loss to total loss
+            loss_dict["loss"] = loss_dict["loss"] + reward_loss
+            
+        # Restore original rewards
+        tensordict.set("reward", original_rewards)
+        
+        return loss_dict
+    
+    def estimate_rewards(self, tensordict: TensorDict) -> torch.Tensor:
+        """
+        Estimate rewards for the given tensordict.
+        
+        Args:
+            tensordict (TensorDict): Input tensordict containing state-action pairs
+            
+        Returns:
+            torch.Tensor: Estimated rewards
+        """
+        states = tensordict.get("observation")
+        actions = tensordict.get("action")
+        
+        # Concatenate states and actions if needed
+        input_features = torch.cat([states, actions], dim=-1)
+        
+        # Get reward estimates
+        with torch.no_grad():
+            estimated_rewards = self.reward_network(input_features)
+        
+        return estimated_rewards
+
+    def compute_reward_loss(self, policy_rewards: torch.Tensor, expert_rewards: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the reward estimation loss.
+        
+        Args:
+            policy_rewards (torch.Tensor): Estimated rewards for current policy
+            expert_rewards (torch.Tensor): Estimated rewards for expert demonstrations
+            
+        Returns:
+            torch.Tensor: Reward estimation loss
+        """
+        # Compute mean rewards
+        mean_policy_reward = policy_rewards.mean()
+        mean_expert_reward = expert_rewards.mean()
+        
+        # Main loss: difference between policy and expert rewards
+        reward_diff_loss = F.mse_loss(mean_policy_reward, mean_expert_reward)
+        
+        # Add regularization term to prevent reward exploitation
+        regularization = self.reward_regularizer * (
+            torch.abs(policy_rewards).mean() + torch.abs(expert_rewards).mean()
+        )
+        
+        return reward_diff_loss + regularization
+
 
 # ====================================================================
 # Environment utils

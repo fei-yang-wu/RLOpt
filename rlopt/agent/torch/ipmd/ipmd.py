@@ -232,6 +232,7 @@ def make_sac_agent(cfg, train_env, eval_env, device):
 # SAC Loss
 # ---------
 
+from utils import SACLossWithRewardEstimation
 
 def make_loss_module(cfg, model):
     """Make loss module and target network updater."""
@@ -241,7 +242,7 @@ def make_loss_module(cfg, model):
     # 2. When the loss module takes in data (sampled tensordict), replace the reward with the estimated reward
     # 3. Takes expoert's sampled tensordict data and compute the rewards for the sampled data
     # 4. Compute the loss with the estimated reward, i.e., average of the estimated rewards of the current batch minus the estimated rewards of the expert batch, with some regularizer.
-    loss_module = SACLoss(
+    loss_module = SACLossWithRewardEstimation(
         actor_network=model[0],
         qvalue_network=model[1],
         num_qvalue_nets=2,
