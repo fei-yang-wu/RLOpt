@@ -1258,7 +1258,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         try:
             # put state_dicts back in place
-            model.set_parameters(params, exact_match=True, device=device)
+            model.set_parameters(params, exact_match=False, device=device)
         except RuntimeError as e:
             # Patch to load Policy saved using SB3 < 1.7.0
             # the error is probably due to old policy being loaded
