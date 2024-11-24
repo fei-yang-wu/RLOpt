@@ -601,7 +601,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             n_envs = observation[next(iter(observation.keys()))].shape[0]
         else:
             n_envs = observation.shape[0]
-        print(observation.shape)
+
         vectorized_env = n_envs > 1
 
         # state : (n_layers, n_envs, dim)
