@@ -71,8 +71,8 @@ class SACLossWithRewardEstimation(SACLoss):
             expert_tensordict (TensorDict, optional): Expert demonstrations tensordict
         """
         # Estimate rewards for current batch and use them directly
-        policy_estimated_reward = self.estimate_rewards(tensordict)
-        tensordict.set("estimated_reward", policy_estimated_reward)  # Changed key to estimated_reward
+        estimated_rewards = self.estimate_rewards(tensordict)
+        tensordict.set("reward", estimated_rewards)
         
         # Compute standard SAC loss with estimated rewards
         loss_dict = super().forward(tensordict)
@@ -81,7 +81,7 @@ class SACLossWithRewardEstimation(SACLoss):
         if expert_tensordict is not None:
             # Compute reward estimation loss
             expert_estimated_reward = self.estimate_rewards(expert_tensordict)
-            reward_loss = self.compute_reward_loss(policy_estimated_reward, expert_estimated_reward)
+            reward_loss = self.compute_reward_loss(estimated_rewards, expert_estimated_reward)
             loss_dict["reward_estimation_loss"] = reward_loss  # Renamed for clarity
             
             # Compute BC loss
