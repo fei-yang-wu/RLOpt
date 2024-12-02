@@ -929,6 +929,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         progress_bar: bool = False,
     ):
         print(f"Training teacher")
+        self.mixture_coeff = 0.0
         self.teacher_learn(
             total_timesteps,
             callback,
@@ -938,6 +939,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
             progress_bar,
         )
         print(f"Training student")
+        self.mixture_coeff = 1.0
         self.student_learn(
             total_timesteps,
             callback,
