@@ -476,11 +476,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                 )
 
                 obs_tensor = self._last_obs
-                if (
-                    th.rand(1)[0]
-                    < self.mixture_coeff * (1 - self._current_progress_remaining)
-                    and self.num_timesteps > 0
-                ):
+                if self.mixture_coeff == 1.0:
                     actions, values, log_probs, lstm_states = (
                         self.compiled_student_policy.forward(
                             obs_tensor["student"],
