@@ -489,7 +489,6 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                     actions, values, log_probs = self.compiled_policy(
                         obs_tensor["teacher"]
                     )
-
                 # get the hidden state of the current student state
                 if not student_predicted:
                     lstm_states = self.compiled_student_policy.forward_lstm(
@@ -675,6 +674,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                 observations = obs_batch["teacher"]
 
             if self.mixture_coeff == 0.0:
+                # print("training teacher")
                 # print("action shape: ", actions.shape)
                 # print("observation shape:", observations.shape)
 
@@ -769,7 +769,8 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                     unpad_trajectories(student_log_prob, mask)
                 )
 
-                teacher_action = actions.detach()
+                # teacher using the state to predict action
+                teacher_action = self.compiled_policy.predict_actions(observations)
 
                 student_loss = F.mse_loss(
                     student_action, teacher_action
