@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 import time
 
 from gymnasium import RewardWrapper
@@ -10,6 +13,7 @@ import tqdm
 
 import torch.cuda
 from tensordict import TensorDict
+from tensordict.utils import expand_as_right, NestedKey
 from torchrl._utils import logger as torchrl_logger
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.record.loggers import generate_exp_name, get_logger
@@ -31,7 +35,7 @@ from utils import (
     make_environment,
     get_activation,
     save_model,
-    load_model
+    load_model,
 )
 
 # ====================================================================
@@ -87,9 +91,11 @@ def make_replay_buffer(
         )
     return replay_buffer
 
+
 ####### Expert Buffer
 
-def load_expert_data(data_path, device= "cpu", batch_size = None) -> TensorDict:
+
+def load_expert_data(data_path, device="cpu", batch_size=None) -> TensorDict:
     """
     Load expert demonstrations from a file into a TensorDict.
     """
@@ -98,26 +104,27 @@ def load_expert_data(data_path, device= "cpu", batch_size = None) -> TensorDict:
     # Create Tensor Dict
     if not isinstance(expert_data, TensorDict):
         if isinstance(expert_data, dict):
-            expert_data = TensorDict(expert_data, batch_size=[len(next(iter(expert_data.values())))])
-    
+            expert_data = TensorDict(
+                expert_data, batch_size=[len(next(iter(expert_data.values())))]
+            )
+
     if batch_size is not None:
-        expert_data = expert_data.reshape(-1)  # 
+        expert_data = expert_data.reshape(-1)  #
         if len(expert_data) < batch_size:
             # Repeat data if needed
             num_repeats = (batch_size + len(expert_data) - 1) // len(expert_data)
             expert_data = expert_data.repeat(num_repeats)
         expert_data = expert_data[:batch_size]  # Trim to exact batch size
-    
+
     return expert_data
 
+
 def create_expert_replay_buffer(
-    expert_data: TensorDict,
-    buffer_size: int,
-    batch_size: int,
-    device) -> TensorDictReplayBuffer:
+    expert_data: TensorDict, buffer_size: int, batch_size: int, device
+) -> TensorDictReplayBuffer:
     """
     Create a replay buffer from expert demonstrations.
-    
+
     TensorDictReplayBuffer containing expert demonstrations
     """
     expert_buffer = TensorDictReplayBuffer(
@@ -127,18 +134,62 @@ def create_expert_replay_buffer(
         ),
         batch_size=batch_size,
     )
-    
 
     expert_buffer.extend(expert_data)
-    
+
     return expert_buffer
+
+
+class DeterministicRewardEstimator(TensorDictModule):
+    """General class for value functions in RL.
+
+    The DeterministicRewardEstimator class comes with default values for the in_keys and
+    out_keys arguments (["observation"] and ["state_value"] or
+    ["state_action_value"], respectively and depending on whether the "action"
+    key is part of the in_keys list).
+
+    Args:
+        module (nn.Module): a :class:`torch.nn.Module` used to map the input to
+            the output parameter space.
+        in_keys (iterable of str, optional): keys to be read from input
+            tensordict and passed to the module. If it
+            contains more than one element, the values will be passed in the
+            order given by the in_keys iterable.
+            Defaults to ``["observation"]``.
+        out_keys (iterable of str): keys to be written to the input tensordict.
+            The length of out_keys must match the
+            number of tensors returned by the embedded module. Using "_" as a
+            key avoid writing tensor to output.
+            Defaults to ``["state_value"]`` or
+            ``["state_action_value"]`` if ``"action"`` is part of the ``in_keys``.
+
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        in_keys: Optional[Sequence[NestedKey]] = None,  # type: ignore
+        out_keys: Optional[Sequence[NestedKey]] = None,  # type: ignore
+    ) -> None:
+        if in_keys is None:
+            in_keys = ["observation"]
+        if out_keys is None:
+            out_keys = (
+                ["state_reward"] if "action" not in in_keys else ["state_action_reward"]
+            )
+        super().__init__(
+            module=module,
+            in_keys=in_keys,
+            out_keys=out_keys,
+        )
+
 
 # ====================================================================
 # Model
 # -----
 
 
-def make_sac_agent(cfg, train_env, eval_env, device):
+def make_ipmd_agent(cfg, train_env, eval_env, device):
     """Make SAC agent."""
     # Define Actor Network
     in_keys = ["observation"]
@@ -212,10 +263,8 @@ def make_sac_agent(cfg, train_env, eval_env, device):
         **reward_net_kwargs,
     )
 
-    reward_estimator = ValueOperator(
-        in_keys=["action"] + in_keys,
-        module=reward_net,
-        out_keys=["estimated_reward"]
+    reward_estimator = DeterministicRewardEstimator(
+        in_keys=["action"] + in_keys, module=reward_net, out_keys=["estimated_reward"]
     )
 
     model = nn.ModuleList([actor, qvalue, reward_estimator]).to(device)
@@ -234,6 +283,7 @@ def make_sac_agent(cfg, train_env, eval_env, device):
 # ---------
 
 from utils import SACLossWithRewardEstimation
+
 
 def make_loss_module(cfg, model):
     """Make loss module and target network updater."""
@@ -271,7 +321,7 @@ def split_critic_params(critic_params):
     return critic1_params, critic2_params
 
 
-def make_sac_optimizer(cfg, loss_module):
+def make_ipmd_optimizer(cfg, loss_module):
     critic_params = list(loss_module.qvalue_network_params.flatten_keys().values())
     actor_params = list(loss_module.actor_network_params.flatten_keys().values())
     reward_params = list(loss_module.reward_network_params.flatten_keys().values())
@@ -301,6 +351,138 @@ def make_sac_optimizer(cfg, loss_module):
     return optimizer_actor, optimizer_critic, optimizer_alpha, optimizer_reward
 
 
+class SACLossWithRewardEstimation(SACLoss):
+    """SAC loss module with IRL reward estimation and behavioral cloning."""
+
+    def __init__(
+        self,
+        actor_network,
+        qvalue_network,
+        reward_network,
+        num_qvalue_nets=2,
+        loss_function="l2",
+        delay_actor=False,
+        delay_qvalue=True,
+        alpha_init=1.0,
+        reward_regularizer=0.01,
+        bc_lambda=0.1,
+    ):
+        super().__init__(
+            actor_network=actor_network,
+            qvalue_network=qvalue_network,
+            num_qvalue_nets=num_qvalue_nets,
+            loss_function=loss_function,
+            delay_actor=delay_actor,
+            delay_qvalue=delay_qvalue,
+            alpha_init=alpha_init,
+        )
+        self.reward_network = reward_network
+        self.reward_regularizer = reward_regularizer
+        self.bc_lambda = bc_lambda
+
+    def forward(self, tensordict: TensorDict, expert_tensordict: TensorDict = None):
+        """
+        Compute the loss with IRL reward estimation and behavioral cloning.
+
+        Args:
+            tensordict (TensorDict): Current policy tensordict
+            expert_tensordict (TensorDict, optional): Expert demonstrations tensordict
+        """
+        # Estimate rewards for current batch and use them directly
+        estimated_rewards = self.estimate_rewards(tensordict)
+        tensordict.set("reward", estimated_rewards)
+
+        # Compute standard SAC loss with estimated rewards
+        loss_dict = super().forward(tensordict)
+
+        # If expert data is provided, compute reward estimation and BC losses
+        if expert_tensordict is not None:
+            # Compute reward estimation loss
+            expert_estimated_reward = self.estimate_rewards(expert_tensordict)
+            reward_loss = self.compute_reward_loss(
+                estimated_rewards, expert_estimated_reward
+            )
+            loss_dict["reward_estimation_loss"] = reward_loss  # Renamed for clarity
+
+            # Compute BC loss
+            expert_states = expert_tensordict.get("observation")
+            expert_actions = expert_tensordict.get("action")
+
+            # Get policy distribution for expert states
+            policy_dist = self.actor_network(expert_states)
+
+            # Compute BC loss based on policy type
+            if hasattr(policy_dist, "log_prob"):
+                # For stochastic policies
+                bc_loss = -policy_dist.log_prob(expert_actions).mean()
+            else:
+                # For deterministic policies, use MSE
+                pred_actions = policy_dist
+                bc_loss = torch.nn.functional.mse_loss(pred_actions, expert_actions)
+
+            loss_dict["bc_loss"] = bc_loss
+
+            # Add both losses to total loss
+            loss_dict["loss"] = (
+                loss_dict["loss"] + reward_loss + self.bc_lambda * bc_loss
+            )
+
+        return loss_dict
+
+    def estimate_rewards(self, tensordict: TensorDict) -> torch.Tensor:
+        """
+        Estimate rewards using IRL reward network.
+
+        Args:
+            tensordict (TensorDict): Input tensordict containing state-action pairs
+
+        Returns:
+            torch.Tensor: Estimated rewards from IRL
+        """
+        states = tensordict.get("observation")
+        actions = tensordict.get("action")
+
+        # Concatenate states and actions
+        input_features = torch.cat([states, actions], dim=-1)
+
+        # Get reward estimates from IRL
+        estimated_rewards = self.reward_network(input_features)
+
+        return estimated_rewards
+
+    def compute_reward_loss(
+        self,
+        policy_estimated_reward: torch.Tensor,
+        expert_estimated_reward: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the IRL reward estimation loss.
+
+        Args:
+            policy_estimated_reward (torch.Tensor): Estimated rewards for current policy
+            expert_estimated_reward (torch.Tensor): Estimated rewards for expert demonstrations
+
+        Returns:
+            torch.Tensor: IRL reward estimation loss
+        """
+        # Compute mean rewards
+        mean_policy_reward = policy_estimated_reward.mean()
+        mean_expert_reward = expert_estimated_reward.mean()
+
+        # Main loss: difference between policy and expert estimated rewards
+        reward_diff_loss = torch.nn.functional.mse_loss(
+            mean_policy_reward, mean_expert_reward
+        )
+
+        # Add regularization term to prevent reward exploitation
+        regularization = self.reward_regularizer * (
+            torch.abs(policy_estimated_reward).mean()
+            + torch.abs(expert_estimated_reward).mean()
+        )
+
+        return reward_diff_loss + regularization
+
+
 @hydra.main(version_base=None, config_path="", config_name="config")
 def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
     device = cfg.network.device
@@ -314,7 +496,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
     device = torch.device(device)
 
     # Create logger
-    exp_name = generate_exp_name("SAC", cfg.logger.exp_name)
+    exp_name = generate_exp_name("IPMD", cfg.logger.exp_name)
     logger = None
     if cfg.logger.backend:
         logger = get_logger(
@@ -336,9 +518,9 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
     train_env, eval_env = make_environment(cfg, logger=logger)
 
     # Create agent
-    model, exploration_policy = make_sac_agent(cfg, train_env, eval_env, device)
+    model, exploration_policy = make_ipmd_agent(cfg, train_env, eval_env, device)
 
-    # Create SAC loss
+    # Create IPMD loss
     loss_module, target_net_updater = make_loss_module(cfg, model)
 
     # Create off-policy collector
@@ -359,7 +541,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
         optimizer_critic,
         optimizer_alpha,
         optimizer_reward,
-    ) = make_sac_optimizer(cfg, loss_module)
+    ) = make_ipmd_optimizer(cfg, loss_module)
 
     # Main loop
     start_time = time.time()
@@ -431,12 +613,9 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
 
                 # Update reward
 
-
                 optimizer_reward.zero_grad()
                 reward_loss.backward()
                 optimizer_reward.step()
-
-
 
                 losses[i] = loss_td.select(
                     "loss_actor", "loss_qvalue", "loss_alpha", "loss_reward"
@@ -465,7 +644,9 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
             metrics_to_log["train/q_loss"] = losses.get("loss_qvalue").mean().item()
             metrics_to_log["train/actor_loss"] = losses.get("loss_actor").mean().item()
             metrics_to_log["train/alpha_loss"] = losses.get("loss_alpha").mean().item()
-            metrics_to_log["train/reward_loss"] = losses.get("loss_reward").mean().item(),
+            metrics_to_log["train/reward_loss"] = (
+                losses.get("loss_reward").mean().item(),
+            )
             metrics_to_log["train/alpha"] = loss_td["alpha"].item()
             metrics_to_log["train/entropy"] = loss_td["entropy"].item()
             metrics_to_log["train/sampling_time"] = sampling_time
@@ -498,6 +679,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
     end_time = time.time()
     execution_time = end_time - start_time
     torchrl_logger.info(f"Training took {execution_time:.2f} seconds to finish")
+
 
 if __name__ == "__main__":
     train_ipmd()
