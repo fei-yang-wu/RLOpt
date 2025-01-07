@@ -212,12 +212,13 @@ def make_sac_agent(cfg, train_env, eval_env, device):
         **reward_net_kwargs,
     )
 
-    reward_estimate = ValueOperator(
+    reward_estimator = ValueOperator(
         in_keys=["action"] + in_keys,
         module=reward_net,
+        out_keys=["estimated_reward"]
     )
 
-    model = nn.ModuleList([actor, qvalue, reward_estimate]).to(device)
+    model = nn.ModuleList([actor, qvalue, reward_estimator]).to(device)
 
     # init nets
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):  # type: ignore
@@ -245,6 +246,7 @@ def make_loss_module(cfg, model):
     loss_module = SACLossWithRewardEstimation(
         actor_network=model[0],
         qvalue_network=model[1],
+        reward_network=model[2],
         num_qvalue_nets=2,
         loss_function=cfg.optim.loss_function,
         delay_actor=False,
@@ -410,6 +412,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
                 actor_loss = loss_td["loss_actor"]
                 q_loss = loss_td["loss_qvalue"]
                 alpha_loss = loss_td["loss_alpha"]
+                reward_loss = loss_td["loss_reward"]
 
                 # Update actor
                 optimizer_actor.zero_grad()
@@ -426,8 +429,17 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
                 alpha_loss.backward()
                 optimizer_alpha.step()
 
+                # Update reward
+
+
+                optimizer_reward.zero_grad()
+                reward_loss.backward()
+                optimizer_reward.step()
+
+
+
                 losses[i] = loss_td.select(
-                    "loss_actor", "loss_qvalue", "loss_alpha"
+                    "loss_actor", "loss_qvalue", "loss_alpha", "loss_reward"
                 ).detach()
 
                 # Update qnet_target params
@@ -453,6 +465,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
             metrics_to_log["train/q_loss"] = losses.get("loss_qvalue").mean().item()
             metrics_to_log["train/actor_loss"] = losses.get("loss_actor").mean().item()
             metrics_to_log["train/alpha_loss"] = losses.get("loss_alpha").mean().item()
+            metrics_to_log["train/reward_loss"] = losses.get("loss_reward").mean().item(),
             metrics_to_log["train/alpha"] = loss_td["alpha"].item()
             metrics_to_log["train/entropy"] = loss_td["entropy"].item()
             metrics_to_log["train/sampling_time"] = sampling_time
