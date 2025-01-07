@@ -1,9 +1,8 @@
 from setuptools import setup, find_packages
 
-
 setup(
     name="RLOpt",
-    version="0.1.0",
+    version="0.2.0",
     description="A reinforcement learning optimization project",
     author="Feiyang Wu",
     author_email="feiyangwu@gatech.edu",
@@ -12,8 +11,8 @@ setup(
     install_requires=[
         "numpy",
         "gymnasium",
-        "torch>=2.2",
         "tensorboard",
+        "torch",
         "tensordict",
         "tqdm",
         "rich",
@@ -22,6 +21,7 @@ setup(
         "wandb",
         "sb3-contrib",
         "transforms3d",
+        "rsl_rl@git+https://github.com/leggedrobotics/rsl_rl.git@master",
         "empy==3.3.4",
         "lark",
     ],

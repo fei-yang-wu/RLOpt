@@ -2,13 +2,16 @@ import warnings
 from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple
 from collections import deque
 import time
-
+import statistics
+import pathlib
+import io
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
-
+from tensordict import TensorDict
+from stable_baselines3.common.utils import get_system_info
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import (
@@ -17,6 +20,12 @@ from stable_baselines3.common.policies import (
     BasePolicy,
     MultiInputActorCriticPolicy,
 )
+from stable_baselines3.common.save_util import (
+    load_from_zip_file,
+    recursive_getattr,
+    recursive_setattr,
+)
+from stable_baselines3.common.vec_env.patch_gym import _convert_space
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import VecEnv
@@ -544,6 +553,15 @@ class PPO(OnPolicyAlgorithm):
         """
         self.start_time = time.time_ns()
 
+        # store the current number of timesteps
+        self.rewbuffer = deque(maxlen=self._stats_window_size)
+        self.lenbuffer = deque(maxlen=self._stats_window_size)
+        self.cur_reward_sum = th.zeros(
+            self.env.num_envs, dtype=th.float, device=self.device
+        )
+        self.cur_episode_length = th.zeros(
+            self.env.num_envs, dtype=th.float, device=self.device
+        )
         if self.ep_info_buffer is None or reset_num_timesteps:
             # Initialize buffers if they don't exist, or reinitialize if resetting counters
             self.ep_info_buffer = deque(maxlen=self._stats_window_size)
@@ -579,4 +597,59 @@ class PPO(OnPolicyAlgorithm):
         # Create eval callback if needed
         callback = self._init_callback(callback, progress_bar)
 
+        print(self.policy)
+
         return total_timesteps, callback
+
+    def _dump_logs(self, iteration: int, locs: dict) -> None:
+        """
+        Write log.
+
+        :param iteration: Current logging iteration
+        :param locs: Local variables
+        """
+        iteration_time = locs["training_end"] - locs["collection_start"]
+
+        if self.ep_infos:
+            for key in self.ep_infos[0]:
+                infotensor = th.tensor([], device=self.device)
+                for ep_info in self.ep_infos:
+                    # handle scalar and zero dimensional tensor infos
+                    if key not in ep_info:
+                        continue
+                    if not isinstance(ep_info[key], th.Tensor):
+                        ep_info[key] = th.Tensor([ep_info[key]])
+                    if len(ep_info[key].shape) == 0:
+                        ep_info[key] = ep_info[key].unsqueeze(0)
+                    infotensor = th.cat((infotensor, ep_info[key].to(self.device)))
+                value = th.mean(infotensor).item()
+                # log to logger and terminal
+                if "/" in key:
+                    self.logger.record(key, value)
+                else:
+                    self.logger.record("Episode/" + key, value)
+        fps = int(
+            self.n_steps
+            * self.env.num_envs
+            / (locs["collection_time"] + locs["training_time"])
+        )
+        self.logger.record("time/fps", fps)
+        self.logger.record("time/iteration_time (s)", iteration_time / 1e9)
+        self.logger.record(
+            "time/collection time per step (s)", locs["collection_time"] / self.n_steps
+        )
+        self.logger.record("time/training_time (s)", locs["training_time"])
+        if len(self.rewbuffer) > 1:
+            self.logger.record(
+                "Episode/average_episodic_reward", statistics.mean(self.rewbuffer)
+            )
+            self.logger.record(
+                "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
+            )
+            self.logger.record(
+                "Episode/max_episodic_length", th.max(self.cur_episode_length).item()
+            )
+            self.logger.record(
+                "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
+            )
+        self.logger.dump(step=self.num_timesteps)

@@ -1766,7 +1766,6 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         n_envs: int = 1,
     ) -> None:
         self.hidden_state_shape = hidden_state_shape
-        print(f"hidden state shape {self.hidden_state_shape}")
         self.seq_start_indices, self.seq_end_indices = None, None
         super().__init__()
         self.buffer_size = buffer_size
