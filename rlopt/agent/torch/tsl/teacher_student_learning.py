@@ -325,6 +325,10 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         if _init_setup_model:
             self._setup_model()
 
+        self.state_dicts = [
+            "policy",
+        ]
+
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
@@ -430,6 +434,11 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         self.rollout_buffer: RLOptDictRecurrentReplayBuffer
 
         self.compiled_student_policy = th.compile(self.student_policy)
+
+        self.state_dicts = [
+            "policy",
+            "student_policy",
+        ]
 
     def teacher_collect_rollouts(
         self,
@@ -908,7 +917,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
 
         # Switch to train mode (this affects batch norm / dropout)
         self.compiled_student_policy: RecurrentActorCriticPolicy
-        self.compiled_policy.set_training_mode(True)
+        self.compiled_policy.set_training_mode(False)
         self.compiled_student_policy.set_training_mode(True)
         # # Update optimizer learning rate
         # self._update_learning_rate(
@@ -974,7 +983,9 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
             )
 
             # teacher using the state to predict action
-            teacher_action, _, _ = self.compiled_policy(obs_batch["teacher"])
+            teacher_action, _, _ = self.compiled_policy(
+                obs_batch["teacher"], deterministic=False
+            )
 
             student_loss = F.mse_loss(
                 student_action, teacher_action
@@ -1202,12 +1213,8 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         ]  # noqa: RUF005
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
-        state_dicts = [
-            "policy",
-            "student_policy",
-        ]
 
-        return state_dicts, []
+        return self.state_dicts, []
 
     def student_predict(
         self,
