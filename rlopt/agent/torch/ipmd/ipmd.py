@@ -65,6 +65,8 @@ def make_replay_buffer(
     device="cpu",
     prefetch=3,
 ):
+    
+    ## million steps half cheetah, load trained agent and collect data using replay buffer, load replay buffer for demonstration
     if prb:
         replay_buffer = TensorDictPrioritizedReplayBuffer(
             alpha=0.7,
@@ -390,8 +392,10 @@ class SACLossWithRewardEstimation(SACLoss):
         """
         # TODO: do th.no_grad() here for critic update
         # Estimate rewards for current batch and use them directly
-        estimated_rewards = self.estimate_rewards(tensordict)
-        tensordict.set("reward", estimated_rewards)
+
+        with torch.no_grad():
+            estimated_rewards = self.estimate_rewards(tensordict)
+            tensordict.set("reward", estimated_rewards)
 
         # Compute standard SAC loss with estimated rewards
         loss_dict = super().forward(tensordict)
@@ -417,10 +421,6 @@ class SACLossWithRewardEstimation(SACLoss):
             if hasattr(policy_dist, "log_prob"):
                 # For stochastic policies
                 bc_loss = -policy_dist.log_prob(expert_actions).mean()
-            else:
-                # For deterministic policies, use MSE
-                pred_actions = policy_dist
-                bc_loss = torch.nn.functional.mse_loss(pred_actions, expert_actions)
 
             loss_dict["bc_loss"] = bc_loss
 
@@ -473,9 +473,8 @@ class SACLossWithRewardEstimation(SACLoss):
 
         # TODO: subtraction instead of MSE
         # Main loss: difference between policy and expert estimated rewards
-        reward_diff_loss = torch.nn.functional.mse_loss(
-            mean_policy_reward, mean_expert_reward
-        )
+        reward_diff_loss = mean_policy_reward - mean_expert_reward
+    
 
         # Add regularization term to prevent reward exploitation
         regularization = self.reward_regularizer * (
@@ -575,6 +574,7 @@ def train_ipmd(cfg: "DictConfig"):  # noqa: F821 # type: ignore
         current_frames = tensordict.numel()
         # Add to replay buffer
         replay_buffer.extend(tensordict.cpu())
+
         collected_frames += current_frames
 
         # Optimization steps
