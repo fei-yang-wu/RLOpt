@@ -388,6 +388,7 @@ class SACLossWithRewardEstimation(SACLoss):
             tensordict (TensorDict): Current policy tensordict
             expert_tensordict (TensorDict, optional): Expert demonstrations tensordict
         """
+        # TODO: do th.no_grad() here for critic update
         # Estimate rewards for current batch and use them directly
         estimated_rewards = self.estimate_rewards(tensordict)
         tensordict.set("reward", estimated_rewards)
@@ -411,6 +412,7 @@ class SACLossWithRewardEstimation(SACLoss):
             # Get policy distribution for expert states
             policy_dist = self.actor_network(expert_states)
 
+            # TODO: get rid of MSE
             # Compute BC loss based on policy type
             if hasattr(policy_dist, "log_prob"):
                 # For stochastic policies
@@ -469,6 +471,7 @@ class SACLossWithRewardEstimation(SACLoss):
         mean_policy_reward = policy_estimated_reward.mean()
         mean_expert_reward = expert_estimated_reward.mean()
 
+        # TODO: subtraction instead of MSE
         # Main loss: difference between policy and expert estimated rewards
         reward_diff_loss = torch.nn.functional.mse_loss(
             mean_policy_reward, mean_expert_reward
