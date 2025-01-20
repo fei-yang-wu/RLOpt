@@ -6,7 +6,6 @@ import statistics
 import pathlib
 import io
 
-
 import numpy as np
 import torch as th
 from gymnasium import spaces
@@ -53,10 +52,8 @@ from stable_baselines3.common.vec_env import (
 )
 
 from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
-
-from rlopt.utils.utils import (
+from rlopt.common.utils import (
     obs_as_tensor,
-    explained_variance,
     unpad_trajectories,
 )
 from rlopt.agent.l2t.policies import (
@@ -65,7 +62,6 @@ from rlopt.agent.l2t.policies import (
     MultiInputLstmPolicy,
     RecurrentActorCriticPolicy,
 )
-
 
 SelfRecurrentL2T = TypeVar("SelfRecurrentL2T", bound="RecurrentL2T")
 
@@ -154,8 +150,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         rollout_buffer_class: Optional[
-            Union[Type[RLOptDictRecurrentReplayBuffer],]
-        ] = None,
+            type[RLOptDictRecurrentReplayBuffer]
+        ] = RLOptDictRecurrentReplayBuffer,
         rollout_buffer_kwargs: Optional[Dict[str, Any]] = None,
         target_kl: Optional[float] = None,
         stats_window_size: int = 100,
@@ -189,10 +185,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.start_time = 0.0
         self.learning_rate = learning_rate
         self.tensorboard_log = tensorboard_log
-        self._last_obs = (  # type: ignore
-            None
-        )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
-        self._last_episode_starts = None  # type: Optional[np.ndarray]
+        self._last_obs = None  # type: ignore
+
+        # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
+        self._last_episode_starts = None  # type: ignore
         # When using VecNormalize:
         self._last_original_obs = (
             None
@@ -351,7 +347,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         self.compiled_policy = th.compile(self.policy)
 
-        self.compiled_student_policy = th.compile(self.student_policy)
+        self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
 
     def _init_student_policy(
         self,
@@ -409,7 +405,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self.observation_space,  # type: ignore[arg-type]
             self.action_space,
             hidden_state_buffer_shape,
-            device=self.device,
+            device=self.device,  # type: ignore[arg-type]
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
@@ -482,7 +478,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     actions, values, log_probs, lstm_states = (
                         self.compiled_student_policy.forward(
                             obs_tensor["student"],
-                            self._last_lstm_states,
+                            self._last_lstm_states,  # type: ignore[arg-type]
                             episode_starts,
                         )
                     )
@@ -496,7 +492,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 if not student_predicted:
                     lstm_states = self.compiled_student_policy.forward_lstm(
                         obs_tensor["student"],
-                        self._last_lstm_states,
+                        self._last_lstm_states,  # type: ignore[arg-type]
                         episode_starts,
                     )
 
@@ -519,7 +515,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                         th.as_tensor(self.action_space.high, device=self.device),
                     )
             time_now = time.time_ns()
-            new_obs, rewards, dones, infos = env.step(clipped_actions)
+            new_obs, rewards, dones, infos = env.step(clipped_actions)  # type: ignore[arg-type]
             self.logger.record("time/step", (time.time_ns() - time_now) / 1e9)
 
             self.num_timesteps += env.num_envs
@@ -551,7 +547,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             self.cur_reward_sum += rewards
             self.cur_episode_length += 1
-            new_ids = (dones > 0).nonzero(as_tuple=False)
+            new_ids = (dones > 0).nonzero(as_tuple=False)  # type: ignore[arg-type]
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
@@ -560,11 +556,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 self._last_episode_starts,  # type: ignore[arg-type]
                 values,
                 log_probs,
-                lstm_states=self._last_lstm_states,
-                dones=dones,
+                lstm_states=self._last_lstm_states,  # type: ignore[arg-type]
+                dones=dones,  # type: ignore[arg-type]
             )
             self._last_obs = new_obs  # type: ignore[assignment]
-            self._last_episode_starts = dones
+            self._last_episode_starts = dones  # type: ignore[arg-type]
             self._last_lstm_states = lstm_states
 
             # record reward and episode length
@@ -648,7 +644,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             num_mini_batches=self.n_batches, num_epochs=self.n_epochs
         )
         # train for n_epochs epochs
-        for (
+        for (  # type: ignore[arg-type]
             obs_batch,
             actions_batch,
             values_batch,
@@ -667,14 +663,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 actions = actions_batch.long().flatten()
 
             # Convert mask from float to bool
-            mask = masks_batch > 1e-8
+            mask = masks_batch > 1e-8  # type: ignore[operator]
 
             # Re-sample the noise matrix because the log_std has changed
             if self.use_sde:
                 self.compiled_policy.reset_noise(self.batch_size)
 
             if self.whole_sequences:
-                actions = actions["teacher"]
+                actions = actions["teacher"]  # type: ignore[arg-type]
                 observations = obs_batch["teacher"]
             # print("action shape: ", actions.shape)
             # print("observation shape:", observations.shape)
@@ -734,7 +730,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             student_observations = obs_batch["student"]
             # student obs shape is (T, B, feature dim)
-            (
+            (  # type: ignore
                 _,
                 student_action,
                 student_entropy,
@@ -744,12 +740,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
             ) = self.compiled_student_policy.predict_whole_sequence(
                 obs=student_observations,
                 deterministic=False,
-                lstm_states=hidden_batch,
+                lstm_states=hidden_batch,  # type: ignore
             )
 
             # align dim with the teacher action
             student_action = BaseBuffer.swap_and_flatten(
-                unpad_trajectories(student_action, mask)
+                unpad_trajectories(student_action, mask)  # type: ignore
             )
 
             student_log_prob = BaseBuffer.swap_and_flatten(
@@ -770,7 +766,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             teacher_action = actions.detach()
 
             student_loss = F.mse_loss(
-                student_action, teacher_action
+                student_action, teacher_action  # type: ignore
             )  # + student_asym_loss
 
             student_losses.append(student_loss.item())
@@ -879,7 +875,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         while self.num_timesteps < total_timesteps:
             collection_start = time.time_ns()
             continue_training = self.collect_rollouts(
-                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
+                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps  # type: ignore
             )
             collection_end = time.time_ns()
             collection_time = (collection_end - collection_start) / 1e9
@@ -1038,10 +1034,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.rewbuffer = deque(maxlen=self._stats_window_size)
         self.lenbuffer = deque(maxlen=self._stats_window_size)
         self.cur_reward_sum = th.zeros(
-            self.env.num_envs, dtype=th.float, device=self.device
+            self.env.num_envs, dtype=th.float, device=self.device  # type: ignore
         )
         self.cur_episode_length = th.zeros(
-            self.env.num_envs, dtype=th.float, device=self.device
+            self.env.num_envs, dtype=th.float, device=self.device  # type: ignore
         )
 
         if self.ep_info_buffer is None or reset_num_timesteps:
@@ -1114,7 +1110,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     self.logger.record("Episode/" + key, value)
         fps = int(
             self.n_steps
-            * self.env.num_envs
+            * self.env.num_envs  # type: ignore
             / (locs["collection_time"] + locs["training_time"])
         )
         self.logger.record("time/fps", fps)
@@ -1141,7 +1137,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
     def inference(self):
         # optimize the model for inference
         self.compiled_policy = th.compile(self.policy)
-        self.compiled_student_policy = th.compile(self.student_policy)
+        self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
 
     @classmethod
     def load(  # noqa: C901
@@ -1246,7 +1242,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         model = cls(
             policy=data["policy_class"],
-            env=env,
+            env=env,  # type: ignore
             device=device,
             _init_setup_model=False,  # type: ignore[call-arg]
         )

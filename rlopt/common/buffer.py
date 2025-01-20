@@ -26,7 +26,7 @@ from rlopt.common.type_aliases import (
     RecurrentDictRolloutBufferSequenceSamples,
 )
 
-from rlopt.utils.utils import split_and_pad_trajectories, unpad_trajectories
+from rlopt.common.utils import split_and_pad_trajectories, unpad_trajectories
 
 try:
     # Check memory used by replay buffer when possible

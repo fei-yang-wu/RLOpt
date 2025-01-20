@@ -54,7 +54,7 @@ from stable_baselines3.common.vec_env import (
 
 from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer, RolloutBuffer
 
-from rlopt.utils.utils import (
+from rlopt.common.utils import (
     obs_as_tensor,
     explained_variance,
     unpad_trajectories,

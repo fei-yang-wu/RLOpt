@@ -34,7 +34,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from rlopt.common.buffer import RolloutBuffer as RLOptRolloutBuffer
 from rlopt.common.buffer import DictRolloutBuffer as RLOptDictRolloutBuffer
-from rlopt.utils.utils import obs_as_tensor, explained_variance
+from rlopt.common.utils import obs_as_tensor, explained_variance
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
