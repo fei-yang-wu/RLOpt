@@ -41,9 +41,9 @@ from stable_baselines3.common.vec_env import (
     unwrap_vec_normalize,
 )
 
-from rlopt.common.torch.buffer import RolloutBuffer as RLOptRolloutBuffer
-from rlopt.common.torch.buffer import DictRolloutBuffer as RLOptDictRolloutBuffer
-from rlopt.utils.torch.utils import obs_as_tensor, explained_variance
+from rlopt.common.buffer import RolloutBuffer as RLOptRolloutBuffer
+from rlopt.common.buffer import DictRolloutBuffer as RLOptDictRolloutBuffer
+from rlopt.utils.utils import obs_as_tensor, explained_variance
 
 SelfL2T = TypeVar("SelfL2T", bound="L2T")
 

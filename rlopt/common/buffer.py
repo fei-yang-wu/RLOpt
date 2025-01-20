@@ -21,12 +21,12 @@ from sb3_contrib.common.recurrent.type_aliases import (
     RNNStates,
 )
 
-from rlopt.common.torch.type_aliases import (
+from rlopt.common.type_aliases import (
     RecurrentRolloutBufferSequenceSamples,
     RecurrentDictRolloutBufferSequenceSamples,
 )
 
-from rlopt.utils.torch.utils import split_and_pad_trajectories, unpad_trajectories
+from rlopt.utils.utils import split_and_pad_trajectories, unpad_trajectories
 
 try:
     # Check memory used by replay buffer when possible

@@ -1,7 +1,7 @@
 import unittest
 
 import gymnasium as gym
-from rlopt.agent.torch.ppo import PPO
+from rlopt.agent.ppo import PPO
 
 
 class TestCustomPPO(unittest.TestCase):
@@ -13,7 +13,7 @@ class TestCustomPPO(unittest.TestCase):
         agent.learn(total_timesteps=1000)
 
     def test_custombuffer_normal_input(self):
-        from rlopt.common.torch.buffer import (
+        from rlopt.common.buffer import (
             ReplayBuffer,
             RolloutBuffer,
             DictReplayBuffer,

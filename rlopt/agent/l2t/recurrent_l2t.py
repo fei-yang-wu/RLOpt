@@ -52,28 +52,25 @@ from stable_baselines3.common.vec_env import (
     unwrap_vec_normalize,
 )
 
-from rlopt.common.torch.buffer import RLOptDictRecurrentReplayBuffer, RolloutBuffer
+from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
 
-from rlopt.utils.torch.utils import (
+from rlopt.utils.utils import (
     obs_as_tensor,
     explained_variance,
     unpad_trajectories,
 )
-from rlopt.agent.torch.l2t.policies import (
+from rlopt.agent.l2t.policies import (
     MlpLstmPolicy,
     CnnLstmPolicy,
     MultiInputLstmPolicy,
     RecurrentActorCriticPolicy,
 )
 
-th.set_float32_matmul_precision("high")
 
-SelfTeacherStudentLearning = TypeVar(
-    "SelfTeacherStudentLearning", bound="TeacherStudentLearning"
-)
+SelfRecurrentL2T = TypeVar("SelfRecurrentL2T", bound="RecurrentL2T")
 
 
-class TeacherStudentLearning(OnPolicyAlgorithm):
+class RecurrentL2T(OnPolicyAlgorithm):
     """
     L2T (Learn to Teach) is a reinforcement learning algorithm that learns to teach a student agent.
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
@@ -340,7 +337,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         )
         self.policy = self.policy.to(self.device)
 
-        # self._init_student_policy(self.student_policy, self.student_policy_kwargs)
+        self._init_student_policy(self.student_policy, self.student_policy_kwargs)
         # Initialize schedules for policy/value clipping
         self.clip_range = get_schedule_fn(self.clip_range)
         if self.clip_range_vf is not None:
@@ -354,17 +351,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
 
         self.compiled_policy = th.compile(self.policy)
 
-        # Initialize the buffer
-        self.rollout_buffer = RolloutBuffer(
-            self.n_steps,
-            self.observation_space["teacher"],  # type: ignore[arg-type]
-            self.action_space,
-            device=self.device,
-            gamma=self.gamma,
-            gae_lambda=self.gae_lambda,
-            n_envs=self.n_envs,
-            **self.rollout_buffer_kwargs,
-        )
+        self.compiled_student_policy = th.compile(self.student_policy)
 
     def _init_student_policy(
         self,
@@ -378,6 +365,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         else:
             self.student_policy_class = student_policy
 
+        print("student policy kwargs", student_policy_kwargs)
         # partial_obversevation_space is from Environment's partial_observation_space
         self.partial_observation_space = self.observation_space["student"]  # type: ignore
         self.student_policy = self.student_policy_class(  # pytype:disable=not-instantiable
@@ -429,146 +417,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         )
         self.rollout_buffer: RLOptDictRecurrentReplayBuffer
 
-        self.compiled_student_policy = th.compile(self.student_policy)
-
-    def teacher_collect_rollouts(
-        self,
-        env: VecEnv,
-        callback: BaseCallback,
-        rollout_buffer: RolloutBuffer,
-        n_rollout_steps: int,
-    ) -> bool:
-        """
-        Collect experiences using the current policy and fill a ``RolloutBuffer``.
-        The term rollout here refers to the model-free notion and should not
-        be used with the concept of rollout used in model-based RL or planning.
-
-        :param env: The training environment
-        :param callback: Callback that will be called at each step
-            (and at the beginning and end of the rollout)
-        :param rollout_buffer: Buffer to fill with rollouts
-        :param n_rollout_steps: Number of experiences to collect per environment
-        :return: True if function returned with at least `n_rollout_steps`
-            collected, False if callback terminated rollout prematurely.
-        """
-        time_now = time.time_ns()
-        self._last_obs: th.Tensor | np.ndarray | None
-        assert self._last_obs is not None, "No previous observation was provided"
-        # Switch to eval mode (this affects batch norm / dropout)
-        self.compiled_policy.set_training_mode(False)
-
-        n_steps = 0
-        rollout_buffer.reset()
-        # Sample new weights for the state dependent exploration
-        if self.use_sde:
-            self.compiled_policy.reset_noise(env.num_envs)
-
-        callback.on_rollout_start()
-        # print("Time before main loop: ", (time.time_ns() - time_now) / 1e9)
-        self.ep_infos = []
-        while n_steps < n_rollout_steps:
-
-            if (
-                self.use_sde
-                and self.sde_sample_freq > 0
-                and n_steps % self.sde_sample_freq == 0
-            ):
-                # Sample a new noise matrix
-                self.compiled_policy.reset_noise(env.num_envs)
-
-            with th.inference_mode():
-                # Convert to pytorch tensor or to TensorDict
-                obs_tensor = self._last_obs
-                actions, values, log_probs = self.compiled_policy(obs_tensor)
-
-            # Rescale and perform action
-            clipped_actions = actions
-
-            if isinstance(self.action_space, spaces.Box):
-                if self.compiled_policy.squash_output:
-                    # Unscale the actions to match env bounds
-                    # if they were previously squashed (scaled in [-1, 1])
-                    clipped_actions = self.compiled_policy.unscale_action(
-                        clipped_actions
-                    )
-                else:
-                    # Otherwise, clip the actions to avoid out of bound error
-                    # as we are sampling from an unbounded Gaussian distribution
-                    clipped_actions = th.clamp(
-                        actions,
-                        th.as_tensor(self.action_space.low, device=self.device),
-                        th.as_tensor(self.action_space.high, device=self.device),
-                    )
-            time_now = time.time_ns()
-            new_obs, rewards, dones, infos = env.step(clipped_actions)
-            new_obs = new_obs["teacher"]
-            self.logger.record("time/step", (time.time_ns() - time_now) / 1e9)
-
-            self.num_timesteps += env.num_envs
-
-            infos: dict
-            # Record infos
-            if "episode" in infos:
-                self.ep_infos.append(infos["episode"])
-            elif "log" in infos:
-                self.ep_infos.append(infos["log"])
-
-            # Give access to local variables
-            callback.update_locals(locals())
-            if not callback.on_step():
-                return False
-
-            n_steps += 1
-
-            if isinstance(self.action_space, spaces.Discrete):
-                # Reshape in case of discrete action
-                actions = actions.reshape(-1, 1)
-
-            # Bootstrapping on time outs
-            if "time_outs" in infos:
-                rewards += self.gamma * th.squeeze(
-                    values * infos["time_outs"].unsqueeze(1).to(self.device),
-                    1,
-                )
-
-            self.cur_reward_sum += rewards
-            self.cur_episode_length += 1
-            new_ids = (dones > 0).nonzero(as_tuple=False)
-
-            rollout_buffer.add(
-                self._last_obs,  # type: ignore[arg-type]
-                actions,
-                rewards,
-                self._last_episode_starts,  # type: ignore[arg-type]
-                values,
-                log_probs,
-            )
-            self._last_obs = new_obs  # type: ignore[assignment]
-            self._last_episode_starts = dones
-
-            # record reward and episode length
-            self.rewbuffer.extend(
-                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.lenbuffer.extend(
-                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.cur_reward_sum[new_ids] = 0
-            self.cur_episode_length[new_ids] = 1
-
-        with th.inference_mode():
-            # Compute value for the last timestep
-            values = self.compiled_policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
-
-        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
-
-        callback.update_locals(locals())
-
-        callback.on_rollout_end()
-
-        return True
-
-    def student_collect_rollouts(
+    def collect_rollouts(
         self,
         env: VecEnv,
         callback: BaseCallback,
@@ -594,7 +443,6 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         self._last_obs: Dict[str, th.Tensor]
         # Switch to eval mode (this affects batch norm / dropout)
         self.compiled_policy.set_training_mode(False)
-        self.compiled_student_policy.set_training_mode(False)
 
         n_steps = 0
         rollout_buffer.reset()
@@ -626,7 +474,11 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                 )
 
                 obs_tensor = self._last_obs
-                if np.random.rand() < self.mixture_coeff:
+                if (
+                    th.rand(1)[0]
+                    < self.mixture_coeff * (1 - self._current_progress_remaining)
+                    and self.num_timesteps > 0
+                ):
                     actions, values, log_probs, lstm_states = (
                         self.compiled_student_policy.forward(
                             obs_tensor["student"],
@@ -639,6 +491,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                     actions, values, log_probs = self.compiled_policy(
                         obs_tensor["teacher"]
                     )
+
                 # get the hidden state of the current student state
                 if not student_predicted:
                     lstm_states = self.compiled_student_policy.forward_lstm(
@@ -764,144 +617,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                     optimizer, self.lr_schedule(self._current_progress_remaining)
                 )
 
-    def teacher_train(self) -> None:
-        self.compiled_policy: ActorCriticPolicy
-        self.compiled_policy.set_training_mode(True)
-
-        # Update optimizer learning rate
-        self._update_learning_rate(self.compiled_policy.optimizer)
-
-        clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
-        if self.clip_range_vf is not None:
-            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
-
-        entropy_losses = []
-        pg_losses, value_losses = [], []
-        clip_fractions = []
-
-        continue_training = True
-
-        # train for n_epochs epochs
-        for epoch in range(self.n_epochs):
-            # Do a complete pass on the rollout buffer
-            for rollout_data in self.rollout_buffer.get(self.batch_size):
-                approx_kl_divs = []
-
-                actions = rollout_data.actions
-                if isinstance(self.action_space, spaces.Discrete):
-                    # Convert discrete action from float to long
-                    actions = rollout_data.actions.long().flatten()
-
-                values, log_prob, entropy = self.policy.evaluate_actions(
-                    rollout_data.observations, actions
-                )
-                values = values.flatten()
-                # Normalize advantage
-                advantages = rollout_data.advantages
-                # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-                if self.normalize_advantage and len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (
-                        advantages.std() + 1e-8
-                    )
-
-                # ratio between old and new policy, should be one at the first iteration
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
-
-                # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * th.clamp(
-                    ratio, 1 - clip_range, 1 + clip_range
-                )
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-                # Logging
-                pg_losses.append(policy_loss.item())
-                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-                clip_fractions.append(clip_fraction)
-
-                if self.clip_range_vf is None:
-                    # No clipping
-                    values_pred = values
-                else:
-                    # Clip the difference between old and new value
-                    # NOTE: this depends on the reward scaling
-                    values_pred = rollout_data.old_values + th.clamp(
-                        values - rollout_data.old_values,
-                        -1.0 * clip_range_vf,
-                        clip_range_vf,
-                    )
-                # Value loss using the TD(gae_lambda) target
-                value_loss = F.mse_loss(rollout_data.returns, values_pred)
-                value_losses.append(value_loss.item())
-
-                # Entropy loss favor exploration
-                if entropy is None:
-                    # Approximate entropy when no analytical form
-                    entropy_loss = -th.mean(-log_prob)
-                else:
-                    entropy_loss = -th.mean(entropy)
-
-                entropy_losses.append(entropy_loss.item())
-
-                loss = (
-                    policy_loss
-                    + self.ent_coef * entropy_loss
-                    + self.vf_coef * value_loss
-                )
-
-                # Calculate approximate form of reverse KL Divergence for early stopping
-                # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
-                # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
-                # and Schulman blog: http://joschu.net/blog/kl-approx.html
-                with th.inference_mode():
-                    log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = (
-                        th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                    )
-                    approx_kl_divs.append(approx_kl_div)
-
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                    continue_training = False
-                    if self.verbose >= 1:
-                        print(
-                            f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}"
-                        )
-                    break
-
-                # Optimization step
-                self.policy.optimizer.zero_grad()
-                loss.backward()
-                # Clip grad norm
-                th.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), self.max_grad_norm
-                )
-                self.policy.optimizer.step()
-
-            self._n_updates += 1
-            if not continue_training:
-                break
-        explained_var = explained_variance(
-            self.rollout_buffer.values.flatten(),  # type: ignore[attr-defined]
-            self.rollout_buffer.returns.flatten(),  # type: ignore[attr-defined]
-        )
-
-        # Logs
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
-        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/loss", loss.item())
-        self.logger.record("train/explained_variance", explained_var)
-        if hasattr(self.policy, "log_std"):
-            self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
-
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/clip_range", clip_range)
-        if self.clip_range_vf is not None:
-            self.logger.record("train/clip_range_vf", clip_range_vf)
-
-    def student_train(self) -> None:
+    def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
         """
@@ -924,6 +640,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         clip_fractions = []
         student_losses = []
+        # student_policy_losses = []
 
         continue_training = True
 
@@ -941,13 +658,79 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
             masks_batch,
             hidden_batch,
         ) in generator:
-            # Do a complete pass on the rollout buffer
+            # # Do a complete pass on the rollout buffer
+            # for rollout_data in self.rollout_buffer.get(self.batch_size):
+
+            actions = actions_batch
+            if isinstance(self.action_space, spaces.Discrete):
+                # Convert discrete action from float to long
+                actions = actions_batch.long().flatten()
 
             # Convert mask from float to bool
             mask = masks_batch > 1e-8
+
             # Re-sample the noise matrix because the log_std has changed
             if self.use_sde:
-                self.compiled_student_policy.reset_noise(self.batch_size)
+                self.compiled_policy.reset_noise(self.batch_size)
+
+            if self.whole_sequences:
+                actions = actions["teacher"]
+                observations = obs_batch["teacher"]
+            # print("action shape: ", actions.shape)
+            # print("observation shape:", observations.shape)
+
+            # teacher is mlp so no funny business
+            values, log_prob, entropy = self.compiled_policy.evaluate_actions(
+                observations, actions  # type: ignore
+            )
+            values = values.flatten()
+
+            # Normalize advantage
+            advantages = advantages_batch
+            # Normalization does not make sense if mini batchsize == 1, see GH issue #325
+            if self.normalize_advantage and len(advantages) > 1:
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8
+                )
+
+            # ratio between old and new policy, should be one at the first iteration
+            ratio = th.exp(log_prob - old_actions_log_prob_batch)
+
+            # clipped surrogate loss
+            policy_loss_1 = advantages * ratio
+            policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+            # Logging
+            pg_losses.append(policy_loss.item())
+            clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+            clip_fractions.append(clip_fraction)
+
+            if self.clip_range_vf is None:
+                # No clipping
+                values_pred = values
+            else:
+                # Clip the difference between old and new value
+                # NOTE: this depends on the reward scaling
+                values_pred = values_batch + th.clamp(
+                    values - values_batch, -clip_range_vf, clip_range_vf  # type: ignore
+                )
+            # Value loss using the TD(gae_lambda) target
+            value_loss = F.mse_loss(returns_batch, values_pred)
+            value_losses.append(value_loss.item())
+
+            # Entropy loss favor exploration
+            if entropy is None:
+                # Approximate entropy when no analytical form
+                entropy_loss = -th.mean(-log_prob)
+            else:
+                entropy_loss = -th.mean(entropy)
+
+            entropy_losses.append(entropy_loss.item())
+
+            loss = (
+                policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+            )
 
             student_observations = obs_batch["student"]
             # student obs shape is (T, B, feature dim)
@@ -973,14 +756,52 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                 unpad_trajectories(student_log_prob, mask)
             )
 
-            # teacher using the state to predict action
-            teacher_action, _, _ = self.compiled_policy(obs_batch["teacher"])
+            # student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+
+            # clipped asym loss
+            # student_asym_loss_1 = advantages * student_ratio
+            # student_asym_loss_2 = advantages * th.clamp(
+            #     student_ratio, 1 - clip_range, 1 + clip_range
+            # )
+            # student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
+            # student_asym_loss = -th.mean(
+            #     advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
+            # ).mean()
+            teacher_action = actions.detach()
 
             student_loss = F.mse_loss(
                 student_action, teacher_action
             )  # + student_asym_loss
 
             student_losses.append(student_loss.item())
+
+            # Calculate approximate form of reverse KL Divergence for early stopping
+            # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
+            # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
+            # and Schulman blog: http://joschu.net/blog/kl-approx.html
+            # with th.no_grad():
+            #     log_ratio = log_prob - old_actions_log_prob_batch
+            #     approx_kl_div = (
+            #         th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+            #     )
+            #     approx_kl_divs.append(approx_kl_div)
+
+            # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+            #     continue_training = False
+            #     if self.verbose >= 1:
+            #         print(
+            #             f"Early stopping at step {self.num_timesteps} due to reaching max kl: {approx_kl_div:.2f}"
+            #         )
+            #     break
+
+            # Optimization step
+            self.compiled_policy.optimizer.zero_grad()
+            loss.backward()
+            # Clip grad norm
+            th.nn.utils.clip_grad_norm_(
+                self.compiled_policy.parameters(), self.max_grad_norm
+            )
+            self.compiled_policy.optimizer.step()
 
             # Update student agent
             self.compiled_student_policy.optimizer.zero_grad()
@@ -998,20 +819,17 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
                 [self.compiled_policy.optimizer, self.student_policy.optimizer]
             )
 
-        # Logs
-        self.logger.record(
-            "train/entropy_loss", np.mean(entropy_losses) if entropy_losses else 0.0
-        )
-        self.logger.record(
-            "train/policy_gradient_loss", np.mean(pg_losses) if pg_losses else 0.0
-        )
-        self.logger.record(
-            "train/value_loss", np.mean(value_losses) if value_losses else 0.0
-        )
-        self.logger.record(
-            "train/clip_fraction", np.mean(clip_fractions) if clip_fractions else 0.0
-        )
+        # explained_var = explained_variance(
+        #     self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
+        # )
 
+        # Logs
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", loss.item())
         # self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.compiled_policy, "log_std"):
             self.logger.record(
@@ -1022,177 +840,68 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
-        self.logger.record(
-            "train/student_loss", np.mean(student_losses) if student_losses else 0.0
-        )
-
-    def _teacher_train(
-        self: SelfTeacherStudentLearning,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: int = 1,
-        tb_log_name: str = "PPO",
-        reset_num_timesteps: bool = True,
-        progress_bar: bool = False,
-    ) -> SelfTeacherStudentLearning:
-
-        iteration = 0
-
-        total_timesteps, callback = self._setup_learn(
-            total_timesteps,
-            callback,
-            reset_num_timesteps,
-            tb_log_name,
-            progress_bar,
-        )
-        self._last_obs = self._last_obs["teacher"]
-
-        callback.on_training_start(locals(), globals())
-
-        assert self.env is not None
-
-        while self.num_timesteps < total_timesteps:
-            collection_start = time.time_ns()
-            continue_training = self.teacher_collect_rollouts(
-                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
-            )
-            collection_end = time.time_ns()
-            collection_time = (collection_end - collection_start) / 1e9
-
-            if not continue_training:
-                break
-
-            iteration += 1
-            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
-            training_start = time.time_ns()
-            self.teacher_train()
-            training_end = time.time_ns()
-            training_time = (training_end - training_start) / 1e9
-
-            # Display training infos
-            if log_interval is not None and iteration % log_interval == 0:
-                assert self.ep_info_buffer is not None
-                self._dump_logs(iteration, locals())
-
-        callback.on_training_end()
-
-        return self
-
-    def _student_learn(
-        self: SelfTeacherStudentLearning,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: int = 1,
-        tb_log_name: str = "PPO",
-        reset_num_timesteps: bool = True,
-        progress_bar: bool = False,
-    ) -> SelfTeacherStudentLearning:
-
-        iteration = 0
-
-        total_timesteps, callback = self._setup_learn(
-            total_timesteps,
-            callback,
-            reset_num_timesteps,
-            tb_log_name,
-            progress_bar,
-        )
-
-        callback.on_training_start(locals(), globals())
-
-        assert self.env is not None
-
-        while self.num_timesteps < total_timesteps:
-            collection_start = time.time_ns()
-            continue_training = self.student_collect_rollouts(
-                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
-            )
-            collection_end = time.time_ns()
-            collection_time = (collection_end - collection_start) / 1e9
-
-            if not continue_training:
-                break
-
-            iteration += 1
-            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
-            training_start = time.time_ns()
-            self.student_train()
-            training_end = time.time_ns()
-            training_time = (training_end - training_start) / 1e9
-
-            # Display training infos
-            if log_interval is not None and iteration % log_interval == 0:
-                assert self.ep_info_buffer is not None
-                self._dump_logs(iteration, locals())
-
-        callback.on_training_end()
-
-        return self
-
-    def teacher_learn(
-        self: SelfTeacherStudentLearning,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: int = 1,
-        tb_log_name: str = "PPO",
-        reset_num_timesteps: bool = True,
-        progress_bar: bool = False,
-    ) -> SelfTeacherStudentLearning:
-        return self._teacher_train(
-            total_timesteps,
-            callback,
-            log_interval,
-            tb_log_name,
-            reset_num_timesteps,
-            progress_bar,
-        )
-
-    def student_learn(
-        self: SelfTeacherStudentLearning,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: int = 1,
-        tb_log_name: str = "PPO",
-        reset_num_timesteps: bool = True,
-        progress_bar: bool = False,
-    ) -> SelfTeacherStudentLearning:
-        self._init_student_policy(self.student_policy, self.student_policy_kwargs)
-        return self._student_learn(
-            total_timesteps,
-            callback,
-            log_interval,
-            tb_log_name,
-            reset_num_timesteps,
-            progress_bar,
-        )
+        self.logger.record("train/student_loss", np.mean(student_losses))
+        # self.logger.record(
+        #     "train/student_policy_loss", statistics.mean(student_policy_losses)
+        # )
 
     def learn(
-        self: SelfTeacherStudentLearning,
+        self: SelfRecurrentL2T,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 1,
         tb_log_name: str = "PPO",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ):
-        print(f"Training teacher")
-        self.teacher_learn(
+    ) -> SelfRecurrentL2T:
+        # return super().learn(
+        #     total_timesteps=total_timesteps,
+        #     callback=callback,
+        #     log_interval=log_interval,
+        #     tb_log_name=tb_log_name,
+        #     reset_num_timesteps=reset_num_timesteps,
+        #     progress_bar=progress_bar,
+        # )
+        iteration = 0
+
+        total_timesteps, callback = self._setup_learn(
             total_timesteps,
             callback,
-            log_interval,
-            tb_log_name,
             reset_num_timesteps,
+            tb_log_name,
             progress_bar,
         )
-        print(f"Training student")
-        self.student_learn(
-            total_timesteps,
-            callback,
-            log_interval,
-            tb_log_name,
-            reset_num_timesteps,
-            progress_bar,
-        )
+
+        callback.on_training_start(locals(), globals())
+
+        assert self.env is not None
+
+        while self.num_timesteps < total_timesteps:
+            collection_start = time.time_ns()
+            continue_training = self.collect_rollouts(
+                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
+            )
+            collection_end = time.time_ns()
+            collection_time = (collection_end - collection_start) / 1e9
+
+            if not continue_training:
+                break
+
+            iteration += 1
+            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
+            training_start = time.time_ns()
+            self.train()
+            training_end = time.time_ns()
+            training_time = (training_end - training_start) / 1e9
+
+            # Display training infos
+            if log_interval is not None and iteration % log_interval == 0:
+                assert self.ep_info_buffer is not None
+                self._dump_logs(iteration, locals())
+
+        callback.on_training_end()
+
+        return self
 
     def _excluded_save_params(self) -> List[str]:
         return super()._excluded_save_params() + [
@@ -1370,9 +1079,9 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         # Create eval callback if needed
         callback = self._init_callback(callback, progress_bar)
 
-        # print(self.policy)
+        print(self.policy)
 
-        # print(self.student_policy)
+        print(self.student_policy)
 
         return total_timesteps, callback
 
@@ -1436,7 +1145,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
 
     @classmethod
     def load(  # noqa: C901
-        cls: Type[SelfTeacherStudentLearning],
+        cls: Type[SelfRecurrentL2T],
         path: Union[str, pathlib.Path, io.BufferedIOBase],
         env: Optional[GymEnv] = None,
         device: Union[th.device, str] = "auto",
@@ -1444,7 +1153,7 @@ class TeacherStudentLearning(OnPolicyAlgorithm):
         print_system_info: bool = False,
         force_reset: bool = True,
         **kwargs,
-    ) -> SelfTeacherStudentLearning:
+    ) -> SelfRecurrentL2T:
         """
         Load the model from a zip-file.
         Warning: ``load`` re-creates the model from scratch, it does not update it in-place!

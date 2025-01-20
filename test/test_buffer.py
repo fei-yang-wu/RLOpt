@@ -1,5 +1,5 @@
 import unittest
-from rlopt.common.torch.buffer import (
+from rlopt.common.buffer import (
     ReplayBuffer,
     RolloutBuffer,
     DictReplayBuffer,
