@@ -5,7 +5,7 @@ import warnings
 import numpy as np
 import torch as th
 import gymnasium as gym
-from stable_baselines3.common.type_aliases import TensorDict
+
 from stable_baselines3.common import type_aliases
 from stable_baselines3.common.callbacks import BaseCallback, EventCallback
 from stable_baselines3.common.vec_env import (
@@ -18,61 +18,6 @@ from stable_baselines3.common.vec_env import (
     is_vecenv_wrapped,
 )
 import wandb
-
-from torch import nn
-
-from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
-from stable_baselines3.common.type_aliases import TensorDict
-from stable_baselines3.common.utils import get_device
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-
-
-def obs_as_tensor(
-    obs: Union[th.Tensor, np.ndarray, Dict[str, np.ndarray], Any], device: th.device
-) -> Union[th.Tensor, TensorDict]:
-    """
-    Moves the observation to the given device.
-
-    :param obs:
-    :param device: PyTorch device
-    :return: PyTorch tensor of the observation on a desired device.
-    """
-    if isinstance(obs, np.ndarray) or isinstance(obs, th.Tensor):
-        return th.as_tensor(obs, device=device)
-    elif isinstance(obs, dict):
-        return {key: th.as_tensor(_obs, device=device) for (key, _obs) in obs.items()}
-    else:
-        raise Exception(f"Unrecognized type of observation {type(obs)}")
-
-
-# From stable baselines
-def explained_variance(
-    y_pred: Union[np.ndarray, th.Tensor], y_true: Union[np.ndarray, th.Tensor]
-) -> Union[float, np.ndarray, th.Tensor]:
-    """
-    Computes fraction of variance that ypred explains about y.
-    Returns 1 - Var[y-ypred] / Var[y]
-
-    interpretation:
-        ev=0  =>  might as well have predicted zero
-        ev=1  =>  perfect prediction
-        ev<0  =>  worse than just predicting zero
-
-    :param y_pred: the prediction
-    :param y_true: the expected value
-    :return: explained variance of ypred and y
-    """
-    assert y_true.ndim == 1 and y_pred.ndim == 1
-    if isinstance(y_pred, np.ndarray):
-        var_y = np.var(y_true)
-        return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-    elif isinstance(y_pred, th.Tensor) and isinstance(y_true, th.Tensor):
-        var_y = th.var(y_true).item()
-        return np.nan if var_y == 0 else 1 - th.var(y_true - y_pred).item() / var_y
-    else:
-        raise ValueError(
-            "y_pred and y_true must be of the same type (np.ndarray or th.Tensor)"
-        )
 
 
 class EvalStudentCallback(EventCallback):
@@ -783,27 +728,6 @@ def evaluate_teacher_policy(
     return mean_reward, std_reward  # type: ignore
 
 
-def linear_schedule(initial_value: float) -> Callable[[float], float]:
-    """
-    Linear learning rate schedule.
-
-    :param initial_value: Initial learning rate.
-    :return: schedule that computes
-      current learning rate depending on remaining progress
-    """
-
-    def func(progress_remaining: float) -> float:
-        """
-        Progress will decrease from 1 (beginning) to 0.
-
-        :param progress_remaining:
-        :return: current learning rate
-        """
-        return progress_remaining * initial_value
-
-    return func
-
-
 class VideoEvalCallback(BaseCallback):
 
     def __init__(
@@ -897,79 +821,3 @@ class StudentVideoEvalCallback(VideoEvalCallback):
                 )
             }
         )
-
-
-# from rsl_rl
-def split_and_pad_trajectories(tensor, dones):
-    """Splits trajectories at done indices. Then concatenates them and pads with zeros up to the length og the longest trajectory.
-    Returns masks corresponding to valid parts of the trajectories
-    Example:
-        Input: [ [a1, a2, a3, a4 | a5, a6],
-                 [b1, b2 | b3, b4, b5 | b6]
-                ]
-
-        Output:[ [a1, a2, a3, a4], | [  [True, True, True, True],
-                 [a5, a6, 0, 0],   |    [True, True, False, False],
-                 [b1, b2, 0, 0],   |    [True, True, False, False],
-                 [b3, b4, b5, 0],  |    [True, True, True, False],
-                 [b6, 0, 0, 0]     |    [True, False, False, False],
-                ]                  | ]
-
-    Assumes that the inputy has the following dimension order: [time, number of envs, additional dimensions]
-    """
-
-    dones = dones.clone()
-    dones[-1] = 1
-    # Permute the buffers to have order (num_envs, num_transitions_per_env, ...), for correct reshaping
-    flat_dones = dones.transpose(1, 0).reshape(-1, 1)
-
-    # Get length of trajectory by counting the number of successive not done elements
-    done_indices = th.cat(
-        (flat_dones.new_tensor([-1], dtype=th.int64), flat_dones.nonzero()[:, 0])
-    )
-    trajectory_lengths = done_indices[1:] - done_indices[:-1]
-    trajectory_lengths_list = trajectory_lengths.tolist()
-    # Extract the individual trajectories
-    trajectories = th.split(
-        tensor.transpose(1, 0).flatten(0, 1), trajectory_lengths_list
-    )
-    # add at least one full length trajectory
-    trajectories = trajectories + (
-        th.zeros(tensor.shape[0], tensor.shape[-1], device=tensor.device),
-    )
-    # pad the trajectories to the length of the longest trajectory
-    padded_trajectories = th.nn.utils.rnn.pad_sequence(trajectories)
-    # remove the added tensor
-    padded_trajectories = padded_trajectories[:, :-1]
-
-    trajectory_masks = trajectory_lengths > th.arange(
-        0, tensor.shape[0], device=tensor.device
-    ).unsqueeze(1)
-    return padded_trajectories, trajectory_masks
-
-
-def unpad_trajectories(trajectories, masks):
-    """Does the inverse operation of  split_and_pad_trajectories()"""
-    # Need to transpose before and after the masking to have proper reshaping
-    return (
-        trajectories.transpose(1, 0)[masks.transpose(1, 0)]
-        .view(-1, trajectories.shape[0], trajectories.shape[-1])
-        .transpose(1, 0)
-    )
-
-
-class ParallelEnvFlattenExtractor(BaseFeaturesExtractor):
-    """
-    Feature extract that flatten the input.
-    Used as a placeholder when feature extraction is not needed.
-
-    :param observation_space: The observation space of the environment
-    """
-
-    def __init__(self, observation_space: gym.Space) -> None:
-        super().__init__(observation_space, get_flattened_obs_dim(observation_space))
-        self.flatten = nn.Flatten(start_dim=2, end_dim=-1)
-
-    def forward(self, observations: th.Tensor) -> th.Tensor:
-        # return self.flatten(observations)
-        return observations

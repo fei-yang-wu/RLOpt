@@ -52,14 +52,14 @@ from stable_baselines3.common.vec_env import (
     unwrap_vec_normalize,
 )
 
-from rlopt.common.torch.buffer import RLOptDictRecurrentReplayBuffer, RolloutBuffer
+from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer, RolloutBuffer
 
-from rlopt.utils.torch.utils import (
+from rlopt.common.utils import (
     obs_as_tensor,
     explained_variance,
     unpad_trajectories,
 )
-from rlopt.agent.torch.l2t.policies import (
+from rlopt.agent.l2t.policies import (
     MlpLstmPolicy,
     CnnLstmPolicy,
     MultiInputLstmPolicy,

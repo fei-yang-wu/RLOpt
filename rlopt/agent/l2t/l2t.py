@@ -1,17 +1,15 @@
 import warnings
-from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple
+from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple, List
 from collections import deque
 import time
 import statistics
-import pathlib
-import io
+
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
-from tensordict import TensorDict
-from stable_baselines3.common.utils import get_system_info
+
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import (
@@ -20,36 +18,39 @@ from stable_baselines3.common.policies import (
     BasePolicy,
     MultiInputActorCriticPolicy,
 )
-from stable_baselines3.common.save_util import (
-    load_from_zip_file,
-    recursive_getattr,
-    recursive_setattr,
-)
-from stable_baselines3.common.vec_env.patch_gym import _convert_space
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_schedule_fn
-from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common import utils
+from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.utils import (
+    check_for_correct_spaces,
+    get_device,
+    get_schedule_fn,
+    get_system_info,
+    set_random_seed,
+    update_learning_rate,
+)
+from stable_baselines3.common.base_class import maybe_make_env
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    VecEnv,
+    VecNormalize,
+    VecTransposeImage,
+    is_vecenv_wrapped,
+    unwrap_vec_normalize,
+)
 
-from rlopt.common.torch.buffer import RolloutBuffer as RLOptRolloutBuffer
-from rlopt.common.torch.buffer import DictRolloutBuffer as RLOptDictRolloutBuffer
-from rlopt.utils.torch.utils import obs_as_tensor, explained_variance
+from rlopt.common.buffer import RolloutBuffer as RLOptRolloutBuffer
+from rlopt.common.buffer import DictRolloutBuffer as RLOptDictRolloutBuffer
+from rlopt.common.utils import obs_as_tensor, explained_variance
 
-SelfPPO = TypeVar("SelfPPO", bound="PPO")
+SelfL2T = TypeVar("SelfL2T", bound="L2T")
 
 
-class PPO(OnPolicyAlgorithm):
+class L2T(OnPolicyAlgorithm):
     """
-    Proximal Policy Optimization algorithm (PPO) (clip version)
-
-    Paper: https://arxiv.org/abs/1707.06347
-    Code: This implementation borrows code from OpenAI Spinning Up (https://github.com/openai/spinningup/)
-    https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail and
-    Stable Baselines (PPO2 from https://github.com/hill-a/stable-baselines)
-
-    Introduction to PPO: https://spinningup.openai.com/en/latest/algorithms/ppo.html
-
+    L2T (Learn to Teach) is a reinforcement learning algorithm that learns to teach a student agent.
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
     :param env: The environment to learn from (if registered in Gym, can be str)
     :param learning_rate: The learning rate, it can be a function
@@ -105,6 +106,7 @@ class PPO(OnPolicyAlgorithm):
         self,
         policy: Union[str, Type[ActorCriticPolicy]],
         env: Union[GymEnv, str],
+        student_policy: Union[str, Type[ActorCriticPolicy]] = ActorCriticPolicy,
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 64,
@@ -120,47 +122,127 @@ class PPO(OnPolicyAlgorithm):
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         rollout_buffer_class: Optional[
-            Union[Type[RolloutBuffer], Type[RLOptRolloutBuffer]]
+            Union[Type[RLOptRolloutBuffer], Type[RLOptDictRolloutBuffer]]
         ] = None,
         rollout_buffer_kwargs: Optional[Dict[str, Any]] = None,
         target_kl: Optional[float] = None,
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
+        mixture_coeff: float = 0.0,
         policy_kwargs: Optional[Dict[str, Any]] = None,
+        student_policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
-        super().__init__(
-            policy,
-            env,
-            learning_rate=learning_rate,
-            n_steps=n_steps,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-            ent_coef=ent_coef,
-            vf_coef=vf_coef,
-            max_grad_norm=max_grad_norm,
-            use_sde=use_sde,
-            sde_sample_freq=sde_sample_freq,
-            rollout_buffer_class=rollout_buffer_class,  # type: ignore
-            rollout_buffer_kwargs=rollout_buffer_kwargs,
-            stats_window_size=stats_window_size,
-            tensorboard_log=tensorboard_log,
-            policy_kwargs=policy_kwargs,
-            verbose=verbose,
-            device=device,
-            seed=seed,
-            _init_setup_model=False,
-            supported_action_spaces=(
-                spaces.Box,
-                spaces.Discrete,
-                spaces.MultiDiscrete,
-                spaces.MultiBinary,
-            ),
-        )
+        if isinstance(policy, str):
+            self.policy_class = self._get_policy_from_name(policy)
+        else:
+            self.policy_class = policy
 
+        self.device = get_device(device)
+        if verbose >= 1:
+            print(f"Using {self.device} device")
+
+        self.verbose = verbose
+        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
+
+        self.num_timesteps = 0
+        # Used for updating schedules
+        self._total_timesteps = 0
+        # Used for computing fps, it is updated at each call of learn()
+        self._num_timesteps_at_start = 0
+        self.seed = seed
+        self.action_noise: Optional[ActionNoise] = None
+        self.start_time = 0.0
+        self.learning_rate = learning_rate
+        self.tensorboard_log = tensorboard_log
+        self._last_obs = (  # type: ignore
+            None
+        )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
+        self._last_episode_starts = None  # type: Optional[np.ndarray]
+        # When using VecNormalize:
+        self._last_original_obs = (
+            None
+        )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
+        self._episode_num = 0
+        # Used for gSDE only
+        self.use_sde = use_sde
+        self.sde_sample_freq = sde_sample_freq
+        # Track the training progress remaining (from 1 to 0)
+        # this is used to update the learning rate
+        self._current_progress_remaining = 1.0
+        # Buffers for logging
+        self._stats_window_size = stats_window_size
+        self.ep_info_buffer = None  # type: Optional[deque]
+        self.ep_success_buffer = None  # type: Optional[deque]
+        # For logging (and TD3 delayed updates)
+        self._n_updates = 0  # type: int
+        # Whether the user passed a custom logger or not
+        self._custom_logger = False
+        self.env: Optional[VecEnv] = None
+        self._vec_normalize_env: Optional[VecNormalize] = None
+        supported_action_spaces = (
+            spaces.Box,
+            spaces.Discrete,
+            spaces.MultiDiscrete,
+            spaces.MultiBinary,
+        )
+        support_multi_env = True
+        # Create and wrap the env if needed
+        if env is not None:
+            env = maybe_make_env(env, self.verbose)
+            env = self._wrap_env(env, self.verbose, True)
+
+            self.observation_space = env.observation_space
+            self.action_space = env.action_space
+            self.n_envs = env.num_envs
+            self.env = env
+
+            # get VecNormalize object if needed
+            self._vec_normalize_env = unwrap_vec_normalize(env)
+
+            if supported_action_spaces is not None:
+                assert isinstance(self.action_space, supported_action_spaces), (
+                    f"The algorithm only supports {supported_action_spaces} as action spaces "
+                    f"but {self.action_space} was provided"
+                )
+
+            if not support_multi_env and self.n_envs > 1:
+                raise ValueError(
+                    "Error: the model does not support multiple envs; it requires "
+                    "a single vectorized environment."
+                )
+
+            # Catch common mistake: using MlpPolicy/CnnPolicy instead of MultiInputPolicy
+            # if policy in ["MlpPolicy", "CnnPolicy"] and isinstance(
+            #     self.observation_space["teacher"], spaces.Dict
+            # ):
+            #     raise ValueError(
+            #         f"You must use `MultiInputPolicy` when working with dict observation space, not {policy}"
+            #     )
+
+            if self.use_sde and not isinstance(self.action_space, spaces.Box):
+                raise ValueError(
+                    "generalized State-Dependent Exploration (gSDE) can only be used with continuous actions."
+                )
+
+            if isinstance(self.action_space, spaces.Box):
+                assert np.all(
+                    np.isfinite(
+                        np.array([self.action_space.low, self.action_space.high])
+                    )
+                ), "Continuous action space must have a finite lower and upper bound"
+
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.ent_coef = ent_coef
+        self.vf_coef = vf_coef
+        self.max_grad_norm = max_grad_norm
+        self.rollout_buffer_class = rollout_buffer_class
+        self.rollout_buffer_kwargs = rollout_buffer_kwargs or {}
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
         if normalize_advantage:
@@ -192,12 +274,47 @@ class PPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
+        self.student_policy = student_policy  # type: ignore
+        self.mixture_coeff = mixture_coeff
+        self.rewbuffer = None
+        self.lenbuffer = None
+        self.cur_reward_sum = None
+        self.cur_episode_length = None
+        self.student_policy_kwargs = (
+            {} if student_policy_kwargs is None else student_policy_kwargs
+        )
 
         if _init_setup_model:
             self._setup_model()
 
     def _setup_model(self) -> None:
-        super()._setup_model()
+        self._setup_lr_schedule()
+        self.set_random_seed(self.seed)
+
+        if self.rollout_buffer_class is None:
+            if isinstance(self.observation_space, spaces.Dict):
+                self.rollout_buffer_class = RLOptDictRolloutBuffer
+            else:
+                self.rollout_buffer_class = RLOptRolloutBuffer
+
+        self.rollout_buffer = self.rollout_buffer_class(
+            self.n_steps,
+            self.observation_space,  # type: ignore[arg-type]
+            self.action_space,
+            device=self.device,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            n_envs=self.n_envs,
+            **self.rollout_buffer_kwargs,
+        )
+        self.policy = self.policy_class(  # type: ignore[assignment]
+            self.observation_space["teacher"],  # type: ignore
+            self.action_space,
+            self.lr_schedule,
+            use_sde=self.use_sde,
+            **self.policy_kwargs,
+        )
+        self.policy = self.policy.to(self.device)
 
         # Initialize schedules for policy/value clipping
         self.clip_range = get_schedule_fn(self.clip_range)
@@ -210,14 +327,46 @@ class PPO(OnPolicyAlgorithm):
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
 
+        self._init_student_policy(self.student_policy, self.student_policy_kwargs)
+
+    def _init_student_policy(
+        self,
+        student_policy: Union[
+            str, Type[ActorCriticPolicy], ActorCriticPolicy, BasePolicy
+        ] = ActorCriticPolicy,
+        student_policy_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if isinstance(student_policy, str):
+            self.student_policy_class = self._get_policy_from_name(student_policy)
+        else:
+            self.student_policy_class = student_policy
+
+        self.student_policy_kwargs = student_policy_kwargs
+
+        # from off_policy_algorithm super()._setup_model()
+        # partial_obversevation_space is from Environment's partial_observation_space
+        self.partial_observation_space = self.observation_space["student"]  # type: ignore
+        self.student_policy = self.student_policy_class(  # pytype:disable=not-instantiable
+            self.partial_observation_space,
+            self.action_space,
+            self.lr_schedule,
+            **self.student_policy_kwargs,  # pytype:disable=not-instantiable # type: ignore
+        )
+        self.student_policy = self.student_policy.to(self.device)
+
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
         """
+
         # Switch to train mode (this affects batch norm / dropout)
+        self.student_policy: BasePolicy
         self.policy.set_training_mode(True)
+        self.student_policy.set_training_mode(True)
         # Update optimizer learning rate
-        self._update_learning_rate(self.policy.optimizer)
+        self._update_learning_rate(
+            [self.policy.optimizer, self.student_policy.optimizer]
+        )
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
         # Optional: clip range for the value function
@@ -232,7 +381,6 @@ class PPO(OnPolicyAlgorithm):
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
-
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions
@@ -240,8 +388,12 @@ class PPO(OnPolicyAlgorithm):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
 
+                # Re-sample the noise matrix because the log_std has changed
+                if self.use_sde:
+                    self.policy.reset_noise(self.batch_size)
+
                 values, log_prob, entropy = self.policy.evaluate_actions(
-                    rollout_data.observations, actions
+                    rollout_data.observations["teacher"], actions  # type: ignore
                 )
                 values = values.flatten()
                 # Normalize advantage
@@ -274,9 +426,7 @@ class PPO(OnPolicyAlgorithm):
                     # Clip the difference between old and new value
                     # NOTE: this depends on the reward scaling
                     values_pred = rollout_data.old_values + th.clamp(
-                        values - rollout_data.old_values,
-                        -1.0 * clip_range_vf,
-                        clip_range_vf,
+                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf  # type: ignore
                     )
                 # Value loss using the TD(gae_lambda) target
                 value_loss = F.mse_loss(rollout_data.returns, values_pred)
@@ -297,11 +447,18 @@ class PPO(OnPolicyAlgorithm):
                     + self.vf_coef * value_loss
                 )
 
+                # Compute student agent loss
+                student_actions, student_values, student_log_prob = self.student_policy(
+                    rollout_data.observations["student"]  # type: ignore
+                )
+
+                student_loss = F.mse_loss(student_actions, actions.detach())
+
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html
-                with th.inference_mode():
+                with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
                     approx_kl_div = (
                         th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
@@ -325,12 +482,20 @@ class PPO(OnPolicyAlgorithm):
                 )
                 self.policy.optimizer.step()
 
+                # Update student agent
+                self.student_policy.optimizer.zero_grad()
+                student_loss.backward()
+                th.nn.utils.clip_grad_norm_(
+                    self.student_policy.parameters(), self.max_grad_norm
+                )
+                self.student_policy.optimizer.step()
+
             self._n_updates += 1
             if not continue_training:
                 break
+
         explained_var = explained_variance(
-            self.rollout_buffer.values.flatten(),  # type: ignore[attr-defined]
-            self.rollout_buffer.returns.flatten(),  # type: ignore[attr-defined]
+            self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
         )
 
         # Logs
@@ -350,14 +515,22 @@ class PPO(OnPolicyAlgorithm):
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
     def learn(
-        self: SelfPPO,
+        self: SelfL2T,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 1,
         tb_log_name: str = "PPO",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ) -> SelfPPO:
+    ) -> SelfL2T:
+        # return super().learn(
+        #     total_timesteps=total_timesteps,
+        #     callback=callback,
+        #     log_interval=log_interval,
+        #     tb_log_name=tb_log_name,
+        #     reset_num_timesteps=reset_num_timesteps,
+        #     progress_bar=progress_bar,
+        # )
         iteration = 0
 
         total_timesteps, callback = self._setup_learn(
@@ -373,34 +546,121 @@ class PPO(OnPolicyAlgorithm):
         assert self.env is not None
 
         while self.num_timesteps < total_timesteps:
-            import time
-
-            time_now = time.time_ns()
+            collection_start = time.time_ns()
             continue_training = self.collect_rollouts(
                 self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
             )
-            # print("Time to collect rollouts: ", (time.time_ns() - time_now) / 1e9)
+            collection_end = time.time_ns()
+            collection_time = (collection_end - collection_start) / 1e9
 
             if not continue_training:
                 break
 
             iteration += 1
             self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
+            training_start = time.time_ns()
+            self.train()
+            training_end = time.time_ns()
+            training_time = (training_end - training_start) / 1e9
 
             # Display training infos
             if log_interval is not None and iteration % log_interval == 0:
                 assert self.ep_info_buffer is not None
-                # self._dump_logs(iteration)
-
-            time_now = time.time_ns()
-            self.train()
-            # print("Time to train: ", (time.time_ns() - time_now) / 1e9)
+                self._dump_logs(iteration, locals())
 
         callback.on_training_end()
 
         return self
 
-    # update rollout collection to support RLOptRolloutBuffer
+    def _excluded_save_params(self) -> List[str]:
+        return super()._excluded_save_params() + [
+            "actor",
+            "critic",
+            "critic_target",
+        ]  # noqa: RUF005
+
+    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+        state_dicts = [
+            "policy",
+            "policy.optimizer",
+            "student_policy",
+            "student_policy.optimizer",
+        ]
+
+        return state_dicts, []
+
+    def student_predict(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+            this correspond to beginning of episodes,
+            where the hidden states of the RNN must be reset.
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+            (used in recurrent policies)
+        """
+        return self.student_policy.predict(  # type: ignore
+            observation["student"], state, episode_start, deterministic  # type: ignore
+        )
+
+    def teacher_predict(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+            this correspond to beginning of episodes,
+            where the hidden states of the RNN must be reset.
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+            (used in recurrent policies)
+        """
+        return self.policy.predict(
+            observation["teacher"], state, episode_start, deterministic
+        )
+
+    def predict(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+            this correspond to beginning of episodes,
+            where the hidden states of the RNN must be reset.
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+            (used in recurrent policies)
+        """
+        return self.policy.predict(
+            observation["teacher"], state, episode_start, deterministic
+        )
+
     def collect_rollouts(
         self,
         env: VecEnv,
@@ -409,6 +669,7 @@ class PPO(OnPolicyAlgorithm):
         n_rollout_steps: int,
     ) -> bool:
         """
+        Special care for policy predict because we only want to take state as input.
         Collect experiences using the current policy and fill a ``RolloutBuffer``.
         The term rollout here refers to the model-free notion and should not
         be used with the concept of rollout used in model-based RL or planning.
@@ -421,9 +682,9 @@ class PPO(OnPolicyAlgorithm):
         :return: True if function returned with at least `n_rollout_steps`
             collected, False if callback terminated rollout prematurely.
         """
-        time_now = time.time_ns()
-        self._last_obs: th.Tensor | np.ndarray | None
         assert self._last_obs is not None, "No previous observation was provided"
+
+        self._last_obs: Dict[str, th.Tensor]
         # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
 
@@ -434,10 +695,10 @@ class PPO(OnPolicyAlgorithm):
             self.policy.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
-        # print("Time before main loop: ", (time.time_ns() - time_now) / 1e9)
+
+        self.ep_infos = []
 
         while n_steps < n_rollout_steps:
-
             if (
                 self.use_sde
                 and self.sde_sample_freq > 0
@@ -445,17 +706,20 @@ class PPO(OnPolicyAlgorithm):
             ):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
-            # print("Time to reset noise: ", (time.time_ns() - time_now) / 1e9)
 
             with th.inference_mode():
                 # Convert to pytorch tensor or to TensorDict
-                # obs_tensor = obs_as_tensor(self._last_obs, self.device)
-                # obs_tensor = self._last_obs.clone().detach()  # type: ignore[arg-type]
                 obs_tensor = self._last_obs
-                actions, values, log_probs = self.policy(obs_tensor)
-
-            # if isinstance(self.rollout_buffer, RolloutBuffer):
-            #     actions = actions.cpu().numpy()
+                if self.mixture_coeff > 0.0:
+                    epsilon = self.mixture_coeff
+                    if np.random.uniform() < epsilon and self.num_timesteps > 0:
+                        actions, values, log_probs = self.student_policy(
+                            obs_tensor["student"]
+                        )
+                    else:
+                        actions, values, log_probs = self.policy(obs_tensor["teacher"])
+                else:
+                    actions, values, log_probs = self.policy(obs_tensor["teacher"])
 
             # Rescale and perform action
             clipped_actions = actions
@@ -468,28 +732,36 @@ class PPO(OnPolicyAlgorithm):
                 else:
                     # Otherwise, clip the actions to avoid out of bound error
                     # as we are sampling from an unbounded Gaussian distribution
-
-                    # if isinstance(
-                    #     self.rollout_buffer, RLOptRolloutBuffer
-                    # ) or isinstance(self.rollout_buffer, RLOptDictRolloutBuffer):
-                    #     clipped_actions = th.clamp(
-                    #         actions,
-                    #         th.as_tensor(self.action_space.low, device=self.device),
-                    #         th.as_tensor(self.action_space.high, device=self.device),
-                    #     )
-                    # else:
-                    #     clipped_actions = np.clip(
-                    #         actions, self.action_space.low, self.action_space.high
-                    #     )
                     clipped_actions = th.clamp(
                         actions,
                         th.as_tensor(self.action_space.low, device=self.device),
                         th.as_tensor(self.action_space.high, device=self.device),
                     )
-
-            new_obs, rewards, dones, infos = env.step(clipped_actions)  # type : ignore
+            time_now = time.time_ns()
+            new_obs, rewards, dones, infos = env.step(clipped_actions)
+            self.logger.record("time/step", (time.time_ns() - time_now) / 1e9)
 
             self.num_timesteps += env.num_envs
+
+            infos: dict
+            # Record infos
+            if "episode" in infos:
+                self.ep_infos.append(infos["episode"])
+            elif "log" in infos:
+                self.ep_infos.append(infos["log"])
+
+            self.cur_reward_sum += rewards
+            self.cur_episode_length += 1
+            new_ids = (dones > 0).nonzero(as_tuple=False)
+            # record reward and episode length
+            self.rewbuffer.extend(
+                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.lenbuffer.extend(
+                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
+            )
+            self.cur_reward_sum[new_ids] = 0
+            self.cur_episode_length[new_ids] = 0
 
             # Give access to local variables
             callback.update_locals(locals())
@@ -523,7 +795,7 @@ class PPO(OnPolicyAlgorithm):
 
         with th.inference_mode():
             # Compute value for the last timestep
-            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+            values = self.policy.predict_values(obs_as_tensor(new_obs["teacher"], self.device))  # type: ignore[arg-type]
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
@@ -554,14 +826,15 @@ class PPO(OnPolicyAlgorithm):
         self.start_time = time.time_ns()
 
         # store the current number of timesteps
-        self.rewbuffer = deque(maxlen=self._stats_window_size)
-        self.lenbuffer = deque(maxlen=self._stats_window_size)
+        self.rewbuffer = deque(maxlen=100)
+        self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = th.zeros(
             self.env.num_envs, dtype=th.float, device=self.device
         )
         self.cur_episode_length = th.zeros(
             self.env.num_envs, dtype=th.float, device=self.device
         )
+
         if self.ep_info_buffer is None or reset_num_timesteps:
             # Initialize buffers if they don't exist, or reinitialize if resetting counters
             self.ep_info_buffer = deque(maxlen=self._stats_window_size)
@@ -596,8 +869,6 @@ class PPO(OnPolicyAlgorithm):
 
         # Create eval callback if needed
         callback = self._init_callback(callback, progress_bar)
-
-        print(self.policy)
 
         return total_timesteps, callback
 
@@ -639,17 +910,23 @@ class PPO(OnPolicyAlgorithm):
             "time/collection time per step (s)", locs["collection_time"] / self.n_steps
         )
         self.logger.record("time/training_time (s)", locs["training_time"])
-        if len(self.rewbuffer) > 1:
-            self.logger.record(
-                "Episode/average_episodic_reward", statistics.mean(self.rewbuffer)
-            )
-            self.logger.record(
-                "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
-            )
-            self.logger.record(
-                "Episode/max_episodic_length", th.max(self.cur_episode_length).item()
-            )
-            self.logger.record(
-                "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
-            )
+        self.logger.record(
+            "Episode/average_episodic_reward", statistics.mean(self.rewbuffer)
+        )
+        self.logger.record(
+            "Episode/average_episodic_length", statistics.mean(self.lenbuffer)
+        )
+        self.logger.record(
+            "Episode/episodic_reward", th.max(self.cur_episode_length).item()
+        )
+        self.logger.record(
+            "Episode/episodic_length", th.max(self.cur_reward_sum).item()
+        )
         self.logger.dump(step=self.num_timesteps)
+
+    def inference(self):
+        # optimize the model for inference
+        self.policy = th.jit.optimize_for_inference(th.jit.script(self.policy.eval()))
+        self.student_policy = th.jit.optimize_for_inference(
+            th.jit.script(self.student_policy.eval())
+        )

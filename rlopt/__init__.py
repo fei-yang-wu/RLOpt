@@ -1,3 +1,3 @@
 import os
 
-from rlopt.agent.torch.ppo.ppo import PPO
+from rlopt.agent.ppo.ppo import PPO
