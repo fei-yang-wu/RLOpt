@@ -33,7 +33,7 @@ dependencies = [
 test = ["pytest"]
 
 [tool.scikit-build-core]
-generator = "Unix Makefiles" # Or "Unix Makefiles" if Ninja is unavailable
+generator = "Unix Makefiles"
 
 
 [tool.scikit-build]
@@ -50,12 +50,6 @@ test-extras = ["test"]
 [tool.cibuildwheel.pyodide]
 build-frontend = { name = "build", args = ["--exports", "whole_archive"] }
 
-
-# [tool.mypy]
-# python_version = ">=3.10"
-# strict = false
-# enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
-# warn_unreachable = true
 
 [[tool.mypy.overrides]]
 module = ["ninja"]

@@ -24,6 +24,7 @@ from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_ima
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.callbacks import CheckpointCallback
 
 
 def obs_as_tensor(
@@ -96,6 +97,7 @@ def linear_schedule(initial_value: float) -> Callable[[float], float]:
 
 
 # from rsl_rl
+# @th.compile
 def split_and_pad_trajectories(tensor, dones):
     """Splits trajectories at done indices. Then concatenates them and pads with zeros up to the length og the longest trajectory.
     Returns masks corresponding to valid parts of the trajectories
@@ -144,6 +146,7 @@ def split_and_pad_trajectories(tensor, dones):
     return padded_trajectories, trajectory_masks
 
 
+@th.jit.script
 def unpad_trajectories(trajectories, masks):
     """Does the inverse operation of  split_and_pad_trajectories()"""
     # Need to transpose before and after the masking to have proper reshaping
@@ -151,7 +154,22 @@ def unpad_trajectories(trajectories, masks):
         trajectories.transpose(1, 0)[masks.transpose(1, 0)]
         .view(-1, trajectories.shape[0], trajectories.shape[-1])
         .transpose(1, 0)
+        .contiguous()
     )
+
+
+@th.jit.script
+def swap_and_flatten(arr: th.Tensor) -> th.Tensor:
+    """
+    Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
+    to convert shape from [n_steps, n_envs, ...] (when ... is the shape of the features)
+    to [n_steps * n_envs, ...] (which maintain the order)
+
+    :param arr:
+    :return:
+    """
+    shape = arr.shape
+    return arr.view(shape[0] * shape[1], -1)
 
 
 class ParallelEnvFlattenExtractor(BaseFeaturesExtractor):
@@ -198,11 +216,8 @@ class OnnxableOffPolicy(th.nn.Module):
 
 def export_to_onnx(
     model: Union[BasePolicy, th.nn.Module],
-    env: VecEnv,
     onnx_filename: str,
-    use_new_zipfile_serialization: bool = False,
     input_shape: Optional[Tuple[int, ...]] = None,
-    input_tensor: Optional[th.Tensor] = None,
     export_params: bool = True,
     verbose: int = 0,
 ) -> None:
@@ -226,12 +241,8 @@ def export_to_onnx(
         raise ValueError("model must be an instance of BasePolicy or th.nn.Module")
 
     if input_shape is None:
-        if input_tensor is not None:
-            input_shape = input_tensor.shape
-        else:
-            input_shape = env.observation_space.shape
-    if input_tensor is None:
-        input_tensor = th.zeros(1, *input_shape, dtype=th.float32)  # type: ignore
+        raise ValueError("input_shape must be provided")
+    input_tensor = th.zeros(1, *input_shape, dtype=th.float32)  # type: ignore
 
     # Export the model
     th.onnx.export(
@@ -249,3 +260,51 @@ def export_to_onnx(
 
     if verbose > 0:
         print(f"Model exported in {onnx_filename}")
+
+
+class OnnxCheckpointCallback(CheckpointCallback):
+    """Overwrite CheckpointCallback to export the model to ONNX format.
+
+    Args:
+        CheckpointCallback (_type_): _description_
+    """
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.save_freq == 0:
+            model_path = self._checkpoint_path(extension="zip")
+            self.model.save(model_path)
+
+            # Export the model to ONNX
+            onnx_filename = self._checkpoint_path(extension="onnx")
+            self.model.export_onnx_policy(path=onnx_filename)
+            if self.verbose >= 2:
+                print(f"Saving model checkpoint to {model_path}")
+
+            if (
+                self.save_replay_buffer
+                and hasattr(self.model, "replay_buffer")
+                and self.model.replay_buffer is not None
+            ):
+                # If model has a replay buffer, save it too
+                replay_buffer_path = self._checkpoint_path(
+                    "replay_buffer_", extension="pkl"
+                )
+                self.model.save_replay_buffer(replay_buffer_path)  # type: ignore[attr-defined]
+                if self.verbose > 1:
+                    print(
+                        f"Saving model replay buffer checkpoint to {replay_buffer_path}"
+                    )
+
+            if (
+                self.save_vecnormalize
+                and self.model.get_vec_normalize_env() is not None
+            ):
+                # Save the VecNormalize statistics
+                vec_normalize_path = self._checkpoint_path(
+                    "vecnormalize_", extension="pkl"
+                )
+                self.model.get_vec_normalize_env().save(vec_normalize_path)  # type: ignore[union-attr]
+                if self.verbose >= 2:
+                    print(f"Saving model VecNormalize to {vec_normalize_path}")
+
+        return True

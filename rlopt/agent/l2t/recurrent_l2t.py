@@ -55,6 +55,8 @@ from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
 from rlopt.common.utils import (
     obs_as_tensor,
     unpad_trajectories,
+    swap_and_flatten,
+    export_to_onnx,
 )
 from rlopt.agent.l2t.policies import (
     MlpLstmPolicy,
@@ -725,11 +727,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
             )
 
             # align dim with the teacher action
-            student_action = BaseBuffer.swap_and_flatten(
+            student_action = swap_and_flatten(
                 unpad_trajectories(student_action, mask)  # type: ignore
             )
 
-            student_log_prob = BaseBuffer.swap_and_flatten(
+            student_log_prob = swap_and_flatten(
                 unpad_trajectories(student_log_prob, mask)
             )
 
@@ -1342,21 +1344,36 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 f"expected {objects_needing_update}, got {updated_objects}"
             )
 
+    def export_onnx_policy(self, path: str) -> None:
+        """
+        Export the policy to ONNX format.
+
+        :param path: Path to the file where the policy will be saved.
+        :param input_shape: Shape of the input tensor.
+        """
+        export_to_onnx(
+            self.student_policy,
+            onnx_filename=path,
+            input_shape=(1, *self.env.observation_space["student"].shape),
+            verbose=self.verbose,
+            export_params=True,
+        )
+
 
 @th.compile
 def compute_ppo_loss(
-    actions,
+    actions: th.Tensor,
     policy: th.nn.Module,
-    observations,
-    advantages,
-    old_log_prob,
-    clip_range,
-    old_values,
-    clip_range_vf,
-    returns,
-    ent_coef,
-    vf_coef,
-) -> dict:
+    observations: th.Tensor,
+    advantages: th.Tensor,
+    old_log_prob: th.Tensor,
+    clip_range: th.Tensor,
+    old_values: th.Tensor,
+    clip_range_vf: float,
+    returns: th.Tensor,
+    ent_coef: th.Tensor,
+    vf_coef: th.Tensor,
+) -> Dict[str, th.Tensor]:
 
     values, log_prob, entropy = policy.evaluate_actions(observations, actions)
     values = values.flatten()
