@@ -490,7 +490,7 @@ class PPO(OnPolicyAlgorithm):
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
-                actions,
+                actions.detach().cpu(),
                 rewards,
                 self._last_episode_starts,  # type: ignore[arg-type]
                 values,
