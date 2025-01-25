@@ -17,7 +17,6 @@ from stable_baselines3.common.vec_env import (
     sync_envs_normalization,
     is_vecenv_wrapped,
 )
-import wandb
 
 from torch import nn
 
@@ -65,7 +64,7 @@ def explained_variance(
     assert y_true.ndim == 1 and y_pred.ndim == 1
     if isinstance(y_pred, np.ndarray):
         var_y = np.var(y_true)
-        return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y  # type: ignore
     elif isinstance(y_pred, th.Tensor) and isinstance(y_true, th.Tensor):
         var_y = th.var(y_true).item()
         return np.nan if var_y == 0 else 1 - th.var(y_true - y_pred).item() / var_y
@@ -135,7 +134,7 @@ def split_and_pad_trajectories(tensor, dones):
         th.zeros(tensor.shape[0], tensor.shape[-1], device=tensor.device),
     )
     # pad the trajectories to the length of the longest trajectory
-    padded_trajectories = th.nn.utils.rnn.pad_sequence(trajectories)
+    padded_trajectories = th.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
     # remove the added tensor
     padded_trajectories = padded_trajectories[:, :-1]
 
@@ -232,15 +231,15 @@ def export_to_onnx(
         else:
             input_shape = env.observation_space.shape
     if input_tensor is None:
-        input_tensor = th.zeros((1,) + input_shape, dtype=th.float32)
+        input_tensor = th.zeros(1, *input_shape, dtype=th.float32)  # type: ignore
 
     # Export the model
     th.onnx.export(
         model,
-        input_tensor,
-        onnx_filename,
+        (input_tensor,),
+        f=onnx_filename,
         export_params=export_params,
-        verbose=verbose,
+        verbose=None,
         opset_version=12,
         do_constant_folding=True,
         input_names=["input"],

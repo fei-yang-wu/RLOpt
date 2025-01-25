@@ -240,10 +240,6 @@ class PPO(OnPolicyAlgorithm):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
 
-                values, log_prob, entropy = self.policy.evaluate_actions(
-                    rollout_data.observations, actions
-                )
-                values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
                 # Normalization does not make sense if mini batchsize == 1, see GH issue #325
@@ -252,69 +248,48 @@ class PPO(OnPolicyAlgorithm):
                         advantages.std() + 1e-8
                     )
 
-                # ratio between old and new policy, should be one at the first iteration
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
-
-                # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * th.clamp(
-                    ratio, 1 - clip_range, 1 + clip_range
-                )
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-                # Logging
-                pg_losses.append(policy_loss.item())
-                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-                clip_fractions.append(clip_fraction)
-
                 if self.clip_range_vf is None:
-                    # No clipping
-                    values_pred = values
-                else:
-                    # Clip the difference between old and new value
-                    # NOTE: this depends on the reward scaling
-                    values_pred = rollout_data.old_values + th.clamp(
-                        values - rollout_data.old_values,
-                        -1.0 * clip_range_vf,
-                        clip_range_vf,
-                    )
-                # Value loss using the TD(gae_lambda) target
-                value_loss = F.mse_loss(rollout_data.returns, values_pred)
-                value_losses.append(value_loss.item())
+                    clip_range_vf = th.inf
 
-                # Entropy loss favor exploration
-                if entropy is None:
-                    # Approximate entropy when no analytical form
-                    entropy_loss = -th.mean(-log_prob)
-                else:
-                    entropy_loss = -th.mean(entropy)
-
-                entropy_losses.append(entropy_loss.item())
-
-                loss = (
-                    policy_loss
-                    + self.ent_coef * entropy_loss
-                    + self.vf_coef * value_loss
+                loss, loss_dict = compute_ppo_loss(
+                    actions=actions,
+                    policy=self.policy,
+                    observations=rollout_data.observations,
+                    advantages=advantages,
+                    old_log_prob=rollout_data.old_log_prob,
+                    clip_range=clip_range,
+                    pg_losses=pg_losses,
+                    clip_fractions=clip_fractions,
+                    old_values=rollout_data.old_values,
+                    clip_range_vf=clip_range_vf,
+                    returns=rollout_data.returns,
+                    value_losses=value_losses,
+                    entropy_losses=entropy_losses,
+                    ent_coef=self.ent_coef,
+                    vf_coef=self.vf_coef,
                 )
+                pg_losses.append(loss_dict["policy_loss"].item())
+                value_losses.append(loss_dict["value_loss"].item())
+                entropy_losses.append(loss_dict["entropy_loss"].item())
+                clip_fractions.append(loss_dict["clip_fraction"].item())
+                # # Calculate approximate form of reverse KL Divergence for early stopping
+                # # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
+                # # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
+                # # and Schulman blog: http://joschu.net/blog/kl-approx.html
+                # with th.inference_mode():
+                #     log_ratio = log_prob - rollout_data.old_log_prob
+                #     approx_kl_div = (
+                #         th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                #     )
+                #     approx_kl_divs.append(approx_kl_div)
 
-                # Calculate approximate form of reverse KL Divergence for early stopping
-                # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
-                # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
-                # and Schulman blog: http://joschu.net/blog/kl-approx.html
-                with th.inference_mode():
-                    log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = (
-                        th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                    )
-                    approx_kl_divs.append(approx_kl_div)
-
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                    continue_training = False
-                    if self.verbose >= 1:
-                        print(
-                            f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}"
-                        )
-                    break
+                # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                #     continue_training = False
+                #     if self.verbose >= 1:
+                #         print(
+                #             f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}"
+                #         )
+                #     break
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
@@ -337,7 +312,7 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
@@ -452,6 +427,8 @@ class PPO(OnPolicyAlgorithm):
                 # obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 # obs_tensor = self._last_obs.clone().detach()  # type: ignore[arg-type]
                 obs_tensor = self._last_obs
+                if isinstance(obs_tensor, np.ndarray):
+                    obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
 
             # if isinstance(self.rollout_buffer, RolloutBuffer):
@@ -486,7 +463,8 @@ class PPO(OnPolicyAlgorithm):
                         th.as_tensor(self.action_space.low, device=self.device),
                         th.as_tensor(self.action_space.high, device=self.device),
                     )
-
+            if isinstance(self._last_obs, np.ndarray):
+                clipped_actions = clipped_actions.detach().cpu().numpy()
             new_obs, rewards, dones, infos = env.step(clipped_actions)  # type : ignore
 
             self.num_timesteps += env.num_envs
@@ -597,8 +575,6 @@ class PPO(OnPolicyAlgorithm):
         # Create eval callback if needed
         callback = self._init_callback(callback, progress_bar)
 
-        print(self.policy)
-
         return total_timesteps, callback
 
     def _dump_logs(self, iteration: int, locs: dict) -> None:
@@ -653,3 +629,61 @@ class PPO(OnPolicyAlgorithm):
                 "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
             )
         self.logger.dump(step=self.num_timesteps)
+
+
+@th.compile
+def compute_ppo_loss(
+    actions,
+    policy: th.nn.Module,
+    observations,
+    advantages,
+    old_log_prob,
+    clip_range,
+    pg_losses,
+    clip_fractions,
+    old_values,
+    clip_range_vf,
+    returns,
+    value_losses,
+    entropy_losses,
+    ent_coef,
+    vf_coef,
+):
+
+    values, log_prob, entropy = policy.evaluate_actions(observations, actions)
+    values = values.flatten()
+
+    # ratio between old and new policy, should be one at the first iteration
+    ratio = th.exp(log_prob - old_log_prob)
+
+    # clipped surrogate loss
+    policy_loss_1 = advantages * ratio
+    policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+    policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+    # Logging
+    clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float())
+
+    # Clip the difference between old and new value
+    # NOTE: this depends on the reward scaling
+    values_pred = old_values + th.clamp(
+        values - old_values,
+        -1.0 * clip_range_vf,
+        clip_range_vf,
+    )
+
+    # Value loss using the TD(gae_lambda) target
+    value_loss = F.mse_loss(returns, values_pred)
+
+    # Entropy loss favor exploration
+    # Approximate entropy when no analytical form
+    entropy_loss = -th.mean(-log_prob)
+
+    loss = policy_loss + ent_coef * entropy_loss + vf_coef * value_loss
+
+    return loss, {
+        "policy_loss": policy_loss,
+        "entropy_loss": entropy_loss,
+        "value_loss": value_loss,
+        "clip_fraction": clip_fraction,
+    }
