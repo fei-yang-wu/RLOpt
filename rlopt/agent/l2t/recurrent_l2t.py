@@ -682,19 +682,29 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
+            values, log_prob, entropy = self.compiled_policy.evaluate_actions(
+                observations, actions
+            )
+            values = values.flatten()
 
             if self.clip_range_vf is None:
-                clip_range_vf = th.inf
+                # No clipping
+                values_pred = values
+            else:
+                # Clip the difference between old and new value
+                # NOTE: this depends on the reward scaling
+                values_pred = values_batch + th.clamp(
+                    values - values_batch,
+                    -1.0 * clip_range_vf,
+                    clip_range_vf,
+                )
 
             loss_dict = compute_ppo_loss(
-                actions=actions,
-                policy=self.compiled_policy,
-                observations=observations,
                 advantages=advantages,
+                log_prob=log_prob,
+                values_pred=values_pred,
                 old_log_prob=old_actions_log_prob_batch,
                 clip_range=clip_range,
-                old_values=values_batch,
-                clip_range_vf=clip_range_vf,
                 returns=returns_batch,
                 ent_coef=self.ent_coef,
                 vf_coef=self.vf_coef,
@@ -1344,39 +1354,18 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 f"expected {objects_needing_update}, got {updated_objects}"
             )
 
-    def export_onnx_policy(self, path: str) -> None:
-        """
-        Export the policy to ONNX format.
 
-        :param path: Path to the file where the policy will be saved.
-        :param input_shape: Shape of the input tensor.
-        """
-        export_to_onnx(
-            self.student_policy,
-            onnx_filename=path,
-            input_shape=(1, *self.env.observation_space["student"].shape),
-            verbose=self.verbose,
-            export_params=True,
-        )
-
-
-@th.compile
+@th.jit.script
 def compute_ppo_loss(
-    actions: th.Tensor,
-    policy: th.nn.Module,
-    observations: th.Tensor,
-    advantages: th.Tensor,
-    old_log_prob: th.Tensor,
-    clip_range: th.Tensor,
-    old_values: th.Tensor,
-    clip_range_vf: float,
-    returns: th.Tensor,
-    ent_coef: th.Tensor,
-    vf_coef: th.Tensor,
-) -> Dict[str, th.Tensor]:
-
-    values, log_prob, entropy = policy.evaluate_actions(observations, actions)
-    values = values.flatten()
+    advantages,
+    values_pred,
+    log_prob,
+    old_log_prob,
+    clip_range,
+    returns,
+    ent_coef,
+    vf_coef,
+) -> dict:
 
     # ratio between old and new policy, should be one at the first iteration
     ratio = th.exp(log_prob - old_log_prob)
@@ -1388,14 +1377,6 @@ def compute_ppo_loss(
 
     # Logging
     clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float())
-
-    # Clip the difference between old and new value
-    # NOTE: this depends on the reward scaling
-    values_pred = old_values + th.clamp(
-        values - old_values,
-        -1.0 * clip_range_vf,
-        clip_range_vf,
-    )
 
     # Value loss using the TD(gae_lambda) target
     value_loss = F.mse_loss(returns, values_pred)
