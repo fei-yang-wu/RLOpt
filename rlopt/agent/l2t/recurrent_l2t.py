@@ -271,8 +271,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.n_steps = n_steps
         self.gamma = gamma
         self.gae_lambda = gae_lambda
-        self.ent_coef = ent_coef
-        self.vf_coef = vf_coef
+        self.ent_coef = th.tensor(ent_coef, device=self.device)
+        self.vf_coef = th.tensor(vf_coef, device=self.device)
         self.max_grad_norm = max_grad_norm
         self.rollout_buffer_class = rollout_buffer_class
         self.rollout_buffer_kwargs = rollout_buffer_kwargs or {}
@@ -630,9 +630,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # )
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
+        clip_range = th.tensor(clip_range).to(self.device)
         # Optional: clip range for the value function
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
+            clip_range_vf = th.tensor(clip_range_vf).to(self.device)
 
         entropy_losses = []
         pg_losses, value_losses = [], []
@@ -699,27 +701,29 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     clip_range_vf,
                 )
 
-            loss_dict = compute_ppo_loss(
-                advantages=advantages,
-                log_prob=log_prob,
-                values_pred=values_pred,
-                old_log_prob=old_actions_log_prob_batch,
-                clip_range=clip_range,
-                returns=returns_batch,
-                ent_coef=self.ent_coef,
-                vf_coef=self.vf_coef,
+            policy_loss, entropy_loss, value_loss, clip_fraction, total_loss = (
+                compute_ppo_loss(
+                    advantages=advantages,
+                    log_prob=log_prob,
+                    values_pred=values_pred,
+                    old_log_prob=old_actions_log_prob_batch,
+                    clip_range=clip_range,
+                    returns=returns_batch,
+                    ent_coef=self.ent_coef,
+                    vf_coef=self.vf_coef,
+                )
             )
 
             # Logging
-            pg_losses.append(loss_dict["policy_loss"].item())
+            pg_losses.append(policy_loss.item())
 
-            value_losses.append(loss_dict["value_loss"].item())
+            value_losses.append(value_loss.item())
 
-            entropy_losses.append(loss_dict["entropy_loss"].item())
+            entropy_losses.append(entropy_loss.item())
 
-            clip_fractions.append(loss_dict["clip_fraction"].item())
+            clip_fractions.append(clip_fraction.item())
 
-            loss = loss_dict["total_loss"]
+            loss = total_loss
 
             student_observations = obs_batch["student"]
             # student obs shape is (T, B, feature dim)
@@ -826,7 +830,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             )
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/clip_range", clip_range)
+        self.logger.record("train/clip_range", clip_range.item())
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self.logger.record("train/student_loss", np.mean(student_losses))
@@ -1365,7 +1369,7 @@ def compute_ppo_loss(
     returns,
     ent_coef,
     vf_coef,
-) -> dict:
+) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
 
     # ratio between old and new policy, should be one at the first iteration
     ratio = th.exp(log_prob - old_log_prob)
@@ -1387,10 +1391,11 @@ def compute_ppo_loss(
 
     loss = policy_loss + ent_coef * entropy_loss + vf_coef * value_loss
 
-    return {
-        "policy_loss": policy_loss,
-        "entropy_loss": entropy_loss,
-        "value_loss": value_loss,
-        "clip_fraction": clip_fraction,
-        "total_loss": loss,
-    }
+    # return {
+    #     "policy_loss": policy_loss,
+    #     "entropy_loss": entropy_loss,
+    #     "value_loss": value_loss,
+    #     "clip_fraction": clip_fraction,
+    #     "total_loss": loss,
+    # }
+    return policy_loss, entropy_loss, value_loss, clip_fraction, loss
