@@ -146,7 +146,6 @@ def split_and_pad_trajectories(tensor, dones):
     return padded_trajectories, trajectory_masks
 
 
-@th.jit.script
 def unpad_trajectories(trajectories, masks):
     """Does the inverse operation of  split_and_pad_trajectories()"""
     # Need to transpose before and after the masking to have proper reshaping
@@ -154,11 +153,9 @@ def unpad_trajectories(trajectories, masks):
         trajectories.transpose(1, 0)[masks.transpose(1, 0)]
         .view(-1, trajectories.shape[0], trajectories.shape[-1])
         .transpose(1, 0)
-        .contiguous()
     )
 
 
-@th.jit.script
 def swap_and_flatten(arr: th.Tensor) -> th.Tensor:
     """
     Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
@@ -169,7 +166,7 @@ def swap_and_flatten(arr: th.Tensor) -> th.Tensor:
     :return:
     """
     shape = arr.shape
-    return arr.view(shape[0] * shape[1], -1)
+    return arr.reshape(shape[0] * shape[1], -1)
 
 
 class ParallelEnvFlattenExtractor(BaseFeaturesExtractor):

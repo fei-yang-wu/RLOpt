@@ -65,6 +65,7 @@ from rlopt.agent.l2t.policies import (
     RecurrentActorCriticPolicy,
 )
 
+
 SelfRecurrentL2T = TypeVar("SelfRecurrentL2T", bound="RecurrentL2T")
 
 
@@ -187,10 +188,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.start_time = 0.0
         self.learning_rate = learning_rate
         self.tensorboard_log = tensorboard_log
-        self._last_obs = None  # type: ignore
-
-        # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
-        self._last_episode_starts = None  # type: ignore
+        self._last_obs = (  # type: ignore
+            None
+        )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
+        self._last_episode_starts = None  # type: Optional[np.ndarray]
         # When using VecNormalize:
         self._last_original_obs = (
             None
@@ -677,6 +678,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 actions = actions["teacher"]  # type: ignore[arg-type]
                 observations = obs_batch["teacher"]
 
+            # teacher is mlp so no funny business
+            values, log_prob, entropy = self.compiled_policy.evaluate_actions(
+                observations, actions  # type: ignore
+            )
+            values = values.flatten()
+
             # Normalize advantage
             advantages = advantages_batch
             # Normalization does not make sense if mini batchsize == 1, see GH issue #325
@@ -684,10 +691,19 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
-            values, log_prob, entropy = self.compiled_policy.evaluate_actions(
-                observations, actions
-            )
-            values = values.flatten()
+
+            # ratio between old and new policy, should be one at the first iteration
+            ratio = th.exp(log_prob - old_actions_log_prob_batch)
+
+            # clipped surrogate loss
+            policy_loss_1 = advantages * ratio
+            policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+            # Logging
+            pg_losses.append(policy_loss.item())
+            clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+            clip_fractions.append(clip_fraction)
 
             if self.clip_range_vf is None:
                 # No clipping
@@ -696,38 +712,28 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # Clip the difference between old and new value
                 # NOTE: this depends on the reward scaling
                 values_pred = values_batch + th.clamp(
-                    values - values_batch,
-                    -1.0 * clip_range_vf,
-                    clip_range_vf,
+                    values - values_batch, -clip_range_vf, clip_range_vf  # type: ignore
                 )
-
-            policy_loss, entropy_loss, value_loss, clip_fraction, total_loss = (
-                compute_ppo_loss(
-                    advantages=advantages,
-                    log_prob=log_prob,
-                    values_pred=values_pred,
-                    old_log_prob=old_actions_log_prob_batch,
-                    clip_range=clip_range,
-                    returns=returns_batch,
-                    ent_coef=self.ent_coef,
-                    vf_coef=self.vf_coef,
-                )
-            )
-
-            # Logging
-            pg_losses.append(policy_loss.item())
-
+            # Value loss using the TD(gae_lambda) target
+            value_loss = F.mse_loss(returns_batch, values_pred)
             value_losses.append(value_loss.item())
+
+            # Entropy loss favor exploration
+            if entropy is None:
+                # Approximate entropy when no analytical form
+                entropy_loss = -th.mean(-log_prob)
+            else:
+                entropy_loss = -th.mean(entropy)
 
             entropy_losses.append(entropy_loss.item())
 
-            clip_fractions.append(clip_fraction.item())
-
-            loss = total_loss
+            loss = (
+                policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+            )
 
             student_observations = obs_batch["student"]
             # student obs shape is (T, B, feature dim)
-            (  # type: ignore
+            (
                 _,
                 student_action,
                 student_entropy,
@@ -737,15 +743,15 @@ class RecurrentL2T(OnPolicyAlgorithm):
             ) = self.compiled_student_policy.predict_whole_sequence(
                 obs=student_observations,
                 deterministic=False,
-                lstm_states=hidden_batch,  # type: ignore
+                lstm_states=hidden_batch,
             )
 
             # align dim with the teacher action
-            student_action = swap_and_flatten(
-                unpad_trajectories(student_action, mask)  # type: ignore
+            student_action = BaseBuffer.swap_and_flatten(
+                unpad_trajectories(student_action, mask)
             )
 
-            student_log_prob = swap_and_flatten(
+            student_log_prob = BaseBuffer.swap_and_flatten(
                 unpad_trajectories(student_log_prob, mask)
             )
 
@@ -1359,43 +1365,43 @@ class RecurrentL2T(OnPolicyAlgorithm):
             )
 
 
-@th.jit.script
-def compute_ppo_loss(
-    advantages,
-    values_pred,
-    log_prob,
-    old_log_prob,
-    clip_range,
-    returns,
-    ent_coef,
-    vf_coef,
-) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+# @th.jit.script
+# def compute_ppo_loss(
+#     advantages,
+#     values_pred,
+#     log_prob,
+#     old_log_prob,
+#     clip_range,
+#     returns,
+#     ent_coef,
+#     vf_coef,
+# ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
 
-    # ratio between old and new policy, should be one at the first iteration
-    ratio = th.exp(log_prob - old_log_prob)
+#     # ratio between old and new policy, should be one at the first iteration
+#     ratio = th.exp(log_prob - old_log_prob)
 
-    # clipped surrogate loss
-    policy_loss_1 = advantages * ratio
-    policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-    policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+#     # clipped surrogate loss
+#     policy_loss_1 = advantages * ratio
+#     policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+#     policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
 
-    # Logging
-    clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float())
+#     # Logging
+#     clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float())
 
-    # Value loss using the TD(gae_lambda) target
-    value_loss = F.mse_loss(returns, values_pred)
+#     # Value loss using the TD(gae_lambda) target
+#     value_loss = F.mse_loss(returns, values_pred)
 
-    # Entropy loss favor exploration
-    # Approximate entropy when no analytical form
-    entropy_loss = -th.mean(-log_prob)
+#     # Entropy loss favor exploration
+#     # Approximate entropy when no analytical form
+#     entropy_loss = -th.mean(-log_prob)
 
-    loss = policy_loss + ent_coef * entropy_loss + vf_coef * value_loss
+#     loss = policy_loss + ent_coef * entropy_loss + vf_coef * value_loss
 
-    # return {
-    #     "policy_loss": policy_loss,
-    #     "entropy_loss": entropy_loss,
-    #     "value_loss": value_loss,
-    #     "clip_fraction": clip_fraction,
-    #     "total_loss": loss,
-    # }
-    return policy_loss, entropy_loss, value_loss, clip_fraction, loss
+#     # return {
+#     #     "policy_loss": policy_loss,
+#     #     "entropy_loss": entropy_loss,
+#     #     "value_loss": value_loss,
+#     #     "clip_fraction": clip_fraction,
+#     #     "total_loss": loss,
+#     # }
+#     return policy_loss, entropy_loss, value_loss, clip_fraction, loss
