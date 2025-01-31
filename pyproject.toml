@@ -27,6 +27,9 @@ dependencies = [
     "hydra-core",
     "torchrl",
     "wandb",
+    "stable-baselines3",
+    "gymnasium",
+    "sb3-contrib",
 ]
 
 [project.optional-dependencies]

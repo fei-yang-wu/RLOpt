@@ -1,0 +1,33 @@
+# config.yaml
+
+device: "auto"
+seed: 42
+total_steps: 1000000
+batch_size: 256
+learning_rate: 3e-4
+grad_clip: 0.5
+compile: false
+offline: false
+num_steps: 128
+
+logging:
+  use_tb: true
+  use_wandb: false
+  wandb_project: "rl-library"
+  log_dir: "./logs"
+  use_stdout: true
+  log_interval: 1000
+
+# If you do not need reward estimation,
+# set this to null or leave it out entirely
+reward_estimation: null
+
+env:
+  # Example: standard Gym environment for demonstration
+  name: "CartPole-v1"
+
+policy:
+  # These should match your policy network’s expected input/output
+  in_features: 4
+  out_features: 2
+  hidden_size: 64
