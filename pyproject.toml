@@ -28,7 +28,7 @@ dependencies = [
     "torchrl",
     "wandb",
     "stable-baselines3",
-    "gymnasium",
+    "gymnasium < 1.0.0",
     "sb3-contrib",
 ]
 
