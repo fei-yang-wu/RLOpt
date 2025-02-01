@@ -52,7 +52,6 @@ class BaseAlgorithm(ABC):
     def __init__(
         self,
         env: EnvBase,
-        collector: Optional[SyncDataCollector],
         config: DictConfig,
         policy: Optional[nn.Module] = None,
         value_net: Optional[nn.Module] = None,
@@ -64,7 +63,6 @@ class BaseAlgorithm(ABC):
     ):
         super().__init__()
         self.env = env
-        self.collector = collector
         self.config = config
         self.logger = logger
         self.device = self._get_device(config.device)
@@ -91,8 +89,8 @@ class BaseAlgorithm(ABC):
         # Construct (optional) target networks
         self.target_value_net = None
         self.target_q_net = None
-        construct_target_value = self.config.get("construct_target_value", False)
-        construct_target_q = self.config.get("construct_target_q", False)
+        construct_target_value = self.config.get("construct_target_value", None)
+        construct_target_q = self.config.get("construct_target_q", None)
         # If you want a separate target for the value function:
         if self.value_net is not None and construct_target_value:
             self.target_value_net = self._construct_target_network(self.value_net)
@@ -109,7 +107,7 @@ class BaseAlgorithm(ABC):
         self.start_time = time.time()
 
         # build collector
-        self.collector = self._construct_collector(make_mujoco_env)
+        self.collector = self._construct_collector(self.env)
 
         # build loss module
         self.loss_module = self._construct_loss_module()
@@ -123,9 +121,6 @@ class BaseAlgorithm(ABC):
         # logger
         self._configure_logger()
 
-        # Compile if requested
-        self._compile_components()
-
     def _set_seed(self, seed: int):
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -136,17 +131,20 @@ class BaseAlgorithm(ABC):
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(device_str)
 
-    def _construct_collector(self, create_env_fn: Callable) -> SyncDataCollector:
+    def _construct_collector(
+        self,
+        create_env_fn: Optional[Callable[[], EnvBase]] = None,
+    ) -> SyncDataCollector:
         collector = SyncDataCollector(
-            create_env_fn=create_env_fn(self.config.env.env_name, self.device),
+            create_env_fn=create_env_fn,
             policy=self.policy,
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
             device=self.device,
             max_frames_per_traj=-1,
             compile_policy=(
-                {"mode": self.config.compile_mode, "warmup": 1}
-                if self.config.compile_mode
+                {"mode": self.config.compile.compile_mode, "warmup": 1}
+                if self.config.compile.compile_mode
                 else False
             ),
             cudagraph_policy=self.config.compile.cudagraphs,
@@ -167,12 +165,11 @@ class BaseAlgorithm(ABC):
 
         return policy
 
-    @abstractmethod
     def _construct_value_function(self) -> Optional[nn.Module]:
         """Override to build your V-network from config."""
-        if self.config.value_net_config is None:
+        if self.config.get("value_net", None) is None:
             return None
-        value_net_config = self.config.value_net_config
+        value_net_config = self.config.value_net
         # Example: simple MLP for state-value
         in_features = value_net_config.get("in_features", 4)
         hidden_size = value_net_config.get("hidden_size", 64)
@@ -183,13 +180,12 @@ class BaseAlgorithm(ABC):
         )
         return model
 
-    @abstractmethod
     def _construct_q_function(self) -> Optional[nn.Module]:
         """Override to build your Q-network from config."""
-        if self.config.q_net_config is None:
+        if self.config.get("q_net", None) is None:
             return None
 
-        q_net_config = self.config.q_net_config
+        q_net_config = self.config.q_net
         # Example: simple MLP for state-action value
         obs_dim = q_net_config.get("obs_dim", 4)
         act_dim = q_net_config.get("act_dim", 2)
@@ -201,7 +197,6 @@ class BaseAlgorithm(ABC):
         )
         return model
 
-    @abstractmethod
     def _construct_target_network(self, net: nn.Module) -> nn.Module:
         """Create a target network as a copy of the provided net."""
         target_net = type(net)()  # same class
@@ -215,7 +210,6 @@ class BaseAlgorithm(ABC):
 
         return target_net.to(self.device)
 
-    @abstractmethod
     def _construct_loss_module(self) -> nn.Module:
         loss_config = self.config.loss
         """Override to build your loss module from config."""
@@ -236,7 +230,6 @@ class BaseAlgorithm(ABC):
         """Override to build your data buffer from config."""
         pass
 
-    @abstractmethod
     def _compile_components(self):
         """compile performance-critical methods.
         Examples:
@@ -312,17 +305,14 @@ class BaseAlgorithm(ABC):
         """Hard update for target network (full copy)."""
         target_net.load_state_dict(source_net.state_dict())
 
-    @abstractmethod
     def _compute_action(self, tensordict: TensorDict) -> TensorDict:
         """Compute the next action given current policy (abstract)."""
         pass
 
-    @abstractmethod
     def _compute_returns(self, rollout: Tensor) -> Tensor:
         """Compute returns and possibly advantages from a rollout."""
         pass
 
-    @abstractmethod
     def _update_policy(self, batch: TensorDict) -> Dict[str, float]:
         """Algorithm-specific policy (and/or value) update logic."""
         pass
@@ -373,12 +363,10 @@ class BaseAlgorithm(ABC):
 
         return metrics
 
-    @abstractmethod
     def train(self) -> None:
         """Main training loop."""
         pass
 
-    @abstractmethod
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""
         pass

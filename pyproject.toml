@@ -30,6 +30,7 @@ dependencies = [
     "stable-baselines3",
     "gymnasium < 1.0.0",
     "sb3-contrib",
+    "tqdm",
 ]
 
 [project.optional-dependencies]

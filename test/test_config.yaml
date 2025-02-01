@@ -34,13 +34,13 @@ loss:
   clip_epsilon: 0.2
   anneal_clip_epsilon: False
   critic_coef: 0.25
-  entropy_coef: 0.0
+  entropy_coef: 0.01
   loss_critic_type: l2
 
 # torch compile
 compile:
-  compile: True
-  compile_mode:
+  compile: False
+  compile_mode: default
   cudagraphs: False
 
 policy:
@@ -48,3 +48,6 @@ policy:
 
 value_net:
   num_cells: [256, 256]
+
+device: auto
+seed: 0

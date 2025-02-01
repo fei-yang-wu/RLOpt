@@ -25,12 +25,14 @@ from torchrl.record import CSVLogger, TensorboardLogger, WandbLogger
 from torchrl.record.loggers.common import Logger
 from torchrl.collectors import SyncDataCollector
 from torchrl.data.replay_buffers import LazyMemmapStorage, ReplayBuffer
-from torchrl.objectives import ClipPPOLoss, group_optimizers  # type: ignore
+from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
-from torchrl._utils import timeit, compile_with_warmup  # type: ignore
+from torchrl._utils import timeit, compile_with_warmup
 
 from omegaconf import DictConfig
 from rlopt.common.base_class import BaseAlgorithm
+
+# set_composite_lp_aggregate(mode=True).set()
 
 
 class PPO(BaseAlgorithm):
@@ -38,7 +40,6 @@ class PPO(BaseAlgorithm):
     def __init__(
         self,
         env: EnvBase,
-        collector: Optional[SyncDataCollector],
         config: DictConfig,
         policy: Optional[nn.Module] = None,
         value_net: Optional[nn.Module] = None,
@@ -50,7 +51,6 @@ class PPO(BaseAlgorithm):
     ):
         super().__init__(
             env,
-            collector,
             config,
             policy,
             value_net,
@@ -63,6 +63,9 @@ class PPO(BaseAlgorithm):
 
         # construct the advantage module
         self.adv_module = self._construct_adv_module()
+
+        # Compile if requested
+        self._compile_components()
 
     def _construct_policy(self) -> nn.Module:
         policy_config = self.config.policy
@@ -117,10 +120,12 @@ class PPO(BaseAlgorithm):
             return_log_prob=True,
             default_interaction_type=ExplorationType.RANDOM,
         )
+
         return policy_module
 
-    def _construct_value_net(self) -> nn.Module:
+    def _construct_value_function(self) -> nn.Module:
         self.env: TransformedEnv
+        value_net_config = self.config.value_net
         # Define input shape
         input_shape = self.env.observation_spec["observation"].shape
         # Define value architecture
@@ -128,7 +133,7 @@ class PPO(BaseAlgorithm):
             in_features=input_shape[-1],
             activation_class=torch.nn.Tanh,
             out_features=1,
-            num_cells=[64, 64],
+            num_cells=value_net_config.num_cells,
             device=self.device,
         )
 
@@ -143,6 +148,8 @@ class PPO(BaseAlgorithm):
             value_mlp,
             in_keys=["observation"],
         )
+        print("value here")
+        print(value_module)
         return value_module
 
     def _construct_loss_module(self) -> nn.Module:
@@ -152,10 +159,11 @@ class PPO(BaseAlgorithm):
         loss_module = ClipPPOLoss(
             actor_network=self.policy,
             critic_network=self.value_net,
-            clip_ratio=loss_config.clip_ratio,
-            value_coef=loss_config.value_coef,
+            clip_epsilon=loss_config.clip_epsilon,
+            loss_critic_type=loss_config.loss_critic_type,
             entropy_coef=loss_config.entropy_coef,
-            device=self.device,
+            critic_coef=loss_config.critic_coef,
+            normalize_advantage=True,
         )
         return loss_module
 
@@ -215,10 +223,8 @@ class PPO(BaseAlgorithm):
                 else:
                     compile_mode = "reduce-overhead"
 
-            self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)
-            self.adv_module = compile_with_warmup(
-                self.adv_module, mode=compile_mode, warmup=1
-            )
+            self.update = torch.compile(self.update, mode=compile_mode)
+            self.adv_module = torch.compile(self.adv_module, mode=compile_mode)
 
     def update(self, batch, num_network_updates) -> Tuple[TensorDict, int]:
         self.optim: Optimizer
@@ -227,7 +233,7 @@ class PPO(BaseAlgorithm):
         # Linearly decrease the learning rate and clip epsilon
         alpha = torch.ones((), device=self.device) * self.config.optim.lr
         if self.config.optim.anneal_lr:
-            alpha = 1 - (num_network_updates / self.config.total_network_updates)
+            alpha = 1 - (num_network_updates / self.total_network_updates)
             for group in self.optim.param_groups:
                 group["lr"] = self.config.optim.lr * alpha
 
@@ -251,10 +257,18 @@ class PPO(BaseAlgorithm):
 
     def train(self):
         """Train the agent"""
+        cfg = self.config
         # Main loop
         collected_frames = 0
         num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
         pbar = tqdm.tqdm(total=self.config.collector.total_frames)
+
+        num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
+        self.total_network_updates = (
+            (cfg.collector.total_frames // cfg.collector.frames_per_batch)
+            * cfg.loss.ppo_epochs
+            * num_mini_batches
+        )
 
         # extract cfg variables
         cfg_loss_ppo_epochs = self.config.loss.ppo_epochs
@@ -269,7 +283,7 @@ class PPO(BaseAlgorithm):
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
         for i in range(total_iter):
-            timeit.printevery(1000, total_iter, erase=True)  # type: ignore
+            # timeit.printevery(1000, total_iter, erase=True)  # type: ignore
 
             with timeit("collecting"):
                 data = next(collector_iter)
@@ -298,7 +312,7 @@ class PPO(BaseAlgorithm):
                     with torch.no_grad(), timeit("adv"):
                         torch.compiler.cudagraph_mark_step_begin()
                         data = self.adv_module(data)
-                        if self.config.compile_mode:
+                        if self.config.compile.compile_mode:
                             data = data.clone()
 
                     with timeit("rb - extend"):
