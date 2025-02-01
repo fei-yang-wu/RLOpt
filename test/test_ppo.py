@@ -9,6 +9,7 @@ from rlopt.envs.gymlike import make_mujoco_env
 import hydra
 from omegaconf import DictConfig
 from torchrl.envs import GymEnv
+from torchrl.record.loggers import WandbLogger
 
 
 class TestCustomPPO(unittest.TestCase):
@@ -20,6 +21,7 @@ class TestCustomPPO(unittest.TestCase):
             agent = PPO(
                 env=make_mujoco_env("HalfCheetah-v4", device="cpu", from_pixels=False),
                 config=cfg,
+                logger=WandbLogger,
             )
 
             agent.train()
