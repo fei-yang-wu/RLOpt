@@ -6,21 +6,24 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
-from prometheus_client import CollectorRegistry
+import multiprocessing
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from torchrl.envs.utils import ExplorationType
 from torchrl.modules import MLP
 from torchrl.data import ReplayBuffer
 from torchrl.envs import EnvBase
 from torchrl.record import CSVLogger, TensorboardLogger, WandbLogger
 from torchrl.record.loggers.common import Logger
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import SyncDataCollector, MultiaSyncDataCollector
 from torchrl.data.replay_buffers import LazyMemmapStorage, ReplayBuffer
 from torchrl.objectives import ClipPPOLoss
 from torchrl.record.loggers import generate_exp_name, get_logger
+from torchrl.trainers import Trainer
 
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
@@ -133,23 +136,38 @@ class BaseAlgorithm(ABC):
 
     def _construct_collector(
         self,
-        create_env_fn: Optional[Callable[[], EnvBase]] = None,
+        create_env_fn: Optional[Callable[[], EnvBase]],
     ) -> SyncDataCollector:
-        collector = SyncDataCollector(
-            create_env_fn=create_env_fn,
+        try:
+            # Set multiprocessing start method
+            multiprocessing.set_start_method("spawn")
+            self.mp_context = "spawn"
+        except RuntimeError:
+            # If we can't set the method globally we can still run the parallel env with "fork"
+            # This will fail on windows! Use "spawn" and put the script within `if __name__ == "__main__"`
+            self.mp_context = "fork"
+            pass
+
+        # We can't use nested child processes with mp_start_method="fork"
+        if self.mp_context == "fork":
+            cls = SyncDataCollector
+            env_arg = create_env_fn
+        else:
+            cls = MultiaSyncDataCollector
+            env_arg = [create_env_fn] * self.config.collector.num_collectors
+        data_collector = cls(
+            env_arg,
             policy=self.policy,
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
+            # this is the default behavior: the collector runs in ``"random"`` (or explorative) mode
+            exploration_type=ExplorationType.RANDOM,
+            # We set the all the devices to be identical. Below is an example of
+            # heterogeneous devices
             device=self.device,
-            max_frames_per_traj=-1,
-            compile_policy=(
-                {"mode": self.config.compile.compile_mode, "warmup": 1}
-                if self.config.compile.compile_mode
-                else False
-            ),
-            cudagraph_policy=self.config.compile.cudagraphs,
+            storing_device=self.device,
         )
-        return collector
+        return data_collector
 
     @abstractmethod
     def _construct_policy(self) -> nn.Module:
@@ -365,7 +383,16 @@ class BaseAlgorithm(ABC):
 
     def train(self) -> None:
         """Main training loop."""
-        pass
+        # get the torchrl trainer
+        trainer = Trainer(
+            collector=self.collector,
+            total_frames=self.config.collector.total_frames,
+            loss_module=self.loss_module,
+            optimizer=self.optim,
+            logger=self.logger,
+            **self.config.trainer,
+        )
+        trainer.train()
 
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""

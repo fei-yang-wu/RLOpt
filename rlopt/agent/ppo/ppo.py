@@ -13,8 +13,11 @@ from torch import nn
 from tensordict import TensorDict
 from torch.optim.optimizer import Optimizer as Optimizer
 
-from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
-
+from tensordict.nn import (
+    AddStateIndependentNormalScale,
+    TensorDictModule,
+    set_composite_lp_aggregate,
+)
 
 from torchrl.modules import MLP, ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.data import ReplayBuffer
@@ -32,7 +35,7 @@ from torchrl._utils import timeit, compile_with_warmup
 from omegaconf import DictConfig
 from rlopt.common.base_class import BaseAlgorithm
 
-# set_composite_lp_aggregate(mode=True).set()
+set_composite_lp_aggregate(True).set()
 
 
 class PPO(BaseAlgorithm):
@@ -148,8 +151,7 @@ class PPO(BaseAlgorithm):
             value_mlp,
             in_keys=["observation"],
         )
-        print("value here")
-        print(value_module)
+
         return value_module
 
     def _construct_loss_module(self) -> nn.Module:
@@ -255,7 +257,7 @@ class PPO(BaseAlgorithm):
         self.optim.step()
         return loss.detach().set("alpha", alpha), num_network_updates
 
-    def train(self):
+    def _train(self):
         """Train the agent"""
         cfg = self.config
         # Main loop
@@ -271,7 +273,7 @@ class PPO(BaseAlgorithm):
         )
 
         # extract cfg variables
-        cfg_loss_ppo_epochs = self.config.loss.ppo_epochs
+        cfg_loss_ppo_epochs = self.config.loss.epochs
 
         cfg_optim_lr = torch.tensor(self.config.optim.lr, device=self.device)
         cfg_loss_anneal_clip_eps = self.config.loss.anneal_clip_epsilon
