@@ -770,7 +770,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             student_loss = (
                 F.mse_loss(student_action, teacher_action)  # type: ignore
-                + student_asym_loss
+                # + student_asym_loss
             )
 
             student_losses.append(student_loss.item())
