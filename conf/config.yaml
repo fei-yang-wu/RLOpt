@@ -1,0 +1,67 @@
+# task and env
+env:
+  env_name: HalfCheetah-v4
+  device:
+  num_envs: 24
+
+# collector
+collector:
+  num_collectors: 10
+  frames_per_batch: 2048
+  total_frames: 1_000_000
+
+# logger
+logger:
+  backend: wandb
+  project_name: torchrl_example_ppo
+  group_name: null
+  exp_name: Mujoco_Schulman17
+  test_interval: 1_000_000
+  num_test_episodes: 5
+  video: False
+
+# Optim
+optim:
+  lr: 3e-4
+  weight_decay: 0.0
+  anneal_lr: True
+  device:
+
+# loss
+loss:
+  gamma: 0.99
+  mini_batch_size: 64
+  epochs: 10
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  anneal_clip_epsilon: False
+  critic_coef: 0.25
+  entropy_coef: 0.01
+  loss_critic_type: l2
+
+# torch compile
+compile:
+  compile: False
+  compile_mode: default
+  cudagraphs: False
+
+# actor and critic
+policy:
+  num_cells: [256, 256]
+
+value_net:
+  num_cells: [256, 256]
+
+# trainer
+trainer:
+  optim_steps_per_batch: ${loss.epochs}
+  clip_grad_norm: True
+  clip_norm: 0.5
+  progress_bar: True
+  save_trainer_interval: 10_000
+  log_interval: 1000
+  save_trainer_file: None
+  frame_skip: 1
+
+device: auto
+seed: 0
