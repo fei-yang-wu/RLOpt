@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from torchrl.envs.utils import ExplorationType
-from torchrl.modules import MLP
+from torchrl.modules import MLP, Actor, ProbabilisticActor, ValueOperator
 from torchrl.data import ReplayBuffer
 from torchrl.envs import EnvBase
 from torchrl.record import CSVLogger, TensorboardLogger, WandbLogger
@@ -123,6 +123,9 @@ class BaseAlgorithm(ABC):
 
         # logger
         self._configure_logger()
+
+        # trainer
+        self.trainer = self._construct_trainer()
 
     def _set_seed(self, seed: int):
         torch.manual_seed(seed)
@@ -381,10 +384,8 @@ class BaseAlgorithm(ABC):
 
         return metrics
 
-    def train(self) -> None:
-        """Main training loop."""
-        # get the torchrl trainer
-        trainer = Trainer(
+    def _construct_trainer(self) -> Trainer:
+        return Trainer(
             collector=self.collector,
             total_frames=self.config.collector.total_frames,
             loss_module=self.loss_module,
@@ -392,7 +393,11 @@ class BaseAlgorithm(ABC):
             logger=self.logger,
             **self.config.trainer,
         )
-        trainer.train()
+
+    def train(self) -> None:
+        """Main training loop."""
+        # get the torchrl trainer
+        self.trainer.train()
 
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""

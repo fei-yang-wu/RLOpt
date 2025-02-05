@@ -2,9 +2,7 @@
 Only supports MuJoCo environments for now
 """
 
-from os import sync
-from tty import CFLAG
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Union
 
 import tqdm
 import numpy as np
@@ -257,130 +255,18 @@ class PPO(BaseAlgorithm):
         self.optim.step()
         return loss.detach().set("alpha", alpha), num_network_updates
 
-    def _train(self):
-        """Train the agent"""
-        cfg = self.config
-        # Main loop
-        collected_frames = 0
-        num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
-        pbar = tqdm.tqdm(total=self.config.collector.total_frames)
-
-        num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
-        self.total_network_updates = (
-            (cfg.collector.total_frames // cfg.collector.frames_per_batch)
-            * cfg.loss.ppo_epochs
-            * num_mini_batches
-        )
-
-        # extract cfg variables
-        cfg_loss_ppo_epochs = self.config.loss.epochs
-
-        cfg_optim_lr = torch.tensor(self.config.optim.lr, device=self.device)
-        cfg_loss_anneal_clip_eps = self.config.loss.anneal_clip_epsilon
-        cfg_loss_clip_epsilon = self.config.loss.clip_epsilon
-
-        losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])  # type: ignore
-
-        self.collector: SyncDataCollector
-        collector_iter = iter(self.collector)
-        total_iter = len(self.collector)
-        for i in range(total_iter):
-            # timeit.printevery(1000, total_iter, erase=True)  # type: ignore
-
-            with timeit("collecting"):
-                data = next(collector_iter)
-
-            metrics_to_log = {}
-            frames_in_batch = data.numel()
-            collected_frames += frames_in_batch
-            pbar.update(frames_in_batch)
-
-            # Get training rewards and episode lengths
-            episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-            if len(episode_rewards) > 0:
-                episode_length = data["next", "step_count"][data["next", "done"]]
-                metrics_to_log.update(
-                    {
-                        "train/reward": episode_rewards.mean().item(),
-                        "train/episode_length": episode_length.sum().item()
-                        / len(episode_length),
-                    }
-                )
-
-            with timeit("training"):
-                for j in range(cfg_loss_ppo_epochs):
-
-                    # Compute GAE
-                    with torch.no_grad(), timeit("adv"):
-                        torch.compiler.cudagraph_mark_step_begin()
-                        data = self.adv_module(data)
-                        if self.config.compile.compile_mode:
-                            data = data.clone()
-
-                    with timeit("rb - extend"):
-                        # Update the data buffer
-                        data_reshape = data.reshape(-1)
-                        self.data_buffer.extend(data_reshape)
-
-                    for k, batch in enumerate(self.data_buffer):
-                        with timeit("update"):
-                            torch.compiler.cudagraph_mark_step_begin()
-                            loss, num_network_updates = self.update(
-                                batch, num_network_updates=num_network_updates
-                            )
-                            loss = loss.clone()
-                        num_network_updates = num_network_updates.clone()  # type: ignore
-                        losses[j, k] = loss.select(
-                            "loss_critic", "loss_entropy", "loss_objective"
-                        )
-
-            # Get training losses and times
-            losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
-            for key, value in losses_mean.items():  # type: ignore
-                metrics_to_log.update({f"train/{key}": value.item()})
-            metrics_to_log.update(
-                {
-                    "train/lr": loss["alpha"] * cfg_optim_lr,
-                    "train/clip_epsilon": (
-                        loss["alpha"] * cfg_loss_clip_epsilon
-                        if cfg_loss_anneal_clip_eps
-                        else cfg_loss_clip_epsilon
-                    ),
-                }
-            )
-
-            # fy: no testing, need to implement for specific envs
-            # # Get test rewards
-            # with (
-            #     torch.no_grad(),
-            #     set_exploration_type(ExplorationType.DETERMINISTIC),
-            #     timeit("eval"),
-            # ):
-            #     if ((i - 1) * frames_in_batch) // cfg_logger_test_interval < (
-            #         i * frames_in_batch
-            #     ) // cfg_logger_test_interval:
-            #         actor.eval()
-            #         test_rewards = eval_model(
-            #             actor, test_env, num_episodes=cfg_logger_num_test_episodes
-            #         )
-            #         metrics_to_log.update(
-            #             {
-            #                 "eval/reward": test_rewards.mean(),
-            #             }
-            #         )
-            #         actor.train()
-
-            self.logger: Logger | None
-            if self.logger:
-                metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-                metrics_to_log["time/speed"] = pbar.format_dict["rate"]
-                for key, value in metrics_to_log.items():
-                    self.logger.log_scalar(key, value, collected_frames)
-
-            self.collector.update_policy_weights_()
-
-        self.collector.shutdown()
-
-    def predict(self, obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, obs: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
         """Predict action and value given observation"""
-        raise NotImplementedError
+        self.policy: ProbabilisticActor
+        self.value_net: ValueOperator
+        obs = torch.as_tensor([obs], device=self.device)
+        self.policy.eval()
+        with torch.inference_mode():
+            td = TensorDict(
+                {"observation": obs},
+                batch_size=[1],
+                device=self.policy.device,
+            )
+            output = self.policy(td).get("action")
+
+        return output
