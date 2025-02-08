@@ -17,15 +17,16 @@ class TestCustomPPO(unittest.TestCase):
 
         @hydra.main(config_path=".", config_name="test_config", version_base=None)
         def train(cfg: DictConfig) -> None:
+            env = make_gym_env(
+                "HalfCheetah-v4",
+                parallel=True,
+                num_workers=cfg.env.num_envs,
+                device="cpu",
+                from_pixels=False,
+            )
 
             agent = PPO(
-                env=make_gym_env(
-                    "HalfCheetah-v4",
-                    parallel=True,
-                    num_workers=cfg.env.num_envs,
-                    device="cpu",
-                    from_pixels=False,
-                ),
+                env=env,
                 config=cfg,
                 logger=WandbLogger,
             )
