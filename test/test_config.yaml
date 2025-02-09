@@ -6,7 +6,7 @@ env:
 
 # collector
 collector:
-  num_collectors: 10
+  num_collectors: 24
   frames_per_batch: 2048
   total_frames: 1_000_000
 

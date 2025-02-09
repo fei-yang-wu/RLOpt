@@ -141,15 +141,17 @@ class BaseAlgorithm(ABC):
         self,
         create_env_fn: Optional[Callable[[], EnvBase]],
     ) -> SyncDataCollector:
-        try:
-            # Set multiprocessing start method
-            multiprocessing.set_start_method("spawn")
-            self.mp_context = "spawn"
-        except RuntimeError:
-            # If we can't set the method globally we can still run the parallel env with "fork"
-            # This will fail on windows! Use "spawn" and put the script within `if __name__ == "__main__"`
-            self.mp_context = "fork"
-            pass
+        # try:
+        #     # Set multiprocessing start method
+        #     multiprocessing.set_start_method("spawn")
+        #     self.mp_context = "spawn"
+        # except RuntimeError:
+        #     # If we can't set the method globally we can still run the parallel env with "fork"
+        #     # This will fail on windows! Use "spawn" and put the script within `if __name__ == "__main__"`
+        #     self.mp_context = "fork"
+        #     pass
+        # multiprocessing.set_start_method("fork")
+        self.mp_context = "fork"
 
         # We can't use nested child processes with mp_start_method="fork"
         if self.mp_context == "fork":
@@ -166,6 +168,11 @@ class BaseAlgorithm(ABC):
             # this is the default behavior: the collector runs in ``"random"`` (or explorative) mode
             exploration_type=ExplorationType.RANDOM,
             # We set the all the devices to be identical. Below is an example of
+            compile_policy=(
+                {"mode": self.config.compile.compile_mode, "warmup": 1}
+                if self.config.compile.compile
+                else False
+            ),
             # heterogeneous devices
             device=self.device,
             storing_device=self.device,

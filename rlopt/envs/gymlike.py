@@ -81,29 +81,12 @@ def make_mujoco_env(
 
 def make_isaaclab_gym_env(
     env,
-    parallel=False,
 ):
 
-    if parallel:
-
-        def maker():
-            return GymWrapper(
-                env=env,
-                convert_actions_to_numpy=False,
-            )
-
-        base_env = ParallelEnv(
-            num_workers,
-            EnvCreator(maker),
-            # Don't create a sub-process if we have only one worker
-            serial_for_single=True,
-            mp_start_method=mp_context,
-        )
-    else:
-        base_env = GymWrapper(
-            env=env,
-            convert_actions_to_numpy=False,
-        )
+    base_env = GymWrapper(
+        env=env,
+        convert_actions_to_numpy=False,
+    )
 
     env = TransformedEnv(
         base_env,
