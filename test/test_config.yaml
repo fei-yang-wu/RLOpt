@@ -41,7 +41,7 @@ loss:
 
 # torch compile
 compile:
-  compile: False
+  compile: True
   compile_mode: default
   cudagraphs: False
 
