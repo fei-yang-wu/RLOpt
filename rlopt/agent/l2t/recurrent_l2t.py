@@ -442,7 +442,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self._last_obs: Dict[str, th.Tensor]
         # Switch to eval mode (this affects batch norm / dropout)
         self.compiled_policy.set_training_mode(False)
-        self.compiled_student_policy.set_training_mode(False)
+        # self.compiled_student_policy.set_training_mode(False)
 
         n_steps = 0
         rollout_buffer.reset()
