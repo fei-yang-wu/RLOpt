@@ -166,7 +166,7 @@ class BaseAlgorithm(ABC):
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
             # this is the default behavior: the collector runs in ``"random"`` (or explorative) mode
-            exploration_type=ExplorationType.RANDOM,
+            # exploration_type=ExplorationType.RANDOM,
             # We set the all the devices to be identical. Below is an example of
             compile_policy=(
                 {"mode": self.config.compile.compile_mode, "warmup": 1}

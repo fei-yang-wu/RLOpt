@@ -19,7 +19,7 @@ from tensordict.nn import (
 
 from torchrl.modules import MLP, ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.data import ReplayBuffer
-from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
+from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer, LazyMemmapStorage
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import EnvBase, TransformedEnv, ExplorationType
 from torchrl.record import CSVLogger, TensorboardLogger, WandbLogger
@@ -199,7 +199,7 @@ class PPO(BaseAlgorithm):
     def _construct_data_buffer(self) -> ReplayBuffer:
         # Create data buffer
         cfg = self.config
-        sampler = SamplerWithoutReplacement()
+        sampler = SamplerWithoutReplacement(True)
         data_buffer = TensorDictReplayBuffer(
             storage=LazyTensorStorage(
                 cfg.collector.frames_per_batch,
@@ -312,17 +312,17 @@ class PPO(BaseAlgorithm):
             collected_frames += frames_in_batch
             pbar.update(frames_in_batch)
 
-            # Get training rewards and episode lengths
-            episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-            if len(episode_rewards) > 0:
-                episode_length = data["next", "step_count"][data["next", "done"]]
-                metrics_to_log.update(
-                    {
-                        "train/reward": episode_rewards.mean().item(),
-                        "train/episode_length": episode_length.sum().item()
-                        / len(episode_length),
-                    }
-                )
+            # # Get training rewards and episode lengths
+            # episode_rewards = data["next", "episode_reward"][data["next", "done"]]
+            # if len(episode_rewards) > 0:
+            #     episode_length = data["next", "step_count"][data["next", "done"]]
+            #     metrics_to_log.update(
+            #         {
+            #             "train/reward": episode_rewards.mean().item(),
+            #             "train/episode_length": episode_length.sum().item()
+            #             / len(episode_length),
+            #         }
+            #     )
 
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
@@ -339,7 +339,10 @@ class PPO(BaseAlgorithm):
                         data_reshape = data.reshape(-1)
                         self.data_buffer.extend(data_reshape)
 
+                    # print("data_buffer:", self.data_buffer)
+
                     for k, batch in enumerate(self.data_buffer):
+                        # print("k, batch", k, batch)
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
                             loss, num_network_updates = self.update(

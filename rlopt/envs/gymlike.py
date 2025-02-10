@@ -6,14 +6,16 @@ import os
 import uuid
 from torch import multiprocessing
 
-try:
-    multiprocessing.set_start_method("fork")
-    mp_context = "fork"
-except RuntimeError:
-    # If we can't set the method globally we can still run the parallel env with "fork"
-    # This will fail on windows! Use "spawn" and put the script within `if __name__ == "__main__"`
-    mp_context = "fork"
-    pass
+# try:
+#     multiprocessing.set_start_method("fork")
+#     mp_context = "fork"
+# except RuntimeError:
+#     # If we can't set the method globally we can still run the parallel env with "fork"
+#     # This will fail on windows! Use "spawn" and put the script within `if __name__ == "__main__"`
+#     mp_context = "fork"
+#     pass
+
+mp_context = "fork"
 
 import torch
 from torch import nn
@@ -93,8 +95,8 @@ def make_isaaclab_gym_env(
         Compose(
             # VecNorm(in_keys=["observation"], decay=0.99999, eps=1e-2),
             # ClipTransform(in_keys=["observation"], low=-10, high=10),
-            RewardSum(),
-            StepCounter(),  # to count the steps of each trajectory
+            # RewardSum(),
+            StepCounter(1000),  # to count the steps of each trajectory
             # DoubleToFloat(in_keys=["observation"]),
         ),
     )
