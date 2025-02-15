@@ -69,7 +69,7 @@ from rlopt.agent.l2t.policies import (
 SelfRecurrentStudent = TypeVar("SelfRecurrentStudent", bound="RecurrentStudent")
 
 
-class RecurrentStudent(OnPolicyAlgorithm):
+class RslExpertRecurrentStudent(OnPolicyAlgorithm):
     """
     L2T (Learn to Teach) is a reinforcement learning algorithm that learns to teach a student agent.
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
@@ -166,7 +166,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
-        teacher_policy: Union[str, Type[ActorCriticPolicy]] = ActorCriticPolicy,
+        teacher_policy: Optional[th.nn.Module] = None,
     ):
         # if isinstance(policy, str):
         #     self.policy_class = self._get_policy_from_name(policy)
@@ -435,14 +435,11 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
         self._last_obs: Dict[str, th.Tensor]
         # Switch to eval mode (this affects batch norm / dropout)
-        self.compiled_policy.set_training_mode(False)
+        self.compiled_policy.eval()
         self.compiled_student_policy.set_training_mode(False)
 
         n_steps = 0
         rollout_buffer.reset()
-        # Sample new weights for the state dependent exploration
-        if self.use_sde:
-            self.compiled_policy.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
 
@@ -455,7 +452,6 @@ class RecurrentStudent(OnPolicyAlgorithm):
                 and n_steps % self.sde_sample_freq == 0
             ):
                 # Sample a new noise matrix
-                self.compiled_policy.reset_noise(env.num_envs)
                 self.compiled_student_policy.reset_noise(env.num_envs)
 
             # flag the student agent to be used
@@ -470,7 +466,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
                 obs_tensor = self._last_obs
                 if (
                     th.rand(1)[0]
-                    < self.mixture_coeff  # * (1 - self._current_progress_remaining)
+                    <= self.mixture_coeff  # * (1 - self._current_progress_remaining)
                     and self.num_timesteps > 0
                 ):
                     actions, values, log_probs, lstm_states = (
@@ -482,9 +478,9 @@ class RecurrentStudent(OnPolicyAlgorithm):
                     )
                     student_predicted = True
                 else:
-                    actions, values, log_probs = self.compiled_policy(
-                        obs_tensor["teacher"]
-                    )
+                    actions = self.compiled_policy.act(obs_tensor["teacher"])
+                    values = self.compiled_policy.evaluate(obs_tensor["teacher"])
+                    log_probs = self.compiled_policy.get_actions_log_prob(actions)
 
                 # get the hidden state of the current student state
                 if not student_predicted:
@@ -498,7 +494,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
             clipped_actions = actions
 
             if isinstance(self.action_space, spaces.Box):
-                if self.compiled_policy.squash_output:
+                if False:
                     # Unscale the actions to match env bounds
                     # if they were previously squashed (scaled in [-1, 1])
                     clipped_actions = self.compiled_policy.unscale_action(
@@ -573,7 +569,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
         with th.inference_mode():
             # Compute value for the last timestep
-            values = self.compiled_policy.predict_values(obs_as_tensor(new_obs["teacher"], self.device))  # type: ignore[arg-type]
+            values = self.compiled_policy.evaluate(obs_as_tensor(new_obs["teacher"], self.device))  # type: ignore[arg-type]
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
@@ -618,7 +614,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
         # Switch to train mode (this affects batch norm / dropout)
         self.compiled_student_policy: RecurrentActorCriticPolicy
-        self.compiled_policy.set_training_mode(True)
+        self.compiled_policy.eval()
         self.compiled_student_policy.set_training_mode(True)
         # # Update optimizer learning rate
         # self._update_learning_rate(
@@ -665,18 +661,19 @@ class RecurrentStudent(OnPolicyAlgorithm):
             # Convert mask from float to bool
             mask = masks_batch > 1e-8  # type: ignore[operator]
 
-            # Re-sample the noise matrix because the log_std has changed
-            if self.use_sde:
-                self.compiled_policy.reset_noise(self.batch_size)
-
             if self.whole_sequences:
                 actions = actions["teacher"]  # type: ignore[arg-type]
                 observations = obs_batch["teacher"]
 
-            # teacher is mlp so no funny business
-            values, log_prob, entropy = self.compiled_policy.evaluate_actions(
-                observations, actions  # type: ignore
-            )
+            # # teacher is mlp so no funny business
+            # values, log_prob, entropy = self.compiled_policy.evaluate_actions(
+            #     observations, actions  # type: ignore
+            # )
+
+            # print(actions.shape)
+            values = self.compiled_policy.evaluate(observations)
+            # log_prob = self.compiled_policy.get_actions_log_prob(actions)
+
             values = values.flatten()
 
             # Normalize advantage
@@ -688,43 +685,12 @@ class RecurrentStudent(OnPolicyAlgorithm):
                 )
 
             # ratio between old and new policy, should be one at the first iteration
-            ratio = th.exp(log_prob - old_actions_log_prob_batch)
-
-            # # clipped surrogate loss
-            # policy_loss_1 = advantages * ratio
-            # policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-            # policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+            # ratio = th.exp(log_prob - old_actions_log_prob_batch)
 
             # # Logging
             # pg_losses.append(policy_loss.item())
-            clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-            clip_fractions.append(clip_fraction)
-
-            # if self.clip_range_vf is None:
-            #     # No clipping
-            #     values_pred = values
-            # else:
-            #     # Clip the difference between old and new value
-            #     # NOTE: this depends on the reward scaling
-            #     values_pred = values_batch + th.clamp(
-            #         values - values_batch, -clip_range_vf, clip_range_vf  # type: ignore
-            #     )
-            # Value loss using the TD(gae_lambda) target
-            # value_loss = F.mse_loss(returns_batch, values_pred)
-            # value_losses.append(value_loss.item())
-
-            # # Entropy loss favor exploration
-            # if entropy is None:
-            #     # Approximate entropy when no analytical form
-            #     entropy_loss = -th.mean(-log_prob)
-            # else:
-            #     entropy_loss = -th.mean(entropy)
-
-            # entropy_losses.append(entropy_loss.item())
-
-            # loss = (
-            #     policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-            # )
+            # clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+            clip_fractions.append(0.0)
 
             student_observations = obs_batch["student"]
             # student obs shape is (T, B, feature dim)
@@ -770,34 +736,6 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
             student_losses.append(student_loss.item())
 
-            # Calculate approximate form of reverse KL Divergence for early stopping
-            # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
-            # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
-            # and Schulman blog: http://joschu.net/blog/kl-approx.html
-            # with th.no_grad():
-            #     log_ratio = log_prob - old_actions_log_prob_batch
-            #     approx_kl_div = (
-            #         th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-            #     )
-            #     approx_kl_divs.append(approx_kl_div)
-
-            # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-            #     continue_training = False
-            #     if self.verbose >= 1:
-            #         print(
-            #             f"Early stopping at step {self.num_timesteps} due to reaching max kl: {approx_kl_div:.2f}"
-            #         )
-            #     break
-
-            # # Optimization step
-            # self.compiled_policy.optimizer.zero_grad()
-            # loss.backward()
-            # # Clip grad norm
-            # th.nn.utils.clip_grad_norm_(
-            #     self.compiled_policy.parameters(), self.max_grad_norm
-            # )
-            # self.compiled_policy.optimizer.step()
-
             # Update student agent
             self.compiled_student_policy.optimizer.zero_grad()
             student_loss.backward()
@@ -810,9 +748,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
             if not continue_training:
                 break
 
-            self._update_learning_rate(
-                [self.compiled_policy.optimizer, self.student_policy.optimizer]
-            )
+            self._update_learning_rate([self.student_policy.optimizer])
 
         # explained_var = explained_variance(
         #     self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
