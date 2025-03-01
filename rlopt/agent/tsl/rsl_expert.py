@@ -1118,6 +1118,7 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
             custom_objects=custom_objects,
             print_system_info=print_system_info,
         )
+        # print("data", data)
 
         assert data is not None, "No data found in the saved file"
         assert params is not None, "No params found in the saved file"
@@ -1175,7 +1176,7 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
                 env = data["env"]
 
         model = cls(
-            policy=data["policy_class"],
+            policy="MlpPolicy",
             env=env,  # type: ignore
             device=device,
             _init_setup_model=False,  # type: ignore[call-arg]
@@ -1258,6 +1259,8 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
         updated_objects = set()
 
         for name in params:
+            if name == "policy":
+                continue
             attr = None
             try:
                 attr = recursive_getattr(self, name)
