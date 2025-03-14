@@ -62,6 +62,7 @@ from torchrl.envs import (
 )
 from torchrl.envs.libs.gym import GymEnv, GymWrapper
 from torchrl.envs import EnvBase
+from torchrl.envs.gym_like import default_info_dict_reader
 from torchrl.modules import MLP, ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.record import VideoRecorder
 
@@ -83,11 +84,14 @@ def make_mujoco_env(
 
 def make_isaaclab_gym_env(
     env,
+    num_envs: int = 4096,
+    device="cuda:0",
 ):
 
     base_env = GymWrapper(
         env=env,
         convert_actions_to_numpy=False,
+        device=device,
     )
 
     env = TransformedEnv(
@@ -95,7 +99,7 @@ def make_isaaclab_gym_env(
         Compose(
             # VecNorm(in_keys=["observation"], decay=0.99999, eps=1e-2),
             # ClipTransform(in_keys=["observation"], low=-10, high=10),
-            # RewardSum(),
+            RewardSum(),
             StepCounter(1000),  # to count the steps of each trajectory
             # DoubleToFloat(in_keys=["observation"]),
         ),
