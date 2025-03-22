@@ -160,6 +160,7 @@ class PPO(BaseAlgorithm):
             actor_network=self.policy,
             critic_network=self.value_net,
             clip_epsilon=loss_config.clip_epsilon,
+            clip_value=loss_config.clip_value,
             loss_critic_type=loss_config.loss_critic_type,
             entropy_coef=loss_config.entropy_coef,
             critic_coef=loss_config.critic_coef,
