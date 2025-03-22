@@ -82,12 +82,13 @@ class PPO(BaseAlgorithm):
             "low": self.env.action_spec_unbatched.space.low.to(self.device),  # type: ignore
             "high": self.env.action_spec_unbatched.space.high.to(self.device),  # type: ignore
             "tanh_loc": False,
+            "safe_tanh": True,
         }
 
         # Define policy architecture
         policy_mlp = MLP(
             in_features=input_shape[-1],
-            activation_class=torch.nn.Tanh,
+            activation_class=torch.nn.ELU,
             out_features=num_outputs,  # predict only loc
             num_cells=policy_config.num_cells,
             device=self.device,
@@ -132,7 +133,7 @@ class PPO(BaseAlgorithm):
         # Define value architecture
         value_mlp = MLP(
             in_features=input_shape[-1],
-            activation_class=torch.nn.Tanh,
+            activation_class=torch.nn.ELU,
             out_features=1,
             num_cells=value_net_config.num_cells,
             device=self.device,
