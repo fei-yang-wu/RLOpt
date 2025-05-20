@@ -120,7 +120,7 @@ class PPO(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.RANDOM,
+            default_interaction_type=ExplorationType.DETERMINISTIC,
         )
 
         return policy_module
@@ -274,6 +274,9 @@ class PPO(BaseAlgorithm):
 
         return output
 
+    def _construct_trainer(self):
+        return None
+
     def train(self):
         """Train the agent"""
         cfg = self.config
@@ -303,11 +306,11 @@ class PPO(BaseAlgorithm):
         total_iter = len(self.collector)
         # print("total_iter:", total_iter)
         for i in range(total_iter):
-            # timeit.printevery(1000, total_iter, erase=True)  # type: ignore
+
+            timeit.printevery(1, total_iter, erase=True)  # type: ignore
 
             with timeit("collecting"):
                 data = next(collector_iter)
-            # print("data:", data)
 
             metrics_to_log = {}
             frames_in_batch = data.numel()
@@ -326,7 +329,7 @@ class PPO(BaseAlgorithm):
                     }
                 )
             env_extras = getattr(self.env.unwrapped, "extras", {})
-            metrics_to_log.update(env_extras["log"])
+            metrics_to_log.update(env_extras["log"]) if "log" in env_extras else None
 
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):

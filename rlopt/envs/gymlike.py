@@ -88,14 +88,8 @@ def make_isaaclab_gym_env(
     device="cuda:0",
 ):
 
-    base_env = GymWrapper(
-        env=env,
-        convert_actions_to_numpy=False,
-        device=device,
-    )
-
-    env = TransformedEnv(
-        base_env,
+    return TransformedEnv(
+        env,
         Compose(
             # VecNorm(in_keys=["observation"], decay=0.99999, eps=1e-2),
             # ClipTransform(in_keys=["observation"], low=-10, high=10),
@@ -104,8 +98,6 @@ def make_isaaclab_gym_env(
             # DoubleToFloat(in_keys=["observation"]),
         ),
     )
-
-    return env
 
 
 def make_gym_env(
