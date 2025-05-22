@@ -18,20 +18,24 @@ class CTSObservationWrapper(gym.ObservationWrapper):
         self.observation_space = env.observation_space
         self.stacked_obs = deque(maxlen=stack_size)
         
-        
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         # Initialize stack with first observation repeated
         self.stacked_obs.clear()
         for _ in range(self.stack_size):
             self.stacked_obs.append(th.zeros_like(obs["student"]))
+        # Add stacked observations to obs dict
+        obs["stacked_obs"] = th.cat(list(self.stacked_obs), dim=-1)
         return obs, info
         
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        assert isinstance(obs, dict)
+        assert isinstance(obs, dict), "Observations must be a dictionary"
+        assert "student" in obs, "Student observations must be present"
+        
+        # Update stacked observations
         self.stacked_obs.append(th.as_tensor(obs["student"]))
-        # Add stacked observations to info
+        # Add stacked observations to obs dict
         obs["stacked_obs"] = th.cat(list(self.stacked_obs), dim=-1)
         return obs, reward, terminated, truncated, info
 
@@ -59,26 +63,34 @@ class CTSPolicy(ActorCriticPolicy):
         self.stack_size = stack_size
 
     def forward(self, obs, deterministic=False):
-        # obs["teacher"], obs["student"], obs["teacher_mask"]
+        # Validate input
+        assert isinstance(obs, dict), "Observations must be a dictionary"
+        assert "teacher" in obs and "student" in obs, "Teacher and student observations must be present"
+        assert "teacher_mask" in obs, "Teacher mask must be present"
+        
         mask = obs["teacher_mask"].float().unsqueeze(-1)  # [batch,1]
         z_t = self.privileged_encoder(obs["teacher"])
         
-        # Handle stacked observations if present
+        # Handle stacked observations
         if "stacked_obs" in obs:
-            # Flatten stacked observations
-            stacked_obs = obs["stacked_obs"]
-            z_s = self.proprio_encoder(stacked_obs)
+            # Validate stacked observations shape
+            expected_shape = (obs["student"].shape[0], obs["student"].shape[1] * self.stack_size)
+            assert obs["stacked_obs"].shape == expected_shape, \
+                f"Stacked observations shape {obs['stacked_obs'].shape} does not match expected shape {expected_shape}"
+            z_s = self.proprio_encoder(obs["stacked_obs"])
         else:
-            z_s = self.proprio_encoder(obs["student"])
+            # If no stacked observations, repeat the current observation
+            repeated_obs = obs["student"].repeat(1, self.stack_size)
+            z_s = self.proprio_encoder(repeated_obs)
             
-        z   = mask * z_t + (1 - mask) * z_s
+        z = mask * z_t + (1 - mask) * z_s
 
         # standard SB3 actor-critic heads
         latent_pi, latent_vf = self.mlp_extractor(z)
         dist = self._get_action_dist_from_latent(latent_pi)
         actions = dist.get_actions(deterministic=deterministic)
         log_prob = dist.log_prob(actions)
-        values   = self.value_net(latent_vf)
+        values = self.value_net(latent_vf)
         return actions, values, log_prob
 
     def _predict(self, obs, deterministic=False):
@@ -97,6 +109,8 @@ class CTSPPO(PPO):
         teacher_ratio: float = 0.75,
         **ppo_kwargs
     ):
+        # Validate teacher ratio
+        assert 0 < teacher_ratio < 1, "Teacher ratio must be between 0 and 1"
         # store ratio before calling super()
         self.teacher_ratio = teacher_ratio
         super().__init__(policy, env, **ppo_kwargs)
@@ -113,7 +127,11 @@ class CTSPPO(PPO):
             gae_lambda=self.gae_lambda,
             normalize_advantage=self.normalize_advantage,
         )
-        # Once at setup, build a fixed mask of shape (n_envs,)
+        # Initialize teacher mask
+        self._update_teacher_mask()
+
+    def _update_teacher_mask(self) -> None:
+        """Update the teacher-student assignments."""
         n_envs = self.env.num_envs
         n_teacher = int(self.teacher_ratio * n_envs)
         mask = np.zeros(n_envs, dtype=np.bool_)
@@ -133,6 +151,8 @@ class CTSPPO(PPO):
 
         # reset the env and inject mask
         obs, info = env.reset()
+        # Update teacher mask periodically (every n_rollout_steps)
+        self._update_teacher_mask()
         # ---- inject teacher_mask ----
         # We assume obs is a dict of np.arrays; append teacher_mask
         obs = {**obs, "teacher_mask": self._teacher_mask.cpu().numpy()}
