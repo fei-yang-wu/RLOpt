@@ -78,7 +78,7 @@ class BaseBuffer(ABC):
 
     @staticmethod
     def swap_and_flatten(
-        arr: Union[th.Tensor, TensorDict]
+        arr: Union[th.Tensor, TensorDict],
     ) -> Union[th.Tensor, TensorDict]:
         """
         Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
@@ -88,7 +88,7 @@ class BaseBuffer(ABC):
         :return:
         """
         shape = arr.shape
-        if len(shape) < 3:
+        if len(shape) < 3 and not isinstance(arr, TensorDict):
             shape = (*shape, 1)
         return arr.transpose(0, 1).reshape(shape[0] * shape[1], *shape[2:])
 
@@ -892,11 +892,6 @@ class DictRolloutBuffer(RolloutBuffer):
         self.reset()
 
     def reset(self) -> None:
-        # self.observations_ = dict()
-        # for key, obs_input_shape in self.obs_shape.items():
-        #     self.observations_[key] = th.zeros(
-        #         (self.buffer_size, self.n_envs, *obs_input_shape), dtype=th.float32
-        #     )
 
         self.observations = TensorDict(
             {
@@ -978,16 +973,16 @@ class DictRolloutBuffer(RolloutBuffer):
             # as torch cannot broadcast (n_discrete,) to (n_discrete, 1)
             if isinstance(self.observation_space.spaces[key], spaces.Discrete):
                 obs_ = obs_.reshape((self.n_envs,) + self.obs_shape[key])
-            self.observations[key][self.pos] = obs_
+            self.observations[key][self.pos] = obs_.to(self.device)
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
         action = action.reshape((self.n_envs, self.action_dim))
 
-        self.actions[self.pos] = action.detach()
-        self.rewards[self.pos] = reward.detach()
-        self.episode_starts[self.pos] = episode_start.detach()
-        self.values[self.pos] = value.detach().flatten()
-        self.log_probs[self.pos] = log_prob.detach()
+        self.actions[self.pos] = action.detach().to(self.device)
+        self.rewards[self.pos] = reward.detach().to(self.device)
+        self.episode_starts[self.pos] = episode_start.detach().to(self.device)
+        self.values[self.pos] = value.detach().flatten().to(self.device)
+        self.log_probs[self.pos] = log_prob.detach().to(self.device)
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -1978,8 +1973,6 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         padded_student_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
             self.observations["student"], self.dones.unsqueeze(-1)
         )
-
-        # print("padded_student_obs_trajectories", padded_student_obs_trajectories.shape)
 
         padded_obs_trajectories = {
             "student": padded_student_obs_trajectories,

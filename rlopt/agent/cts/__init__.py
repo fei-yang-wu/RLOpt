@@ -1,1 +1,1 @@
-from .cts import CTSObservationWrapper, CTSPolicy, CTSPPO
+from .cts import CTSPolicy, CTSPPO
