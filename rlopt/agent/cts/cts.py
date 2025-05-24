@@ -20,17 +20,20 @@ from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import VecEnv
 
 from rlopt.common import DictRolloutBuffer
+import gc
 
 
 class CTSPolicy(ActorCriticPolicy):
-    def __init__(self, *args, latent_dim=32, stack_size=3, teacher_mask=None, **kwargs):
+    def __init__(
+        self, *args, latent_dim=128, stack_size=5, teacher_mask=None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
-        
+
         # Get dimensions
         teacher_dim = self.observation_space["teacher"].shape[0]
         student_dim = self.observation_space["stacked_obs"].shape[0]
         student_obs_dim = self.observation_space["student"].shape[0]
-        
+
         # Privileged encoder on obs["teacher"]
         self.privileged_encoder = nn.Sequential(
             nn.Linear(teacher_dim, 128),
@@ -38,7 +41,7 @@ class CTSPolicy(ActorCriticPolicy):
             nn.Linear(128, latent_dim),
             nn.ELU(),
         )
-        
+
         # Proprio encoder on obs["stacked_obs"]
         self.proprio_encoder = nn.Sequential(
             nn.Linear(student_dim, 128),
@@ -46,7 +49,7 @@ class CTSPolicy(ActorCriticPolicy):
             nn.Linear(128, latent_dim),
             nn.ELU(),
         )
-        
+
         # Policy network: takes student observations + encoder latents
         policy_input_dim = student_obs_dim + latent_dim
         self.policy_net = nn.Sequential(
@@ -55,7 +58,7 @@ class CTSPolicy(ActorCriticPolicy):
             nn.Linear(256, 128),
             nn.ELU(),
         )
-        
+
         # Value network: takes teacher observations + encoder latents
         value_input_dim = teacher_dim + latent_dim
         self.value_net_custom = nn.Sequential(
@@ -65,7 +68,7 @@ class CTSPolicy(ActorCriticPolicy):
             nn.ELU(),
             nn.Linear(128, 1),
         )
-        
+
         # Override features_dim for SB3 compatibility
         self.features_dim = 128
         self._build_mlp_extractor()
@@ -90,17 +93,17 @@ class CTSPolicy(ActorCriticPolicy):
         mask = obs["teacher_mask"].bool()
         z_t = self.privileged_encoder(obs["teacher"])
         # Encode proprioceptive state from stacked observations
+        # Use no_grad to prevent gradients from policy/value losses
         with th.no_grad():
-            # Use stacked observations for proprio encoder
             z_s = self.proprio_encoder(obs["stacked_obs"])
-        
+
         # Combine encodings based on mask for policy input
         z = th.where(mask, z_t, z_s)
-        
+
         # Policy input: student observations + encoder latents
         policy_input = th.cat([obs["student"], z], dim=-1)
         policy_features = self.policy_net(policy_input)
-        
+
         # Value input: teacher observations + encoder latents
         value_input = th.cat([obs["teacher"], z], dim=-1)
         values = self.value_net_custom(value_input)
@@ -120,17 +123,17 @@ class CTSPolicy(ActorCriticPolicy):
         mask = obs["teacher_mask"].bool()
         z_t = self.privileged_encoder(obs["teacher"])
         # Encode proprioceptive state from stacked observations
+        # Use no_grad to prevent gradients from policy/value losses
         with th.no_grad():
-            # Use stacked observations for proprio encoder
             z_s = self.proprio_encoder(obs["stacked_obs"])
-        
+
         # Combine encodings based on mask
         z = th.where(mask, z_t, z_s)
-        
+
         # Policy input: student observations + encoder latents
         policy_input = th.cat([obs["student"], z], dim=-1)
         policy_features = self.policy_net(policy_input)
-        
+
         # Value input: teacher observations + encoder latents
         value_input = th.cat([obs["teacher"], z], dim=-1)
         values = self.value_net_custom(value_input)
@@ -138,23 +141,23 @@ class CTSPolicy(ActorCriticPolicy):
         dist = self._get_action_dist_from_latent(policy_features)
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
-        
+
         return values, log_prob, entropy
 
     def predict_values(self, obs):
         mask = obs["teacher_mask"].bool()
         z_t = self.privileged_encoder(obs["teacher"])
+        # Use no_grad to prevent gradients from policy/value losses
         with th.no_grad():
-            # Use stacked observations for proprio encoder
             z_s = self.proprio_encoder(obs["stacked_obs"])
-        
+
         # Combine encodings based on mask
         z = th.where(mask, z_t, z_s)
-        
+
         # Value input: teacher observations + encoder latents
         value_input = th.cat([obs["teacher"], z], dim=-1)
         values = self.value_net_custom(value_input)
-        
+
         return values
 
 
@@ -169,6 +172,7 @@ class CTSPPO(PPO):
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
+        self.rollout_buffer_kwargs["device"] = "cuda:0"
 
         if self.rollout_buffer_class is None:
             if isinstance(self.observation_space, spaces.Dict):
@@ -215,6 +219,7 @@ class CTSPPO(PPO):
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
         # Optional: clip range for the value function
+        clip_range_vf = None  # Initialize to None by default
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
 
@@ -268,7 +273,7 @@ class CTSPPO(PPO):
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
 
-                if self.clip_range_vf is None:
+                if clip_range_vf is None:
                     # No clipping
                     values_pred = values
                 else:
@@ -294,17 +299,18 @@ class CTSPPO(PPO):
 
                 entropy_losses.append(entropy_loss.item())
 
-                with th.no_grad():
-                    # reconstruction between encoders
-                    z_t = self.policy.privileged_encoder(
-                        rollout_data.observations["teacher"].to(self.device)
-                    )
-                # Use stacked observations for proprio encoder
+                # Reconstruction loss between encoders - fix memory leak
+                # Compute both encodings with gradient tracking for reconstruction loss
+                z_t = self.policy.privileged_encoder(
+                    rollout_data.observations["teacher"].to(self.device)
+                )
                 z_s = self.policy.proprio_encoder(
                     rollout_data.observations["stacked_obs"].to(self.device)
                 )
 
-                loss_rec = F.mse_loss(z_s, z_t)
+                loss_rec = F.mse_loss(
+                    z_s, z_t.detach()
+                )  # Detach z_t to prevent double backprop
 
                 # total
                 loss = (
@@ -341,14 +347,110 @@ class CTSPPO(PPO):
                 self.policy.optimizer.step()
 
             self._n_updates += 1
+            
             if not continue_training:
                 break
+
+        # Log statistics
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_range", clip_range)
+        self.logger.record(
+            "train/learning_rate", self.policy.optimizer.param_groups[0]["lr"]
+        )
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+
+    def _analyze_cuda_memory(self, step_name=""):
+        """Analyze CUDA memory usage with detailed breakdown"""
+        if not th.cuda.is_available():
+            return
+            
+        print(f"\n[CUDA] Memory analysis - {step_name}")
+        print(f"[CUDA] Allocated: {th.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"[CUDA] Reserved: {th.cuda.memory_reserved() / 1024**2:.2f} MB")
+        
+        try:
+            snapshot = th.cuda.memory_snapshot()
+            allocations = []
+            
+            for segment in snapshot:
+                for block in segment["blocks"]:
+                    if block["state"] == "active_alloc":
+                        allocations.append({
+                            'size': block['size'],
+                            'filename': block.get('filename', 'unknown'),
+                            'line': block.get('line', 0),
+                            'stack': block.get('frames', [])
+                        })
+            
+            # Sort by size (largest first)
+            allocations.sort(key=lambda x: x['size'], reverse=True)
+            
+            print(f"[CUDA] Top 10 persistent allocations:")
+            for i, alloc in enumerate(allocations[:10]):
+                print(f"  {i+1}. Size: {alloc['size']/1024**2:.2f} MB")
+                print(f"     Location: {alloc['filename']}:{alloc['line']}")
+                
+                # Show stack trace for large allocations
+                if alloc['size'] > 1024**2:  # > 1MB
+                    print(f"     Stack trace:")
+                    for frame in alloc['stack'][:5]:  # Show top 5 frames
+                        print(f"       {frame.get('filename', 'unknown')}:{frame.get('line', 0)} in {frame.get('name', 'unknown')}")
+                print()
+                
+            # Group by location
+            location_groups = {}
+            for alloc in allocations:
+                key = f"{alloc['filename']}:{alloc['line']}"
+                if key not in location_groups:
+                    location_groups[key] = {'count': 0, 'total_size': 0}
+                location_groups[key]['count'] += 1
+                location_groups[key]['total_size'] += alloc['size']
+            
+            print(f"[CUDA] Memory by location (top 5):")
+            sorted_locations = sorted(location_groups.items(), key=lambda x: x[1]['total_size'], reverse=True)
+            for location, info in sorted_locations[:5]:
+                print(f"  {location}: {info['total_size']/1024**2:.2f} MB ({info['count']} allocations)")
+                
+        except Exception as e:
+            print(f"[CUDA] memory_snapshot() failed: {e}")
+            
+        # Find Python objects holding CUDA tensors
+        try:
+            cuda_objects = []
+            for obj in gc.get_objects():
+                if hasattr(obj, 'is_cuda') and obj.is_cuda:
+                    cuda_objects.append({
+                        'type': type(obj).__name__,
+                        'size': obj.numel() * obj.element_size() if hasattr(obj, 'numel') else 0,
+                        'shape': tuple(obj.shape) if hasattr(obj, 'shape') else 'unknown',
+                        'dtype': str(obj.dtype) if hasattr(obj, 'dtype') else 'unknown'
+                    })
+            
+            # Group by type and size
+            type_groups = {}
+            for obj in cuda_objects:
+                obj_type = obj['type']
+                if obj_type not in type_groups:
+                    type_groups[obj_type] = {'count': 0, 'total_size': 0}
+                type_groups[obj_type]['count'] += 1
+                type_groups[obj_type]['total_size'] += obj['size']
+            
+            print(f"[CUDA] Python objects holding CUDA memory:")
+            sorted_types = sorted(type_groups.items(), key=lambda x: x[1]['total_size'], reverse=True)
+            for obj_type, info in sorted_types[:5]:
+                print(f"  {obj_type}: {info['total_size']/1024**2:.2f} MB ({info['count']} objects)")
+                
+        except Exception as e:
+            print(f"[CUDA] Python object analysis failed: {e}")
 
     def collect_rollouts(
         self,
         env: VecEnv,
         callback: BaseCallback,
-        rollout_buffer: RolloutBuffer,
+        rollout_buffer: DictRolloutBuffer,
         n_rollout_steps: int,
     ) -> bool:
         """
@@ -416,31 +518,41 @@ class CTSPPO(PPO):
                 clipped_actions.to(env.sim_device)
             )
 
+            # Ensure tensors are on correct device and avoid redundant transfers
             new_obs = {k: v.to(self.device) for k, v in new_obs.items()}
             rewards = rewards.to(self.device)
             dones = dones.to(self.device)
 
+            # if th.cuda.is_available() and n_steps % 200 == 0:
+            #     self._analyze_cuda_memory(f"after env step - step {n_steps}")
+
             self.num_timesteps += env.num_envs
 
-            infos: dict
-            # Record infos
-            if "episode" in infos:
-                self.ep_infos.append(infos["episode"])
-            elif "log" in infos:
-                self.ep_infos.append(infos["log"])
+            # infos: dict
+            # # Record infos
+            # if "episode" in infos:
+            #     self.ep_infos.append(infos["episode"])
+            # elif "log" in infos:
+            #     self.ep_infos.append(infos["log"])
 
-            self.cur_reward_sum += rewards.to(self.device)
+            self.cur_reward_sum += rewards.clone().detach()
             self.cur_episode_length += 1.0
-            new_ids = (dones > 0).nonzero(as_tuple=False).to(self.device)
-            # record reward and episode length
-            self.rewbuffer.extend(
-                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.lenbuffer.extend(
-                self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
-            )
-            self.cur_reward_sum[new_ids] = 0
-            self.cur_episode_length[new_ids] = 0
+            new_ids = (dones > 0).nonzero(as_tuple=False)
+
+            # record reward and episode length - use detach() to avoid gradient tracking
+            if len(new_ids) > 0:
+                self.rewbuffer.extend(
+                    self.cur_reward_sum[new_ids][:, 0].detach().cpu().numpy().tolist()
+                )
+                self.lenbuffer.extend(
+                    self.cur_episode_length[new_ids][:, 0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .tolist()
+                )
+                self.cur_reward_sum[new_ids] = 0
+                self.cur_episode_length[new_ids] = 0
 
             # Give access to local variables
             callback.update_locals(locals())
@@ -462,28 +574,31 @@ class CTSPPO(PPO):
                 )
 
             rollout_buffer.add(
-                {k: v.to(self.device) for k, v in self._last_obs.items()},  # type: ignore[arg-type]
-                actions.to(self.device),
-                rewards.to(self.device),
-                self._last_episode_starts.to(self.device),  # type: ignore[arg-type]
-                values.to(self.device),
-                log_probs.to(self.device),
+                self._last_obs,  # type: ignore[arg-type]
+                actions,
+                rewards,  # Already on device
+                self._last_episode_starts,  # type: ignore[arg-type]
+                values,
+                log_probs,
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
 
+        gc.collect()
+
+            
         with th.inference_mode():
             # Compute value for the last timestep
             values = self.policy.predict_values(
-                {k: v.to(self.device) for k, v in new_obs.items()}
-            )  # type: ignore[arg-type]
+                new_obs
+            )  
 
         rollout_buffer.compute_returns_and_advantage(
-            last_values=values.to(rollout_buffer.device),
-            dones=dones.to(rollout_buffer.device),
+            last_values=values.detach().to(rollout_buffer.device),
+            dones=dones.detach().to(rollout_buffer.device),
         )
 
-        callback.update_locals(locals())
+        # callback.update_locals(locals())
 
         callback.on_rollout_end()
 
@@ -582,12 +697,23 @@ class CTSPPO(PPO):
                 else:
                     self.logger.record("Episode/" + key, value)
 
-        self.logger.record("Episode/average_episodic_reward", np.mean(self.rewbuffer))
-        self.logger.record("Episode/average_episodic_length", np.mean(self.lenbuffer))
-        self.logger.record(
-            "Episode/episodic_reward", th.max(self.cur_episode_length).item()
-        )
-        self.logger.record(
-            "Episode/episodic_length", th.max(self.cur_reward_sum).item()
-        )
+        if len(self.rewbuffer) > 0:
+            self.logger.record(
+                "Episode/average_episodic_reward", np.mean(self.rewbuffer)
+            )
+        if len(self.lenbuffer) > 0:
+            self.logger.record(
+                "Episode/average_episodic_length", np.mean(self.lenbuffer)
+            )
+
+        # Use detach() to avoid memory leaks when converting to scalar
+        if len(self.cur_reward_sum) > 0:
+            self.logger.record(
+                "Episode/episodic_reward", th.max(self.cur_reward_sum).detach().item()
+            )
+        if len(self.cur_episode_length) > 0:
+            self.logger.record(
+                "Episode/episodic_length",
+                th.max(self.cur_episode_length).detach().item(),
+            )
         self.logger.dump(step=self.num_timesteps)
