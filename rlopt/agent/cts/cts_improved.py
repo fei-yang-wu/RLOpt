@@ -90,12 +90,10 @@ class CTSPolicy(ActorCriticPolicy):
         mask = obs["teacher_mask"].bool()
         z_t = self.privileged_encoder(obs["teacher"])
         # Encode proprioceptive state from stacked observations
-        with th.no_grad():
-            # Use stacked observations for proprio encoder
-            z_s = self.proprio_encoder(obs["stacked_obs"])
+        z_s = self.proprio_encoder(obs["stacked_obs"])
         
         # Combine encodings based on mask for policy input
-        z = th.where(mask, z_t, z_s)
+        z = th.where(mask.unsqueeze(-1), z_t, z_s)
         
         # Policy input: student observations + encoder latents
         policy_input = th.cat([obs["student"], z], dim=-1)
@@ -120,12 +118,10 @@ class CTSPolicy(ActorCriticPolicy):
         mask = obs["teacher_mask"].bool()
         z_t = self.privileged_encoder(obs["teacher"])
         # Encode proprioceptive state from stacked observations
-        with th.no_grad():
-            # Use stacked observations for proprio encoder
-            z_s = self.proprio_encoder(obs["stacked_obs"])
+        z_s = self.proprio_encoder(obs["stacked_obs"])
         
         # Combine encodings based on mask
-        z = th.where(mask, z_t, z_s)
+        z = th.where(mask.unsqueeze(-1), z_t, z_s)
         
         # Policy input: student observations + encoder latents
         policy_input = th.cat([obs["student"], z], dim=-1)
@@ -144,12 +140,10 @@ class CTSPolicy(ActorCriticPolicy):
     def predict_values(self, obs):
         mask = obs["teacher_mask"].bool()
         z_t = self.privileged_encoder(obs["teacher"])
-        with th.no_grad():
-            # Use stacked observations for proprio encoder
-            z_s = self.proprio_encoder(obs["stacked_obs"])
+        z_s = self.proprio_encoder(obs["stacked_obs"])
         
         # Combine encodings based on mask
-        z = th.where(mask, z_t, z_s)
+        z = th.where(mask.unsqueeze(-1), z_t, z_s)
         
         # Value input: teacher observations + encoder latents
         value_input = th.cat([obs["teacher"], z], dim=-1)
