@@ -164,17 +164,17 @@ class PPO(OnPolicyAlgorithm):
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
         if normalize_advantage:
-            assert (
-                batch_size > 1
-            ), "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
+            assert batch_size > 1, (
+                "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
+            )
 
         if self.env is not None:
             # Check that `n_steps * n_envs > 1` to avoid NaN
             # when doing advantage normalization
             buffer_size = self.env.num_envs * self.n_steps
-            assert buffer_size > 1 or (
-                not normalize_advantage
-            ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
+            assert buffer_size > 1 or (not normalize_advantage), (
+                f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
+            )
             # Check that the rollout buffer size is a multiple of the mini-batch size
             untruncated_batches = buffer_size // batch_size
             if buffer_size % batch_size > 0:
@@ -412,7 +412,6 @@ class PPO(OnPolicyAlgorithm):
         # print("Time before main loop: ", (time.time_ns() - time_now) / 1e9)
 
         while n_steps < n_rollout_steps:
-
             if (
                 self.use_sde
                 and self.sde_sample_freq > 0
@@ -649,7 +648,6 @@ def compute_ppo_loss(
     ent_coef,
     vf_coef,
 ):
-
     values, log_prob, entropy = policy.evaluate_actions(observations, actions)
     values = values.flatten()
 

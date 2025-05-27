@@ -1,164 +1,157 @@
 from __future__ import annotations
 
+import gc
 import time
 from collections import deque
-from typing import Dict, Tuple
+from typing import Optional, Union
 
 import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common import utils
+from stable_baselines3.common import preprocessing, utils
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.type_aliases import MaybeCallback
-from stable_baselines3.common.utils import get_schedule_fn
+from stable_baselines3.common.torch_layers import (
+    BaseFeaturesExtractor,
+    CombinedExtractor,
+    FlattenExtractor,
+    MlpExtractor,
+    NatureCNN,
+    create_mlp,
+)
+from stable_baselines3.common.type_aliases import MaybeCallback, PyTorchObs
+from stable_baselines3.common.utils import get_device, get_schedule_fn
 from stable_baselines3.common.vec_env import VecEnv
 
 from rlopt.common import DictRolloutBuffer
-import gc
 
 
 class CTSPolicy(ActorCriticPolicy):
     def __init__(
-        self, *args, latent_dim=128, stack_size=5, teacher_mask=None, **kwargs
+        self,
+        *args,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
-
-        # Get dimensions
-        teacher_dim = self.observation_space["teacher"].shape[0]
-        student_dim = self.observation_space["stacked_obs"].shape[0]
-        student_obs_dim = self.observation_space["student"].shape[0]
-
-        # Privileged encoder on obs["teacher"]
-        self.privileged_encoder = nn.Sequential(
-            nn.Linear(teacher_dim, 128),
-            nn.ELU(),
-            nn.Linear(128, latent_dim),
-            nn.ELU(),
-        )
-
-        # Proprio encoder on obs["stacked_obs"]
-        self.proprio_encoder = nn.Sequential(
-            nn.Linear(student_dim, 128),
-            nn.ELU(),
-            nn.Linear(128, latent_dim),
-            nn.ELU(),
-        )
-
-        # Policy network: takes student observations + encoder latents
-        policy_input_dim = student_obs_dim + latent_dim
-        self.policy_net = nn.Sequential(
-            nn.Linear(policy_input_dim, 256),
-            nn.ELU(),
-            nn.Linear(256, 128),
-            nn.ELU(),
-        )
-
-        # Value network: takes teacher observations + encoder latents
-        value_input_dim = teacher_dim + latent_dim
-        self.value_net_custom = nn.Sequential(
-            nn.Linear(value_input_dim, 256),
-            nn.ELU(),
-            nn.Linear(256, 128),
-            nn.ELU(),
-            nn.Linear(128, 1),
-        )
-
-        # Override features_dim for SB3 compatibility
-        self.features_dim = 128
-        self._build_mlp_extractor()
-
-        self.stack_size = stack_size
-        self.latent_dim = latent_dim
-
-        if teacher_mask is not None:
-            self.teacher_mask = teacher_mask.to(self.device)
-        else:
-            self.teacher_mask = None
-
-    def forward(self, obs, deterministic=False):
-        # Validate input
-        assert isinstance(obs, dict), "Observations must be a dictionary"
         assert (
-            "teacher" in obs and "student" in obs
-        ), "Teacher and student observations must be present"
-        assert "stacked_obs" in obs, "Stacked observations must be present"
+            self.share_features_extractor is False
+        ), "share_features_extractor must be False"
+        print(self.mlp_extractor)
 
-        # Get teacher mask and encode privileged state
-        mask = obs["teacher_mask"].bool()
-        z_t = self.privileged_encoder(obs["teacher"])
-        # Encode proprioceptive state from stacked observations
-        # Use no_grad to prevent gradients from policy/value losses
-        with th.no_grad():
-            z_s = self.proprio_encoder(obs["stacked_obs"])
+    def make_features_extractor(self) -> BaseFeaturesExtractor:
+        """Create a custom features extractor for the CTS policy."""
+        return CTSExtractor(
+            self.observation_space,  # type: ignore[arg-type]
+            features_dim=256,
+            activation_fn=nn.ELU,
+        )
 
-        # Combine encodings based on mask for policy input
-        z = th.where(mask, z_t, z_s)
+    def extract_features(  # type: ignore[override]
+        self,
+        obs: PyTorchObs,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        preprocessed_obs = preprocessing.preprocess_obs(
+            obs, self.observation_space, normalize_images=self.normalize_images
+        )
+        return self.features_extractor(preprocessed_obs)
 
-        # Policy input: student observations + encoder latents
-        policy_input = th.cat([obs["student"], z], dim=-1)
-        policy_features = self.policy_net(policy_input)
+    def _build_mlp_extractor(self) -> None:
+        """
+        Create the policy and value networks.
+        Part of the layers can be shared.
+        """
+        # Note: If net_arch is None and some features extractor is used,
+        #       net_arch here is an empty list and mlp_extractor does not
+        #       really contain any layers (acts like an identity module).
+        self.mlp_extractor = CTSMlpExtractor(  # type: ignore[assignment]
+            (
+                int(self.features_dim + self.observation_space["student"].shape[0]),  # type: ignore[index]
+                int(self.features_dim + self.observation_space["teacher"].shape[0]),  # type: ignore[index]
+            ),
+            net_arch=self.net_arch,
+            activation_fn=self.activation_fn,
+            device=self.device,
+        )
 
-        # Value input: teacher observations + encoder latents
-        value_input = th.cat([obs["teacher"], z], dim=-1)
-        values = self.value_net_custom(value_input)
+    def forward(
+        self, obs: th.Tensor | dict, deterministic: bool = False
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
 
-        # Use policy features for action distribution
-        dist = self._get_action_dist_from_latent(policy_features)
-        actions = dist.get_actions(deterministic=deterministic)
-        log_prob = dist.log_prob(actions)
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        assert isinstance(obs, dict), "obs must be a dictionary"
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
 
+        # Use teacher features for policy and value
+        teacher_features, stacked_student_features, student_features = features
+
+        pi_features = th.where(
+            obs["teacher_mask"].bool(),
+            teacher_features,
+            stacked_student_features.detach(),
+        )
+
+        vf_features = teacher_features
+        pi_features = th.cat((pi_features, obs["student"]), dim=-1)
+        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
+        latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        latent_vf = self.mlp_extractor.forward_critic(vf_features)
+
+        # Evaluate the values for the given observations
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
         return actions, values, log_prob
 
-    def _predict(self, observation, deterministic=False):
-        return self.forward(observation, deterministic)[0]
+    def evaluate_actions(
+        self, obs: PyTorchObs, actions: th.Tensor
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor | None]:
+        assert isinstance(obs, dict), "obs must be a dictionary"
+        features = self.extract_features(obs)
+        teacher_features, stacked_student_features, student_features = features
+        pi_features = th.where(
+            obs["teacher_mask"].bool(),
+            teacher_features,
+            stacked_student_features.detach(),
+        )
+        vf_features = teacher_features
+        pi_features = th.cat((pi_features, obs["student"]), dim=-1)
+        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
+        latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        latent_vf = self.mlp_extractor.forward_critic(vf_features)
 
-    def evaluate_actions(self, obs, actions):
-        # Get teacher mask and encode privileged state
-        mask = obs["teacher_mask"].bool()
-        z_t = self.privileged_encoder(obs["teacher"])
-        # Encode proprioceptive state from stacked observations
-        # Use no_grad to prevent gradients from policy/value losses
-        with th.no_grad():
-            z_s = self.proprio_encoder(obs["stacked_obs"])
-
-        # Combine encodings based on mask
-        z = th.where(mask, z_t, z_s)
-
-        # Policy input: student observations + encoder latents
-        policy_input = th.cat([obs["student"], z], dim=-1)
-        policy_features = self.policy_net(policy_input)
-
-        # Value input: teacher observations + encoder latents
-        value_input = th.cat([obs["teacher"], z], dim=-1)
-        values = self.value_net_custom(value_input)
-
-        dist = self._get_action_dist_from_latent(policy_features)
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
-
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        entropy = distribution.entropy()
         return values, log_prob, entropy
 
-    def predict_values(self, obs):
-        mask = obs["teacher_mask"].bool()
-        z_t = self.privileged_encoder(obs["teacher"])
-        # Use no_grad to prevent gradients from policy/value losses
-        with th.no_grad():
-            z_s = self.proprio_encoder(obs["stacked_obs"])
+    def predict_values(self, obs: PyTorchObs) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
 
-        # Combine encodings based on mask
-        z = th.where(mask, z_t, z_s)
-
-        # Value input: teacher observations + encoder latents
-        value_input = th.cat([obs["teacher"], z], dim=-1)
-        values = self.value_net_custom(value_input)
-
-        return values
+        :param obs: Observation
+        :return: the estimated values.
+        """
+        assert isinstance(obs, dict), "obs must be a dictionary"
+        features = self.extract_features(obs)
+        teacher_features, _, _ = features
+        vf_features = teacher_features
+        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
+        latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        return self.value_net(latent_vf)
 
 
 class CTSPPO(PPO):
@@ -301,16 +294,19 @@ class CTSPPO(PPO):
 
                 # Reconstruction loss between encoders - fix memory leak
                 # Compute both encodings with gradient tracking for reconstruction loss
-                z_t = self.policy.privileged_encoder(
-                    rollout_data.observations["teacher"].to(self.device)
+                assert isinstance(self.policy, CTSPolicy)
+                teacher_features, stacked_student_features, student_features = (
+                    self.policy.extract_features(
+                        {
+                            "teacher": rollout_data.observations["teacher"],
+                            "stacked_obs": rollout_data.observations["stacked_obs"],
+                            "student": rollout_data.observations["student"],
+                        }
+                    )
                 )
-                z_s = self.policy.proprio_encoder(
-                    rollout_data.observations["stacked_obs"].to(self.device)
-                )
-
                 loss_rec = F.mse_loss(
-                    z_s, z_t.detach()
-                )  # Detach z_t to prevent double backprop
+                    stacked_student_features, teacher_features.detach()
+                )
 
                 # total
                 loss = (
@@ -347,7 +343,7 @@ class CTSPPO(PPO):
                 self.policy.optimizer.step()
 
             self._n_updates += 1
-            
+
             if not continue_training:
                 break
 
@@ -366,83 +362,105 @@ class CTSPPO(PPO):
         """Analyze CUDA memory usage with detailed breakdown"""
         if not th.cuda.is_available():
             return
-            
+
         print(f"\n[CUDA] Memory analysis - {step_name}")
         print(f"[CUDA] Allocated: {th.cuda.memory_allocated() / 1024**2:.2f} MB")
         print(f"[CUDA] Reserved: {th.cuda.memory_reserved() / 1024**2:.2f} MB")
-        
+
         try:
             snapshot = th.cuda.memory_snapshot()
             allocations = []
-            
+
             for segment in snapshot:
                 for block in segment["blocks"]:
                     if block["state"] == "active_alloc":
-                        allocations.append({
-                            'size': block['size'],
-                            'filename': block.get('filename', 'unknown'),
-                            'line': block.get('line', 0),
-                            'stack': block.get('frames', [])
-                        })
-            
+                        allocations.append(
+                            {
+                                "size": block["size"],
+                                "filename": block.get("filename", "unknown"),
+                                "line": block.get("line", 0),
+                                "stack": block.get("frames", []),
+                            }
+                        )
+
             # Sort by size (largest first)
-            allocations.sort(key=lambda x: x['size'], reverse=True)
-            
+            allocations.sort(key=lambda x: x["size"], reverse=True)
+
             print(f"[CUDA] Top 10 persistent allocations:")
             for i, alloc in enumerate(allocations[:10]):
-                print(f"  {i+1}. Size: {alloc['size']/1024**2:.2f} MB")
+                print(f"  {i + 1}. Size: {alloc['size'] / 1024**2:.2f} MB")
                 print(f"     Location: {alloc['filename']}:{alloc['line']}")
-                
+
                 # Show stack trace for large allocations
-                if alloc['size'] > 1024**2:  # > 1MB
+                if alloc["size"] > 1024**2:  # > 1MB
                     print(f"     Stack trace:")
-                    for frame in alloc['stack'][:5]:  # Show top 5 frames
-                        print(f"       {frame.get('filename', 'unknown')}:{frame.get('line', 0)} in {frame.get('name', 'unknown')}")
+                    for frame in alloc["stack"][:5]:  # Show top 5 frames
+                        print(
+                            f"       {frame.get('filename', 'unknown')}:{frame.get('line', 0)} in {frame.get('name', 'unknown')}"
+                        )
                 print()
-                
+
             # Group by location
             location_groups = {}
             for alloc in allocations:
                 key = f"{alloc['filename']}:{alloc['line']}"
                 if key not in location_groups:
-                    location_groups[key] = {'count': 0, 'total_size': 0}
-                location_groups[key]['count'] += 1
-                location_groups[key]['total_size'] += alloc['size']
-            
+                    location_groups[key] = {"count": 0, "total_size": 0}
+                location_groups[key]["count"] += 1
+                location_groups[key]["total_size"] += alloc["size"]
+
             print(f"[CUDA] Memory by location (top 5):")
-            sorted_locations = sorted(location_groups.items(), key=lambda x: x[1]['total_size'], reverse=True)
+            sorted_locations = sorted(
+                location_groups.items(), key=lambda x: x[1]["total_size"], reverse=True
+            )
             for location, info in sorted_locations[:5]:
-                print(f"  {location}: {info['total_size']/1024**2:.2f} MB ({info['count']} allocations)")
-                
+                print(
+                    f"  {location}: {info['total_size'] / 1024**2:.2f} MB ({info['count']} allocations)"
+                )
+
         except Exception as e:
             print(f"[CUDA] memory_snapshot() failed: {e}")
-            
+
         # Find Python objects holding CUDA tensors
         try:
             cuda_objects = []
             for obj in gc.get_objects():
-                if hasattr(obj, 'is_cuda') and obj.is_cuda:
-                    cuda_objects.append({
-                        'type': type(obj).__name__,
-                        'size': obj.numel() * obj.element_size() if hasattr(obj, 'numel') else 0,
-                        'shape': tuple(obj.shape) if hasattr(obj, 'shape') else 'unknown',
-                        'dtype': str(obj.dtype) if hasattr(obj, 'dtype') else 'unknown'
-                    })
-            
+                if hasattr(obj, "is_cuda") and obj.is_cuda:
+                    cuda_objects.append(
+                        {
+                            "type": type(obj).__name__,
+                            "size": (
+                                obj.numel() * obj.element_size()
+                                if hasattr(obj, "numel")
+                                else 0
+                            ),
+                            "shape": (
+                                tuple(obj.shape) if hasattr(obj, "shape") else "unknown"
+                            ),
+                            "dtype": (
+                                str(obj.dtype) if hasattr(obj, "dtype") else "unknown"
+                            ),
+                        }
+                    )
+
             # Group by type and size
             type_groups = {}
             for obj in cuda_objects:
-                obj_type = obj['type']
+                obj_type = obj["type"]
                 if obj_type not in type_groups:
-                    type_groups[obj_type] = {'count': 0, 'total_size': 0}
-                type_groups[obj_type]['count'] += 1
-                type_groups[obj_type]['total_size'] += obj['size']
-            
+                    type_groups[obj_type] = {"count": 0, "total_size": 0}
+                type_groups[obj_type]["count"] += 1
+                type_groups[obj_type]["total_size"] += obj["size"]
+
             print(f"[CUDA] Python objects holding CUDA memory:")
-            sorted_types = sorted(type_groups.items(), key=lambda x: x[1]['total_size'], reverse=True)
+            sorted_types = sorted(
+                type_groups.items(), key=lambda x: x[1]["total_size"], reverse=True
+            )
             for obj_type, info in sorted_types[:5]:
-                print(f"  {obj_type}: {info['total_size']/1024**2:.2f} MB ({info['count']} objects)")
-                
+                print(
+                    f"  {obj_type}: {info['total_size'] / 1024**2:.2f} MB ({info['count']} objects)"
+                )
+
         except Exception as e:
             print(f"[CUDA] Python object analysis failed: {e}")
 
@@ -523,17 +541,14 @@ class CTSPPO(PPO):
             rewards = rewards.to(self.device)
             dones = dones.to(self.device)
 
-            # if th.cuda.is_available() and n_steps % 200 == 0:
-            #     self._analyze_cuda_memory(f"after env step - step {n_steps}")
-
             self.num_timesteps += env.num_envs
 
-            # infos: dict
-            # # Record infos
-            # if "episode" in infos:
-            #     self.ep_infos.append(infos["episode"])
-            # elif "log" in infos:
-            #     self.ep_infos.append(infos["log"])
+            infos: dict
+            # Record infos
+            if "episode" in infos:
+                self.ep_infos.append(infos["episode"])
+            elif "log" in infos:
+                self.ep_infos.append(infos["log"])
 
             self.cur_reward_sum += rewards.clone().detach()
             self.cur_episode_length += 1.0
@@ -586,19 +601,16 @@ class CTSPPO(PPO):
 
         gc.collect()
 
-            
         with th.inference_mode():
             # Compute value for the last timestep
-            values = self.policy.predict_values(
-                new_obs
-            )  
+            values = self.policy.predict_values(new_obs)
 
         rollout_buffer.compute_returns_and_advantage(
             last_values=values.detach().to(rollout_buffer.device),
             dones=dones.detach().to(rollout_buffer.device),
         )
 
-        # callback.update_locals(locals())
+        callback.update_locals(locals())
 
         callback.on_rollout_end()
 
@@ -671,7 +683,7 @@ class CTSPPO(PPO):
 
         return total_timesteps, callback
 
-    def _dump_logs(self, iteration: int) -> None:
+    def dump_logs(self, iteration: int) -> None:
         """
         Write log.
 
@@ -717,3 +729,123 @@ class CTSPPO(PPO):
                 th.max(self.cur_episode_length).detach().item(),
             )
         self.logger.dump(step=self.num_timesteps)
+
+
+class CTSExtractor(BaseFeaturesExtractor):
+    """
+    Custom features extractor for Concurrent Teacher-Student policy.
+    Handles three observation spaces: teacher, stacked_student, and student.
+    Returns a dictionary of features for each observation type.
+    """
+
+    def __init__(
+        self,
+        observation_space: spaces.Dict,
+        features_dim: int = 256,
+        activation_fn: type[nn.Module] = nn.ELU,
+        latent_dims: tuple[int, int, int] = (512, 512, 512),
+    ):
+        if not isinstance(observation_space, spaces.Dict):
+            value_error = "CTSExtractor requires a Dict observation space"
+            raise ValueError(value_error)
+
+        super().__init__(observation_space, features_dim)
+
+        # Get dimensions from observation space
+        self.teacher_dim = observation_space["teacher"].shape[0]  # type: ignore[index]
+        self.stacked_student_dim = observation_space["stacked_obs"].shape[0]  # type: ignore[index]
+        self.student_dim = observation_space["student"].shape[0]  # type: ignore[index]
+        self.teacher_latent_dims = latent_dims[0]
+        self.stacked_student_latent_dims = latent_dims[1]
+        self.student_latent_dims = latent_dims[2]
+
+        # Create MLP extractors for each observation space
+        self.teacher_encoder = nn.Sequential(
+            nn.Linear(self.teacher_dim, self.teacher_latent_dims),
+            activation_fn(),
+            nn.Linear(self.teacher_latent_dims, features_dim),
+            activation_fn(),
+        )
+
+        self.stacked_student_encoder = nn.Sequential(
+            nn.Linear(self.stacked_student_dim, self.stacked_student_latent_dims),
+            activation_fn(),
+            nn.Linear(self.stacked_student_latent_dims, features_dim),
+            activation_fn(),
+        )
+
+        self.student_encoder = nn.Sequential(
+            nn.Linear(self.student_dim, self.student_latent_dims),
+            activation_fn(),
+            nn.Linear(self.student_latent_dims, features_dim),
+            activation_fn(),
+        )
+
+        # Update features_dim to match the size of each feature vector
+        self._features_dim = features_dim
+
+    def forward(
+        self, observations: dict[str, th.Tensor]
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Extract features from each observation space and return them as a dictionary.
+
+        :param observations: Dictionary containing teacher, stacked_obs, and student observations
+        :return: Dictionary containing extracted features for each observation type
+        """
+        # Extract features from each observation space
+        teacher_features = self.teacher_encoder(observations["teacher"])
+        stacked_student_features = self.stacked_student_encoder(
+            observations["stacked_obs"]
+        )
+        student_features = self.student_encoder(observations["student"])
+
+        return (
+            teacher_features,
+            stacked_student_features,
+            student_features,
+        )
+
+
+class CTSMlpExtractor(MlpExtractor):
+
+    def __init__(
+        self,
+        feature_dims: tuple[int, int],
+        net_arch: list[int] | dict[str, list[int]],
+        activation_fn: type[nn.Module],
+        device: th.device | str = "auto",
+    ) -> None:
+        super(MlpExtractor, self).__init__()
+        device = get_device(device)
+        policy_net: list[nn.Module] = []
+        value_net: list[nn.Module] = []
+        last_layer_dim_pi = feature_dims[0]
+        last_layer_dim_vf = feature_dims[1]
+
+        # save dimensions of layers in policy and value nets
+        if isinstance(net_arch, dict):
+            # Note: if key is not specified, assume linear network
+            pi_layers_dims = net_arch.get("pi", [])  # Layer sizes of the policy network
+            vf_layers_dims = net_arch.get("vf", [])  # Layer sizes of the value network
+        else:
+            pi_layers_dims = vf_layers_dims = net_arch
+        # Iterate through the policy layers and build the policy net
+        for curr_layer_dim in pi_layers_dims:
+            policy_net.append(nn.Linear(last_layer_dim_pi, curr_layer_dim))
+            policy_net.append(activation_fn())
+            last_layer_dim_pi = curr_layer_dim
+        # Iterate through the value layers and build the value net
+        for curr_layer_dim in vf_layers_dims:
+            value_net.append(nn.Linear(last_layer_dim_vf, curr_layer_dim))
+            value_net.append(activation_fn())
+            last_layer_dim_vf = curr_layer_dim
+
+        # Save dim, used to create the distributions
+        self.latent_dim_pi = last_layer_dim_pi
+        self.latent_dim_vf = last_layer_dim_vf
+
+        # Create networks
+        # If the list of layers is empty, the network will just act as an Identity module
+        self.policy_net = nn.Sequential(*policy_net).to(device)
+        self.value_net = nn.Sequential(*value_net).to(device)
