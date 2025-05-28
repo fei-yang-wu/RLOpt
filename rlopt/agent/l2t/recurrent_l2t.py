@@ -173,8 +173,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self.policy_class = policy
 
         self.device = get_device(device)
-        if verbose >= 1:
-            print(f"Using {self.device} device")
 
         self.verbose = verbose
 
@@ -193,9 +191,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
         self._last_episode_starts = None  # type: Optional[np.ndarray]
         # When using VecNormalize:
-        self._last_original_obs = (
-            None
-        )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
+        self._last_original_obs = None  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
         self._episode_num = 0
         # Used for gSDE only
         self.use_sde = use_sde
@@ -280,17 +276,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
         if normalize_advantage:
-            assert (
-                batch_size > 1
-            ), "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
+            assert batch_size > 1, (
+                "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
+            )
 
         if self.env is not None:
             # Check that `n_steps * n_envs > 1` to avoid NaN
             # when doing advantage normalization
             buffer_size = self.env.num_envs * self.n_steps
-            assert buffer_size > 1 or (
-                not normalize_advantage
-            ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
+            assert buffer_size > 1 or (not normalize_advantage), (
+                f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
+            )
             # Check that the rollout buffer size is a multiple of the mini-batch size
             untruncated_batches = buffer_size // batch_size
             if buffer_size % batch_size > 0:
@@ -364,7 +360,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
         else:
             self.student_policy_class = student_policy
 
-        print("student policy kwargs", student_policy_kwargs)
         # partial_obversevation_space is from Environment's partial_observation_space
         self.partial_observation_space = self.observation_space["student"]  # type: ignore
         self.student_policy = self.student_policy_class(  # pytype:disable=not-instantiable
@@ -579,7 +574,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         with th.inference_mode():
             # Compute value for the last timestep
-            values = self.compiled_policy.predict_values(obs_as_tensor(new_obs["teacher"], self.device))  # type: ignore[arg-type]
+            values = self.compiled_policy.predict_values(
+                obs_as_tensor(new_obs["teacher"], self.device)
+            )  # type: ignore[arg-type]
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
@@ -591,8 +588,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def _update_learning_rate(
         self,
-        optimizers: Union[List[th.optim.Optimizer], th.optim.Optimizer],
-        lr: Optional[float] = None,
+        optimizers: list[th.optim.Optimizer] | th.optim.Optimizer,
+        lr: float | None = None,
     ) -> None:
         """
         Update the optimizers learning rate using the current learning rate schedule
@@ -601,9 +598,13 @@ class RecurrentL2T(OnPolicyAlgorithm):
         :param optimizers:
             An optimizer or a list of optimizers.
         """
+
         # Log the current learning rate
         self.logger.record(
-            "train/learning_rate", self.lr_schedule(self._current_progress_remaining)
+            "train/learning_rate",
+            lr
+            if lr is not None
+            else self.lr_schedule(self._current_progress_remaining),
         )
 
         if not isinstance(optimizers, list):
@@ -676,7 +677,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             # teacher is mlp so no funny business
             values, log_prob, entropy = self.compiled_policy.evaluate_actions(
-                observations, actions  # type: ignore
+                observations,
+                actions,  # type: ignore
             )
             values = values.flatten()
 
@@ -695,7 +697,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # Clip the difference between old and new value
                 # NOTE: this depends on the reward scaling
                 values_pred = values_batch + th.clamp(
-                    values - values_batch, -clip_range_vf, clip_range_vf  # type: ignore
+                    values - values_batch,
+                    -clip_range_vf,
+                    clip_range_vf,  # type: ignore
                 )
             # Value loss using the TD(gae_lambda) target
             value_loss = F.mse_loss(returns_batch, values_pred)
@@ -771,24 +775,29 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             student_losses.append(student_loss.item())
 
-            # Calculate approximate form of reverse KL Divergence for early stopping
-            # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
-            # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
-            # and Schulman blog: http://joschu.net/blog/kl-approx.html
-            # with th.no_grad():
-            #     log_ratio = log_prob - old_actions_log_prob_batch
-            #     approx_kl_div = (
-            #         th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-            #     )
-            #     approx_kl_divs.append(approx_kl_div)
+            # adaptive step size
+            with th.no_grad():
+                log_ratio = log_prob - old_actions_log_prob_batch
+                approx_kl_div = (
+                    th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                )
 
-            # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-            #     continue_training = False
-            #     if self.verbose >= 1:
-            #         print(
-            #             f"Early stopping at step {self.num_timesteps} due to reaching max kl: {approx_kl_div:.2f}"
-            #         )
-            #     break
+                # Adjust learning rate based on KL divergence
+                if self.target_kl is not None:
+                    if approx_kl_div > 2.0 * self.target_kl:
+                        self.current_lr = self.current_lr * 0.5
+                    elif approx_kl_div < 0.5 * self.target_kl:
+                        self.current_lr = self.current_lr * 2
+
+                # Log KL divergence
+                self.logger.record("train/approx_kl", float(approx_kl_div))
+
+            self._update_learning_rate(
+                [
+                    self.compiled_policy.optimizer,
+                    self.compiled_student_policy.optimizer,
+                ],
+            )
 
             # Optimization step
             self.compiled_policy.optimizer.zero_grad()
@@ -810,10 +819,6 @@ class RecurrentL2T(OnPolicyAlgorithm):
             self._n_updates += 1
             if not continue_training:
                 break
-
-            self._update_learning_rate(
-                [self.compiled_policy.optimizer, self.student_policy.optimizer]
-            )
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
@@ -858,7 +863,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
         while self.num_timesteps < total_timesteps:
             collection_start = time.time_ns()
             continue_training = self.collect_rollouts(
-                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps  # type: ignore
+                self.env,
+                callback,
+                self.rollout_buffer,
+                n_rollout_steps=self.n_steps,  # type: ignore
             )
             collection_end = time.time_ns()
             collection_time = (collection_end - collection_start) / 1e9
@@ -918,7 +926,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
             (used in recurrent policies)
         """
         return self.compiled_student_policy.predict(  # type: ignore
-            observation["student"], state, episode_start, deterministic  # type: ignore
+            observation["student"],
+            state,
+            episode_start,
+            deterministic,  # type: ignore
         )
 
     def student_predict_and_return_tensor(
@@ -942,7 +953,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
             (used in recurrent policies)
         """
         return self.compiled_student_policy.predict_and_return_tensor(  # type: ignore
-            observation["student"], state, episode_start, deterministic  # type: ignore
+            observation["student"],
+            state,
+            episode_start,
+            deterministic,  # type: ignore
         )
 
     def teacher_predict(
@@ -1017,10 +1031,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.rewbuffer = deque(maxlen=self._stats_window_size)
         self.lenbuffer = deque(maxlen=self._stats_window_size)
         self.cur_reward_sum = th.zeros(
-            self.env.num_envs, dtype=th.float, device=self.device  # type: ignore
+            self.env.num_envs,
+            dtype=th.float,
+            device=self.device,  # type: ignore
         )
         self.cur_episode_length = th.zeros(
-            self.env.num_envs, dtype=th.float, device=self.device  # type: ignore
+            self.env.num_envs,
+            dtype=th.float,
+            device=self.device,  # type: ignore
         )
 
         if self.ep_info_buffer is None or reset_num_timesteps:
@@ -1058,9 +1076,13 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Create eval callback if needed
         callback = self._init_callback(callback, progress_bar)
 
-        print(self.policy)
+        policy_str = f"Policy: {self.policy}"
+        student_policy_str = f"Student Policy: {self.student_policy}"
+        self.logger.info(policy_str)
+        self.logger.info(student_policy_str)
 
-        print(self.student_policy)
+        if not hasattr(self, "current_lr"):
+            self.current_lr = float(self.lr_schedule(self._current_progress_remaining))
 
         return total_timesteps, callback
 
@@ -1093,7 +1115,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     self.logger.record("Episode/" + key, value)
         fps = int(
             self.n_steps
-            * self.env.num_envs  # type: ignore
+            * self.env.num_envs  # type: ignore[attr-defined]
             / (locs["collection_time"] + locs["training_time"])
         )
         self.logger.record("time/fps", fps)
@@ -1123,7 +1145,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
 
     @classmethod
-    def load(  # noqa: C901
+    def load(  # type: ignore[reportIncompatibleMethodOverride]
         cls: Type[SelfRecurrentL2T],
         path: Union[str, pathlib.Path, io.BufferedIOBase],
         env: Optional[GymEnv] = None,
@@ -1356,7 +1378,6 @@ def compute_ppo_loss(
     ent_coef,
     vf_coef,
 ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-
     # ratio between old and new policy, should be one at the first iteration
     ratio = th.exp(log_prob - old_log_prob)
 
