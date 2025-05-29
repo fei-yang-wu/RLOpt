@@ -3,7 +3,8 @@ from __future__ import annotations
 import gc
 import time
 from collections import deque
-from typing import Optional, Union, Dict
+from typing import Optional, Union, Dict, Tuple
+import warnings
 
 import gymnasium as gym
 import numpy as np
@@ -70,8 +71,8 @@ class ROAPolicy(ActorCriticPolicy):
         #       really contain any layers (acts like an identity module).
         self.mlp_extractor = ROAMlpExtractor(  # type: ignore[assignment]
             (
-                int(self.features_dim + self.observation_space["student"].shape[0]),  # type: ignore[index]
-                int(self.features_dim + self.observation_space["teacher"].shape[0]),  # type: ignore[index]
+                int(self.features_dim),  # Policy uses only encoded features
+                int(self.features_dim),  # Critic uses only encoded features
             ),
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
@@ -102,8 +103,7 @@ class ROAPolicy(ActorCriticPolicy):
         )
 
         vf_features = teacher_features
-        pi_features = th.cat((pi_features, obs["student"]), dim=-1)
-        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
+        # Use only encoded features, no concatenation with raw observations
         latent_pi = self.mlp_extractor.forward_actor(pi_features)
         latent_vf = self.mlp_extractor.forward_critic(vf_features)
 
@@ -127,8 +127,7 @@ class ROAPolicy(ActorCriticPolicy):
             stacked_student_features.detach(),
         )
         vf_features = teacher_features
-        pi_features = th.cat((pi_features, obs["student"]), dim=-1)
-        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
+        # Use only encoded features, no concatenation with raw observations
         latent_pi = self.mlp_extractor.forward_actor(pi_features)
         latent_vf = self.mlp_extractor.forward_critic(vf_features)
 
@@ -149,7 +148,7 @@ class ROAPolicy(ActorCriticPolicy):
         features = self.extract_features(obs)
         teacher_features, _, _ = features
         vf_features = teacher_features
-        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
+        # Use only encoded features, no concatenation with raw observations
         latent_vf = self.mlp_extractor.forward_critic(vf_features)
         return self.value_net(latent_vf)
 
@@ -230,7 +229,7 @@ class ROAPPO(PPO):
         clip_fractions = []
         continue_training = True
         # Update lambda according to curriculum
-        lambda_latent = self.lambda_schedule(self.update_count)
+        lambda_latent = self.lambda_schedule(self._n_updates)
 
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
@@ -368,112 +367,6 @@ class ROAPPO(PPO):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-
-    def _analyze_cuda_memory(self, step_name=""):
-        """Analyze CUDA memory usage with detailed breakdown"""
-        if not th.cuda.is_available():
-            return
-
-        print(f"\n[CUDA] Memory analysis - {step_name}")
-        print(f"[CUDA] Allocated: {th.cuda.memory_allocated() / 1024**2:.2f} MB")
-        print(f"[CUDA] Reserved: {th.cuda.memory_reserved() / 1024**2:.2f} MB")
-
-        try:
-            snapshot = th.cuda.memory_snapshot()
-            allocations = []
-
-            for segment in snapshot:
-                for block in segment["blocks"]:
-                    if block["state"] == "active_alloc":
-                        allocations.append(
-                            {
-                                "size": block["size"],
-                                "filename": block.get("filename", "unknown"),
-                                "line": block.get("line", 0),
-                                "stack": block.get("frames", []),
-                            }
-                        )
-
-            # Sort by size (largest first)
-            allocations.sort(key=lambda x: x["size"], reverse=True)
-
-            print(f"[CUDA] Top 10 persistent allocations:")
-            for i, alloc in enumerate(allocations[:10]):
-                print(f"  {i + 1}. Size: {alloc['size'] / 1024**2:.2f} MB")
-                print(f"     Location: {alloc['filename']}:{alloc['line']}")
-
-                # Show stack trace for large allocations
-                if alloc["size"] > 1024**2:  # > 1MB
-                    print(f"     Stack trace:")
-                    for frame in alloc["stack"][:5]:  # Show top 5 frames
-                        print(
-                            f"       {frame.get('filename', 'unknown')}:{frame.get('line', 0)} in {frame.get('name', 'unknown')}"
-                        )
-                print()
-
-            # Group by location
-            location_groups = {}
-            for alloc in allocations:
-                key = f"{alloc['filename']}:{alloc['line']}"
-                if key not in location_groups:
-                    location_groups[key] = {"count": 0, "total_size": 0}
-                location_groups[key]["count"] += 1
-                location_groups[key]["total_size"] += alloc["size"]
-
-            print(f"[CUDA] Memory by location (top 5):")
-            sorted_locations = sorted(
-                location_groups.items(), key=lambda x: x[1]["total_size"], reverse=True
-            )
-            for location, info in sorted_locations[:5]:
-                print(
-                    f"  {location}: {info['total_size'] / 1024**2:.2f} MB ({info['count']} allocations)"
-                )
-
-        except Exception as e:
-            print(f"[CUDA] memory_snapshot() failed: {e}")
-
-        # Find Python objects holding CUDA tensors
-        try:
-            cuda_objects = []
-            for obj in gc.get_objects():
-                if hasattr(obj, "is_cuda") and obj.is_cuda:
-                    cuda_objects.append(
-                        {
-                            "type": type(obj).__name__,
-                            "size": (
-                                obj.numel() * obj.element_size()
-                                if hasattr(obj, "numel")
-                                else 0
-                            ),
-                            "shape": (
-                                tuple(obj.shape) if hasattr(obj, "shape") else "unknown"
-                            ),
-                            "dtype": (
-                                str(obj.dtype) if hasattr(obj, "dtype") else "unknown"
-                            ),
-                        }
-                    )
-
-            # Group by type and size
-            type_groups = {}
-            for obj in cuda_objects:
-                obj_type = obj["type"]
-                if obj_type not in type_groups:
-                    type_groups[obj_type] = {"count": 0, "total_size": 0}
-                type_groups[obj_type]["count"] += 1
-                type_groups[obj_type]["total_size"] += obj["size"]
-
-            print(f"[CUDA] Python objects holding CUDA memory:")
-            sorted_types = sorted(
-                type_groups.items(), key=lambda x: x[1]["total_size"], reverse=True
-            )
-            for obj_type, info in sorted_types[:5]:
-                print(
-                    f"  {obj_type}: {info['total_size'] / 1024**2:.2f} MB ({info['count']} objects)"
-                )
-
-        except Exception as e:
-            print(f"[CUDA] Python object analysis failed: {e}")
 
     def collect_rollouts(
         self,
@@ -740,6 +633,30 @@ class ROAPPO(PPO):
                 th.max(self.cur_episode_length).detach().item(),
             )
         self.logger.dump(step=self.num_timesteps)
+
+    def _excluded_save_params(self) -> list:
+        return super()._excluded_save_params() + [
+            "ep_infos",
+            "rewbuffer",
+            "lenbuffer",
+            "cur_reward_sum",
+            "cur_episode_length",
+            "_last_obs",
+            "activation_fn",
+            "start_time",
+            "learning_rate",
+            "_last_episode_starts",
+            "_last_original_obs",
+            "ep_info_buffer",
+            "observation_space",
+            "student",
+            "teacher",
+            "teacher_mask",
+            "action_space",
+            "lr_schedule",
+            "lambda_latent",
+            "lambda_schedule",
+        ]
 
 
 class ROAExtractor(BaseFeaturesExtractor):

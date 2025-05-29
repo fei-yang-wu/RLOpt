@@ -31,7 +31,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from rlopt.common import DictRolloutBuffer
 
 
-class DWMPolicy(ActorCriticPolicy):
+class DWLPolicy(ActorCriticPolicy):
     def __init__(
         self,
         *args,
@@ -44,21 +44,22 @@ class DWMPolicy(ActorCriticPolicy):
         print(self.mlp_extractor)
 
     def make_features_extractor(self) -> BaseFeaturesExtractor:
-        """Create a custom features extractor for the DWM policy."""
-        return DWMExtractor(
+        """Create a custom features extractor for the DWL policy."""
+        return DWLExtractor(
             self.observation_space,  # type: ignore[arg-type]
-            features_dim=256,
+            features_dim=24,  # Based on architecture table
             activation_fn=nn.ELU,
         )
 
     def extract_features(  # type: ignore[override]
         self,
         obs: PyTorchObs,
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        episode_starts: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor]:
         preprocessed_obs = preprocessing.preprocess_obs(
             obs, self.observation_space, normalize_images=self.normalize_images
         )
-        return self.features_extractor(preprocessed_obs)
+        return self.features_extractor(preprocessed_obs, episode_starts)
 
     def _build_mlp_extractor(self) -> None:
         """
@@ -68,10 +69,14 @@ class DWMPolicy(ActorCriticPolicy):
         # Note: If net_arch is None and some features extractor is used,
         #       net_arch here is an empty list and mlp_extractor does not
         #       really contain any layers (acts like an identity module).
-        self.mlp_extractor = DWMMlpExtractor(  # type: ignore[assignment]
+
+        # Get privileged state dimension directly from observation space
+        privileged_dim = self.observation_space["teacher"].shape[0]  # type: ignore[index]
+
+        self.mlp_extractor = DWLMlpExtractor(  # type: ignore[assignment]
             (
-                int(self.features_dim + self.observation_space["student"].shape[0]),  # type: ignore[index]
-                int(self.features_dim + self.observation_space["teacher"].shape[0]),  # type: ignore[index]
+                24,  # latent features from encoder for actor
+                privileged_dim,  # privileged state dimension for critic
             ),
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
@@ -90,22 +95,12 @@ class DWMPolicy(ActorCriticPolicy):
         """
         assert isinstance(obs, dict), "obs must be a dictionary"
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
+        latent_features, decoded_features = self.extract_features(obs)
 
-        # Use teacher features for policy and value
-        teacher_features, stacked_student_features, student_features = features
-
-        pi_features = th.where(
-            obs["teacher_mask"].bool(),
-            teacher_features,
-            stacked_student_features.detach(),
-        )
-
-        vf_features = teacher_features
-        pi_features = th.cat((pi_features, obs["student"]), dim=-1)
-        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
-        latent_pi = self.mlp_extractor.forward_actor(pi_features)
-        latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        # Actor uses latent features directly
+        latent_pi = self.mlp_extractor.forward_actor(latent_features)
+        # Critic uses privileged observations directly
+        latent_vf = self.mlp_extractor.forward_critic(obs["teacher"])
 
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
@@ -116,21 +111,17 @@ class DWMPolicy(ActorCriticPolicy):
         return actions, values, log_prob
 
     def evaluate_actions(
-        self, obs: PyTorchObs, actions: th.Tensor
+        self,
+        obs: PyTorchObs,
+        actions: th.Tensor,
+        episode_starts: th.Tensor | None = None,
     ) -> tuple[th.Tensor, th.Tensor, th.Tensor | None]:
         assert isinstance(obs, dict), "obs must be a dictionary"
-        features = self.extract_features(obs)
-        teacher_features, stacked_student_features, student_features = features
-        pi_features = th.where(
-            obs["teacher_mask"].bool(),
-            teacher_features,
-            stacked_student_features.detach(),
-        )
-        vf_features = teacher_features
-        pi_features = th.cat((pi_features, obs["student"]), dim=-1)
-        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
-        latent_pi = self.mlp_extractor.forward_actor(pi_features)
-        latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        latent_features, decoded_features = self.extract_features(obs, episode_starts)
+
+        latent_pi = self.mlp_extractor.forward_actor(latent_features)
+        # Critic uses privileged observations directly
+        latent_vf = self.mlp_extractor.forward_critic(obs["teacher"])
 
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
@@ -146,21 +137,20 @@ class DWMPolicy(ActorCriticPolicy):
         :return: the estimated values.
         """
         assert isinstance(obs, dict), "obs must be a dictionary"
-        features = self.extract_features(obs)
-        teacher_features, _, _ = features
-        vf_features = teacher_features
-        vf_features = th.cat((vf_features, obs["teacher"]), dim=-1)
-        latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        latent_features, decoded_features = self.extract_features(obs)
+        # Critic uses privileged observations directly
+        latent_vf = self.mlp_extractor.forward_critic(obs["teacher"])
         return self.value_net(latent_vf)
 
 
-class DWMPPO(PPO):
+class DWLPPO(PPO):
     """
-    PPO with Denoising World Model, using GRU encoder and decoder for privileged state reconstruction.
+    PPO with Denoising World model Learning, using GRU encoder with running memory for observation history.
     """
 
     def __init__(self, policy, env, **ppo_kwargs):
         super().__init__(policy, env, **ppo_kwargs)
+        print(self.policy)
 
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
@@ -294,7 +284,7 @@ class DWMPPO(PPO):
                 entropy_losses.append(entropy_loss.item())
 
                 # Denoising loss - decode from latent to reconstruct privileged observations
-                assert isinstance(self.policy, DWMPolicy)
+                assert isinstance(self.policy, DWLPolicy)
 
                 # Extract observations from rollout data
                 obs_dict = {}
@@ -306,13 +296,9 @@ class DWMPPO(PPO):
                     # This assumes the rollout buffer stores observations properly
                     obs_dict = rollout_data.observations
 
-                teacher_features, stacked_student_features, student_features = (
-                    self.policy.extract_features(obs_dict)
-                )
-
-                # Get reconstructed privileged state from decoder
-                reconstructed_privileged = self.policy.features_extractor.decoder(  # type: ignore[attr-defined]
-                    stacked_student_features
+                # Don't pass episode_starts during training evaluation since it's not available
+                latent_features, decoded_features = self.policy.extract_features(
+                    obs_dict
                 )
 
                 # Get teacher observations for denoising loss
@@ -322,8 +308,8 @@ class DWMPPO(PPO):
 
                 # Denoising loss: ||s_tilde - s_t||_2 + lambda_r * ||z_t||_1
                 denoise_loss = (
-                    F.mse_loss(reconstructed_privileged, teacher_obs.detach())
-                    + 0.01 * th.norm(stacked_student_features, p=1, dim=-1).mean()
+                    F.mse_loss(decoded_features, teacher_obs.detach())
+                    + 0.01 * th.norm(latent_features, p=1, dim=-1).mean()
                 )
 
                 denoise_losses.append(denoise_loss.item())
@@ -646,119 +632,156 @@ class DWMPPO(PPO):
         self.logger.dump(step=self.num_timesteps)
 
 
-class DWMExtractor(BaseFeaturesExtractor):
+class DWLExtractor(BaseFeaturesExtractor):
     """
-    Custom features extractor for Denoising World Model policy.
-    Uses GRU encoder for observation history and includes a decoder for privileged state reconstruction.
+    Custom features extractor for Denoising World model Learning.
+    Uses GRU encoder with running memory for observation history and decoder for privileged state reconstruction.
+    Architecture based on the provided table.
     """
 
     def __init__(
         self,
         observation_space: spaces.Dict,
-        features_dim: int = 256,
+        features_dim: int = 24,
         activation_fn: type[nn.Module] = nn.ELU,
-        latent_dims: tuple[int, int, int] = (512, 512, 512),
-        gru_hidden_size: int = 256,
-        gru_num_layers: int = 2,
     ):
         if not isinstance(observation_space, spaces.Dict):
-            value_error = "DWMExtractor requires a Dict observation space"
+            value_error = "DWLExtractor requires a Dict observation space"
             raise ValueError(value_error)
 
         super().__init__(observation_space, features_dim)
 
-        # Get dimensions from observation space
-        self.teacher_dim = observation_space["teacher"].shape[0]  # type: ignore[index]
-        self.stacked_student_dim = observation_space["stacked_obs"].shape[0]  # type: ignore[index]
-        self.student_dim = observation_space["student"].shape[0]  # type: ignore[index]
-        self.teacher_latent_dims = latent_dims[0]
-        self.stacked_student_latent_dims = latent_dims[1]
-        self.student_latent_dims = latent_dims[2]
-        self.gru_hidden_size = gru_hidden_size
+        # Get dimensions from observation space - assuming current observation is 47-dim
+        self.current_obs_dim = 47  # Based on table: GRU(47 → 256)
+        self.privileged_dim = 184  # Based on table: decoder output
+        self.latent_dim = 24  # Based on table: encoder output
 
-        # Teacher encoder (simple MLP for privileged information)
-        self.teacher_encoder = nn.Sequential(
-            nn.Linear(self.teacher_dim, self.teacher_latent_dims),
-            activation_fn(),
-            nn.Linear(self.teacher_latent_dims, features_dim),
-            activation_fn(),
-        )
-
-        # GRU encoder for stacked observations (observation history)
-        # Assume stacked_obs is flattened history, we need to reshape for GRU
-        self.obs_per_timestep = (
-            self.student_dim
-        )  # Each timestep has student_dim observations
-        self.sequence_length = self.stacked_student_dim // self.obs_per_timestep
-
+        # GRU encoder with running memory - Architecture: GRU(47 → 256)
+        self.gru_hidden_size = 256
         self.gru_encoder = nn.GRU(
-            input_size=self.obs_per_timestep,
-            hidden_size=gru_hidden_size,
-            num_layers=gru_num_layers,
+            input_size=self.current_obs_dim,
+            hidden_size=self.gru_hidden_size,
+            num_layers=1,
             batch_first=True,
-            dropout=0.1 if gru_num_layers > 1 else 0.0,
         )
 
-        # Project GRU output to features_dim
-        self.gru_projection = nn.Sequential(
-            nn.Linear(gru_hidden_size, features_dim),
+        # Encoder post-processing - Architecture: Linear(256 → 256), ELU, Linear(256 → 24)
+        self.encoder_post = nn.Sequential(
+            nn.Linear(self.gru_hidden_size, 256),
             activation_fn(),
+            nn.Linear(256, self.latent_dim),
         )
 
-        # Student encoder (current observation)
-        self.student_encoder = nn.Sequential(
-            nn.Linear(self.student_dim, self.student_latent_dims),
-            activation_fn(),
-            nn.Linear(self.student_latent_dims, features_dim),
-            activation_fn(),
-        )
-
-        # Decoder for privileged state reconstruction (Z_t -> privileged state)
+        # Decoder for privileged state reconstruction - Architecture: Linear(24 → 64), ELU, Linear(64 → 184)
         self.decoder = nn.Sequential(
-            nn.Linear(features_dim, self.teacher_latent_dims),
+            nn.Linear(self.latent_dim, 64),
             activation_fn(),
-            nn.Linear(self.teacher_latent_dims, self.teacher_latent_dims),
-            activation_fn(),
-            nn.Linear(
-                self.teacher_latent_dims, self.teacher_dim
-            ),  # Reconstruct full privileged state
+            nn.Linear(64, self.privileged_dim),
         )
 
-        # Update features_dim to match the size of each feature vector
+        # Running GRU hidden state - will be reset on episode starts
+        self.register_buffer("gru_hidden", th.zeros(1, 1, self.gru_hidden_size))
+
+        # Update features_dim to match the latent dimension
         self._features_dim = features_dim
 
+    def reset_memory(self, batch_size: int, device: th.device) -> None:
+        """Reset the GRU hidden state"""
+        self.gru_hidden.data = th.zeros(
+            1, batch_size, self.gru_hidden_size, device=device
+        )
+
     def forward(
-        self, observations: dict[str, th.Tensor]
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        self,
+        observations: dict[str, th.Tensor],
+        episode_starts: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor]:
         """
-        Extract features using GRU encoder for stacked observations and decoder for reconstruction.
+        Extract features using GRU encoder with running memory and decoder for reconstruction.
 
-        :param observations: Dictionary containing teacher, stacked_obs, and student observations
-        :return: Tuple of (teacher_features, stacked_student_features, student_features)
+        :param observations: Dictionary containing current observations
+        :param episode_starts: Boolean tensor indicating episode starts for memory reset
+        :return: Tuple of (latent_features, decoded_privileged_features)
         """
-        batch_size = observations["teacher"].shape[0]
+        # Get current observation (47-dim based on architecture)
+        current_obs = observations[
+            "student"
+        ]  # Assuming this is the 47-dim current observation
+        batch_size = current_obs.shape[0]
 
-        # Extract features from teacher (privileged information)
-        teacher_features = self.teacher_encoder(observations["teacher"])
+        # Reset GRU memory on episode starts
+        if episode_starts is not None and episode_starts.any():
+            # Reset hidden states for environments that started new episodes
+            for i in range(batch_size):
+                if episode_starts[i]:
+                    self.gru_hidden[:, i, :] = 0
 
-        # Process stacked observations with GRU encoder
-        stacked_obs = observations["stacked_obs"]
-        # Reshape for GRU: (batch_size, sequence_length, obs_per_timestep)
-        stacked_reshaped = stacked_obs.view(
-            batch_size, self.sequence_length, self.obs_per_timestep
-        )
+        # Ensure hidden state has correct batch size
+        if self.gru_hidden.shape[1] != batch_size:
+            self.reset_memory(batch_size, current_obs.device)
 
-        # GRU encoding
-        gru_output, hidden = self.gru_encoder(stacked_reshaped)
-        # Use the last output or hidden state
-        last_output = gru_output[:, -1, :]  # Shape: (batch_size, gru_hidden_size)
-        stacked_student_features = self.gru_projection(last_output)
+        # GRU forward pass - input current observation and previous hidden state
+        # Reshape current_obs for GRU: (batch_size, seq_len=1, input_size)
+        gru_input = current_obs.unsqueeze(1)  # Shape: (batch_size, 1, 47)
 
-        # Extract features from current student observation
-        student_features = self.student_encoder(observations["student"])
+        # GRU forward pass
+        gru_output, new_hidden = self.gru_encoder(gru_input, self.gru_hidden)
 
-        return (
-            teacher_features,
-            stacked_student_features,
-            student_features,
-        )
+        # Update hidden state for next timestep
+        self.gru_hidden.data = new_hidden.detach()
+
+        # Get the output from the sequence (only one timestep)
+        gru_out = gru_output.squeeze(1)  # Shape: (batch_size, 256)
+
+        # Encoder post-processing: Linear(256 → 256), ELU, Linear(256 → 24)
+        latent_features = self.encoder_post(gru_out)  # Shape: (batch_size, 24)
+
+        # Decoder: reconstruct privileged state
+        decoded_features = self.decoder(latent_features)  # Shape: (batch_size, 184)
+
+        return latent_features, decoded_features
+
+
+class DWLMlpExtractor(MlpExtractor):
+    """
+    MLP extractor for DWL with specific architecture for Actor and Critic networks.
+    Actor: Linear(24 → 48), ELU, Linear(48 → 12)
+    Critic: Uses privileged state dimension directly, following the table architecture
+    """
+
+    def __init__(
+        self,
+        feature_dims: tuple[int, int],
+        net_arch: list[int] | dict[str, list[int]],
+        activation_fn: type[nn.Module],
+        device: th.device | str = "auto",
+    ) -> None:
+        super(MlpExtractor, self).__init__()
+        device = get_device(device)
+
+        # Use fixed architecture from table instead of net_arch
+        latent_dim = feature_dims[0]  # 24 for actor
+        privileged_dim = feature_dims[1]  # privileged state dimension for critic
+
+        # Actor network: Linear(24 → 48), ELU, Linear(48 → 12)
+        self.policy_net = nn.Sequential(
+            nn.Linear(latent_dim, 48),
+            activation_fn(),
+            nn.Linear(48, 12),
+        ).to(device)
+
+        # Critic network: Takes privileged state directly
+        # Architecture: Linear(privileged_dim → 512), ELU, Linear(512 → 512), ELU, Linear(512 → 256), ELU
+        # Note: The final Linear(256 → 1) will be handled by the value_net in the policy
+        self.value_net = nn.Sequential(
+            nn.Linear(privileged_dim, 512),
+            activation_fn(),
+            nn.Linear(512, 512),
+            activation_fn(),
+            nn.Linear(512, 256),
+            activation_fn(),
+        ).to(device)
+
+        # Save dimensions - actor outputs 12, critic outputs 256 (final layer handled by value_net)
+        self.latent_dim_pi = 12  # Actor final output dimension
+        self.latent_dim_vf = 256  # Critic output dimension before final value layer
