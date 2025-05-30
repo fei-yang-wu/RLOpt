@@ -652,8 +652,12 @@ class DWLExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
 
         # Get dimensions from observation space - assuming current observation is 47-dim
-        self.current_obs_dim = observation_space["student"].shape[0]  # Based on table: GRU(47 → 256)
-        self.privileged_dim = observation_space["teacher"].shape[0]  # Based on table: decoder output
+        self.current_obs_dim = observation_space["student"].shape[
+            0
+        ]  # Based on table: GRU(47 → 256)
+        self.privileged_dim = observation_space["teacher"].shape[
+            0
+        ]  # Based on table: decoder output
         self.latent_dim = features_dim  # Based on table: encoder output
 
         # GRU encoder with running memory - Architecture: GRU(47 → 256)
@@ -762,7 +766,8 @@ class DWLMlpExtractor(MlpExtractor):
     ) -> None:
         super(MlpExtractor, self).__init__()
         device = get_device(device)
-
+        policy_net: list[nn.Module] = []
+        value_net: list[nn.Module] = []
         # Use fixed architecture from table instead of net_arch
         last_layer_dim_pi = feature_dims[0]  # student observation dimension
         last_layer_dim_vf = feature_dims[1]  # teacher observation dimension
