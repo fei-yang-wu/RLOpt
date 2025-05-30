@@ -96,12 +96,7 @@ class ROAPolicy(ActorCriticPolicy):
         # Use teacher features for policy and value
         teacher_features, stacked_student_features, student_features = features
 
-        pi_features = th.where(
-            obs["teacher_mask"].bool(),
-            teacher_features,
-            stacked_student_features.detach(),
-        )
-
+        pi_features = stacked_student_features
         vf_features = teacher_features
         # Use only encoded features, no concatenation with raw observations
         latent_pi = self.mlp_extractor.forward_actor(pi_features)
@@ -121,11 +116,7 @@ class ROAPolicy(ActorCriticPolicy):
         assert isinstance(obs, dict), "obs must be a dictionary"
         features = self.extract_features(obs)
         teacher_features, stacked_student_features, student_features = features
-        pi_features = th.where(
-            obs["teacher_mask"].bool(),
-            teacher_features,
-            stacked_student_features.detach(),
-        )
+        pi_features = stacked_student_features
         vf_features = teacher_features
         # Use only encoded features, no concatenation with raw observations
         latent_pi = self.mlp_extractor.forward_actor(pi_features)
@@ -330,7 +321,7 @@ class ROAPPO(PPO):
                         policy_loss
                         + self.ent_coef * entropy_loss
                         + self.vf_coef * value_loss
-                        + lambda_latent * (loss_latent_policy + loss_latent_adapt)
+                        + lambda_latent * loss_latent_policy
                     )
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob.to(self.device)
