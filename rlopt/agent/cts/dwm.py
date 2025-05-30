@@ -47,7 +47,7 @@ class DWLPolicy(ActorCriticPolicy):
         """Create a custom features extractor for the DWL policy."""
         return DWLExtractor(
             self.observation_space,  # type: ignore[arg-type]
-            features_dim=24,  # Based on architecture table
+            features_dim=128,  # Based on architecture table
             activation_fn=nn.ELU,
         )
 
@@ -75,7 +75,7 @@ class DWLPolicy(ActorCriticPolicy):
 
         self.mlp_extractor = DWLMlpExtractor(  # type: ignore[assignment]
             (
-                24,  # latent features from encoder for actor
+                128,  # latent features from encoder for actor
                 privileged_dim,  # privileged state dimension for critic
             ),
             net_arch=self.net_arch,
@@ -652,12 +652,12 @@ class DWLExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
 
         # Get dimensions from observation space - assuming current observation is 47-dim
-        self.current_obs_dim = 47  # Based on table: GRU(47 → 256)
-        self.privileged_dim = 184  # Based on table: decoder output
-        self.latent_dim = 24  # Based on table: encoder output
+        self.current_obs_dim = observation_space["student"].shape[0]  # Based on table: GRU(47 → 256)
+        self.privileged_dim = observation_space["teacher"].shape[0]  # Based on table: decoder output
+        self.latent_dim = features_dim  # Based on table: encoder output
 
         # GRU encoder with running memory - Architecture: GRU(47 → 256)
-        self.gru_hidden_size = 256
+        self.gru_hidden_size = 512
         self.gru_encoder = nn.GRU(
             input_size=self.current_obs_dim,
             hidden_size=self.gru_hidden_size,
@@ -669,14 +669,18 @@ class DWLExtractor(BaseFeaturesExtractor):
         self.encoder_post = nn.Sequential(
             nn.Linear(self.gru_hidden_size, 256),
             activation_fn(),
-            nn.Linear(256, self.latent_dim),
+            nn.Linear(256, self.gru_hidden_size),
         )
 
         # Decoder for privileged state reconstruction - Architecture: Linear(24 → 64), ELU, Linear(64 → 184)
         self.decoder = nn.Sequential(
-            nn.Linear(self.latent_dim, 64),
+            nn.Linear(self.latent_dim, 128),
             activation_fn(),
-            nn.Linear(64, self.privileged_dim),
+            nn.Linear(128, 256),
+            activation_fn(),
+            nn.linear(256, 512),
+            activation_fn(),
+            nn.Linear(512, self.privileged_dim),
         )
 
         # Running GRU hidden state - will be reset on episode starts
@@ -760,28 +764,33 @@ class DWLMlpExtractor(MlpExtractor):
         device = get_device(device)
 
         # Use fixed architecture from table instead of net_arch
-        latent_dim = feature_dims[0]  # 24 for actor
-        privileged_dim = feature_dims[1]  # privileged state dimension for critic
+        last_layer_dim_pi = feature_dims[0]  # student observation dimension
+        last_layer_dim_vf = feature_dims[1]  # teacher observation dimension
+        # save dimensions of layers in policy and value nets
+        if isinstance(net_arch, dict):
+            # Note: if key is not specified, assume linear network
+            pi_layers_dims = net_arch.get("pi", [])  # Layer sizes of the policy network
+            vf_layers_dims = net_arch.get("vf", [])  # Layer sizes of the value network
+        else:
+            pi_layers_dims = vf_layers_dims = net_arch
+        vf_layers_dims = [512, 256, 128]
 
-        # Actor network: Linear(24 → 48), ELU, Linear(48 → 12)
-        self.policy_net = nn.Sequential(
-            nn.Linear(latent_dim, 48),
-            activation_fn(),
-            nn.Linear(48, 12),
-        ).to(device)
+        # Iterate through the policy layers and build the policy net
+        for curr_layer_dim in pi_layers_dims:
+            policy_net.append(nn.Linear(last_layer_dim_pi, curr_layer_dim))
+            policy_net.append(activation_fn())
+            last_layer_dim_pi = curr_layer_dim
+        # Iterate through the value layers and build the value net
+        for curr_layer_dim in vf_layers_dims:
+            value_net.append(nn.Linear(last_layer_dim_vf, curr_layer_dim))
+            value_net.append(activation_fn())
+            last_layer_dim_vf = curr_layer_dim
 
-        # Critic network: Takes privileged state directly
-        # Architecture: Linear(privileged_dim → 512), ELU, Linear(512 → 512), ELU, Linear(512 → 256), ELU
-        # Note: The final Linear(256 → 1) will be handled by the value_net in the policy
-        self.value_net = nn.Sequential(
-            nn.Linear(privileged_dim, 512),
-            activation_fn(),
-            nn.Linear(512, 512),
-            activation_fn(),
-            nn.Linear(512, 256),
-            activation_fn(),
-        ).to(device)
+        # Save dim, used to create the distributions
+        self.latent_dim_pi = last_layer_dim_pi
+        self.latent_dim_vf = last_layer_dim_vf
 
-        # Save dimensions - actor outputs 12, critic outputs 256 (final layer handled by value_net)
-        self.latent_dim_pi = 12  # Actor final output dimension
-        self.latent_dim_vf = 256  # Critic output dimension before final value layer
+        # Create networks
+        # If the list of layers is empty, the network will just act as an Identity module
+        self.policy_net = nn.Sequential(*policy_net).to(device)
+        self.value_net = nn.Sequential(*value_net).to(device)
