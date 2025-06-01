@@ -1007,6 +1007,7 @@ class DictRolloutBuffer(RolloutBuffer):
                 "advantages",
                 "returns",
                 "rewards",
+                "episode_starts",
             ]
 
             for tensor in _tensor_names:
@@ -1035,6 +1036,7 @@ class DictRolloutBuffer(RolloutBuffer):
             self.log_probs[batch_inds].flatten(),
             self.advantages[batch_inds].flatten(),
             self.returns[batch_inds].flatten(),
+            self.episode_starts[batch_inds].flatten(),
         )
         return DictRolloutBufferSamples(*data)
 

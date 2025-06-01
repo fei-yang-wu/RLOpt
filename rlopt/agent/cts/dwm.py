@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import time
 from collections import deque
-from typing import Optional, Union
+from typing import Optional, Union, Generator, NamedTuple, Dict
 
 import gymnasium as gym
 import numpy as np
@@ -26,9 +26,135 @@ from stable_baselines3.common.torch_layers import (
 )
 from stable_baselines3.common.type_aliases import MaybeCallback, PyTorchObs
 from stable_baselines3.common.utils import get_device, get_schedule_fn
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecEnv, VecNormalize
 
 from rlopt.common import DictRolloutBuffer
+
+
+class DictRolloutBufferSamplesWithHiddenState(NamedTuple):
+    observations: dict[str, th.Tensor]
+    actions: th.Tensor
+    rewards: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    episode_starts: th.Tensor
+    hidden_state: th.Tensor
+
+
+class DictRolloutBufferWithHiddenState(DictRolloutBuffer):
+    """
+    Dict Rollout buffer that also stores hidden states for recurrent policies.
+    Extends DictRolloutBuffer to add hidden state storage and retrieval.
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Dict,
+        action_space: spaces.Space,
+        hidden_state_shape: tuple[int, ...],
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        self.hidden_state_shape = hidden_state_shape
+        super().__init__(
+            buffer_size, observation_space, action_space, device, gae_lambda, gamma, n_envs
+        )
+        self.hidden_states: th.Tensor = th.zeros(
+            (self.buffer_size, self.n_envs, *hidden_state_shape),
+            dtype=th.float32,
+            device=self.device,
+        )
+
+    def reset(self) -> None:
+        super().reset()
+        self.hidden_states = th.zeros(
+            (self.buffer_size, self.n_envs, *self.hidden_state_shape),
+            dtype=th.float32,
+            device=self.device,
+        )
+
+    def add(  # type: ignore[override]
+        self,
+        obs: dict[str, th.Tensor],
+        action: th.Tensor,
+        reward: th.Tensor,
+        episode_start: th.Tensor,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+        hidden_state: th.Tensor,
+    ) -> None:
+        """
+        Add data to the buffer including hidden state.
+        """
+        # Store hidden state
+        if hidden_state is not None:
+            # hidden_state shape: (1, n_envs, hidden_size)
+            # Store as (n_envs, 1, hidden_size) then squeeze to (n_envs, hidden_size)
+            self.hidden_states[self.pos] = hidden_state.transpose(0, 1).squeeze(1).detach()
+        
+        # Call parent add method
+        super().add(obs, action, reward, episode_start, value, log_prob)
+
+    def get(  # type: ignore[override]
+        self,
+        batch_size: Optional[int] = None,
+    ) -> Generator[DictRolloutBufferSamplesWithHiddenState, None, None]:
+        assert self.full, ""
+        indices = th.randperm(self.buffer_size * self.n_envs, device=self.device)
+        
+        # Prepare the data
+        if not self.generator_ready:
+            # tensor dict handles transpose and reshape
+            self.observations = self.swap_and_flatten(
+                self.observations
+            )  # type : ignore
+
+            _tensor_names = [
+                "actions",
+                "values",
+                "log_probs",
+                "advantages",
+                "returns",
+                "rewards",
+                "episode_starts",
+                "hidden_states",
+            ]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            yield self._get_samples(indices[start_idx : start_idx + batch_size])
+            start_idx += batch_size
+
+    def _get_samples(  # type: ignore[override]
+        self,
+        batch_inds: th.Tensor,
+        env: Optional[VecNormalize] = None,
+    ) -> DictRolloutBufferSamplesWithHiddenState:
+        data = (
+            self.observations[batch_inds],
+            self.actions[batch_inds],
+            self.rewards[batch_inds],
+            self.values[batch_inds].flatten(),
+            self.log_probs[batch_inds].flatten(),
+            self.advantages[batch_inds].flatten(),
+            self.returns[batch_inds].flatten(),
+            self.episode_starts[batch_inds].flatten(),
+            self.hidden_states[batch_inds],
+        )
+        return DictRolloutBufferSamplesWithHiddenState(*data)
 
 
 class DWLPolicy(ActorCriticPolicy):
@@ -42,6 +168,8 @@ class DWLPolicy(ActorCriticPolicy):
             self.share_features_extractor is False
         ), "share_features_extractor must be False"
         print(self.mlp_extractor)
+        # Track hidden state for recurrent extractor
+        self._hidden_state = None
 
     def make_features_extractor(self) -> BaseFeaturesExtractor:
         """Create a custom features extractor for the DWL policy."""
@@ -55,11 +183,15 @@ class DWLPolicy(ActorCriticPolicy):
         self,
         obs: PyTorchObs,
         episode_starts: th.Tensor | None = None,
-    ) -> tuple[th.Tensor, th.Tensor]:
+        hidden_state: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         preprocessed_obs = preprocessing.preprocess_obs(
             obs, self.observation_space, normalize_images=self.normalize_images
         )
-        return self.features_extractor(preprocessed_obs, episode_starts)
+        # Ensure episode_starts is on the correct device
+        if episode_starts is not None:
+            episode_starts = episode_starts.to(self.device)
+        return self.features_extractor(preprocessed_obs, episode_starts, hidden_state)
 
     def _build_mlp_extractor(self) -> None:
         """
@@ -84,18 +216,18 @@ class DWLPolicy(ActorCriticPolicy):
         )
 
     def forward(
-        self, obs: th.Tensor | dict, deterministic: bool = False
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        self, obs: th.Tensor | dict, episode_starts: th.Tensor | None = None, deterministic: bool = False, hidden_state: th.Tensor | None = None
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
 
         :param obs: Observation
         :param deterministic: Whether to sample or use deterministic actions
-        :return: action, value and log probability of the action
+        :return: action, value, log probability of the action, new hidden state
         """
         assert isinstance(obs, dict), "obs must be a dictionary"
         # Preprocess the observation if needed
-        latent_features, decoded_features = self.extract_features(obs)
+        latent_features, decoded_features, new_hidden = self.extract_features(obs, episode_starts, hidden_state)
 
         # Actor uses latent features directly
         latent_pi = self.mlp_extractor.forward_actor(latent_features)
@@ -108,16 +240,17 @@ class DWLPolicy(ActorCriticPolicy):
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
-        return actions, values, log_prob
+        return actions, values, log_prob, new_hidden
 
     def evaluate_actions(
         self,
         obs: PyTorchObs,
         actions: th.Tensor,
         episode_starts: th.Tensor | None = None,
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor | None]:
+        hidden_state: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor | None, th.Tensor]:
         assert isinstance(obs, dict), "obs must be a dictionary"
-        latent_features, decoded_features = self.extract_features(obs, episode_starts)
+        latent_features, decoded_features, new_hidden = self.extract_features(obs, episode_starts, hidden_state)
 
         latent_pi = self.mlp_extractor.forward_actor(latent_features)
         # Critic uses privileged observations directly
@@ -127,9 +260,9 @@ class DWLPolicy(ActorCriticPolicy):
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
         entropy = distribution.entropy()
-        return values, log_prob, entropy
+        return values, log_prob, entropy, new_hidden
 
-    def predict_values(self, obs: PyTorchObs) -> th.Tensor:
+    def predict_values(self, obs: PyTorchObs, episode_starts: th.Tensor | None = None, hidden_state: th.Tensor | None = None) -> th.Tensor:
         """
         Get the estimated values according to the current policy given the observations.
 
@@ -137,7 +270,7 @@ class DWLPolicy(ActorCriticPolicy):
         :return: the estimated values.
         """
         assert isinstance(obs, dict), "obs must be a dictionary"
-        latent_features, decoded_features = self.extract_features(obs)
+        latent_features, decoded_features, _ = self.extract_features(obs, episode_starts, hidden_state)
         # Critic uses privileged observations directly
         latent_vf = self.mlp_extractor.forward_critic(obs["teacher"])
         return self.value_net(latent_vf)
@@ -149,6 +282,7 @@ class DWLPPO(PPO):
     """
 
     def __init__(self, policy, env, **ppo_kwargs):
+        ppo_kwargs["rollout_buffer_class"] = DictRolloutBufferWithHiddenState
         super().__init__(policy, env, **ppo_kwargs)
         print(self.policy)
 
@@ -159,25 +293,26 @@ class DWLPPO(PPO):
 
         if self.rollout_buffer_class is None:
             if isinstance(self.observation_space, spaces.Dict):
-                self.rollout_buffer_class = DictRolloutBuffer  # type: ignore[assignment]
+                self.rollout_buffer_class = DictRolloutBufferWithHiddenState  # type: ignore[assignment]
             else:
                 self.rollout_buffer_class = RolloutBuffer  # type: ignore[assignment]
 
-        self.rollout_buffer = self.rollout_buffer_class(
-            self.n_steps,
-            self.observation_space,  # type: ignore[arg-type]
-            self.action_space,
-            gamma=self.gamma,
-            gae_lambda=self.gae_lambda,
-            n_envs=self.n_envs,
-            **self.rollout_buffer_kwargs,
-        )
         self.policy = self.policy_class(  # type: ignore[assignment]
             self.observation_space,
             self.action_space,
             self.lr_schedule,
             use_sde=self.use_sde,
             **self.policy_kwargs,
+        )
+        self.rollout_buffer = self.rollout_buffer_class(
+            self.n_steps,
+            self.observation_space,  # type: ignore[arg-type]
+            self.action_space,
+            hidden_state_shape=(self.policy.features_extractor.gru_hidden_size,),
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            n_envs=self.n_envs,
+            **self.rollout_buffer_kwargs,
         )
         self.policy = self.policy.to(self.device)
         # Warn when not using CPU with MlpPolicy
@@ -226,12 +361,14 @@ class DWLPPO(PPO):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
-                values, log_prob, entropy = self.policy.evaluate_actions(
+                values, log_prob, entropy, new_hidden = self.policy.evaluate_actions(
                     {
                         k: v.to(self.device)
                         for k, v in rollout_data.observations.items()  # type: ignore[attr-defined]
                     },
-                    actions,  # type: ignore
+                    actions,  # type: ignore,
+                    episode_starts=rollout_data.episode_starts.to(self.device),
+                    hidden_state=rollout_data.hidden_state.to(self.device) if rollout_data.hidden_state is not None else None
                 )
                 values = values.flatten()
 
@@ -296,9 +433,12 @@ class DWLPPO(PPO):
                     # This assumes the rollout buffer stores observations properly
                     obs_dict = rollout_data.observations
 
-                # Don't pass episode_starts during training evaluation since it's not available
-                latent_features, decoded_features = self.policy.extract_features(
-                    obs_dict
+                # Get episode_starts from rollout data if available
+                episode_starts = rollout_data.episode_starts.to(self.device)
+
+                # Extract features with episode_starts
+                latent_features, decoded_features, _ = self.policy.extract_features(
+                    obs_dict, episode_starts=episode_starts, hidden_state=rollout_data.hidden_state.to(self.device) if rollout_data.hidden_state is not None else None
                 )
 
                 # Get teacher observations for denoising loss
@@ -369,7 +509,7 @@ class DWLPPO(PPO):
         self,
         env: VecEnv,
         callback: BaseCallback,
-        rollout_buffer: DictRolloutBuffer,
+        rollout_buffer: DictRolloutBufferWithHiddenState,
         n_rollout_steps: int,
     ) -> bool:
         """
@@ -414,7 +554,7 @@ class DWLPPO(PPO):
             with th.inference_mode():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = {k: v.to(self.device) for k, v in self._last_obs.items()}
-                actions, values, log_probs = self.policy(obs_tensor)
+                actions, values, log_probs, new_hidden = self.policy(obs_tensor, episode_starts=self._last_episode_starts, hidden_state=self._last_hidden_state)
 
             # Rescale and perform action
             clipped_actions = actions
@@ -496,15 +636,17 @@ class DWLPPO(PPO):
                 self._last_episode_starts,  # type: ignore[arg-type]
                 values,
                 log_probs,
+                new_hidden,
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
+            self._last_hidden_state = new_hidden
 
         gc.collect()
 
         with th.inference_mode():
             # Compute value for the last timestep
-            values = self.policy.predict_values(new_obs)
+            values = self.policy.predict_values(new_obs, episode_starts=self._last_episode_starts, hidden_state=self._last_hidden_state)
 
         rollout_buffer.compute_returns_and_advantage(
             last_values=values.detach().to(rollout_buffer.device),
@@ -572,6 +714,11 @@ class DWLPPO(PPO):
             # Retrieve unnormalized observation for saving into the buffer
             if self._vec_normalize_env is not None:
                 self._last_original_obs = self._vec_normalize_env.get_original_obs()  # type: ignore[attr-defined]
+            # Initialize hidden state for recurrent policy
+            hidden_size = self.policy.features_extractor.gru_hidden_size
+            num_envs = self.env.num_envs
+            device = self.device
+            self._last_hidden_state = th.zeros(1, num_envs, hidden_size, device=device)
 
         # Configure logger's outputs if no logger was passed
         if not self._custom_logger:
@@ -669,85 +816,65 @@ class DWLExtractor(BaseFeaturesExtractor):
             batch_first=True,
         )
 
-        # Encoder post-processing - Architecture: Linear(256 → 256), ELU, Linear(256 → 24)
+        # Encoder post-processing
         self.encoder_post = nn.Sequential(
             nn.Linear(self.gru_hidden_size, 256),
             activation_fn(),
-            nn.Linear(256, self.gru_hidden_size),
+            nn.Linear(256, 256),
+            activation_fn(),
+            nn.Linear(256, features_dim),
         )
 
-        # Decoder for privileged state reconstruction - Architecture: Linear(24 → 64), ELU, Linear(64 → 184)
+        # Decoder for privileged state reconstruction
         self.decoder = nn.Sequential(
             nn.Linear(self.latent_dim, 128),
             activation_fn(),
             nn.Linear(128, 256),
             activation_fn(),
-            nn.linear(256, 512),
+            nn.Linear(256, 512),
             activation_fn(),
             nn.Linear(512, self.privileged_dim),
         )
 
-        # Running GRU hidden state - will be reset on episode starts
-        self.register_buffer("gru_hidden", th.zeros(1, 1, self.gru_hidden_size))
-
         # Update features_dim to match the latent dimension
         self._features_dim = features_dim
-
-    def reset_memory(self, batch_size: int, device: th.device) -> None:
-        """Reset the GRU hidden state"""
-        self.gru_hidden.data = th.zeros(
-            1, batch_size, self.gru_hidden_size, device=device
-        )
 
     def forward(
         self,
         observations: dict[str, th.Tensor],
         episode_starts: th.Tensor | None = None,
-    ) -> tuple[th.Tensor, th.Tensor]:
+        hidden_state: th.Tensor | None = None,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Extract features using GRU encoder with running memory and decoder for reconstruction.
 
         :param observations: Dictionary containing current observations
         :param episode_starts: Boolean tensor indicating episode starts for memory reset
-        :return: Tuple of (latent_features, decoded_privileged_features)
+        :param hidden_state: Previous GRU hidden state (1, batch, hidden_size)
+        :return: Tuple of (latent_features, decoded_privileged_features, new_hidden_state)
         """
-        # Get current observation (47-dim based on architecture)
-        current_obs = observations[
-            "student"
-        ]  # Assuming this is the 47-dim current observation
+        current_obs = observations["student"]  # (batch_size, obs_dim)
         batch_size = current_obs.shape[0]
+        device = current_obs.device
 
-        # Reset GRU memory on episode starts
-        if episode_starts is not None and episode_starts.any():
-            # Reset hidden states for environments that started new episodes
-            for i in range(batch_size):
-                if episode_starts[i]:
-                    self.gru_hidden[:, i, :] = 0
+        # Initialize hidden state if needed
+        if hidden_state is None or hidden_state.shape[1] != batch_size:
+            hidden_state = th.zeros(1, batch_size, self.gru_hidden_size, device=device)
 
-        # Ensure hidden state has correct batch size
-        if self.gru_hidden.shape[1] != batch_size:
-            self.reset_memory(batch_size, current_obs.device)
+        # Reset hidden state for new episodes
+        if episode_starts is not None:
+            episode_starts = episode_starts.to(device)
+            if episode_starts.any():
+                # Convert to boolean for indexing
+                episode_starts_bool = episode_starts.bool()
+                hidden_state[:, episode_starts_bool, :] = 0
 
-        # GRU forward pass - input current observation and previous hidden state
-        # Reshape current_obs for GRU: (batch_size, seq_len=1, input_size)
-        gru_input = current_obs.unsqueeze(1)  # Shape: (batch_size, 1, 47)
-
-        # GRU forward pass
-        gru_output, new_hidden = self.gru_encoder(gru_input, self.gru_hidden)
-
-        # Update hidden state for next timestep
-        self.gru_hidden.data = new_hidden.detach()
-
-        # Get the output from the sequence (only one timestep)
-        gru_out = gru_output.squeeze(1)  # Shape: (batch_size, 256)
-
-        # Encoder post-processing: Linear(256 → 256), ELU, Linear(256 → 24)
-        latent_features = self.encoder_post(gru_out)  # Shape: (batch_size, 24)
-
-        # Decoder: reconstruct privileged state
-        decoded_features = self.decoder(latent_features)  # Shape: (batch_size, 184)
-
-        return latent_features, decoded_features
+        gru_input = current_obs.unsqueeze(1)  # (batch_size, 1, obs_dim)
+        gru_output, new_hidden = self.gru_encoder(gru_input, hidden_state)
+        gru_out = gru_output.squeeze(1)  # (batch_size, hidden_size)
+        latent_features = self.encoder_post(gru_out)  # (batch_size, latent_dim)
+        decoded_features = self.decoder(latent_features)  # (batch_size, privileged_dim)
+        return latent_features, decoded_features, new_hidden
 
 
 class DWLMlpExtractor(MlpExtractor):

@@ -62,6 +62,7 @@ class DictRolloutBufferSamples(NamedTuple):
     old_log_prob: th.Tensor
     advantages: th.Tensor
     returns: th.Tensor
+    episode_starts: th.Tensor
 
 
 class ReplayBufferSamples(NamedTuple):
