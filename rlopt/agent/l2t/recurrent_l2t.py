@@ -109,7 +109,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
     :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
         the reported success rate, mean episode length, and mean reward over
     :param tensorboard_log: the log location for tensorboard (if None, no logging)
+    :param bc_coeff: Coefficient for the behavioral cloning loss (default: 1.0)
+    :param il_coeff: Coefficient for the imitation learning loss (default: 1.0)
+    :param kl_coeff: Coefficient for the KL divergence loss between teacher and student policies (default: 0.1)
+    :param asym_coeff: Coefficient for the asymmetric PPO-style loss for the student (default: 0.0)
     :param policy_kwargs: additional arguments to be passed to the policy on creation
+    :param student_policy_kwargs: additional arguments to be passed to the student policy on creation
     :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
         debug messages
     :param seed: Seed for the pseudo random generators
@@ -160,6 +165,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
         mixture_coeff: float = 0.0,
+        il_coeff: float = 0.5,
+        kl_coeff: float = 0.5,
+        asym_coeff: float = 0.0,
         policy_kwargs: Optional[Dict[str, Any]] = None,
         student_policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
@@ -191,7 +199,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
         self._last_episode_starts = None  # type: Optional[np.ndarray]
         # When using VecNormalize:
-        self._last_original_obs = None  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
+        self._last_original_obs = (
+            None
+        )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
         self._episode_num = 0
         # Used for gSDE only
         self.use_sde = use_sde
@@ -276,17 +286,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
         if normalize_advantage:
-            assert batch_size > 1, (
-                "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
-            )
+            assert (
+                batch_size > 1
+            ), "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
 
         if self.env is not None:
             # Check that `n_steps * n_envs > 1` to avoid NaN
             # when doing advantage normalization
             buffer_size = self.env.num_envs * self.n_steps
-            assert buffer_size > 1 or (not normalize_advantage), (
-                f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
-            )
+            assert buffer_size > 1 or (
+                not normalize_advantage
+            ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
             # Check that the rollout buffer size is a multiple of the mini-batch size
             untruncated_batches = buffer_size // batch_size
             if buffer_size % batch_size > 0:
@@ -306,6 +316,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.student_policy = student_policy  # type: ignore
         self.mixture_coeff = mixture_coeff
+        self.il_coeff = il_coeff
+        self.kl_coeff = kl_coeff
+        self.asym_coeff = asym_coeff
 
         self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
         self.student_policy_kwargs = (
@@ -602,9 +615,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Log the current learning rate
         self.logger.record(
             "train/learning_rate",
-            lr
-            if lr is not None
-            else self.lr_schedule(self._current_progress_remaining),
+            (
+                lr
+                if lr is not None
+                else self.lr_schedule(self._current_progress_remaining)
+            ),
         )
 
         if not isinstance(optimizers, list):
@@ -640,6 +655,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         clip_fractions = []
         student_losses = []
+        il_losses = []
+        kl_losses = []
+        asym_losses = []
 
         continue_training = True
 
@@ -763,17 +781,49 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 student_ratio, 1 - clip_range, 1 + clip_range
             )
             student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
-            student_asym_loss = -th.mean(
-                advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
-            ).mean()
             teacher_action = actions.detach()
 
+            # Imitation Learning (IL) Loss - MSE between student and teacher actions
+            il_loss = F.mse_loss(student_action, teacher_action)
+
+            # KL Divergence Loss between teacher and student policies
+            # Get teacher policy distribution for the same observations
+            teacher_observations_flat = observations
+
+            # Get teacher action distribution
+            with th.no_grad():
+                teacher_distribution = self.compiled_policy.get_distribution(
+                    teacher_observations_flat
+                )
+                teacher_std = teacher_distribution.distribution.stddev
+                teacher_mean = teacher_distribution.distribution.mean
+
+            # Get student action distribution parameters (flatten to match teacher)
+            student_mu_flat = BaseBuffer.swap_and_flatten(unpad_trajectories(mu, mask))
+            student_sigma_flat = BaseBuffer.swap_and_flatten(
+                unpad_trajectories(sigma, mask)
+            )
+
+            # Compute KL divergence between teacher (p) and student (q) policies
+            # KL(p||q) = log(σ_q/σ_p) + (σ_p² + (μ_p - μ_q)²)/(2σ_q²) - 1/2
+            kl_loss = (
+                th.log(student_sigma_flat / teacher_std)
+                + (teacher_std.pow(2) + (teacher_mean - student_mu_flat).pow(2))
+                / (2 * student_sigma_flat.pow(2))
+                - 0.5
+            ).mean()
+
+            # Combined student loss with weighting coefficients
             student_loss = (
-                F.mse_loss(student_action, teacher_action)  # type: ignore
-                # + student_asym_loss
+                self.il_coeff * il_loss
+                + self.kl_coeff * kl_loss
+                + self.asym_coeff * student_asym_loss
             )
 
             student_losses.append(student_loss.item())
+            il_losses.append(il_loss.item())
+            kl_losses.append(kl_loss.item())
+            asym_losses.append(student_asym_loss.item())
 
             # adaptive step size
             with th.no_grad():
@@ -836,6 +886,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self.logger.record("train/student_loss", np.mean(student_losses))
+        self.logger.record("train/il_loss", np.mean(il_losses))
+        self.logger.record("train/kl_loss", np.mean(kl_losses))
+        self.logger.record("train/asym_loss", np.mean(asym_losses))
 
     def learn(
         self: SelfRecurrentL2T,
