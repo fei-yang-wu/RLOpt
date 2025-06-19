@@ -116,19 +116,19 @@ class PPO(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.RANDOM,  # Changed to RANDOM to match utils_mujoco.py
+            default_interaction_type=ExplorationType.RANDOM,
         )
 
     def _construct_value_function(self) -> torch.nn.Module:
         """Construct value function following utils_mujoco.py pattern"""
         # Define input shape
         input_shape = self.env.observation_spec["observation"].shape  # type: ignore
-        # Define value architecture - following utils_mujoco.py pattern
+        # Define value architecture
         value_mlp = MLP(
             in_features=input_shape[-1],
-            activation_class=torch.nn.Tanh,  # Changed from ELU to Tanh to match utils_mujoco.py
+            activation_class=torch.nn.Tanh,
             out_features=1,
-            num_cells=[64, 64],  # Use fixed architecture like utils_mujoco.py
+            num_cells=self.config.policy.num_cells,
             device=self.device,
         )
 
