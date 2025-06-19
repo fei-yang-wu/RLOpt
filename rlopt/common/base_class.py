@@ -136,7 +136,7 @@ class BaseAlgorithm(ABC):
 
     def _construct_collector(
         self,
-        create_env_fn: Callable,
+        env: TransformedEnv,
     ) -> SyncDataCollector | MultiSyncDataCollector:
         # try:
         #     # Set multiprocessing start method
@@ -152,13 +152,11 @@ class BaseAlgorithm(ABC):
         # We can't use nested child processes with mp_start_method="fork"
         if self.mp_context == "fork":
             cls = SyncDataCollector
-            env_arg = EnvCreator(create_env_fn)
         else:
             cls = MultiSyncDataCollector
-            env_arg = [EnvCreator(create_env_fn) for _ in range(self.config.collector.num_collectors)]
         
         return cls(
-            create_env_fn=env_arg, # type: ignore
+            create_env_fn=lambda: env,
             policy=self.policy,
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,

@@ -31,6 +31,8 @@ dependencies = [
     "gymnasium > 1.0.0",
     "sb3-contrib",
     "tqdm",
+    "ruff",
+    "pyrefly",
 ]
 
 [project.optional-dependencies]
@@ -54,10 +56,6 @@ test-extras = ["test"]
 [tool.cibuildwheel.pyodide]
 build-frontend = { name = "build", args = ["--exports", "whole_archive"] }
 
-
-[[tool.mypy.overrides]]
-module = ["ninja"]
-ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "6.2"
@@ -100,6 +98,7 @@ extend-select = [
 ignore = [
     "PLR09",   # Too many X
     "PLR2004", # Magic comparison
+    "PGH003",  # PGH003 error
 ]
 isort.required-imports = ["from __future__ import annotations"]
 

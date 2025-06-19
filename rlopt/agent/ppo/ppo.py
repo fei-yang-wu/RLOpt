@@ -4,8 +4,6 @@ Only supports MuJoCo environments for now
 
 from __future__ import annotations
 
-from typing import Optional, Union, Tuple
-
 import numpy as np
 import torch
 import torch.nn
@@ -15,22 +13,22 @@ from omegaconf import DictConfig
 from tensordict import TensorDict
 from tensordict.nn import (
     AddStateIndependentNormalScale,
-    CudaGraphModule,
     TensorDictModule,
 )
-
-from rlopt.common.base_class import BaseAlgorithm
+from torch import Tensor
+from torchrl._utils import timeit
 
 # Import missing modules
 from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
-from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer, ReplayBuffer
+from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
-from torchrl.envs import EnvBase, ExplorationType, TransformedEnv
+from torchrl.envs import ExplorationType, TransformedEnv
 from torchrl.modules import MLP, ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
-from torchrl._utils import timeit
+
+from rlopt.common.base_class import BaseAlgorithm
 
 
 class PPO(BaseAlgorithm):
@@ -38,10 +36,10 @@ class PPO(BaseAlgorithm):
         self,
         env: TransformedEnv,
         config: DictConfig,
-        policy: Optional[torch.nn.Module] = None,
-        value_net: Optional[torch.nn.Module] = None,
-        q_net: Optional[torch.nn.Module] = None,
-        reward_estimator: Optional[torch.nn.Module] = None,
+        policy: torch.nn.Module | None = None,
+        value_net: torch.nn.Module | None = None,
+        q_net: torch.nn.Module | None = None,
+        reward_estimator: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
         **kwargs,
@@ -65,13 +63,13 @@ class PPO(BaseAlgorithm):
         self._compile_components()
 
         # Initialize total network updates
-        self.total_network_updates = 0        
+        self.total_network_updates = 0
 
     def _construct_policy(self) -> torch.nn.Module:
         """Construct policy following utils_mujoco.py pattern"""
         # for PPO, we use a probabilistic actor
         # Define input shape
-        input_shape = self.env.observation_spec['observation'].shape # type: ignore
+        input_shape = self.env.observation_spec["observation"].shape  # type: ignore
 
         # Define policy output distribution class
         num_outputs = self.env.action_spec_unbatched.shape[-1]  # type: ignore
@@ -82,7 +80,7 @@ class PPO(BaseAlgorithm):
             "tanh_loc": False,
         }
 
-        # Define policy architecture 
+        # Define policy architecture
         policy_mlp = MLP(
             in_features=input_shape[-1],
             activation_class=torch.nn.Tanh,
@@ -101,32 +99,30 @@ class PPO(BaseAlgorithm):
         policy_mlp = torch.nn.Sequential(
             policy_mlp,
             AddStateIndependentNormalScale(
-                self.env.action_spec_unbatched.shape[-1], # type: ignore
-                scale_lb=1e-8
+                self.env.action_spec_unbatched.shape[-1],  # type: ignore
+                scale_lb=1e-8,  # type: ignore
             ).to(self.device),
         )
 
         # Add probabilistic sampling of the actions
-        policy_module = ProbabilisticActor(
+        return ProbabilisticActor(
             TensorDictModule(
                 module=policy_mlp,
                 in_keys=["observation"],
                 out_keys=["loc", "scale"],
             ),
             in_keys=["loc", "scale"],
-            spec=self.env.full_action_spec_unbatched.to(self.device), # type: ignore
+            spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
             default_interaction_type=ExplorationType.RANDOM,  # Changed to RANDOM to match utils_mujoco.py
         )
 
-        return policy_module
-
     def _construct_value_function(self) -> torch.nn.Module:
         """Construct value function following utils_mujoco.py pattern"""
         # Define input shape
-        input_shape = self.env.observation_spec["observation"].shape # type: ignore
+        input_shape = self.env.observation_spec["observation"].shape  # type: ignore
         # Define value architecture - following utils_mujoco.py pattern
         value_mlp = MLP(
             in_features=input_shape[-1],
@@ -143,17 +139,15 @@ class PPO(BaseAlgorithm):
                 layer.bias.data.zero_()
 
         # Define value module
-        value_module = ValueOperator(
+        return ValueOperator(
             value_mlp,
             in_keys=["observation"],
         )
 
-        return value_module
-
     def _construct_loss_module(self) -> torch.nn.Module:
         """Construct loss module following ppo_mujoco.py pattern"""
         loss_config = self.config.loss
-        loss_module = ClipPPOLoss(
+        return ClipPPOLoss(
             actor_network=self.policy,
             critic_network=self.value_net,
             clip_epsilon=loss_config.clip_epsilon,
@@ -162,7 +156,6 @@ class PPO(BaseAlgorithm):
             critic_coef=loss_config.critic_coef,
             normalize_advantage=True,
         )
-        return loss_module
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers following ppo_mujoco.py pattern"""
@@ -173,7 +166,7 @@ class PPO(BaseAlgorithm):
             eps=1e-5,
         )
         critic_optim = torch.optim.Adam(
-            self.value_net.parameters(), # type: ignore
+            self.value_net.parameters(),  # type: ignore
             lr=torch.tensor(self.config.optim.lr, device=self.device),
             eps=1e-5,
         )
@@ -182,15 +175,14 @@ class PPO(BaseAlgorithm):
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module following ppo_mujoco.py pattern"""
         # Create advantage module
-        adv_module = GAE(
+        return GAE(
             gamma=self.config.loss.gamma,
             lmbda=self.config.loss.gae_lambda,
-            value_network=self.value_net, # type: ignore
+            value_network=self.value_net,  # type: ignore
             average_gae=False,
             device=self.device,
             vectorized=not self.config.compile.compile,
         )
-        return adv_module
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer following ppo_mujoco.py pattern"""
@@ -199,7 +191,7 @@ class PPO(BaseAlgorithm):
         sampler = (
             SamplerWithoutReplacement()
         )  # Removed True parameter to match ppo_mujoco.py
-        data_buffer = TensorDictReplayBuffer(
+        return TensorDictReplayBuffer(
             storage=LazyTensorStorage(
                 cfg.collector.frames_per_batch,
                 compilable=cfg.compile.compile,  # type: ignore
@@ -209,7 +201,6 @@ class PPO(BaseAlgorithm):
             batch_size=cfg.loss.mini_batch_size,
             compilable=cfg.compile.compile,
         )
-        return data_buffer
 
     def _compile_components(self):
         """Compile components following ppo_mujoco.py pattern"""
@@ -223,10 +214,12 @@ class PPO(BaseAlgorithm):
                 else:
                     compile_mode = "reduce-overhead"
 
-            self.update = torch.compile(self.update, mode=compile_mode) # type: ignore
-            self.adv_module = torch.compile(self.adv_module, mode=compile_mode) # type: ignore
+            self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore
+            self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore
 
-    def update(self, batch, num_network_updates) -> Tuple[TensorDict, int]:
+    def update(
+        self, batch: TensorDict, num_network_updates: int
+    ) -> tuple[TensorDict, int]:
         """Update function following ppo_mujoco.py pattern"""
         self.optim.zero_grad(set_to_none=True)
 
@@ -255,7 +248,7 @@ class PPO(BaseAlgorithm):
         self.optim.step()
         return loss.detach().set("alpha", alpha), num_network_updates
 
-    def predict(self, obs: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+    def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
         """Predict action given observation"""
         obs = torch.as_tensor([obs], device=self.device)
         self.policy.eval()
@@ -263,17 +256,27 @@ class PPO(BaseAlgorithm):
             td = TensorDict(
                 {"observation": obs},
                 batch_size=[1],
-                device=self.policy.device,
+                device=self.policy.device,  # type: ignore
             )
-            output = self.policy(td).get("action")
+            return self.policy(td).get("action")
 
-        return output
-
-    def _construct_trainer(self) -> None: # type: ignore
+    def _construct_trainer(self) -> None:  # type: ignore
         """Override to return None since we implement custom training loop"""
-        return None
+        return
 
-    def train(self) -> None: # type: ignore
+    def _update_policy(self, batch: TensorDict) -> dict[str, float]:
+        msg = "PPO does not support _update_policy"
+        raise NotImplementedError(msg)
+
+    def _compute_action(self, tensordict: TensorDict) -> TensorDict:
+        msg = "PPO does not support _compute_action"
+        raise NotImplementedError(msg)
+
+    def _compute_returns(self, rollout: Tensor) -> Tensor:
+        msg = "PPO does not support _compute_returns"
+        raise NotImplementedError(msg)
+
+    def train(self) -> None:  # type: ignore
         """Train the agent following ppo_mujoco.py pattern"""
         cfg = self.config
         # Main loop
@@ -299,7 +302,7 @@ class PPO(BaseAlgorithm):
         self.collector: SyncDataCollector | MultiSyncDataCollector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
-        for i in range(total_iter):
+        for _i in range(total_iter):
             timeit.printevery(
                 1000, total_iter, erase=True
             )  # Changed from 1 to 1000 to match ppo_mujoco.py
@@ -341,7 +344,7 @@ class PPO(BaseAlgorithm):
                     for k, batch in enumerate(self.data_buffer):
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
-                            loss, num_network_updates = self.update( # type: ignore
+                            loss, num_network_updates = self.update(  # type: ignore
                                 batch, num_network_updates=num_network_updates
                             )
                             loss = loss.clone()
