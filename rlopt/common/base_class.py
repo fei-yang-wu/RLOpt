@@ -16,12 +16,12 @@ from tensordict.nn import (
     TensorDictModule,
 )
 from torch import Tensor
-from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
+from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import (
     ReplayBuffer,
 )
-from torchrl.envs import EnvBase
-from torchrl.objectives import ClipPPOLoss
+from torchrl.envs import EnvBase, TransformedEnv
+from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.record.loggers import generate_exp_name, get_logger
 from torchrl.record.loggers.common import Logger
 from torchrl.trainers import Trainer
@@ -46,7 +46,7 @@ class BaseAlgorithm(ABC):
 
     def __init__(
         self,
-        env: EnvBase,
+        env: TransformedEnv,
         config: DictConfig,
         policy: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
@@ -137,7 +137,7 @@ class BaseAlgorithm(ABC):
     def _construct_collector(
         self,
         create_env_fn: Callable,
-    ) -> SyncDataCollector | MultiaSyncDataCollector:
+    ) -> SyncDataCollector | MultiSyncDataCollector:
         # try:
         #     # Set multiprocessing start method
         #     multiprocessing.set_start_method("spawn")
@@ -154,11 +154,11 @@ class BaseAlgorithm(ABC):
             cls = SyncDataCollector
             env_arg = EnvCreator(create_env_fn)
         else:
-            cls = MultiaSyncDataCollector
+            cls = MultiSyncDataCollector
             env_arg = [EnvCreator(create_env_fn) for _ in range(self.config.collector.num_collectors)]
         
         return cls(
-            create_env_fn=env_arg,
+            create_env_fn=env_arg, # type: ignore
             policy=self.policy,
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
@@ -259,8 +259,9 @@ class BaseAlgorithm(ABC):
             ...     self.compute_action = self._compute_action
             ...     self.compute_returns = self._compute_returns
         """
-
-    def _configure_optimizers(self) -> dict[str, torch.optim.Optimizer]:
+    
+    @abstractmethod
+    def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers for different components."""
         # Basic example: one optimizer for each component
         optimizers: dict[str, torch.optim.Optimizer] = {}
@@ -282,7 +283,7 @@ class BaseAlgorithm(ABC):
                 self.reward_estimator.parameters(),
                 lr=lr,
             )
-        return optimizers
+        return group_optimizers(*optimizers.values())
 
     def _configure_logger(self) -> None:
         # Create logger
@@ -353,32 +354,11 @@ class BaseAlgorithm(ABC):
         assert self.replay_buffer is not None, (
             "ReplayBuffer must be provided for offline."
         )
-        return self.replay_buffer.sample(self.config.batch_size)
-
-    def update_reward_estimator(self, batch: TensorDict) -> dict[str, float]:
-        """Update reward function for Inverse RL or learned reward shaping."""
-        if not self.reward_estimator:
-            return {}
-
-        obs = batch["observation"]
-        pred_rewards = self.reward_estimator(obs)
-        if "returns" in batch:
-            loss = F.mse_loss(pred_rewards, batch["returns"])
-        else:
-            # Example placeholder
-            loss = pred_rewards.mean()
-
-        self.optimizers["reward"].zero_grad()
-        loss.backward()
-        self.optimizers["reward"].step()
-        return {"reward_loss": loss.item()}
+        return self.replay_buffer.sample(self.config.batch_size)        
 
     def update_parameters(self, batch: TensorDict) -> dict[str, float]:
         """Generic parameter update (handles policy, value, reward, etc.)."""
         metrics = {}
-        if self.reward_estimator:
-            metrics.update(self.update_reward_estimator(batch))
-
         policy_metrics = self._update_policy(batch)
         metrics.update(policy_metrics)
 
@@ -425,7 +405,7 @@ class BaseAlgorithm(ABC):
             "reward_estimator": (
                 self.reward_estimator.state_dict() if self.reward_estimator else None
             ),
-            "optimizers": {k: v.state_dict() for k, v in self.optimizers.items()},
+            "optimizers": self.optimizers.state_dict() if self.optimizers else None, # type: ignore
             "step_count": self.step_count,
             "config": OmegaConf.to_container(self.config),
         }
@@ -458,5 +438,5 @@ class BaseAlgorithm(ABC):
             self.target_q_net.load_state_dict(checkpoint["target_q_net"])
         if self.reward_estimator:
             self.reward_estimator.load_state_dict(checkpoint["reward_estimator"])
-        for k, v in self.optimizers.items():
-            v.load_state_dict(checkpoint["optimizers"][k])
+        if self.optimizers:
+            self.optimizers.load_state_dict(checkpoint["optimizers"])
