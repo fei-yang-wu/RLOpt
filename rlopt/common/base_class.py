@@ -1,39 +1,31 @@
-from typing import Any, Callable, Dict, Optional, Type, Union, List
-from abc import ABC, abstractmethod
-import os
+from __future__ import annotations
+
 import time
-from collections import defaultdict
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import Sequence
 
 import numpy as np
-import multiprocessing
-
 import torch
-import torch.nn as nn
+import torch.nn
 import torch.nn.functional as F
+import torch.optim
+from omegaconf import DictConfig, OmegaConf
+from tensordict import TensorDict
+from tensordict.nn import (
+    TensorDictModule,
+)
 from torch import Tensor
-
-from torchrl.envs.utils import ExplorationType
-from torchrl.modules import MLP, Actor, ProbabilisticActor, ValueOperator
-from torchrl.data import ReplayBuffer
+from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
+from torchrl.data import (
+    ReplayBuffer,
+)
 from torchrl.envs import EnvBase
-from torchrl.record import CSVLogger, TensorboardLogger, WandbLogger
-from torchrl.record.loggers.common import Logger
-from torchrl.collectors import SyncDataCollector, MultiaSyncDataCollector
-from torchrl.data.replay_buffers import LazyMemmapStorage, ReplayBuffer
 from torchrl.objectives import ClipPPOLoss
 from torchrl.record.loggers import generate_exp_name, get_logger
+from torchrl.record.loggers.common import Logger
 from torchrl.trainers import Trainer
-
-from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
-
-from omegaconf import OmegaConf, DictConfig
-import hydra
-from hydra.core.config_store import ConfigStore
-
-from rlopt.envs import make_mujoco_env
-
+from torchrl.envs.env_creator import EnvCreator
 
 class BaseAlgorithm(ABC):
     """
@@ -56,22 +48,23 @@ class BaseAlgorithm(ABC):
         self,
         env: EnvBase,
         config: DictConfig,
-        policy: Optional[nn.Module] = None,
-        value_net: Optional[nn.Module] = None,
-        q_net: Optional[nn.Module] = None,
-        reward_estimator: Optional[nn.Module] = None,
+        policy: torch.nn.Module | None = None,
+        value_net: torch.nn.Module | None = None,
+        q_net: torch.nn.Module | None = None,
+        reward_estimator: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
-        logger: type[Logger] = TensorboardLogger,
+        logger: Logger | None = None,
         **kwargs,
     ):
         super().__init__()
         self.env = env
         self.config = config
         self.logger = logger
-        self.device = self._get_device(config.device)
 
         # Seed for reproducibility
-        self._set_seed(config.seed)
+        torch.manual_seed(config.seed)
+        self.np_rng = np.random.default_rng(config.seed)
+        self.mp_context = "fork"
 
         # Construct or attach networks based on existence in config
         self.policy = policy if policy else self._construct_policy()
@@ -90,8 +83,8 @@ class BaseAlgorithm(ABC):
             self.reward_estimator.to(self.device)
 
         # Construct (optional) target networks
-        self.target_value_net = None
-        self.target_q_net = None
+        self.target_value_net: torch.nn.Module | None = None
+        self.target_q_net: torch.nn.Module | None = None
         construct_target_value = self.config.get("construct_target_value", None)
         construct_target_q = self.config.get("construct_target_q", None)
         # If you want a separate target for the value function:
@@ -121,15 +114,19 @@ class BaseAlgorithm(ABC):
         # buffer
         self.data_buffer = self._construct_data_buffer()
 
+        # logger_video attribute must be defined before use
+        self.logger_video = False
+
         # logger
         self._configure_logger()
 
         # trainer
         self.trainer = self._construct_trainer()
 
-    def _set_seed(self, seed: int):
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+    @property
+    def device(self) -> torch.device:
+        """Return the device used for training."""
+        return self._get_device(self.config.device)
 
     def _get_device(self, device_str: str) -> torch.device:
         """Decide on CPU or GPU device."""
@@ -139,8 +136,8 @@ class BaseAlgorithm(ABC):
 
     def _construct_collector(
         self,
-        create_env_fn: Optional[Callable[[], EnvBase]],
-    ) -> SyncDataCollector:
+        create_env_fn: Callable,
+    ) -> SyncDataCollector | MultiaSyncDataCollector:
         # try:
         #     # Set multiprocessing start method
         #     multiprocessing.set_start_method("spawn")
@@ -151,17 +148,17 @@ class BaseAlgorithm(ABC):
         #     self.mp_context = "fork"
         #     pass
         # multiprocessing.set_start_method("fork")
-        self.mp_context = "fork"
 
         # We can't use nested child processes with mp_start_method="fork"
         if self.mp_context == "fork":
             cls = SyncDataCollector
-            env_arg = create_env_fn
+            env_arg = EnvCreator(create_env_fn)
         else:
             cls = MultiaSyncDataCollector
-            env_arg = [create_env_fn] * self.config.collector.num_collectors
-        data_collector = cls(
-            env_arg,
+            env_arg = [EnvCreator(create_env_fn) for _ in range(self.config.collector.num_collectors)]
+        
+        return cls(
+            create_env_fn=env_arg,
             policy=self.policy,
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
@@ -177,23 +174,21 @@ class BaseAlgorithm(ABC):
             device=self.device,
             storing_device=self.device,
         )
-        return data_collector
 
     @abstractmethod
-    def _construct_policy(self) -> nn.Module:
+    def _construct_policy(self) -> torch.nn.Module:
         """Override to build your policy network from config."""
         # use torchrl modules for common policy components
         # e.g. CategoricalPolicy, GaussianPolicy, etc.
-        module = torch.nn.LazyLinear(out_features=self.env.action_spec.shape[-1])
-        policy = TensorDictModule(
+        out_features = self.env.action_spec_unbatched.shape[-1]  # type: ignore
+        module = torch.nn.LazyLinear(out_features=out_features)
+        return TensorDictModule(
             module,
             in_keys=["observation"],
             out_keys=["action"],
         )
 
-        return policy
-
-    def _construct_value_function(self) -> Optional[nn.Module]:
+    def _construct_value_function(self) -> torch.nn.Module | None:
         """Override to build your V-network from config."""
         if self.config.get("value_net", None) is None:
             return None
@@ -201,14 +196,13 @@ class BaseAlgorithm(ABC):
         # Example: simple MLP for state-value
         in_features = value_net_config.get("in_features", 4)
         hidden_size = value_net_config.get("hidden_size", 64)
-        model = nn.Sequential(
-            nn.Linear(in_features, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),  # V(s)
+        return torch.nn.Sequential(
+            torch.nn.Linear(in_features, hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_size, 1),  # V(s)
         )
-        return model
 
-    def _construct_q_function(self) -> Optional[nn.Module]:
+    def _construct_q_function(self) -> torch.nn.Module | None:
         """Override to build your Q-network from config."""
         if self.config.get("q_net", None) is None:
             return None
@@ -218,17 +212,16 @@ class BaseAlgorithm(ABC):
         obs_dim = q_net_config.get("obs_dim", 4)
         act_dim = q_net_config.get("act_dim", 2)
         hidden_size = q_net_config.get("hidden_size", 64)
-        model = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),  # Q(s,a)
+        return torch.nn.Sequential(
+            torch.nn.Linear(obs_dim + act_dim, hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_size, 1),  # Q(s,a)
         )
-        return model
 
-    def _construct_target_network(self, net: nn.Module) -> nn.Module:
+    def _construct_target_network(self, net: torch.nn.Module) -> torch.nn.Module:
         """Create a target network as a copy of the provided net."""
         target_net = type(net)()  # same class
-        # This assumes your net is a nn.Sequential or a custom class:
+        # This assumes your net is a torch.nn.Sequential or a custom class:
         # We copy the state dict so that it starts off identical.
         target_net.load_state_dict(net.state_dict())
 
@@ -238,11 +231,11 @@ class BaseAlgorithm(ABC):
 
         return target_net.to(self.device)
 
-    def _construct_loss_module(self) -> nn.Module:
+    def _construct_loss_module(self) -> torch.nn.Module:
         loss_config = self.config.loss
         """Override to build your loss module from config."""
         # Example: simple PPO loss
-        loss_module = ClipPPOLoss(
+        return ClipPPOLoss(
             actor_network=None,
             critic_network=None,
             clip_epsilon=loss_config.clip_epsilon,
@@ -251,14 +244,12 @@ class BaseAlgorithm(ABC):
             critic_coef=loss_config.critic_coef,
             normalize_advantage=True,
         )
-        return loss_module
 
     @abstractmethod
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Override to build your data buffer from config."""
-        pass
 
-    def _compile_components(self):
+    def _compile_components(self) -> None:  # noqa: B027
         """compile performance-critical methods.
         Examples:
             >>> if self.config.compile:
@@ -268,12 +259,11 @@ class BaseAlgorithm(ABC):
             ...     self.compute_action = self._compute_action
             ...     self.compute_returns = self._compute_returns
         """
-        pass
 
-    def _configure_optimizers(self) -> Dict[str, torch.optim.Optimizer]:
+    def _configure_optimizers(self) -> dict[str, torch.optim.Optimizer]:
         """Configure optimizers for different components."""
         # Basic example: one optimizer for each component
-        optimizers = {}
+        optimizers: dict[str, torch.optim.Optimizer] = {}
         if self.policy:
             optimizers["policy"] = torch.optim.Adam(
                 self.policy.parameters(), lr=self.config.learning_rate
@@ -318,32 +308,35 @@ class BaseAlgorithm(ABC):
             self.logger_video = False
 
     def soft_update(
-        self, source_net: nn.Module, target_net: nn.Module, tau: float = 0.005
+        self,
+        source_net: torch.nn.Module,
+        target_net: torch.nn.Module,
+        tau: float = 0.005,
     ):
         """Polyak/soft-update target network parameters."""
         with torch.no_grad():
             for param, target_param in zip(
-                source_net.parameters(), target_net.parameters()
+                source_net.parameters(), target_net.parameters(), strict=False
             ):
                 target_param.data.copy_(
                     tau * param.data + (1.0 - tau) * target_param.data
                 )
 
-    def hard_update(self, source_net: nn.Module, target_net: nn.Module):
+    def hard_update(self, source_net: torch.nn.Module, target_net: torch.nn.Module):
         """Hard update for target network (full copy)."""
         target_net.load_state_dict(source_net.state_dict())
 
+    @abstractmethod
     def _compute_action(self, tensordict: TensorDict) -> TensorDict:
         """Compute the next action given current policy (abstract)."""
-        pass
 
+    @abstractmethod
     def _compute_returns(self, rollout: Tensor) -> Tensor:
         """Compute returns and possibly advantages from a rollout."""
-        pass
 
-    def _update_policy(self, batch: TensorDict) -> Dict[str, float]:
+    @abstractmethod
+    def _update_policy(self, batch: TensorDict) -> dict[str, float]:
         """Algorithm-specific policy (and/or value) update logic."""
-        pass
 
     def collect_experience(self) -> TensorDict:
         """Generic experience collection (for on-policy).
@@ -352,24 +345,24 @@ class BaseAlgorithm(ABC):
         if self.config.offline:
             return self._load_offline_data()
 
-        raise NotImplementedError("Override for online collection.")
+        msg = "Override for online collection."
+        raise NotImplementedError(msg)
 
     def _load_offline_data(self) -> TensorDict:
         """Load from replay buffer or offline dataset."""
-        assert (
-            self.replay_buffer is not None
-        ), "ReplayBuffer must be provided for offline."
-        batch = self.replay_buffer.sample(self.config.batch_size)
-        return batch
+        assert self.replay_buffer is not None, (
+            "ReplayBuffer must be provided for offline."
+        )
+        return self.replay_buffer.sample(self.config.batch_size)
 
-    def update_reward_estimator(self, batch: TensorDict) -> Dict[str, float]:
+    def update_reward_estimator(self, batch: TensorDict) -> dict[str, float]:
         """Update reward function for Inverse RL or learned reward shaping."""
         if not self.reward_estimator:
             return {}
 
         obs = batch["observation"]
         pred_rewards = self.reward_estimator(obs)
-        if "returns" in batch.keys():
+        if "returns" in batch:
             loss = F.mse_loss(pred_rewards, batch["returns"])
         else:
             # Example placeholder
@@ -380,7 +373,7 @@ class BaseAlgorithm(ABC):
         self.optimizers["reward"].step()
         return {"reward_loss": loss.item()}
 
-    def update_parameters(self, batch: TensorDict) -> Dict[str, float]:
+    def update_parameters(self, batch: TensorDict) -> dict[str, float]:
         """Generic parameter update (handles policy, value, reward, etc.)."""
         metrics = {}
         if self.reward_estimator:
@@ -392,11 +385,18 @@ class BaseAlgorithm(ABC):
         return metrics
 
     def _construct_trainer(self) -> Trainer:
+        # Use the policy optimizer if available, otherwise pick any optimizer from the dict
+        main_optimizer = None
+        if isinstance(self.optim, dict):
+            main_optimizer = self.optim.get("policy", next(iter(self.optim.values())))
+        else:
+            main_optimizer = self.optim
+
         return Trainer(
             collector=self.collector,
             total_frames=self.config.collector.total_frames,
             loss_module=self.loss_module,
-            optimizer=self.optim,
+            optimizer=main_optimizer,
             logger=self.logger,
             **self.config.trainer,
         )
@@ -406,9 +406,9 @@ class BaseAlgorithm(ABC):
         # get the torchrl trainer
         self.trainer.train()
 
+    @abstractmethod
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""
-        pass
 
     def save_checkpoint(self, path: str):
         """Save complete training state."""
@@ -434,11 +434,11 @@ class BaseAlgorithm(ABC):
     def export_onnx_policy_to(self, path: str):
         """Export policy network to ONNX format."""
         if self.policy:
-            dummy_input = torch.randn(1, *self.env.observation_spec.shape)
+            dummy_input: Tensor = torch.randn(1, *self.env.observation_spec.shape)  # type: ignore
             torch.onnx.export(
                 self.policy,
-                dummy_input,  # type: ignore
-                path,
+                args=(dummy_input,),
+                f=path,
                 verbose=True,
                 input_names=["observation"],
                 output_names=["action"],

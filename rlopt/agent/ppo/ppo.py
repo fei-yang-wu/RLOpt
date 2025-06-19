@@ -2,42 +2,29 @@
 Only supports MuJoCo environments for now
 """
 
-from typing import List, Tuple, Dict, Any, Optional, Union
+from __future__ import annotations
 
-import tqdm
+from typing import Optional, Union
+
 import numpy as np
 import torch
-from torch import nn
+import torch.nn
+import torch.optim
+import tqdm
+from omegaconf import DictConfig
 from tensordict import TensorDict
-from torch.optim.optimizer import Optimizer as Optimizer
-
 from tensordict.nn import (
     AddStateIndependentNormalScale,
+    CudaGraphModule,
     TensorDictModule,
-    set_composite_lp_aggregate,
 )
 
-from torchrl.modules import MLP, ProbabilisticActor, TanhNormal, ValueOperator
-from torchrl.data import ReplayBuffer
-from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer, LazyMemmapStorage
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
-from torchrl.envs import EnvBase, TransformedEnv, ExplorationType
-from torchrl.record import CSVLogger, TensorboardLogger, WandbLogger
-from torchrl.record.loggers.common import Logger
-from torchrl.collectors import SyncDataCollector
-from torchrl.data.replay_buffers import LazyMemmapStorage, ReplayBuffer
-from torchrl.objectives import ClipPPOLoss, group_optimizers
-from torchrl.objectives.value.advantages import GAE
-from torchrl._utils import timeit, compile_with_warmup
-
-from omegaconf import DictConfig
 from rlopt.common.base_class import BaseAlgorithm
 
 set_composite_lp_aggregate(True).set()
 
 
 class PPO(BaseAlgorithm):
-
     def __init__(
         self,
         env: EnvBase,
@@ -104,7 +91,8 @@ class PPO(BaseAlgorithm):
         policy_mlp = torch.nn.Sequential(
             policy_mlp,
             AddStateIndependentNormalScale(
-                self.env.action_spec_unbatched.shape[-1], scale_lb=1e-8  # type:ignore
+                self.env.action_spec_unbatched.shape[-1],
+                scale_lb=1e-8,  # type:ignore
             ).to(self.device),
         )
 
@@ -306,7 +294,6 @@ class PPO(BaseAlgorithm):
         total_iter = len(self.collector)
         # print("total_iter:", total_iter)
         for i in range(total_iter):
-
             timeit.printevery(1, total_iter, erase=True)  # type: ignore
 
             with timeit("collecting"):
@@ -333,7 +320,6 @@ class PPO(BaseAlgorithm):
 
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
-
                     # Compute GAE
                     with torch.no_grad(), timeit("adv"):
                         torch.compiler.cudagraph_mark_step_begin()
