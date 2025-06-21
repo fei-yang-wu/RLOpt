@@ -303,9 +303,7 @@ class PPO(BaseAlgorithm):
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
         for _i in range(total_iter):
-            timeit.printevery(
-                1000, total_iter, erase=True
-            )  # Changed from 1 to 1000 to match ppo_mujoco.py
+            # timeit.printevery(1000, total_iter, erase=True)
 
             with timeit("collecting"):
                 data = next(collector_iter)

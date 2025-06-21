@@ -21,11 +21,12 @@ from torchrl.data import (
     ReplayBuffer,
 )
 from torchrl.envs import EnvBase, TransformedEnv
+from torchrl.envs.env_creator import EnvCreator
 from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.record.loggers import generate_exp_name, get_logger
 from torchrl.record.loggers.common import Logger
 from torchrl.trainers import Trainer
-from torchrl.envs.env_creator import EnvCreator
+
 
 class BaseAlgorithm(ABC):
     """
@@ -150,11 +151,11 @@ class BaseAlgorithm(ABC):
         # multiprocessing.set_start_method("fork")
 
         # We can't use nested child processes with mp_start_method="fork"
-        if self.mp_context == "fork":
+        if self.mp_context == "fork":  # noqa: SIM108
             cls = SyncDataCollector
         else:
             cls = MultiSyncDataCollector
-        
+
         return cls(
             create_env_fn=lambda: env,
             policy=self.policy,
@@ -171,6 +172,7 @@ class BaseAlgorithm(ABC):
             # heterogeneous devices
             device=self.device,
             storing_device=self.device,
+            postproc=self.log_postproc,  # type: ignore[reportUnknownReturnType]
         )
 
     @abstractmethod
@@ -257,7 +259,7 @@ class BaseAlgorithm(ABC):
             ...     self.compute_action = self._compute_action
             ...     self.compute_returns = self._compute_returns
         """
-    
+
     @abstractmethod
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers for different components."""
@@ -306,6 +308,20 @@ class BaseAlgorithm(ABC):
         else:
             self.logger_video = False
 
+    def log_postproc(self, tensordict: TensorDict) -> TensorDict:
+        # info comes back in the root of the next-step tensordict
+        info = tensordict.get("info")
+        assert info is not None, "info must be in the tensordict"
+        log_dict = info["log"]  # dict[str, dict[str, Tensor(shape=[1,1])]]
+        episode_log_dict = info["episode"]  # dict[str, dict[str, Tensor(shape=[1,1])]]
+        print(log_dict, episode_log_dict)
+        # for key, tensor in log_dict.items():
+        #     # remove the two singleton dims → scalar
+        #     value = tensor.squeeze(-1).squeeze(-1).item()
+        #     self.logger.log_scalar(f"env/{key}", value)  # type: ignore
+
+        return tensordict
+
     def soft_update(
         self,
         source_net: torch.nn.Module,
@@ -349,10 +365,10 @@ class BaseAlgorithm(ABC):
 
     def _load_offline_data(self) -> TensorDict:
         """Load from replay buffer or offline dataset."""
-        assert self.replay_buffer is not None, (
-            "ReplayBuffer must be provided for offline."
-        )
-        return self.replay_buffer.sample(self.config.batch_size)        
+        assert (
+            self.replay_buffer is not None
+        ), "ReplayBuffer must be provided for offline."
+        return self.replay_buffer.sample(self.config.batch_size)
 
     def update_parameters(self, batch: TensorDict) -> dict[str, float]:
         """Generic parameter update (handles policy, value, reward, etc.)."""
@@ -403,7 +419,7 @@ class BaseAlgorithm(ABC):
             "reward_estimator": (
                 self.reward_estimator.state_dict() if self.reward_estimator else None
             ),
-            "optimizers": self.optimizers.state_dict() if self.optimizers else None, # type: ignore
+            "optimizers": self.optimizers.state_dict() if self.optimizers else None,  # type: ignore
             "step_count": self.step_count,
             "config": OmegaConf.to_container(self.config),
         }
