@@ -172,7 +172,8 @@ class BaseAlgorithm(ABC):
             # heterogeneous devices
             device=self.device,
             storing_device=self.device,
-            postproc=self.log_postproc,  # type: ignore[reportUnknownReturnType]
+            reset_at_each_iter=False,
+            set_truncated=self.config.collector.set_truncated,
         )
 
     @abstractmethod
@@ -308,20 +309,6 @@ class BaseAlgorithm(ABC):
         else:
             self.logger_video = False
 
-    def log_postproc(self, tensordict: TensorDict) -> TensorDict:
-        # info comes back in the root of the next-step tensordict
-        info = tensordict.get("info")
-        assert info is not None, "info must be in the tensordict"
-        log_dict = info["log"]  # dict[str, dict[str, Tensor(shape=[1,1])]]
-        episode_log_dict = info["episode"]  # dict[str, dict[str, Tensor(shape=[1,1])]]
-        print(log_dict, episode_log_dict)
-        # for key, tensor in log_dict.items():
-        #     # remove the two singleton dims → scalar
-        #     value = tensor.squeeze(-1).squeeze(-1).item()
-        #     self.logger.log_scalar(f"env/{key}", value)  # type: ignore
-
-        return tensordict
-
     def soft_update(
         self,
         source_net: torch.nn.Module,
@@ -365,9 +352,9 @@ class BaseAlgorithm(ABC):
 
     def _load_offline_data(self) -> TensorDict:
         """Load from replay buffer or offline dataset."""
-        assert (
-            self.replay_buffer is not None
-        ), "ReplayBuffer must be provided for offline."
+        assert self.replay_buffer is not None, (
+            "ReplayBuffer must be provided for offline."
+        )
         return self.replay_buffer.sample(self.config.batch_size)
 
     def update_parameters(self, batch: TensorDict) -> dict[str, float]:

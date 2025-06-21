@@ -4,6 +4,8 @@ Only supports MuJoCo environments for now
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 import torch
 import torch.nn
@@ -69,7 +71,7 @@ class PPO(BaseAlgorithm):
         """Construct policy following utils_mujoco.py pattern"""
         # for PPO, we use a probabilistic actor
         # Define input shape
-        input_shape = self.env.observation_spec["observation"].shape  # type: ignore
+        input_shape = self.env.observation_spec["policy"].shape  # type: ignore
 
         # Define policy output distribution class
         num_outputs = self.env.action_spec_unbatched.shape[-1]  # type: ignore
@@ -108,7 +110,7 @@ class PPO(BaseAlgorithm):
         return ProbabilisticActor(
             TensorDictModule(
                 module=policy_mlp,
-                in_keys=["observation"],
+                in_keys=["policy"],
                 out_keys=["loc", "scale"],
             ),
             in_keys=["loc", "scale"],
@@ -122,7 +124,7 @@ class PPO(BaseAlgorithm):
     def _construct_value_function(self) -> torch.nn.Module:
         """Construct value function following utils_mujoco.py pattern"""
         # Define input shape
-        input_shape = self.env.observation_spec["observation"].shape  # type: ignore
+        input_shape = self.env.observation_spec["policy"].shape  # type: ignore
         # Define value architecture
         value_mlp = MLP(
             in_features=input_shape[-1],
@@ -141,7 +143,7 @@ class PPO(BaseAlgorithm):
         # Define value module
         return ValueOperator(
             value_mlp,
-            in_keys=["observation"],
+            in_keys=["policy"],
         )
 
     def _construct_loss_module(self) -> torch.nn.Module:
@@ -254,7 +256,7 @@ class PPO(BaseAlgorithm):
         self.policy.eval()
         with torch.inference_mode():
             td = TensorDict(
-                {"observation": obs},
+                {"policy": obs},
                 batch_size=[1],
                 device=self.policy.device,  # type: ignore
             )
@@ -292,16 +294,19 @@ class PPO(BaseAlgorithm):
         )
 
         # extract cfg variables
-        cfg_loss_ppo_epochs = self.config.loss.epochs
-        cfg_optim_lr = torch.tensor(self.config.optim.lr, device=self.device)
-        cfg_loss_anneal_clip_eps = self.config.loss.anneal_clip_epsilon
-        cfg_loss_clip_epsilon = self.config.loss.clip_epsilon
+        cfg_loss_ppo_epochs: int = self.config.loss.epochs
+        cfg_optim_lr: torch.Tensor = torch.tensor(
+            self.config.optim.lr, device=self.device
+        )
+        cfg_loss_anneal_clip_eps: bool = self.config.loss.anneal_clip_epsilon
+        cfg_loss_clip_epsilon: float = self.config.loss.clip_epsilon
 
         losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])  # type: ignore
 
         self.collector: SyncDataCollector | MultiSyncDataCollector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
+        episode_lengths = deque(maxlen=100)
         for _i in range(total_iter):
             # timeit.printevery(1000, total_iter, erase=True)
 
@@ -317,11 +322,12 @@ class PPO(BaseAlgorithm):
             episode_rewards = data["next", "episode_reward"][data["next", "done"]]
             if len(episode_rewards) > 0:
                 episode_length = data["next", "step_count"][data["next", "done"]]
+                episode_lengths.extend(episode_length.cpu().tolist())
+
                 metrics_to_log.update(
                     {
                         "train/reward": episode_rewards.mean().item(),
-                        "train/episode_length": episode_length.sum().item()
-                        / len(episode_length),
+                        "train/episode_length": np.mean(episode_lengths),
                     }
                 )
 
@@ -365,6 +371,29 @@ class PPO(BaseAlgorithm):
                     ),
                 }
             )
+
+            # for IsaacLab, we need to log the metrics from the environment
+            if hasattr(self.env, "log_infos"):
+                for _ in range(len(self.env.log_infos)):
+                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                    # log all the keys
+                    for key, value in log_info_dict.items():
+                        if "/" in key:
+                            metrics_to_log.update(
+                                {
+                                    key: value.item()
+                                    if isinstance(value, Tensor)
+                                    else value
+                                }
+                            )
+                        else:
+                            metrics_to_log.update(
+                                {
+                                    "Episode/" + key: value.item()
+                                    if isinstance(value, Tensor)
+                                    else value
+                                }
+                            )
 
             # Log metrics
             if self.logger:
