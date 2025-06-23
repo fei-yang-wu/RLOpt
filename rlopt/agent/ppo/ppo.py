@@ -25,7 +25,13 @@ from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import ExplorationType, TransformedEnv
-from torchrl.modules import MLP, ProbabilisticActor, TanhNormal, ValueOperator
+from torchrl.modules import (
+    MLP,
+    ProbabilisticActor,
+    TanhNormal,
+    TruncatedNormal,
+    ValueOperator,
+)
 from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
@@ -85,7 +91,7 @@ class PPO(BaseAlgorithm):
         # Define policy architecture
         policy_mlp = MLP(
             in_features=input_shape[-1],
-            activation_class=torch.nn.Tanh,
+            activation_class=torch.nn.ELU,
             out_features=num_outputs,
             num_cells=self.config.policy.num_cells,
             device=self.device,
