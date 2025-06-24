@@ -50,12 +50,13 @@ class BaseAlgorithm(ABC):
         self,
         env: TransformedEnv,
         config: DictConfig,
-        policy: torch.nn.Module | None = None,
+        policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,
-        reward_estimator: torch.nn.Module | None = None,
+        reward_estimator_net: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
+        feature_extractor_net: torch.nn.Module | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -69,18 +70,22 @@ class BaseAlgorithm(ABC):
         self.mp_context = "fork"
 
         # Construct or attach networks based on existence in config
-        self.policy = policy if policy else self._construct_policy()
-        self.value_net = value_net if value_net else self._construct_value_function()
-        self.q_net = q_net if q_net else self._construct_q_function()
-        self.reward_estimator = reward_estimator
+        self.feature_extractor = self._construct_feature_extractor(
+            feature_extractor_net
+        )
+        self.policy = self._construct_policy(policy_net)
+        self.value_function = self._construct_value_function(value_net)
+        self.actor_critic = self._construct_actor_critic()
+        self.q_function = self._construct_q_function(q_net)
+        self.reward_estimator = reward_estimator_net
 
         # Move them to device
         if self.policy:
             self.policy.to(self.device)
-        if self.value_net:
-            self.value_net.to(self.device)
-        if self.q_net:
-            self.q_net.to(self.device)
+        if self.value_function:
+            self.value_function.to(self.device)
+        if self.q_function:
+            self.q_function.to(self.device)
         if self.reward_estimator:
             self.reward_estimator.to(self.device)
 
@@ -90,11 +95,11 @@ class BaseAlgorithm(ABC):
         construct_target_value = self.config.get("construct_target_value", None)
         construct_target_q = self.config.get("construct_target_q", None)
         # If you want a separate target for the value function:
-        if self.value_net is not None and construct_target_value:
-            self.target_value_net = self._construct_target_network(self.value_net)
+        if self.value_function is not None and construct_target_value:
+            self.target_value_net = self._construct_target_network(self.value_function)
         # If you want a separate target for the Q function:
-        if self.q_net is not None and construct_target_q:
-            self.target_q_net = self._construct_target_network(self.q_net)
+        if self.q_function is not None and construct_target_q:
+            self.target_q_net = self._construct_target_network(self.q_function)
 
         # Create optimizers
         self.optimizers = self._configure_optimizers()
@@ -132,6 +137,62 @@ class BaseAlgorithm(ABC):
         self.episode_rewards = deque(maxlen=100)
 
     @property
+    def value_input_shape(self) -> int:
+        if self.config.use_feature_extractor:
+            return self.config.feature_extractor.output_dim
+        return int(
+            torch.tensor(
+                [
+                    self.env.observation_spec[key].shape[-1]
+                    for key in self.config.value_net_in_keys
+                ]
+            )
+            .sum()
+            .item()  # type: ignore
+        )
+
+    @property
+    def policy_input_shape(self) -> int:
+        if self.config.use_feature_extractor:
+            return self.config.feature_extractor.output_dim
+        return int(
+            torch.tensor(
+                [
+                    self.env.observation_spec[key].shape[-1]
+                    for key in self.config.policy_in_keys
+                    + self.config.value_net_in_keys
+                ]
+            )
+            .sum()
+            .item()  # type: ignore
+        )
+
+    @property
+    def total_input_keys(self) -> list[str]:
+        return self.config.total_input_keys
+
+    @property
+    def total_input_shape(self) -> int:
+        return int(
+            torch.tensor(
+                [
+                    self.env.observation_spec[key].shape[-1]
+                    for key in self.total_input_keys
+                ]
+            )
+            .sum()
+            .item()  # type: ignore
+        )
+
+    @property
+    def policy_output_shape(self) -> int:
+        return int(self.env.action_spec_unbatched.shape[-1])  # type: ignore
+
+    @property
+    def value_output_shape(self) -> int:
+        return 1
+
+    @property
     def device(self) -> torch.device:
         """Return the device used for training."""
         return self._get_device(self.config.device)
@@ -165,7 +226,7 @@ class BaseAlgorithm(ABC):
 
         return cls(
             create_env_fn=lambda: env,
-            policy=self.policy,
+            policy=self.actor_critic.get_policy_operator(),
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
             # this is the default behavior: the collector runs in ``"random"`` (or explorative) mode
@@ -184,47 +245,42 @@ class BaseAlgorithm(ABC):
         )
 
     @abstractmethod
-    def _construct_policy(self) -> torch.nn.Module:
+    def _construct_policy(
+        self, policy_net: torch.nn.Module | None = None
+    ) -> TensorDictModule:
         """Override to build your policy network from config."""
-        # use torchrl modules for common policy components
-        # e.g. CategoricalPolicy, GaussianPolicy, etc.
-        out_features = self.env.action_spec_unbatched.shape[-1]  # type: ignore
-        module = torch.nn.LazyLinear(out_features=out_features)
-        return TensorDictModule(
-            module,
-            in_keys=["observation"],
-            out_keys=["action"],
-        )
+        msg = "Subclasses must implement this method"
+        raise NotImplementedError(msg)
 
-    def _construct_value_function(self) -> torch.nn.Module | None:
+    @abstractmethod
+    def _construct_feature_extractor(
+        self, feature_extractor_net: torch.nn.Module | None = None
+    ) -> TensorDictModule:
+        """Override to build your feature extractor network from config."""
+        msg = "Subclasses must implement this method"
+        raise NotImplementedError(msg)
+
+    @abstractmethod
+    def _construct_actor_critic(self) -> TensorDictModule:
+        """Override to build your actor-critic network from config."""
+        msg = "Subclasses must implement this method"
+        raise NotImplementedError(msg)
+
+    @abstractmethod
+    def _construct_value_function(
+        self, value_net: torch.nn.Module | None = None
+    ) -> TensorDictModule:
         """Override to build your V-network from config."""
-        if self.config.get("value_net", None) is None:
-            return None
-        value_net_config = self.config.value_net
-        # Example: simple MLP for state-value
-        in_features = value_net_config.get("in_features", 4)
-        hidden_size = value_net_config.get("hidden_size", 64)
-        return torch.nn.Sequential(
-            torch.nn.Linear(in_features, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, 1),  # V(s)
-        )
+        msg = "Subclasses must implement this method"
+        raise NotImplementedError(msg)
 
-    def _construct_q_function(self) -> torch.nn.Module | None:
+    @abstractmethod
+    def _construct_q_function(
+        self, q_net: torch.nn.Module | None = None
+    ) -> TensorDictModule:
         """Override to build your Q-network from config."""
-        if self.config.get("q_net", None) is None:
-            return None
-
-        q_net_config = self.config.q_net
-        # Example: simple MLP for state-action value
-        obs_dim = q_net_config.get("obs_dim", 4)
-        act_dim = q_net_config.get("act_dim", 2)
-        hidden_size = q_net_config.get("hidden_size", 64)
-        return torch.nn.Sequential(
-            torch.nn.Linear(obs_dim + act_dim, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, 1),  # Q(s,a)
-        )
+        msg = "Subclasses must implement this method"
+        raise NotImplementedError(msg)
 
     def _construct_target_network(self, net: torch.nn.Module) -> torch.nn.Module:
         """Create a target network as a copy of the provided net."""
@@ -239,19 +295,10 @@ class BaseAlgorithm(ABC):
 
         return target_net.to(self.device)
 
+    @abstractmethod
     def _construct_loss_module(self) -> torch.nn.Module:
-        loss_config = self.config.loss
-        """Override to build your loss module from config."""
-        # Example: simple PPO loss
-        return ClipPPOLoss(
-            actor_network=None,
-            critic_network=None,
-            clip_epsilon=loss_config.clip_epsilon,
-            loss_critic_type=loss_config.loss_critic_type,
-            entropy_coef=loss_config.entropy_coef,
-            critic_coef=loss_config.critic_coef,
-            normalize_advantage=True,
-        )
+        msg = "Subclasses must implement this method"
+        raise NotImplementedError(msg)
 
     @abstractmethod
     def _construct_data_buffer(self) -> ReplayBuffer:
@@ -277,13 +324,13 @@ class BaseAlgorithm(ABC):
             optimizers["policy"] = torch.optim.Adam(
                 self.policy.parameters(), lr=self.config.learning_rate
             )
-        if self.value_net:
+        if self.value_function:
             optimizers["value"] = torch.optim.Adam(
-                self.value_net.parameters(), lr=self.config.learning_rate
+                self.value_function.parameters(), lr=self.config.learning_rate
             )
-        if self.q_net:
+        if self.q_function:
             optimizers["q"] = torch.optim.Adam(
-                self.q_net.parameters(), lr=self.config.learning_rate
+                self.q_function.parameters(), lr=self.config.learning_rate
             )
         if self.reward_estimator and self.config.reward_estimation:
             lr = self.config.reward_estimation.get("learning_rate", 3e-4)
@@ -402,12 +449,14 @@ class BaseAlgorithm(ABC):
         """Save complete training state."""
         checkpoint = {
             "policy": self.policy.state_dict() if self.policy else None,
-            "value_net": self.value_net.state_dict() if self.value_net else None,
-            "q_net": self.q_net.state_dict() if self.q_net else None,
-            "target_value_net": (
+            "value_function": self.value_function.state_dict()
+            if self.value_function
+            else None,
+            "q_function": self.q_function.state_dict() if self.q_function else None,
+            "target_value_function": (
                 self.target_value_net.state_dict() if self.target_value_net else None
             ),
-            "target_q_net": (
+            "target_q_function": (
                 self.target_q_net.state_dict() if self.target_q_net else None
             ),
             "reward_estimator": (
@@ -436,14 +485,14 @@ class BaseAlgorithm(ABC):
         """Load training state from a checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         self.policy.load_state_dict(checkpoint["policy"])
-        if self.value_net:
-            self.value_net.load_state_dict(checkpoint["value_net"])
-        if self.q_net:
-            self.q_net.load_state_dict(checkpoint["q_net"])
+        if self.value_function:
+            self.value_function.load_state_dict(checkpoint["value_function"])
+        if self.q_function:
+            self.q_function.load_state_dict(checkpoint["q_function"])
         if self.target_value_net:
-            self.target_value_net.load_state_dict(checkpoint["target_value_net"])
+            self.target_value_net.load_state_dict(checkpoint["target_value_function"])
         if self.target_q_net:
-            self.target_q_net.load_state_dict(checkpoint["target_q_net"])
+            self.target_q_net.load_state_dict(checkpoint["target_q_function"])
         if self.reward_estimator:
             self.reward_estimator.load_state_dict(checkpoint["reward_estimator"])
         if self.optimizers:
