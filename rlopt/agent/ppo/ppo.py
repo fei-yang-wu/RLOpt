@@ -76,8 +76,24 @@ class PPO(BaseAlgorithm):
     def _construct_policy(self) -> torch.nn.Module:
         """Construct policy following utils_mujoco.py pattern"""
         # for PPO, we use a probabilistic actor
-        # Define input shape
-        input_shape = self.env.observation_spec["policy"].shape  # type: ignore
+        # Define input shape from self.config.policy_in_keys, which is a list of strings
+        input_shape = (
+            torch.tensor(
+                [
+                    self.env.observation_spec[key].shape[-1]
+                    for key in self.config.policy_in_keys
+                ]
+            )
+            .sum()
+            .item()
+        )
+        print(
+            [
+                self.env.observation_spec[key].shape[-1]
+                for key in self.config.policy_in_keys
+            ]
+        )
+        print(f"input_shape: {input_shape}")
 
         # Define policy output distribution class
         num_outputs = self.env.action_spec_unbatched.shape[-1]  # type: ignore
@@ -90,7 +106,7 @@ class PPO(BaseAlgorithm):
 
         # Define policy architecture
         policy_mlp = MLP(
-            in_features=input_shape[-1],
+            in_features=input_shape,
             activation_class=torch.nn.ELU,
             out_features=num_outputs,
             num_cells=self.config.policy.num_cells,
@@ -116,7 +132,7 @@ class PPO(BaseAlgorithm):
         return ProbabilisticActor(
             TensorDictModule(
                 module=policy_mlp,
-                in_keys=["policy"],
+                in_keys=self.config.policy_in_keys,
                 out_keys=["loc", "scale"],
             ),
             in_keys=["loc", "scale"],
@@ -124,16 +140,26 @@ class PPO(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.RANDOM,
+            default_interaction_type=ExplorationType.DETERMINISTIC,
         )
 
     def _construct_value_function(self) -> torch.nn.Module:
         """Construct value function following utils_mujoco.py pattern"""
         # Define input shape
-        input_shape = self.env.observation_spec["policy"].shape  # type: ignore
+        input_shape = (
+            torch.tensor(
+                [
+                    self.env.observation_spec[key].shape[-1]
+                    for key in self.config.value_net_in_keys
+                ]
+            )
+            .sum()
+            .item()
+        )
+        print(f"input_shape: {input_shape}")
         # Define value architecture
         value_mlp = MLP(
-            in_features=input_shape[-1],
+            in_features=input_shape,
             activation_class=torch.nn.Tanh,
             out_features=1,
             num_cells=self.config.policy.num_cells,
@@ -149,7 +175,7 @@ class PPO(BaseAlgorithm):
         # Define value module
         return ValueOperator(
             value_mlp,
-            in_keys=["policy"],
+            in_keys=self.config.value_net_in_keys,
         )
 
     def _construct_loss_module(self) -> torch.nn.Module:
@@ -163,6 +189,7 @@ class PPO(BaseAlgorithm):
             entropy_coef=loss_config.entropy_coef,
             critic_coef=loss_config.critic_coef,
             normalize_advantage=True,
+            clip_value=loss_config.clip_value,
         )
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
@@ -248,6 +275,10 @@ class PPO(BaseAlgorithm):
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         total_loss = critic_loss + actor_loss
+        if self.config.trainer.clip_grad_norm:
+            torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), self.config.trainer.clip_norm
+            )
 
         # Backward pass
         total_loss.backward()
@@ -262,7 +293,7 @@ class PPO(BaseAlgorithm):
         self.policy.eval()
         with torch.inference_mode():
             td = TensorDict(
-                {"policy": obs},
+                {key: obs for key in self.config.policy_in_keys},
                 batch_size=[1],
                 device=self.policy.device,  # type: ignore
             )
@@ -293,6 +324,9 @@ class PPO(BaseAlgorithm):
         pbar = tqdm.tqdm(total=self.config.collector.total_frames)
 
         num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
+        if cfg.collector.frames_per_batch % cfg.loss.mini_batch_size != 0:
+            num_mini_batches += 1
+
         self.total_network_updates = (
             (cfg.collector.total_frames // cfg.collector.frames_per_batch)
             * cfg.loss.epochs
@@ -312,7 +346,6 @@ class PPO(BaseAlgorithm):
         self.collector: SyncDataCollector | MultiSyncDataCollector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
-        episode_lengths = deque(maxlen=100)
         for _i in range(total_iter):
             # timeit.printevery(1000, total_iter, erase=True)
 
@@ -328,15 +361,16 @@ class PPO(BaseAlgorithm):
             episode_rewards = data["next", "episode_reward"][data["next", "done"]]
             if len(episode_rewards) > 0:
                 episode_length = data["next", "step_count"][data["next", "done"]]
-                episode_lengths.extend(episode_length.cpu().tolist())
-
+                self.episode_lengths.extend(episode_length.cpu().tolist())
+                self.episode_rewards.extend(episode_rewards.cpu().tolist())
                 metrics_to_log.update(
                     {
+                        "train/episode_length": np.mean(self.episode_lengths),
+                        "train/episode_reward": np.mean(self.episode_rewards),
                         "train/reward": episode_rewards.mean().item(),
-                        "train/episode_length": np.mean(episode_lengths),
                     }
                 )
-
+            self.data_buffer.empty()
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
                     # Compute GAE

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable
 from typing import Sequence
 
@@ -123,6 +124,12 @@ class BaseAlgorithm(ABC):
 
         # trainer
         self.trainer = self._construct_trainer()
+
+        # episode length
+        self.episode_lengths = deque(maxlen=100)
+
+        # episode rewards
+        self.episode_rewards = deque(maxlen=100)
 
     @property
     def device(self) -> torch.device:
