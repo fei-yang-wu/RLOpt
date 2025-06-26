@@ -65,6 +65,7 @@ from rlopt.agent.l2t.policies import (
     RecurrentActorCriticPolicy,
 )
 
+from rlopt.agent.l2t.encoder.autoencoder import DepthEncoder
 
 SelfRecurrentL2T = TypeVar("SelfRecurrentL2T", bound="RecurrentL2T")
 
@@ -220,12 +221,34 @@ class RecurrentL2T(OnPolicyAlgorithm):
         )
         support_multi_env = True
         self.whole_sequences = whole_sequences
+
+        self.non_image_features_dim = 94
+        self.image_height = 480
+        self.image_width = 640
+        self.latent_vector_dim = 32
+        self.encoder_batch_size = 16
+
         # Create and wrap the env if needed
         if env is not None:
             env = maybe_make_env(env, self.verbose)
             env = self._wrap_env(env, self.verbose, True)
 
             self.observation_space = env.observation_space
+            if "student" in self.observation_space.spaces:
+                original_space = self.observation_space["student"]
+
+                low = np.concatenate([
+                    original_space.low[:self.non_image_features_dim], 
+                    np.full(self.latent_vector_dim, -np.inf)  
+                ])
+                high = np.concatenate([
+                    original_space.high[:self.non_image_features_dim], 
+                    np.full(self.latent_vector_dim, np.inf)
+                ])
+                self.observation_space["student"] = spaces.Box(
+                    low=low, high=high, dtype=np.float32
+                )
+
             self.action_space = env.action_space
             self.n_envs = env.num_envs
             self.env = env
@@ -314,6 +337,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         self._last_lstm_states = None
 
+        self.encoder = DepthEncoder(latent_dim=32)
+
         if _init_setup_model:
             self._setup_model()
 
@@ -347,6 +372,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.compiled_policy = th.compile(self.policy)
 
         self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
+
+        encoder_state_dict = th.load("/home/asus/RLOpt/rlopt/agent/l2t/encoder/pretrained_model/best_autoencoder.pth")['encoder_only']
+        self.encoder.load_state_dict(encoder_state_dict)
+        self.encoder = self.encoder.eval().to(self.device)
+
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.compiled_encoder = th.compile(self.encoder)
 
     def _init_student_policy(
         self,
@@ -515,6 +548,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     )
             time_now = time.time_ns()
             new_obs, rewards, dones, infos = env.step(clipped_actions)  # type: ignore[arg-type]
+            new_obs = self._process_student_obs(
+                new_obs,
+                non_image_features_dim=self.non_image_features_dim,
+                image_height=self.image_height,
+                image_width=self.image_width,
+                batch_size=self.batch_size
+            )
+
             self.logger.record("time/step", (time.time_ns() - time_now) / 1e9)
 
             self.num_timesteps += env.num_envs
@@ -1061,7 +1102,15 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Avoid resetting the environment when calling ``.learn()`` consecutive times
         if reset_num_timesteps or self._last_obs is None:
             assert self.env is not None
-            self._last_obs = self.env.reset()  # type: ignore[assignment]
+            new_obs = self.env.reset()  # type: ignore[assignment]
+            new_obs = self._process_student_obs(
+                new_obs,
+                non_image_features_dim=self.non_image_features_dim,
+                image_height=self.image_height,
+                image_width=self.image_width,
+                batch_size=self.batch_size,
+            )
+            self._last_obs = new_obs
             self._last_episode_starts = th.ones((self.env.num_envs,), dtype=th.bool)
             # Retrieve unnormalized observation for saving into the buffer
             if self._vec_normalize_env is not None:
@@ -1138,6 +1187,58 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
             )
         self.logger.dump(step=self.num_timesteps)
+    
+    def _process_student_obs(
+        self, 
+        new_obs: Dict[str, th.Tensor],
+        non_image_features_dim: int,
+        image_height: int,
+        image_width: int,
+        batch_size: int
+    ) -> Dict[str, th.Tensor]:
+        """
+        Process student observations by:
+        1. Separating non-image features and depth image
+        2. Encoding depth image into feature vectors
+        3. Concatenating to form new observations
+        
+        Args:
+            new_obs: Raw observation dictionary containing both "student" and "teacher" observations
+            non_image_features_dim: Dimension of non-image features (default: 94)
+            image_height: Height of the depth image (default: 480)
+            image_width: Width of the depth image (default: 640)
+            encoded_feature_dim: Output dimension of encoder (default: 32)
+            batch_size: Batch size for encoding (default: 16)
+        
+        Returns:
+            Updated observation dictionary with encoded "student" observations
+        """
+        # Calculate depth image dimension
+        depth_image_dim = image_width * image_height  # 307200 for 640x480
+        
+        student_obs = new_obs['student']
+        
+        # Separate non-image features and depth image
+        non_image_obs = student_obs[:, :non_image_features_dim]  # shape: [env.num_envs, non_image_features_dim]
+        depth_image = student_obs[:, -depth_image_dim:].reshape(
+            self.env.num_envs, 1, image_height, image_width
+        )  # shape: [env.num_envs, 1, image_height, image_width]
+        
+        # Batch process depth images
+        features = []
+        with th.no_grad():
+            for i in range(0, len(depth_image), batch_size):
+                batch = depth_image[i:i + batch_size]
+                features.append(self.compiled_encoder(batch))
+        
+        # Concatenate encoded features with non-image features
+        encoded_features = th.cat(features, dim=0)  # shape: [env.num_envs, encoded_feature_dim]
+        new_obs['student'] = th.cat(
+            [non_image_obs, encoded_features], 
+            dim=1
+        )  # Final shape: [env.num_envs, non_image_features_dim + encoded_feature_dim]
+        
+        return new_obs
 
     def inference(self):
         # optimize the model for inference
