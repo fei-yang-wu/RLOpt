@@ -1,18 +1,24 @@
-import warnings
-from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple, List
-from collections import deque
-import time
-import statistics
-import pathlib
+from __future__ import annotations
+
 import io
+import os
+import pathlib
+import statistics
+import time
+import warnings
+from collections import deque
+from copy import deepcopy
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
-from torch.nn import functional as F
-from copy import deepcopy
-
-from stable_baselines3.common.buffers import RolloutBuffer, BaseBuffer
+from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
+from stable_baselines3.common import utils
+from stable_baselines3.common.base_class import maybe_make_env
+from stable_baselines3.common.buffers import BaseBuffer, RolloutBuffer
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import (
     ActorCriticCnnPolicy,
@@ -20,52 +26,46 @@ from stable_baselines3.common.policies import (
     BasePolicy,
     MultiInputActorCriticPolicy,
 )
-
-
-from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
 from stable_baselines3.common.save_util import (
     load_from_zip_file,
     recursive_getattr,
     recursive_setattr,
     save_to_zip_file,
 )
-from stable_baselines3.common.utils import get_system_info
-from stable_baselines3.common.vec_env.patch_gym import _convert_space
 from stable_baselines3.common.type_aliases import (
     GymEnv,
     MaybeCallback,
     Schedule,
     TensorDict,
 )
-from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
-from stable_baselines3.common import utils
-from stable_baselines3.common.noise import ActionNoise
-from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.utils import (
     get_device,
+    get_schedule_fn,
+    get_system_info,
+    update_learning_rate,
 )
-from stable_baselines3.common.base_class import maybe_make_env
 from stable_baselines3.common.vec_env import (
     VecEnv,
     VecNormalize,
     unwrap_vec_normalize,
 )
+from stable_baselines3.common.vec_env.patch_gym import _convert_space
+from torch.nn import functional as F
 
-from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
-from rlopt.common.utils import (
-    obs_as_tensor,
-    unpad_trajectories,
-    swap_and_flatten,
-    export_to_onnx,
-)
+from rlopt.agent.l2t.encoder.autoencoder import DepthEncoder
 from rlopt.agent.l2t.policies import (
-    MlpLstmPolicy,
     CnnLstmPolicy,
+    MlpLstmPolicy,
     MultiInputLstmPolicy,
     RecurrentActorCriticPolicy,
 )
-
-from rlopt.agent.l2t.encoder.autoencoder import DepthEncoder
+from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
+from rlopt.common.utils import (
+    export_to_onnx,
+    obs_as_tensor,
+    swap_and_flatten,
+    unpad_trajectories,
+)
 
 SelfRecurrentL2T = TypeVar("SelfRecurrentL2T", bound="RecurrentL2T")
 
@@ -237,14 +237,18 @@ class RecurrentL2T(OnPolicyAlgorithm):
             if "student" in self.observation_space.spaces:
                 original_space = self.observation_space["student"]
 
-                low = np.concatenate([
-                    original_space.low[:self.non_image_features_dim], 
-                    np.full(self.latent_vector_dim, -np.inf)  
-                ])
-                high = np.concatenate([
-                    original_space.high[:self.non_image_features_dim], 
-                    np.full(self.latent_vector_dim, np.inf)
-                ])
+                low = np.concatenate(
+                    [
+                        original_space.low[: self.non_image_features_dim],
+                        np.full(self.latent_vector_dim, -np.inf),
+                    ]
+                )
+                high = np.concatenate(
+                    [
+                        original_space.high[: self.non_image_features_dim],
+                        np.full(self.latent_vector_dim, np.inf),
+                    ]
+                )
                 self.observation_space["student"] = spaces.Box(
                     low=low, high=high, dtype=np.float32
                 )
@@ -299,17 +303,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
         if normalize_advantage:
-            assert batch_size > 1, (
-                "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
-            )
+            assert (
+                batch_size > 1
+            ), "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
 
         if self.env is not None:
             # Check that `n_steps * n_envs > 1` to avoid NaN
             # when doing advantage normalization
             buffer_size = self.env.num_envs * self.n_steps
-            assert buffer_size > 1 or (not normalize_advantage), (
-                f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
-            )
+            assert (
+                buffer_size > 1 or (not normalize_advantage)
+            ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
             # Check that the rollout buffer size is a multiple of the mini-batch size
             untruncated_batches = buffer_size // batch_size
             if buffer_size % batch_size > 0:
@@ -373,7 +377,15 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
 
-        encoder_state_dict = th.load("/home/asus/RLOpt/rlopt/agent/l2t/encoder/pretrained_model/best_autoencoder.pth")['encoder_only']
+        # get the script path of the current file
+        script_path = os.path.dirname(os.path.abspath(__file__))
+        # get the path of the pretrained model
+        pretrained_model_path = os.path.join(
+            script_path, "encoder", "pretrained_model", "best_autoencoder.pth"
+        )
+        # load the pretrained model
+        encoder_state_dict = th.load(pretrained_model_path)["encoder_only"]
+
         self.encoder.load_state_dict(encoder_state_dict)
         self.encoder = self.encoder.eval().to(self.device)
 
@@ -553,7 +565,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 non_image_features_dim=self.non_image_features_dim,
                 image_height=self.image_height,
                 image_width=self.image_width,
-                batch_size=self.batch_size
+                batch_size=self.batch_size,
             )
 
             self.logger.record("time/step", (time.time_ns() - time_now) / 1e9)
@@ -1187,21 +1199,21 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
             )
         self.logger.dump(step=self.num_timesteps)
-    
+
     def _process_student_obs(
-        self, 
+        self,
         new_obs: Dict[str, th.Tensor],
         non_image_features_dim: int,
         image_height: int,
         image_width: int,
-        batch_size: int
+        batch_size: int,
     ) -> Dict[str, th.Tensor]:
         """
         Process student observations by:
         1. Separating non-image features and depth image
         2. Encoding depth image into feature vectors
         3. Concatenating to form new observations
-        
+
         Args:
             new_obs: Raw observation dictionary containing both "student" and "teacher" observations
             non_image_features_dim: Dimension of non-image features (default: 94)
@@ -1209,35 +1221,38 @@ class RecurrentL2T(OnPolicyAlgorithm):
             image_width: Width of the depth image (default: 640)
             encoded_feature_dim: Output dimension of encoder (default: 32)
             batch_size: Batch size for encoding (default: 16)
-        
+
         Returns:
             Updated observation dictionary with encoded "student" observations
         """
         # Calculate depth image dimension
         depth_image_dim = image_width * image_height  # 307200 for 640x480
-        
-        student_obs = new_obs['student']
-        
+
+        student_obs = new_obs["student"]
+
         # Separate non-image features and depth image
-        non_image_obs = student_obs[:, :non_image_features_dim]  # shape: [env.num_envs, non_image_features_dim]
+        non_image_obs = student_obs[
+            :, :non_image_features_dim
+        ]  # shape: [env.num_envs, non_image_features_dim]
         depth_image = student_obs[:, -depth_image_dim:].reshape(
             self.env.num_envs, 1, image_height, image_width
         )  # shape: [env.num_envs, 1, image_height, image_width]
-        
+
         # Batch process depth images
         features = []
         with th.no_grad():
             for i in range(0, len(depth_image), batch_size):
-                batch = depth_image[i:i + batch_size]
+                batch = depth_image[i : i + batch_size]
                 features.append(self.compiled_encoder(batch))
-        
+
         # Concatenate encoded features with non-image features
-        encoded_features = th.cat(features, dim=0)  # shape: [env.num_envs, encoded_feature_dim]
-        new_obs['student'] = th.cat(
-            [non_image_obs, encoded_features], 
-            dim=1
+        encoded_features = th.cat(
+            features, dim=0
+        )  # shape: [env.num_envs, encoded_feature_dim]
+        new_obs["student"] = th.cat(
+            [non_image_obs, encoded_features], dim=1
         )  # Final shape: [env.num_envs, non_image_features_dim + encoded_feature_dim]
-        
+
         return new_obs
 
     def inference(self):
