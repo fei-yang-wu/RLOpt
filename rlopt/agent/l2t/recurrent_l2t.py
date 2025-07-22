@@ -797,7 +797,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     self.compiled_policy.optimizer,
                     self.compiled_student_policy.optimizer,
                 ],
-                lr=self.current_lr
+                #lr=self.current_lr
             )
 
             # Optimization step

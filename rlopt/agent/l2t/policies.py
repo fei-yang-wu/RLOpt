@@ -890,6 +890,63 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         )
 
 
+class HeightScanFeatureExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space, mlp_dim=64, cnn_out_dim=32, height_scan_dim=187):
+        """
+        Custom feature extractor: Processes the last height_scan_dim dimensions of the input with a 1D CNN,
+        the remaining part with an MLP, and then concatenates the results.
+        :param observation_space: Input space (obs_dim)
+        :param mlp_dim: Output dimension of the MLP
+        :param cnn_out_dim: Output dimension of the CNN
+        :param height_scan_dim: Length of the height_scan feature
+        """
+        super().__init__(observation_space, features_dim=mlp_dim+cnn_out_dim)
+        obs_dim = observation_space.shape[0]
+        self.height_scan_dim = height_scan_dim
+        # MLP for features except height_scan
+        self.mlp = nn.Sequential(
+            nn.Linear(obs_dim - height_scan_dim, mlp_dim),
+            nn.ReLU(),
+        )
+        # 1D CNN for height_scan features
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(16, 32, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(32 * height_scan_dim, cnn_out_dim),
+            nn.ReLU(),
+        )
+    
+    def forward(self, obs):
+        """
+        Forward pass:
+        Input obs can be [T, B, obs_dim] or [batch, obs_dim]
+        - If 3D, reshape to [T*B, obs_dim]
+        - Take the last height_scan_dim dims as height_scan, the rest as other
+        - Pass other through MLP, height_scan through CNN
+        - Concatenate the outputs
+        Output shape matches input ([T, B, ...] or [batch, ...])
+        """
+        orig_shape = obs.shape
+        if obs.dim() == 3:
+            T, B, D = obs.shape
+            obs = obs.reshape(-1, D)  # [T*B, obs_dim]
+        # Split height_scan and other features
+        other = obs[..., :-self.height_scan_dim]  # [N, obs_dim-height_scan_dim]
+        height_scan = obs[..., -self.height_scan_dim:]  # [N, height_scan_dim]
+        mlp_out = self.mlp(other)  # [N, mlp_dim]
+        # Add channel dimension for Conv1d: [N, 1, height_scan_dim]
+        cnn_in = height_scan.unsqueeze(1)
+        cnn_out = self.cnn(cnn_in)  # [N, cnn_out_dim]
+        out = th.cat([mlp_out, cnn_out], dim=-1)  # [N, mlp_dim+cnn_out_dim]
+        # If original input was 3D, reshape back to [T, B, ...]
+        if len(orig_shape) == 3:
+            out = out.view(orig_shape[0], orig_shape[1], -1)  # [T, B, ...]
+        return out
+
+
 MlpLstmPolicy = RecurrentActorCriticPolicy
 CnnLstmPolicy = RecurrentActorCriticCnnPolicy
 MultiInputLstmPolicy = RecurrentMultiInputActorCriticPolicy
