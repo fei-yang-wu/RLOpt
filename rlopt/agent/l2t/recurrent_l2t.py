@@ -1,18 +1,26 @@
-import warnings
-from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple, List
-from collections import deque
-import time
-import statistics
-import pathlib
+from __future__ import annotations
+
 import io
+import pathlib
+import statistics
+import time
+import warnings
+from collections import deque
+from typing import (
+    Any,
+    ClassVar,
+    TypeVar,
+)
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
-from torch.nn import functional as F
-from copy import deepcopy
-
-from stable_baselines3.common.buffers import RolloutBuffer, BaseBuffer
+from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
+from stable_baselines3.common import utils
+from stable_baselines3.common.base_class import maybe_make_env
+from stable_baselines3.common.buffers import BaseBuffer, RolloutBuffer
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import (
     ActorCriticCnnPolicy,
@@ -20,51 +28,42 @@ from stable_baselines3.common.policies import (
     BasePolicy,
     MultiInputActorCriticPolicy,
 )
-
-
-from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
 from stable_baselines3.common.save_util import (
     load_from_zip_file,
     recursive_getattr,
     recursive_setattr,
-    save_to_zip_file,
 )
-from stable_baselines3.common.utils import get_system_info
-from stable_baselines3.common.vec_env.patch_gym import _convert_space
 from stable_baselines3.common.type_aliases import (
     GymEnv,
     MaybeCallback,
     Schedule,
     TensorDict,
 )
-from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
-from stable_baselines3.common import utils
-from stable_baselines3.common.noise import ActionNoise
-from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.utils import (
     get_device,
+    get_schedule_fn,
+    get_system_info,
+    update_learning_rate,
 )
-from stable_baselines3.common.base_class import maybe_make_env
 from stable_baselines3.common.vec_env import (
     VecEnv,
     VecNormalize,
     unwrap_vec_normalize,
 )
+from stable_baselines3.common.vec_env.patch_gym import _convert_space
+from torch.nn import functional as F
 
+from rlopt.agent.l2t.policies import (
+    CnnLstmPolicy,
+    MlpLstmPolicy,
+    MultiInputLstmPolicy,
+    RecurrentActorCriticPolicy,
+)
 from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
 from rlopt.common.utils import (
     obs_as_tensor,
     unpad_trajectories,
-    swap_and_flatten,
-    export_to_onnx,
 )
-from rlopt.agent.l2t.policies import (
-    MlpLstmPolicy,
-    CnnLstmPolicy,
-    MultiInputLstmPolicy,
-    RecurrentActorCriticPolicy,
-)
-
 
 SelfRecurrentL2T = TypeVar("SelfRecurrentL2T", bound="RecurrentL2T")
 
@@ -118,12 +117,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
-    policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
+    policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "MlpPolicy": ActorCriticPolicy,
         "CnnPolicy": ActorCriticCnnPolicy,
         "MultiInputPolicy": MultiInputActorCriticPolicy,
     }
-    student_policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
+    student_policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "MlpLstmPolicy": MlpLstmPolicy,
         "CnnLstmPolicy": CnnLstmPolicy,
         "MultiInputLstmPolicy": MultiInputLstmPolicy,
@@ -131,12 +130,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticPolicy]],
-        env: Union[GymEnv, str],
-        student_policy: Union[
-            str, Type[RecurrentActorCriticPolicy]
-        ] = RecurrentActorCriticPolicy,
-        learning_rate: Union[float, Schedule] = 3e-4,
+        policy: str | type[ActorCriticPolicy],
+        env: GymEnv | str,
+        student_policy: str
+        | type[RecurrentActorCriticPolicy] = RecurrentActorCriticPolicy,
+        learning_rate: float | Schedule = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 64,
         whole_sequences: bool = True,
@@ -144,27 +142,26 @@ class RecurrentL2T(OnPolicyAlgorithm):
         n_batches: int = 5,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_range: Union[float, Schedule] = 0.2,
-        clip_range_vf: Union[None, float, Schedule] = None,
+        clip_range: float | Schedule = 0.2,
+        clip_range_vf: None | float | Schedule = None,
         normalize_advantage: bool = True,
         ent_coef: float = 0.0,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
-        rollout_buffer_class: Optional[
-            type[RLOptDictRecurrentReplayBuffer]
-        ] = RLOptDictRecurrentReplayBuffer,
-        rollout_buffer_kwargs: Optional[Dict[str, Any]] = None,
-        target_kl: Optional[float] = None,
+        rollout_buffer_class: type[RLOptDictRecurrentReplayBuffer]
+        | None = RLOptDictRecurrentReplayBuffer,
+        rollout_buffer_kwargs: dict[str, Any] | None = None,
+        target_kl: float | None = None,
         stats_window_size: int = 100,
-        tensorboard_log: Optional[str] = None,
+        tensorboard_log: str | None = None,
         mixture_coeff: float = 0.0,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
-        student_policy_kwargs: Optional[Dict[str, Any]] = None,
+        policy_kwargs: dict[str, Any] | None = None,
+        student_policy_kwargs: dict[str, Any] | None = None,
         verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
+        seed: int | None = None,
+        device: th.device | str = "auto",
         _init_setup_model: bool = True,
     ):
         if isinstance(policy, str):
@@ -182,16 +179,16 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Used for computing fps, it is updated at each call of learn()
         self._num_timesteps_at_start = 0
         self.seed = seed
-        self.action_noise: Optional[ActionNoise] = None
+        self.action_noise: ActionNoise | None = None
         self.start_time = 0.0
         self.learning_rate = learning_rate
         self.tensorboard_log = tensorboard_log
         self._last_obs = (  # type: ignore
             None
-        )  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
-        self._last_episode_starts = None  # type: Optional[np.ndarray]
+        )
+        self._last_episode_starts = None  # type: ignore
         # When using VecNormalize:
-        self._last_original_obs = None  # type: Optional[Union[np.ndarray, Dict[str, np.ndarray]]]
+        self._last_original_obs = None
         self._episode_num = 0
         # Used for gSDE only
         self.use_sde = use_sde
@@ -204,14 +201,14 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self._current_progress_remaining = 1.0
         # Buffers for logging
         self._stats_window_size = stats_window_size
-        self.ep_info_buffer = None  # type: Optional[deque]
-        self.ep_success_buffer = None  # type: Optional[deque]
+        self.ep_info_buffer = None
+        self.ep_success_buffer = None
         # For logging (and TD3 delayed updates)
         self._n_updates = 0  # type: int
         # Whether the user passed a custom logger or not
         self._custom_logger = False
-        self.env: Optional[VecEnv] = None
-        self._vec_normalize_env: Optional[VecNormalize] = None
+        self.env: VecEnv | None = None
+        self._vec_normalize_env: VecNormalize | None = None
         supported_action_spaces = (
             spaces.Box,
             spaces.Discrete,
@@ -240,10 +237,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 )
 
             if not support_multi_env and self.n_envs > 1:
-                raise ValueError(
+                msg = (
                     "Error: the model does not support multiple envs; it requires "
                     "a single vectorized environment."
                 )
+                raise ValueError(msg)
 
             # Catch common mistake: using MlpPolicy/CnnPolicy instead of MultiInputPolicy
             # if policy in ["MlpPolicy", "CnnPolicy"] and isinstance(
@@ -254,9 +252,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
             #     )
 
             if self.use_sde and not isinstance(self.action_space, spaces.Box):
-                raise ValueError(
-                    "generalized State-Dependent Exploration (gSDE) can only be used with continuous actions."
-                )
+                msg = "generalized State-Dependent Exploration (gSDE) can only be used with continuous actions."
+                raise ValueError(msg)
 
             if isinstance(self.action_space, spaces.Box):
                 assert np.all(
@@ -296,7 +293,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     f" after every {untruncated_batches} untruncated mini-batches,"
                     f" there will be a truncated mini-batch of size {buffer_size % batch_size}\n"
                     f"We recommend using a `batch_size` that is a factor of `n_steps * n_envs`.\n"
-                    f"Info: (n_steps={self.n_steps} and n_envs={self.env.num_envs})"
+                    f"Info: (n_steps={self.n_steps} and n_envs={self.env.num_envs})",
+                    stacklevel=2,
                 )
         self.batch_size = batch_size
         self.n_epochs = n_epochs
@@ -336,7 +334,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Initialize schedules for policy/value clipping
         self.clip_range = get_schedule_fn(self.clip_range)
         if self.clip_range_vf is not None:
-            if isinstance(self.clip_range_vf, (float, int)):
+            if isinstance(self.clip_range_vf, float | int):
                 assert self.clip_range_vf > 0, (
                     "`clip_range_vf` must be positive, "
                     "pass `None` to deactivate vf clipping"
@@ -344,16 +342,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
 
-        self.compiled_policy = th.compile(self.policy)
+        self.compiled_policy = th.compile(self.policy)  # type: ignore
 
         self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
 
     def _init_student_policy(
         self,
-        student_policy: Union[
-            str, Type[ActorCriticPolicy], ActorCriticPolicy, BasePolicy
-        ] = ActorCriticPolicy,
-        student_policy_kwargs: Optional[Dict[str, Any]] = None,
+        student_policy: str
+        | type[ActorCriticPolicy]
+        | ActorCriticPolicy
+        | BasePolicy = ActorCriticPolicy,
+        student_policy_kwargs: dict[str, Any] | None = None,
     ) -> None:
         if isinstance(student_policy, str):
             self.student_policy_class = self._get_policy_from_name(student_policy)
@@ -409,7 +408,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             n_envs=self.n_envs,
             **self.rollout_buffer_kwargs,
         )
-        self.rollout_buffer: RLOptDictRecurrentReplayBuffer
+        self.rollout_buffer: RLOptDictRecurrentReplayBuffer  # type: ignore[assignment]
 
     def collect_rollouts(
         self,
@@ -434,8 +433,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         """
         assert self._last_obs is not None, "No previous observation was provided"
 
-        self._last_obs: Dict[str, th.Tensor]
+        self._last_obs: dict[str, th.Tensor]
         # Switch to eval mode (this affects batch norm / dropout)
+        self.compiled_policy: ActorCriticPolicy
         self.compiled_policy.set_training_mode(False)
         # self.compiled_student_policy.set_training_mode(False)
 
@@ -503,7 +503,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     # Unscale the actions to match env bounds
                     # if they were previously squashed (scaled in [-1, 1])
                     clipped_actions = self.compiled_policy.unscale_action(
-                        clipped_actions
+                        clipped_actions  # type: ignore
                     )
                 else:
                     # Otherwise, clip the actions to avoid out of bound error
@@ -560,11 +560,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones  # type: ignore[arg-type]
-            self._last_lstm_states = lstm_states
+            self._last_lstm_states = lstm_states  # type: ignore
 
             # record reward and episode length
             self.rewbuffer.extend(
-                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
+                self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()  # type: ignore[arg-type]
             )
             self.lenbuffer.extend(
                 self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
@@ -575,10 +575,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         with th.inference_mode():
             # Compute value for the last timestep
             values = self.compiled_policy.predict_values(
-                obs_as_tensor(new_obs["teacher"], self.device)
-            )  # type: ignore[arg-type]
-
-        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+                obs_as_tensor(new_obs["teacher"], self.device)  # type: ignore[arg-type]
+            )
+        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)  # type: ignore[arg-type]
 
         callback.update_locals(locals())
 
@@ -677,7 +676,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
             # teacher is mlp so no funny business
             values, log_prob, entropy = self.compiled_policy.evaluate_actions(
-                observations,
+                observations,  # type: ignore[arg-type]
                 actions,  # type: ignore
             )
             values = values.flatten()
@@ -698,7 +697,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # NOTE: this depends on the reward scaling
                 values_pred = values_batch + th.clamp(
                     values - values_batch,
-                    -clip_range_vf,
+                    -clip_range_vf,  # type: ignore
                     clip_range_vf,  # type: ignore
                 )
             # Value loss using the TD(gae_lambda) target
@@ -719,7 +718,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             clip_fractions.append(clip_fraction)
 
             # Entropy loss favor exploration
-            if entropy is None:
+            if entropy is None:  # noqa: SIM108
                 # Approximate entropy when no analytical form
                 entropy_loss = -th.mean(-log_prob)
             else:
@@ -740,22 +739,22 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 student_log_prob,
                 mu,
                 sigma,
-            ) = self.compiled_student_policy.predict_whole_sequence(
+            ) = self.compiled_student_policy.predict_whole_sequence(  # type: ignore
                 obs=student_observations,
                 deterministic=False,
-                lstm_states=hidden_batch,
+                lstm_states=hidden_batch,  # type: ignore
             )
 
             # align dim with the teacher action
             student_action = BaseBuffer.swap_and_flatten(
-                unpad_trajectories(student_action, mask)
+                unpad_trajectories(student_action, mask)  # type: ignore
             )
 
             student_log_prob = BaseBuffer.swap_and_flatten(
                 unpad_trajectories(student_log_prob, mask)
             )
 
-            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)
+            student_ratio = th.exp(student_log_prob - old_actions_log_prob_batch)  # type: ignore
 
             # clipped asym loss
             student_asym_loss_1 = advantages * student_ratio
@@ -763,7 +762,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 student_ratio, 1 - clip_range, 1 + clip_range
             )
             student_asym_loss = -th.min(student_asym_loss_1, student_asym_loss_2).mean()
-            student_asym_loss = -th.mean(
+            student_asym_loss = -th.mean(  # noqa: F841
                 advantages * th.clamp(student_ratio, 1 - clip_range, 1 + clip_range)
             ).mean()
             teacher_action = actions.detach()
@@ -825,7 +824,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/loss", loss.item())  # type: ignore
         if hasattr(self.compiled_policy, "log_std"):
             self.logger.record(
                 "train/std", th.exp(self.compiled_policy.log_std).mean().item()
@@ -834,7 +833,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range.item())
         if self.clip_range_vf is not None:
-            self.logger.record("train/clip_range_vf", clip_range_vf)
+            self.logger.record("train/clip_range_vf", clip_range_vf)  # type: ignore
         self.logger.record("train/student_loss", np.mean(student_losses))
 
     def learn(
@@ -865,7 +864,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             continue_training = self.collect_rollouts(
                 self.env,
                 callback,
-                self.rollout_buffer,
+                self.rollout_buffer,  # type: ignore
                 n_rollout_steps=self.n_steps,  # type: ignore
             )
             collection_end = time.time_ns()
@@ -890,14 +889,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         return self
 
-    def _excluded_save_params(self) -> List[str]:
-        return super()._excluded_save_params() + [
-            "actor",
-            "critic",
-            "critic_target",
-        ]  # noqa: RUF005
+    def _excluded_save_params(self) -> list[str]:
+        return [*super()._excluded_save_params(), "actor", "critic", "critic_target"]
 
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         state_dicts = [
             "policy",
             "student_policy",
@@ -907,11 +902,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def student_predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -934,11 +929,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def student_predict_and_return_tensor(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -953,19 +948,19 @@ class RecurrentL2T(OnPolicyAlgorithm):
             (used in recurrent policies)
         """
         return self.compiled_student_policy.predict_and_return_tensor(  # type: ignore
-            observation["student"],
-            state,
-            episode_start,
+            observation["student"],  # type: ignore
+            state,  # type: ignore
+            episode_start,  # type: ignore
             deterministic,  # type: ignore
         )
 
     def teacher_predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -985,11 +980,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -1014,7 +1009,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         tb_log_name: str = "run",
         progress_bar: bool = False,
-    ) -> Tuple[int, BaseCallback]:
+    ) -> tuple[int, BaseCallback]:
         """
         Initialize different variables needed for training.
 
@@ -1031,12 +1026,12 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.rewbuffer = deque(maxlen=self._stats_window_size)
         self.lenbuffer = deque(maxlen=self._stats_window_size)
         self.cur_reward_sum = th.zeros(
-            self.env.num_envs,
+            self.env.num_envs,  # type: ignore
             dtype=th.float,
             device=self.device,  # type: ignore
         )
         self.cur_episode_length = th.zeros(
-            self.env.num_envs,
+            self.env.num_envs,  # type: ignore
             dtype=th.float,
             device=self.device,  # type: ignore
         )
@@ -1086,7 +1081,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         return total_timesteps, callback
 
-    def _dump_logs(self, iteration: int, locs: dict) -> None:
+    def _dump_logs(self, iteration: int, locs: dict) -> None:  # type: ignore  # noqa: ARG002
         """
         Write log.
 
@@ -1135,22 +1130,23 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 "Episode/max_episodic_length", th.max(self.cur_episode_length).item()
             )
             self.logger.record(
-                "Episode/max_episodic_reward", th.max(self.cur_reward_sum).item()
+                "Episode/max_episodic_reward",
+                th.max(self.cur_reward_sum).item(),  # type: ignore
             )
         self.logger.dump(step=self.num_timesteps)
 
     def inference(self):
         # optimize the model for inference
-        self.compiled_policy = th.compile(self.policy)
+        self.compiled_policy = th.compile(self.policy)  # type: ignore
         self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
 
     @classmethod
     def load(  # type: ignore[reportIncompatibleMethodOverride]
-        cls: Type[SelfRecurrentL2T],
-        path: Union[str, pathlib.Path, io.BufferedIOBase],
-        env: Optional[GymEnv] = None,
-        device: Union[th.device, str] = "auto",
-        custom_objects: Optional[Dict[str, Any]] = None,
+        cls: type[SelfRecurrentL2T],
+        path: str | pathlib.Path | io.BufferedIOBase,
+        env: GymEnv | None = None,
+        device: th.device | str = "auto",
+        custom_objects: dict[str, Any] | None = None,
         print_system_info: bool = False,
         force_reset: bool = True,
         **kwargs,
@@ -1180,7 +1176,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         :return: new model instance with loaded parameters
         """
         if print_system_info:
-            print("== CURRENT SYSTEM INFO ==")
+            print("== CURRENT SYSTEM INFO ==")  # noqa: T201
             get_system_info()
 
         data, params, pytorch_variables = load_from_zip_file(
@@ -1212,18 +1208,18 @@ class RecurrentL2T(OnPolicyAlgorithm):
             "policy_kwargs" in kwargs
             and kwargs["policy_kwargs"] != data["policy_kwargs"]
         ):
-            raise ValueError(
+            msg = (
                 f"The specified policy kwargs do not equal the stored policy kwargs."
                 f"Stored kwargs: {data['policy_kwargs']}, specified kwargs: {kwargs['policy_kwargs']}"
             )
+            raise ValueError(msg)
 
         if "observation_space" not in data or "action_space" not in data:
-            raise KeyError(
-                "The observation_space and action_space were not given, can't verify new environments"
-            )
+            msg = "The observation_space and action_space were not given, can't verify new environments"
+            raise KeyError(msg)
 
         # Gym -> Gymnasium space conversion
-        for key in {"observation_space", "action_space"}:
+        for key in ("observation_space", "action_space"):
             data[key] = _convert_space(data[key])
 
         if env is not None:
@@ -1240,10 +1236,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
             # `n_envs` must be updated. See issue https://github.com/DLR-RM/stable-baselines3/issues/1018
             if data is not None:
                 data["n_envs"] = env.num_envs
-        else:
-            # Use stored env, if one exists. If not, continue as is (can be used for predict)
-            if "env" in data:
-                env = data["env"]
+        # Use stored env, if one exists. If not, continue as is (can be used for predict)
+        elif "env" in data:
+            env = data["env"]
 
         model = cls(
             policy=data["policy_class"],
@@ -1274,7 +1269,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     "again to avoid issues in the future "
                     "(see https://github.com/DLR-RM/stable-baselines3/issues/1233 for more info). "
                     f"Original error: {e} \n"
-                    "Note: the model should still work fine, this only a warning."
+                    "Note: the model should still work fine, this only a warning.",
+                    stacklevel=2,
                 )
             else:
                 raise e
@@ -1300,9 +1296,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def set_parameters(
         self,
-        load_path_or_dict: Union[str, TensorDict],
+        load_path_or_dict: str | TensorDict,
         exact_match: bool = True,
-        device: Union[th.device, str] = "auto",
+        device: th.device | str = "auto",
     ) -> None:
         """
         Load parameters from a given zip-file or a nested dictionary containing parameters for
@@ -1336,7 +1332,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # What errors recursive_getattr could throw? KeyError, but
                 # possible something else too (e.g. if key is an int?).
                 # Catch anything for now.
-                raise ValueError(f"Key {name} is an invalid object name.") from e
+                msg = f"Key {name} is an invalid object name."
+                raise ValueError(msg) from e
 
             if isinstance(attr, th.optim.Optimizer):
                 # Optimizers do not support "strict" keyword...
@@ -1361,10 +1358,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
             updated_objects.add(name)
 
         if exact_match and updated_objects != objects_needing_update:
-            raise ValueError(
+            msg = (
                 "Names of parameters do not match agents' parameters: "
                 f"expected {objects_needing_update}, got {updated_objects}"
             )
+            raise ValueError(msg)
 
 
 @th.jit.script
@@ -1377,7 +1375,7 @@ def compute_ppo_loss(
     returns,
     ent_coef,
     vf_coef,
-) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
     # ratio between old and new policy, should be one at the first iteration
     ratio = th.exp(log_prob - old_log_prob)
 
