@@ -204,7 +204,7 @@ class PPO(BaseAlgorithm):
             critic_network=self.actor_critic.get_value_operator(),
             clip_epsilon=loss_config.clip_epsilon,
             loss_critic_type=loss_config.loss_critic_type,
-            entropy_coef=loss_config.entropy_coef,
+            entropy_coeff=loss_config.entropy_coef,
             critic_coef=loss_config.critic_coef,
             normalize_advantage=True,
             clip_value=loss_config.clip_value,
