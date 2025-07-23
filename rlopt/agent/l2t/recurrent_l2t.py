@@ -789,6 +789,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     elif approx_kl_div < 0.5 * self.target_kl:
                         self.current_lr = self.current_lr * 2
 
+                # add an upper bound and lower bound for learning rate
+                self.current_lr = max(1e-5, min(1e-2, self.current_lr))
+
                 # Log KL divergence
                 self.logger.record("train/approx_kl", float(approx_kl_div))
 
@@ -797,7 +800,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     self.compiled_policy.optimizer,
                     self.compiled_student_policy.optimizer,
                 ],
-                #lr=self.current_lr
+                lr=self.current_lr
             )
 
             # Optimization step
