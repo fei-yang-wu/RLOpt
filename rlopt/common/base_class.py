@@ -445,55 +445,32 @@ class BaseAlgorithm(ABC):
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""
 
-    def save_checkpoint(self, path: str):
-        """Save complete training state."""
-        checkpoint = {
-            "policy": self.policy.state_dict() if self.policy else None,
-            "value_function": self.value_function.state_dict()
-            if self.value_function
-            else None,
-            "q_function": self.q_function.state_dict() if self.q_function else None,
-            "target_value_function": (
-                self.target_value_net.state_dict() if self.target_value_net else None
-            ),
-            "target_q_function": (
-                self.target_q_net.state_dict() if self.target_q_net else None
-            ),
-            "reward_estimator": (
-                self.reward_estimator.state_dict() if self.reward_estimator else None
-            ),
-            "optimizers": self.optimizers.state_dict() if self.optimizers else None,  # type: ignore
-            "step_count": self.step_count,
-            "config": OmegaConf.to_container(self.config),
+    def save_model(self, path: str | None = None) -> None:
+        """Save the model and related parameters to a file."""
+        if path is None:
+            path = f"{self.logger.log_dir}/model.pt"
+        data_to_save = {
+            "policy_state_dict": self.policy.state_dict(),
+            "value_state_dict": self.value_function.state_dict(),
+            "optimizer_state_dict": self.optim.state_dict(),
         }
-        torch.save(checkpoint, path)
+        if self.config.use_feature_extractor:
+            data_to_save["feature_extractor_state_dict"] = self.feature_extractor.state_dict()
+        # if we are using VecNorm, we need to save the running mean and std
+        if hasattr(self.env, "is_closed") and not self.env.is_closed and hasattr(self.env, "normalize_obs"):
+            data_to_save["vec_norm_msg"] = self.env.state_dict()
 
-    def export_onnx_policy_to(self, path: str):
-        """Export policy network to ONNX format."""
-        if self.policy:
-            dummy_input: Tensor = torch.randn(1, *self.env.observation_spec.shape)  # type: ignore
-            torch.onnx.export(
-                self.policy,
-                args=(dummy_input,),
-                f=path,
-                verbose=True,
-                input_names=["observation"],
-                output_names=["action"],
-            )
+        torch.save(data_to_save, path)
 
-    def load_from(self, path: str):
-        """Load training state from a checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.policy.load_state_dict(checkpoint["policy"])
-        if self.value_function:
-            self.value_function.load_state_dict(checkpoint["value_function"])
-        if self.q_function:
-            self.q_function.load_state_dict(checkpoint["q_function"])
-        if self.target_value_net:
-            self.target_value_net.load_state_dict(checkpoint["target_value_function"])
-        if self.target_q_net:
-            self.target_q_net.load_state_dict(checkpoint["target_q_function"])
-        if self.reward_estimator:
-            self.reward_estimator.load_state_dict(checkpoint["reward_estimator"])
-        if self.optimizers:
-            self.optimizers.load_state_dict(checkpoint["optimizers"])
+    
+
+    def load_model(self, path: str) -> None:
+        """Load the model and related parameters from a file."""
+        data = torch.load(path, map_location=self.device)
+        self.policy.load_state_dict(data["policy_state_dict"])
+        self.value_function.load_state_dict(data["value_state_dict"])
+        self.optim.load_state_dict(data["optimizer_state_dict"])
+        if self.config.use_feature_extractor and "feature_extractor_state_dict" in data:
+            self.feature_extractor.load_state_dict(data["feature_extractor_state_dict"])
+        if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
+            self.env.load_state_dict(data["vec_norm_msg"])

@@ -107,7 +107,6 @@ class PPO(BaseAlgorithm):
     ) -> torch.nn.Module:
         """Construct policy"""
         # for PPO, we use a probabilistic actor
-        # Define input shape from self.config.policy_in_keys, which is a list of strings
 
         # Define policy output distribution class
         distribution_class = TanhNormal
@@ -121,7 +120,7 @@ class PPO(BaseAlgorithm):
         if policy_net is None:
             policy_mlp = MLP(
                 in_features=self.policy_input_shape,
-                activation_class=torch.nn.ELU,
+                activation_class=torch.nn.Tanh,
                 out_features=self.policy_output_shape,
                 num_cells=self.config.policy.num_cells,
                 device=self.device,
@@ -205,7 +204,7 @@ class PPO(BaseAlgorithm):
             clip_epsilon=loss_config.clip_epsilon,
             loss_critic_type=loss_config.loss_critic_type,
             entropy_coeff=loss_config.entropy_coef,
-            critic_coef=loss_config.critic_coef,
+            critic_coeff=loss_config.critic_coeff,
             normalize_advantage=True,
             clip_value=loss_config.clip_value,
         )
@@ -301,11 +300,6 @@ class PPO(BaseAlgorithm):
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         total_loss = critic_loss + actor_loss
-        if self.config.trainer.clip_grad_norm:
-            torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(), self.config.trainer.clip_norm
-            )
-
         # Backward pass
         total_loss.backward()
 
@@ -319,7 +313,7 @@ class PPO(BaseAlgorithm):
         self.policy.eval()
         with torch.inference_mode():
             td = TensorDict(
-                {key: obs for key in self.config.policy_in_keys},
+                dict.fromkeys(self.config.policy_in_keys, obs),
                 batch_size=[1],
                 device=self.policy.device,  # type: ignore
             )
@@ -440,8 +434,8 @@ class PPO(BaseAlgorithm):
 
             # for IsaacLab, we need to log the metrics from the environment
             if (
-                hasattr(self.env, "log_infos")
-                and "IsaacLab" in self.config.env.env_name
+                "IsaacLab" in self.config.env.env_name
+                and hasattr(self.env, "log_infos")
             ):
                 for _ in range(len(self.env.log_infos)):
                     log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
@@ -472,5 +466,12 @@ class PPO(BaseAlgorithm):
                     self.logger.log_scalar(key, value, collected_frames)
 
             self.collector.update_policy_weights_()
+
+            # Save model periodically
+            if (
+                self.config.save_interval > 0
+                and collected_frames % self.config.save_interval == 0
+            ):
+                self.save_model()
 
         self.collector.shutdown()

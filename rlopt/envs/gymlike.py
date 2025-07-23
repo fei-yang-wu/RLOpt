@@ -1,72 +1,23 @@
 from __future__ import annotations
 
-import torch.nn
-import torch.optim
-import os
-import uuid
-from torch import multiprocessing
-
-# try:
-#     multiprocessing.set_start_method("fork")
-#     mp_context = "fork"
-# except RuntimeError:
-#     # If we can't set the method globally we can still run the parallel env with "fork"
-#     # This will fail on windows! Use "spawn" and put the script within `if __name__ == "__main__"`
-#     mp_context = "fork"
-#     pass
 
 mp_context = "fork"
 
-import torch
-from torch import nn
-from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
-from torchrl.data import LazyMemmapStorage, MultiStep, TensorDictReplayBuffer
-from torchrl.envs import (
-    EnvCreator,
-    ExplorationType,
-    ParallelEnv,
-    RewardScaling,
-    StepCounter,
-)
-from torchrl.envs.libs.gym import GymEnv
-from torchrl.envs.transforms import (
-    CatFrames,
-    Compose,
-    GrayScale,
-    ObservationNorm,
-    Resize,
-    ToTensorImage,
-    TransformedEnv,
-)
-from torchrl.modules import DuelingCnnDQNet, EGreedyModule, QValueActor
-
-from torchrl.objectives import DQNLoss, SoftUpdate
-from torchrl.record.loggers.csv import CSVLogger
-from torchrl.trainers import (
-    LogReward,
-    Recorder,
-    ReplayBufferTrainer,
-    Trainer,
-    UpdateWeights,
-)
-
-from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torchrl.envs import (
     ClipTransform,
     DoubleToFloat,
-    ExplorationType,
+    EnvBase,
+    EnvCreator,
+    ParallelEnv,
     RewardSum,
     StepCounter,
     TransformedEnv,
-    VecNorm,
 )
-from torchrl.envs.libs.gym import GymEnv, GymWrapper
-from torchrl.envs import EnvBase
-from torchrl.envs.gym_like import default_info_dict_reader
-from torchrl.modules import MLP, ProbabilisticActor, TanhNormal, ValueOperator
-from torchrl.record import VideoRecorder
-
-from omegaconf import DictConfig
+from torchrl.envs.libs.gym import GymEnv
+from torchrl.envs.transforms import (
+    Compose,
+    TransformedEnv,
+)
 
 
 def make_mujoco_env(
@@ -74,7 +25,7 @@ def make_mujoco_env(
 ) -> EnvBase:
     env = GymEnv(env_name, device=device, from_pixels=from_pixels, pixels_only=False)
     env = TransformedEnv(env)
-    env.append_transform(VecNorm(in_keys=["observation"], decay=0.99999, eps=1e-2))
+    env.append_transform(VecNormV2(in_keys=["observation"], decay=0.99999, eps=1e-2))
     env.append_transform(ClipTransform(in_keys=["observation"], low=-10, high=10))
     env.append_transform(RewardSum())
     env.append_transform(StepCounter())
@@ -87,7 +38,6 @@ def make_isaaclab_gym_env(
     num_envs: int = 4096,
     device="cuda:0",
 ):
-
     return TransformedEnv(
         env,
         Compose(
@@ -142,7 +92,7 @@ def make_gym_env(
     env = TransformedEnv(
         base_env,
         Compose(
-            VecNorm(in_keys=["observation"], decay=0.99999, eps=1e-2),
+            # VecNormV2(in_keys=["observation"], decay=0.99999, eps=1e-2),
             ClipTransform(in_keys=["observation"], low=-10, high=10),
             RewardSum(),
             StepCounter(),  # to count the steps of each trajectory

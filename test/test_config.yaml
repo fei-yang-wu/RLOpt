@@ -36,7 +36,7 @@ loss:
   gae_lambda: 0.95
   clip_epsilon: 0.2
   anneal_clip_epsilon: False
-  critic_coef: 0.25
+  critic_coeff: 0.25
   entropy_coef: 0.01
   loss_critic_type: l2
   clip_value: False
@@ -68,6 +68,7 @@ trainer:
   save_trainer_file: null
   frame_skip: 1
 
+save_interval: 1000
 use_feature_extractor: true
 device: cuda:0
 seed: 0
