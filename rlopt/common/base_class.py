@@ -445,24 +445,32 @@ class BaseAlgorithm(ABC):
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""
 
-    def save_model(self, path: str | None = None) -> None:
+    def save_model(self, path: str | None = None, step: int | None = None) -> None:
         """Save the model and related parameters to a file."""
         if path is None:
-            path = f"{self.logger.log_dir}/model.pt"
+            # Include step in filename if provided
+            if step is not None:
+                path = f"{self.logger.log_dir}/model_step_{step}.pt"
+            else:
+                path = f"{self.logger.log_dir}/model.pt"
         data_to_save = {
             "policy_state_dict": self.policy.state_dict(),
             "value_state_dict": self.value_function.state_dict(),
             "optimizer_state_dict": self.optim.state_dict(),
         }
         if self.config.use_feature_extractor:
-            data_to_save["feature_extractor_state_dict"] = self.feature_extractor.state_dict()
+            data_to_save["feature_extractor_state_dict"] = (
+                self.feature_extractor.state_dict()
+            )
         # if we are using VecNorm, we need to save the running mean and std
-        if hasattr(self.env, "is_closed") and not self.env.is_closed and hasattr(self.env, "normalize_obs"):
+        if (
+            hasattr(self.env, "is_closed")
+            and not self.env.is_closed
+            and hasattr(self.env, "normalize_obs")
+        ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
 
         torch.save(data_to_save, path)
-
-    
 
     def load_model(self, path: str) -> None:
         """Load the model and related parameters from a file."""

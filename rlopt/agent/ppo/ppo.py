@@ -471,6 +471,6 @@ class PPO(BaseAlgorithm):
                 self.config.save_interval > 0
                 and collected_frames % self.config.save_interval == 0
             ):
-                self.save_model()
+                self.save_model(step=collected_frames)
 
         self.collector.shutdown()
