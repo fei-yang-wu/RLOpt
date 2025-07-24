@@ -203,7 +203,7 @@ class PPO(BaseAlgorithm):
             critic_network=self.actor_critic.get_value_operator(),
             clip_epsilon=loss_config.clip_epsilon,
             loss_critic_type=loss_config.loss_critic_type,
-            entropy_coeff=loss_config.entropy_coef,
+            entropy_coeff=loss_config.entropy_coeff,
             critic_coeff=loss_config.critic_coeff,
             normalize_advantage=True,
             clip_value=loss_config.clip_value,
@@ -433,9 +433,8 @@ class PPO(BaseAlgorithm):
             )
 
             # for IsaacLab, we need to log the metrics from the environment
-            if (
-                "IsaacLab" in self.config.env.env_name
-                and hasattr(self.env, "log_infos")
+            if "IsaacLab" in self.config.env.env_name and hasattr(
+                self.env, "log_infos"
             ):
                 for _ in range(len(self.env.log_infos)):
                     log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
