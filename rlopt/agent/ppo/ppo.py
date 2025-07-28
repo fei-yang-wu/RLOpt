@@ -385,8 +385,8 @@ class PPO(BaseAlgorithm):
                 self.episode_rewards.extend(episode_rewards.cpu().tolist())
                 metrics_to_log.update(
                     {
-                        "train/episode_length": np.mean(self.episode_lengths),
-                        "train/episode_reward": np.mean(self.episode_rewards),
+                        "episode/length": np.mean(self.episode_lengths),
+                        "episode/return": np.mean(self.episode_rewards),
                         "train/reward": episode_rewards.mean().item(),
                     }
                 )
@@ -433,9 +433,7 @@ class PPO(BaseAlgorithm):
             )
 
             # for IsaacLab, we need to log the metrics from the environment
-            if "IsaacLab" in self.config.env.env_name and hasattr(
-                self.env, "log_infos"
-            ):
+            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
                 for _ in range(len(self.env.log_infos)):
                     log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
                     # log all the keys
