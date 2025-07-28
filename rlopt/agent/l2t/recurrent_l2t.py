@@ -470,9 +470,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
                 obs_tensor = self._last_obs
                 if (
-                    th.rand(1)[0]
-                    < self.mixture_coeff * (1 - self._current_progress_remaining)
-                    and self.num_timesteps > 0
+                    False
+                    # th.rand(1)[0]
+                    # < self.mixture_coeff  # * (1 - self._current_progress_remaining)
+                    # and self.num_timesteps > 0
                 ):
                     actions, values, log_probs, lstm_states = (
                         self.compiled_student_policy.forward(
@@ -784,9 +785,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # Adjust learning rate based on KL divergence
                 if self.target_kl is not None:
                     if approx_kl_div > 2.0 * self.target_kl:
-                        self.current_lr = self.current_lr * 0.5
+                        self.current_lr = max(self.current_lr * 0.5, 1e-5)
                     elif approx_kl_div < 0.5 * self.target_kl:
-                        self.current_lr = self.current_lr * 2
+                        self.current_lr = min(self.current_lr * 2, 1e-2)
 
                 # Log KL divergence
                 self.logger.record("train/approx_kl", float(approx_kl_div))
@@ -796,6 +797,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     self.compiled_policy.optimizer,
                     self.compiled_student_policy.optimizer,
                 ],
+                lr=self.current_lr,  # type: ignore[arg-type]
             )
 
             # Optimization step
