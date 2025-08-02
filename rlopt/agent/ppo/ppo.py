@@ -24,16 +24,17 @@ from torchrl._utils import timeit
 from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
-from torchrl.envs import ExplorationType, TransformedEnv
+from torchrl.envs import Compose, ExplorationType, TransformedEnv
+from torchrl.envs.transforms import InitTracker
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
+    LSTMModule,
     ProbabilisticActor,
     TanhNormal,
-    TruncatedNormal,
     ValueOperator,
 )
-from torchrl.objectives import ClipPPOLoss, group_optimizers
+from torchrl.objectives import ClipPPOLoss, KLPENPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
@@ -76,23 +77,34 @@ class PPO(BaseAlgorithm):
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
-    ) -> torch.nn.Module | None:
+    ) -> TensorDictModule:
         """Override to build your feature extractor network from config.
         Note that if you don't want to use a shared feature extractor,
         you can set `use_feature_extractor` to False, then this will be an identity map. Then do feature extraction separately in policy and value functions.
         """
         if feature_extractor_net is not None:
-            return feature_extractor_net
+            return TensorDictModule(
+                module=feature_extractor_net,
+                in_keys=self.total_input_keys,
+                out_keys=["hidden"],
+            )
 
         if self.config.use_feature_extractor:
+            feature_extractor_mlp = MLP(
+                in_features=self.total_input_shape,
+                out_features=self.config.feature_extractor.output_dim,
+                num_cells=self.config.feature_extractor.num_cells,
+                activation_class=torch.nn.ELU,
+                device=self.device,
+            )
+
+            for layer in feature_extractor_mlp.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
+                    layer.bias.data.zero_()
+
             return TensorDictModule(
-                module=MLP(
-                    in_features=self.total_input_shape,
-                    out_features=self.config.feature_extractor.output_dim,
-                    num_cells=self.config.feature_extractor.num_cells,
-                    activation_class=torch.nn.ELU,
-                    device=self.device,
-                ),
+                module=feature_extractor_mlp,
                 in_keys=self.total_input_keys,
                 out_keys=["hidden"],
             )
@@ -104,7 +116,7 @@ class PPO(BaseAlgorithm):
 
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None
-    ) -> torch.nn.Module:
+    ) -> TensorDictModule:
         """Construct policy"""
         # for PPO, we use a probabilistic actor
 
@@ -120,7 +132,7 @@ class PPO(BaseAlgorithm):
         if policy_net is None:
             policy_mlp = MLP(
                 in_features=self.policy_input_shape,
-                activation_class=torch.nn.Tanh,
+                activation_class=torch.nn.ELU,
                 out_features=self.policy_output_shape,
                 num_cells=self.config.policy.num_cells,
                 device=self.device,
@@ -154,18 +166,18 @@ class PPO(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.RANDOM,
+            default_interaction_type=ExplorationType.DETERMINISTIC,
         )
 
     def _construct_value_function(
         self, value_net: torch.nn.Module | None = None
-    ) -> torch.nn.Module:
+    ) -> TensorDictModule:
         """Construct value function"""
         # Define value architecture
         if value_net is None:
             value_mlp = MLP(
                 in_features=self.value_input_shape,
-                activation_class=torch.nn.Tanh,
+                activation_class=torch.nn.ELU,
                 out_features=self.value_output_shape,
                 num_cells=self.config.value_net.num_cells,
                 device=self.device,
@@ -205,28 +217,28 @@ class PPO(BaseAlgorithm):
             loss_critic_type=loss_config.loss_critic_type,
             entropy_coeff=loss_config.entropy_coeff,
             critic_coeff=loss_config.critic_coeff,
-            normalize_advantage=True,
+            normalize_advantage=False,
             clip_value=loss_config.clip_value,
         )
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers"""
         # Create optimizers
-        actor_optim = torch.optim.Adam(
+        actor_optim = torch.optim.AdamW(
             self.actor_critic.get_policy_head().parameters(),
             lr=torch.tensor(self.config.optim.lr, device=self.device),
-            eps=1e-5,
+            # eps=1e-5,
         )
-        critic_optim = torch.optim.Adam(
+        critic_optim = torch.optim.AdamW(
             self.actor_critic.get_value_head().parameters(),
             lr=torch.tensor(self.config.optim.lr, device=self.device),
-            eps=1e-5,
+            # eps=1e-5,
         )
         if self.config.use_feature_extractor:
-            feature_optim = torch.optim.Adam(
+            feature_optim = torch.optim.AdamW(
                 self.feature_extractor.parameters(),
                 lr=torch.tensor(self.config.optim.lr, device=self.device),
-                eps=1e-5,
+                # eps=1e-5,
             )
             return group_optimizers(actor_optim, critic_optim, feature_optim)
 
@@ -472,3 +484,200 @@ class PPO(BaseAlgorithm):
                 self.save_model(step=collected_frames)
 
         self.collector.shutdown()
+
+
+class PPORecurrent(PPO):
+    """PPO with LSTM-based feature extractor following TorchRL recurrent patterns.
+
+    This implementation follows the TorchRL tutorial patterns from:
+    https://docs.pytorch.org/rl/main/tutorials/dqn_with_rnn.html
+
+    Key features:
+    - Uses TorchRL's LSTMModule for proper recurrent state management
+    - Automatically handles recurrent states through TensorDict
+    - Adds TensorDictPrimer for proper state initialization
+    - Compatible with episode boundaries and InitTracker transform
+
+    For optimal performance, ensure your environment includes:
+    - InitTracker() transform to handle episode boundaries
+    - Proper episode termination handling
+
+    Example configuration:
+        feature_extractor:
+            lstm:
+                hidden_size: 256
+                num_layers: 1
+                dropout: 0.0
+                bidirectional: false
+    """
+
+    def __init__(
+        self,
+        env: TransformedEnv,
+        config: DictConfig,
+        policy_net: torch.nn.Module | None = None,
+        value_net: torch.nn.Module | None = None,
+        q_net: torch.nn.Module | None = None,
+        reward_estimator_net: torch.nn.Module | None = None,
+        replay_buffer: type[ReplayBuffer] = ReplayBuffer,
+        logger: Logger | None = None,
+        **kwargs,
+    ):
+        # Store LSTM module reference for primer creation
+        self.lstm_module = None
+
+        super().__init__(
+            env,
+            config,
+            policy_net,
+            value_net,
+            q_net,
+            reward_estimator_net,
+            replay_buffer,
+            logger,
+            **kwargs,
+        )
+
+        # Add recurrent state primer to environment if LSTM is used
+        if self.lstm_module is not None:
+            primer = self.lstm_module.make_tensordict_primer()
+            if hasattr(self.env, "append_transform"):
+                self.env.append_transform(primer)
+            else:
+                # For environments that don't support append_transform
+                if hasattr(self.env, "transform") and self.env.transform is not None:
+                    if isinstance(self.env.transform, Compose):
+                        self.env.transform.append(primer)
+                    else:
+                        self.env.transform = Compose(self.env.transform, primer)
+
+    def _construct_feature_extractor(
+        self, feature_extractor_net: torch.nn.Module | None = None
+    ) -> torch.nn.Module | None:
+        """Override to build LSTM-based feature extractor using TorchRL's LSTMModule."""
+        if feature_extractor_net is not None:
+            return feature_extractor_net
+
+        if self.config.use_feature_extractor:
+            # Get LSTM configuration with defaults
+            lstm_config = getattr(self.config.feature_extractor, "lstm", {})
+            hidden_size = getattr(
+                lstm_config,
+                "hidden_size",
+                getattr(self.config.feature_extractor, "output_dim", 256),
+            )
+            num_layers = getattr(lstm_config, "num_layers", 1)
+            dropout = getattr(lstm_config, "dropout", 0.0)
+            bidirectional = getattr(lstm_config, "bidirectional", False)
+
+            # Create LSTM module using TorchRL's LSTMModule
+            self.lstm_module = LSTMModule(
+                input_size=self.total_input_shape,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+                batch_first=True,
+                device=self.device,
+                in_keys=self.total_input_keys,
+                out_keys=["hidden"],
+            )
+
+            return self.lstm_module
+
+        # If not using feature extractor, return identity
+        return TensorDictModule(
+            module=torch.nn.Identity(),
+            in_keys=self.total_input_keys,
+            out_keys=self.total_input_keys,
+        )
+
+    def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
+        """Predict action given observation with LSTM state management"""
+        obs = torch.as_tensor([obs], device=self.device)
+        self.policy.eval()
+
+        with torch.inference_mode():
+            td = TensorDict(
+                dict.fromkeys(self.config.policy_in_keys, obs),
+                batch_size=[1],
+                device=self.policy.device,  # type: ignore
+            )
+
+            # The LSTMModule automatically handles recurrent states through TensorDict
+            # No need for manual state management - TorchRL handles this
+            return self.policy(td).get("action")
+
+    def reset_recurrent_states(self):
+        """Reset LSTM recurrent states - called at episode boundaries"""
+        # With TorchRL's LSTMModule, states are automatically managed
+        # This method is provided for compatibility but may not be needed
+        # as the InitTracker transform and proper episode boundaries handle this
+        pass
+
+    @classmethod
+    def check_environment_compatibility(
+        cls, env: TransformedEnv
+    ) -> tuple[bool, list[str]]:
+        """Check if environment is properly configured for recurrent policies.
+
+        Args:
+            env: The environment to check
+
+        Returns:
+            tuple: (is_compatible, list_of_missing_transforms)
+        """
+        missing_transforms = []
+
+        # Check for InitTracker
+        has_init_tracker = False
+        if hasattr(env, "transform") and env.transform is not None:
+            if isinstance(env.transform, Compose):
+                transforms = env.transform._modules
+            else:
+                transforms = [env.transform]
+
+            for transform in transforms:
+                if isinstance(transform, InitTracker):
+                    has_init_tracker = True
+                    break
+
+        if not has_init_tracker:
+            missing_transforms.append(
+                "InitTracker() - needed for episode boundary tracking"
+            )
+
+        is_compatible = len(missing_transforms) == 0
+        return is_compatible, missing_transforms
+
+    @classmethod
+    def add_required_transforms(cls, env: TransformedEnv) -> TransformedEnv:
+        """Add required transforms for recurrent policy compatibility.
+
+        Args:
+            env: The environment to modify
+
+        Returns:
+            Modified environment with required transforms
+        """
+        is_compatible, missing_transforms = cls.check_environment_compatibility(env)
+
+        if not is_compatible:
+            new_transforms = []
+
+            # Add InitTracker if missing
+            if any("InitTracker" in msg for msg in missing_transforms):
+                new_transforms.append(InitTracker())
+
+            # Add new transforms to environment
+            if new_transforms:
+                if hasattr(env, "transform") and env.transform is not None:
+                    if isinstance(env.transform, Compose):
+                        for transform in new_transforms:
+                            env.transform.append(transform)
+                    else:
+                        env.transform = Compose(env.transform, *new_transforms)
+                else:
+                    env.transform = Compose(*new_transforms)
+
+        return env

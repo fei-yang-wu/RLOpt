@@ -345,9 +345,7 @@ class BaseAlgorithm(ABC):
         self.logger = None
         cfg = self.config
         if cfg.logger.backend:
-            exp_name = generate_exp_name(
-                "PPO", f"{cfg.logger.exp_name}_{cfg.env.env_name}"
-            )
+            exp_name = generate_exp_name("PPO", f"{cfg.logger.exp_name}")
             self.logger = get_logger(
                 cfg.logger.backend,
                 logger_name="ppo",
