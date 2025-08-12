@@ -1,16 +1,19 @@
+from __future__ import annotations
+
 import unittest
+
+import torch as th
+from gymnasium import spaces
+
 from rlopt.common.buffer import (
-    ReplayBuffer,
-    RolloutBuffer,
     DictReplayBuffer,
     DictRolloutBuffer,
+    ReplayBuffer,
+    RolloutBuffer,
 )
-from gymnasium import spaces
-import torch as th
 
 
 class TestBuffer(unittest.TestCase):
-
     def test_replay_buffer(self):
         buffer_size = 100
         observation_space = spaces.Box(low=0, high=1, shape=(4,))

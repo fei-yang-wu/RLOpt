@@ -16,16 +16,17 @@ from tensordict import TensorDict
 from tensordict.nn import (
     AddStateIndependentNormalScale,
     TensorDictModule,
+    TensorDictModuleBase,
 )
 from torch import Tensor
 from torchrl._utils import timeit
 
 # Import missing modules
 from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
-from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
+from torchrl.data import LazyMemmapStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
-from torchrl.envs.transforms import InitTracker
+from torchrl.envs.transforms import InitTracker, TensorDictPrimer
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
@@ -264,7 +265,7 @@ class PPO(BaseAlgorithm):
             SamplerWithoutReplacement()
         )  # Removed True parameter to match ppo_mujoco.py
         return TensorDictReplayBuffer(
-            storage=LazyTensorStorage(
+            storage=LazyMemmapStorage(
                 cfg.collector.frames_per_batch,
                 compilable=cfg.compile.compile,  # type: ignore
                 device=self.device,
@@ -524,7 +525,7 @@ class PPORecurrent(PPO):
         **kwargs,
     ):
         # Store LSTM module reference for primer creation
-        self.lstm_module = None
+        self.lstm_module: LSTMModule | None = None
 
         super().__init__(
             env,
@@ -553,7 +554,7 @@ class PPORecurrent(PPO):
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
-    ) -> torch.nn.Module | None:
+    ) -> TensorDictModuleBase:
         """Override to build LSTM-based feature extractor using TorchRL's LSTMModule."""
         if feature_extractor_net is not None:
             return feature_extractor_net
@@ -571,6 +572,7 @@ class PPORecurrent(PPO):
             bidirectional = getattr(lstm_config, "bidirectional", False)
 
             # Create LSTM module using TorchRL's LSTMModule
+            # Use in_key/out_key so TorchRL expands the recurrent state keys automatically
             self.lstm_module = LSTMModule(
                 input_size=self.total_input_shape,
                 hidden_size=hidden_size,
@@ -579,8 +581,8 @@ class PPORecurrent(PPO):
                 bidirectional=bidirectional,
                 batch_first=True,
                 device=self.device,
-                in_keys=self.total_input_keys,
-                out_keys=["hidden"],
+                in_key=self.total_input_keys[0],
+                out_key="hidden",
             )
 
             return self.lstm_module
@@ -590,6 +592,20 @@ class PPORecurrent(PPO):
             module=torch.nn.Identity(),
             in_keys=self.total_input_keys,
             out_keys=self.total_input_keys,
+        )
+
+    def _construct_adv_module(self) -> torch.nn.Module:
+        """Construct advantage module"""
+        # Create advantage module
+        return GAE(
+            gamma=self.config.loss.gamma,
+            lmbda=self.config.loss.gae_lambda,
+            value_network=self.actor_critic.get_value_operator(),  # type: ignore
+            average_gae=False,
+            device=self.device,
+            vectorized=not self.config.compile.compile,
+            deactivate_vmap=True,  # to be compatible with lstm
+            shifted=True,  # to be compatible with lstm
         )
 
     def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:

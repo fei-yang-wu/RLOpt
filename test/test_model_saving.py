@@ -1,14 +1,16 @@
-import tempfile
-import os
-import torch
+from __future__ import annotations
+
 import multiprocessing as mp
+import os
+import tempfile
+
 import hydra
-from omegaconf import DictConfig
-import pytest
-from rlopt.agent.ppo import PPO
-from rlopt.envs.gymlike import make_gym_env
+import torch
 import torchrl.envs.libs.gym
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
+
+from rlopt.agent.ppo import PPO
+from rlopt.envs.gymlike import make_gym_env
 
 
 def test_model_saving_and_loading(monkeypatch):
