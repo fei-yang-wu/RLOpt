@@ -4,11 +4,11 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "rlopt"
-version = "2025.2.0"
+version = "2025.3.0"
 description = "Reinforcement Learning Optimization"
 readme = "README.md"
 authors = [{ name = "Feiyang Wu", email = "feiyangwu@gatech.edu" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "License :: OSI Approved :: MIT License",
