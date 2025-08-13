@@ -23,7 +23,7 @@ from torchrl._utils import timeit
 
 # Import missing modules
 from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
-from torchrl.data import LazyMemmapStorage, ReplayBuffer, TensorDictReplayBuffer
+from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
 from torchrl.envs.transforms import InitTracker, TensorDictPrimer
@@ -265,7 +265,7 @@ class PPO(BaseAlgorithm):
             SamplerWithoutReplacement()
         )  # Removed True parameter to match ppo_mujoco.py
         return TensorDictReplayBuffer(
-            storage=LazyMemmapStorage(
+            storage=LazyTensorStorage(
                 cfg.collector.frames_per_batch,
                 compilable=cfg.compile.compile,  # type: ignore
                 device=self.device,
