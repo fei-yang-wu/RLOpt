@@ -4,7 +4,9 @@ Only supports MuJoCo environments for now
 
 from __future__ import annotations
 
+import os
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -482,7 +484,11 @@ class PPO(BaseAlgorithm):
                 self.config.save_interval > 0
                 and collected_frames % self.config.save_interval == 0
             ):
-                self.save_model(step=collected_frames)
+                self.save_model(
+                    path=Path(self.config.logger.get("log_dir", "logs"))
+                    / self.config.get("save_path", "models"),
+                    step=collected_frames,
+                )
 
         self.collector.shutdown()
 
@@ -527,6 +533,9 @@ class PPORecurrent(PPO):
         # Store LSTM module reference for primer creation
         self.lstm_module: LSTMModule | None = None
 
+        # Add required transforms InitTracker to environment
+        env = self.add_required_transforms(env)
+
         super().__init__(
             env,
             config,
@@ -544,13 +553,12 @@ class PPORecurrent(PPO):
             primer = self.lstm_module.make_tensordict_primer()
             if hasattr(self.env, "append_transform"):
                 self.env.append_transform(primer)
-            else:
-                # For environments that don't support append_transform
-                if hasattr(self.env, "transform") and self.env.transform is not None:
-                    if isinstance(self.env.transform, Compose):
-                        self.env.transform.append(primer)
-                    else:
-                        self.env.transform = Compose(self.env.transform, primer)
+            # For environments that don't support append_transform
+            elif hasattr(self.env, "transform") and self.env.transform is not None:
+                if isinstance(self.env.transform, Compose):
+                    self.env.transform.append(primer)
+                else:
+                    self.env.transform = Compose(self.env.transform, primer)
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None

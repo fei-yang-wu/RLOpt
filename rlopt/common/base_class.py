@@ -4,6 +4,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -350,6 +351,7 @@ class BaseAlgorithm(ABC):
                 cfg.logger.backend,
                 logger_name="ppo",
                 experiment_name=exp_name,
+                log_dir=cfg.logger.get("log_dir", None),
                 wandb_kwargs={
                     "config": dict(cfg),
                     "project": cfg.logger.project_name,
@@ -443,14 +445,20 @@ class BaseAlgorithm(ABC):
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""
 
-    def save_model(self, path: str | None = None, step: int | None = None) -> None:
+    def save_model(
+        self, path: str | Path | None = None, step: int | None = None
+    ) -> None:
         """Save the model and related parameters to a file."""
-        if path is None:
-            # Include step in filename if provided
-            if step is not None:
-                path = f"{self.logger.log_dir}/model_step_{step}.pt"
-            else:
-                path = f"{self.logger.log_dir}/model.pt"
+        prefix = (
+            f"{self.config.logger.get('log_dir', self.logger.log_dir)}"
+            if path is None
+            else path
+        )
+        # Include step in filename if provided
+        if step is not None:
+            path = f"{prefix}/model_step_{step}.pt"
+        else:
+            path = f"{prefix}/model.pt"
         data_to_save = {
             "policy_state_dict": self.policy.state_dict(),
             "value_state_dict": self.value_function.state_dict(),
