@@ -1,30 +1,32 @@
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union, Callable
+from __future__ import annotations
+
 import os
 import warnings
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
+import gymnasium as gym
 import numpy as np
 import torch as th
-import gymnasium as gym
-from stable_baselines3.common.type_aliases import TensorDict
-from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.callbacks import BaseCallback, EventCallback
-from stable_baselines3.common.vec_env import (
-    VecMonitor,
-    VecEnvWrapper,
-    SubprocVecEnv,
-    DummyVecEnv,
-    VecEnv,
-    sync_envs_normalization,
-    is_vecenv_wrapped,
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    CheckpointCallback,
+    EventCallback,
 )
-
-from torch import nn
-
+from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import get_device
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecEnv,
+    VecEnvWrapper,
+    VecMonitor,
+    is_vecenv_wrapped,
+    sync_envs_normalization,
+)
+from torch import nn
 
 
 def obs_as_tensor(
@@ -305,3 +307,11 @@ class OnnxCheckpointCallback(CheckpointCallback):
                     print(f"Saving model VecNormalize to {vec_normalize_path}")
 
         return True
+
+
+def _orthogonal_init_(module: nn.Module, gain: float = 1.0) -> None:
+    for m in module.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=gain)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)

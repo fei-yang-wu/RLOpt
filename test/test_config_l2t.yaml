@@ -1,0 +1,83 @@
+# task and env
+env:
+  env_name: HalfCheetah-v4
+  device:
+  num_envs: 24
+
+# collector
+collector:
+  num_collectors: 24
+  frames_per_batch: 2048
+  total_frames: 1_000_000
+  set_truncated: false
+
+# logger
+logger:
+  backend: wandb
+  project_name: torchrl_example_l2t
+  group_name: null
+  exp_name: Mujoco_L2T
+  test_interval: 1_000_000
+  num_test_episodes: 5
+  video: False
+
+# Optim
+optim:
+  lr: 3e-4
+  weight_decay: 0.0
+  anneal_lr: True
+  device:
+
+# loss
+loss:
+  gamma: 0.99
+  mini_batch_size: 64
+  epochs: 10
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  anneal_clip_epsilon: False
+  critic_coeff: 0.25
+  entropy_coeff: 0.01
+  loss_critic_type: l2
+  clip_value: False
+
+# torch compile
+compile:
+  compile: False
+  compile_mode: default
+  cudagraphs: False
+
+# actor and critic
+policy:
+  num_cells: [256, 256]
+
+value_net:
+  num_cells: [256, 256]
+
+feature_extractor:
+  num_cells: [256, 256, 128]
+  output_dim: 128
+
+trainer:
+  optim_steps_per_batch: 10
+  clip_grad_norm: true
+  clip_norm: 0.5
+  progress_bar: true
+  save_trainer_interval: 10000
+  log_interval: 1000
+  save_trainer_file: null
+  frame_skip: 1
+
+save_interval: 1000
+use_feature_extractor: true
+device: cuda:0
+seed: 0
+policy_in_keys: ["hidden"]
+value_net_in_keys: ["hidden"]
+total_input_keys: ["observation"]
+
+# L2T specific parameters
+mixture_alpha: 0.0
+mixture_alpha_end: 0.5
+anneal_mixture_alpha: True
+student_bc_coeff: 1.0

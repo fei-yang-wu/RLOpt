@@ -16,7 +16,6 @@ from tensordict import TensorDict
 from tensordict.nn import (
     AddStateIndependentNormalScale,
     TensorDictModule,
-    TensorDictModuleBase,
 )
 from torch import Tensor
 from torchrl._utils import timeit
@@ -86,7 +85,7 @@ class PPO(BaseAlgorithm):
         if feature_extractor_net is not None:
             return TensorDictModule(
                 module=feature_extractor_net,
-                in_keys=self.total_input_keys,
+                in_keys=tuple(self.total_input_keys),
                 out_keys=["hidden"],
             )
 
@@ -106,13 +105,13 @@ class PPO(BaseAlgorithm):
 
             return TensorDictModule(
                 module=feature_extractor_mlp,
-                in_keys=self.total_input_keys,
+                in_keys=tuple(self.total_input_keys),
                 out_keys=["hidden"],
             )
         return TensorDictModule(
             module=torch.nn.Identity(),
-            in_keys=self.total_input_keys,
-            out_keys=self.total_input_keys,
+            in_keys=tuple(self.total_input_keys),
+            out_keys=tuple(self.total_input_keys),
         )
 
     def _construct_policy(
@@ -205,8 +204,29 @@ class PPO(BaseAlgorithm):
             value_operator=self.value_function,
         )
 
-    def _construct_q_function(self, q_net: torch.nn.Module | None = None):
-        pass
+    def _construct_q_function(
+        self, q_net: torch.nn.Module | None = None
+    ) -> TensorDictModule:
+        """Construct Q-function module.
+
+        For PPO we typically don't use a Q-function. To satisfy the base-class
+        contract and static type checkers we return a TensorDictModule. If a
+        `q_net` is provided we wrap it; otherwise we return an identity
+        TensorDictModule that maps inputs to outputs unchanged.
+        """
+        if q_net is not None:
+            return TensorDictModule(
+                module=q_net,
+                in_keys=tuple(self.total_input_keys),
+                out_keys=tuple(self.total_input_keys),
+            )
+
+        # default: identity mapping (no Q-function used)
+        return TensorDictModule(
+            module=torch.nn.Identity(),
+            in_keys=tuple(self.total_input_keys),
+            out_keys=tuple(self.total_input_keys),
+        )
 
     def _construct_loss_module(self) -> torch.nn.Module:
         """Construct loss module"""
@@ -554,10 +574,25 @@ class PPORecurrent(PPO):
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
-    ) -> TensorDictModuleBase:
-        """Override to build LSTM-based feature extractor using TorchRL's LSTMModule."""
+    ) -> TensorDictModule:
+        """Override to build LSTM-based feature extractor using TorchRL's LSTMModule.
+
+        This implementation returns a TensorDictModule to match the base-class
+        contract. If `feature_extractor_net` is provided and is already a
+        TensorDictModule, it is returned as-is; if it's a plain
+        torch.nn.Module it is wrapped into a TensorDictModule.
+        """
         if feature_extractor_net is not None:
-            return feature_extractor_net
+            # If the provided module is already a TensorDictModule (or subclass),
+            # return it directly. Otherwise wrap it so the return type matches
+            # the expected TensorDictModule contract.
+            if isinstance(feature_extractor_net, TensorDictModule):
+                return feature_extractor_net
+            return TensorDictModule(
+                module=feature_extractor_net,
+                in_keys=tuple(self.total_input_keys),
+                out_keys=("hidden",),
+            )
 
         if self.config.use_feature_extractor:
             # Get LSTM configuration with defaults
@@ -585,13 +620,19 @@ class PPORecurrent(PPO):
                 out_key="hidden",
             )
 
-            return self.lstm_module
+            # Wrap LSTMModule in a TensorDictModule so the return type matches
+            # the base-class contract (TensorDictModule).
+            return TensorDictModule(
+                module=self.lstm_module,
+                in_keys=(self.total_input_keys[0],),
+                out_keys=("hidden",),
+            )
 
         # If not using feature extractor, return identity
         return TensorDictModule(
             module=torch.nn.Identity(),
-            in_keys=self.total_input_keys,
-            out_keys=self.total_input_keys,
+            in_keys=tuple(self.total_input_keys),
+            out_keys=tuple(self.total_input_keys),
         )
 
     def _construct_adv_module(self) -> torch.nn.Module:
@@ -629,7 +670,6 @@ class PPORecurrent(PPO):
         # With TorchRL's LSTMModule, states are automatically managed
         # This method is provided for compatibility but may not be needed
         # as the InitTracker transform and proper episode boundaries handle this
-        pass
 
     @classmethod
     def check_environment_compatibility(
