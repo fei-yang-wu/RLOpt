@@ -132,8 +132,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self,
         policy: str | type[ActorCriticPolicy],
         env: GymEnv | str,
-        student_policy: str
-        | type[RecurrentActorCriticPolicy] = RecurrentActorCriticPolicy,
+        student_policy: (
+            str | type[RecurrentActorCriticPolicy]
+        ) = RecurrentActorCriticPolicy,
         learning_rate: float | Schedule = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 64,
@@ -150,8 +151,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
-        rollout_buffer_class: type[RLOptDictRecurrentReplayBuffer]
-        | None = RLOptDictRecurrentReplayBuffer,
+        rollout_buffer_class: (
+            type[RLOptDictRecurrentReplayBuffer] | None
+        ) = RLOptDictRecurrentReplayBuffer,
         rollout_buffer_kwargs: dict[str, Any] | None = None,
         target_kl: float | None = None,
         stats_window_size: int = 100,
@@ -183,9 +185,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.start_time = 0.0
         self.learning_rate = learning_rate
         self.tensorboard_log = tensorboard_log
-        self._last_obs = (  # type: ignore
-            None
-        )
+        self._last_obs = None  # type: ignore
         self._last_episode_starts = None  # type: ignore
         # When using VecNormalize:
         self._last_original_obs = None
@@ -273,17 +273,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
         if normalize_advantage:
-            assert batch_size > 1, (
-                "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
-            )
+            assert (
+                batch_size > 1
+            ), "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
 
         if self.env is not None:
             # Check that `n_steps * n_envs > 1` to avoid NaN
             # when doing advantage normalization
             buffer_size = self.env.num_envs * self.n_steps
-            assert buffer_size > 1 or (not normalize_advantage), (
-                f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
-            )
+            assert buffer_size > 1 or (
+                not normalize_advantage
+            ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
             # Check that the rollout buffer size is a multiple of the mini-batch size
             untruncated_batches = buffer_size // batch_size
             if buffer_size % batch_size > 0:
@@ -348,10 +348,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
     def _init_student_policy(
         self,
-        student_policy: str
-        | type[ActorCriticPolicy]
-        | ActorCriticPolicy
-        | BasePolicy = ActorCriticPolicy,
+        student_policy: (
+            str | type[ActorCriticPolicy] | ActorCriticPolicy | BasePolicy
+        ) = ActorCriticPolicy,
         student_policy_kwargs: dict[str, Any] | None = None,
     ) -> None:
         if isinstance(student_policy, str):
@@ -833,7 +832,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range.item())
         if self.clip_range_vf is not None:
-            self.logger.record("train/clip_range_vf", clip_range_vf)  # type: ignore
+            self.logger.record(
+                "train/clip_range_vf",
+                clip_range_vf.item() if isinstance(clip_range_vf, th.Tensor) else clip_range_vf,  # type: ignore
+            )
         self.logger.record("train/student_loss", np.mean(student_losses))
 
     def learn(

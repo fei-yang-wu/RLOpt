@@ -1707,14 +1707,14 @@ class RecurrentSequenceDictRolloutBuffer(RecurrentDictRolloutBuffer):
             ]:
                 self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
 
-            self.episode_start_indices = np.where(self.episode_starts == 1)[0]
+            self.episode_start_indices = np.where(self.episode_starts == 1)[0]  # type: ignore[assignment]
             self.generator_ready = True
 
         random_indices = SubsetRandomSampler(range(len(self.episode_start_indices)))
         # drop last batch to prevent extremely small batches causing spurious updates
         batch_sampler = BatchSampler(random_indices, batch_size, drop_last=True)
         # add a dummy index to make the code below simpler
-        episode_start_indices = np.concatenate(
+        episode_start_indices = np.concatenate(  # type: ignore[assignment]
             [self.episode_start_indices, np.array([len(self.episode_starts)])]
         )
 
@@ -1775,7 +1775,7 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         self.action_dim = get_action_dim(action_space)
         self.pos = 0
         self.full = False
-        self.device = get_device(device)
+        self.device = get_device(device)  # type: ignore[assignment]
         self.n_envs = n_envs
         assert isinstance(
             self.obs_shape, dict
@@ -1899,9 +1899,11 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         last_values = last_values.detach().flatten()  # type: ignore[assignment]
 
         last_gae_lam = 0
-        for step in reversed(range(self.buffer_size)):
+        for step in reversed(range(self.buffer_size)):  # type: ignore[arg-type]
             if step == self.buffer_size - 1:
-                next_non_terminal = 1.0 - dones  # .type(th.float32)
+                next_non_terminal = (
+                    ~dones if dones.dtype == th.bool else 1.0 - dones
+                )  # .type(th.float32)
                 next_values = last_values
             else:
                 next_non_terminal = 1.0 - self.episode_starts[step + 1]
@@ -1993,7 +1995,7 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         mini_batch_size = self.n_envs // num_mini_batches
         for ep in range(num_epochs):
             first_traj = 0
-            for i in range(num_mini_batches):
+            for i in range(num_mini_batches):  # type: ignore[arg-type]
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
 
