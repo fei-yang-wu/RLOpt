@@ -1,74 +1,37 @@
-"""Soft Actor-Critic implementation following the structural pattern of PPO.
-
-This class adapts the SOTA TorchRL SAC reference implementation to the
-BaseAlgorithm / PPO style used in this repository (feature extractor +
-ActorValueOperator + custom training loop with collector + replay buffer).
-
-Key design notes:
- - Reuses BaseAlgorithm for env / collector / logging wiring.
- - Uses an optional shared feature extractor (config.use_feature_extractor).
- - Builds a ProbabilisticActor (Gaussian Tanh) and a Q-value network.
- - Leverages torchrl.objectives.sac.SACLoss with automatic entropy tuning.
- - Maintains a replay buffer and performs UTD (update-to-data) ratio updates
-   per collected batch.
- - Provides Polyak target network updates through SoftUpdate helper.
-
-Expected (additional) config keys (defaults provided if missing):
-   replay_buffer:
-       size: 1000000
-       prb: False                # prioritized replay (not implemented here)
-   optim:
-       batch_size: 256           # replay sample batch size
-       utd_ratio: 1.0            # updates per frames_per_batch * utd_ratio
-       target_update_polyak: 0.005
-       alpha_init: 1.0
-       adam_eps: 1e-8
-   collector:
-       init_random_frames: 0     # initial random exploration frames
-
-If keys are absent they will be inferred with safe defaults.
-"""
+"""Soft Actor-Critic"""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+import tqdm
+from omegaconf import DictConfig
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
-from tensordict.nn.distributions import NormalParamExtractor
-from torch import nn, Tensor
-from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector  # noqa: F401 (BaseAlgorithm may expect types)
+from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
+from torch import Tensor, nn
+from torchrl._utils import timeit
 from torchrl.data import (
     LazyTensorStorage,
     ReplayBuffer,
     TensorDictReplayBuffer,
 )
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import (
     MLP,
+    ActorValueOperator,
     ProbabilisticActor,
     TanhNormal,
     ValueOperator,
-    ActorValueOperator,
 )
-from torchrl.objectives.sac import SACLoss
 from torchrl.objectives import SoftUpdate, group_optimizers
-from torchrl._utils import timeit
-import numpy as np  # noqa: F401
-import tqdm
+from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 
 from rlopt.common.base_class import BaseAlgorithm
-
-
-def _get_cfg(cfg: DictConfig, path: str, default):  # robust nested select
-    try:
-        val = OmegaConf.select(cfg, path)
-    except Exception:  # pragma: no cover
-        val = None
-    return default if val in (None, "") else val
 
 
 class SAC(BaseAlgorithm):
@@ -83,8 +46,9 @@ class SAC(BaseAlgorithm):
         env,
         config: DictConfig,
         policy_net: nn.Module | None = None,
-        value_net: nn.Module
-        | None = None,  # (unused; placeholder for ActorValueOperator)
+        value_net: (
+            nn.Module | None
+        ) = None,  # (unused; placeholder for ActorValueOperator)
         q_net: nn.Module | None = None,  # optional external Q-value module
         reward_estimator_net: nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
@@ -105,121 +69,116 @@ class SAC(BaseAlgorithm):
             **kwargs,
         )
 
-        # SAC-specific components
-        self.target_net_updater: SoftUpdate | None = None
-        if isinstance(self.loss_module, SACLoss):
-            tau_cfg = _get_cfg(self.config, "optim.target_update_polyak", 0.005)
-            tau = float(tau_cfg) if not isinstance(tau_cfg, DictConfig) else 0.005
-            self.target_net_updater = SoftUpdate(self.loss_module, eps=tau)
+        # Compile if requested
+        self._compile_components()
 
-        # Track number of updates
+        # Initialize total network updates
         self.total_network_updates = 0
 
-    # ---------------------------------------------------------------------
-    # Network construction
-    # ---------------------------------------------------------------------
+        # construct the target net updater
+        self.target_net_updater = self._construct_target_net_updater()
+
     def _construct_feature_extractor(
-        self, feature_extractor_net: nn.Module | None = None
+        self, feature_extractor_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
+        """Override to build your feature extractor network from config.
+        Note that if you don't want to use a shared feature extractor,
+        you can set `use_feature_extractor` to False, then this will be an identity map. Then do feature extraction separately in policy and value functions.
+        """
         if feature_extractor_net is not None:
-            return TensorDictModule(  # type: ignore[arg-type]
+            return TensorDictModule(
                 module=feature_extractor_net,
                 in_keys=list(self.total_input_keys),
                 out_keys=["hidden"],
             )
 
         if self.config.use_feature_extractor:
-            feat = MLP(
+            feature_extractor_mlp = MLP(
                 in_features=self.total_input_shape,
                 out_features=self.config.feature_extractor.output_dim,
                 num_cells=self.config.feature_extractor.num_cells,
-                activation_class=nn.ELU,
+                activation_class=torch.nn.ELU,
                 device=self.device,
             )
-            # Simple weight init
-            for m in feat.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.kaiming_uniform_(m.weight, a=0.01)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+
+            for layer in feature_extractor_mlp.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
+                    layer.bias.data.zero_()
+
             return TensorDictModule(
-                feat, in_keys=list(self.total_input_keys), out_keys=["hidden"]
-            )  # type: ignore[arg-type]
-        return TensorDictModule(  # type: ignore[arg-type]
-            nn.Identity(),
+                module=feature_extractor_mlp,
+                in_keys=list(self.total_input_keys),
+                out_keys=["hidden"],
+            )
+        return TensorDictModule(
+            module=torch.nn.Identity(),
             in_keys=list(self.total_input_keys),
             out_keys=list(self.total_input_keys),
         )
 
     def _construct_policy(
-        self, policy_net: nn.Module | None = None
+        self, policy_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        # Actor: outputs loc, scale for TanhNormal distribution
-        in_keys = (
-            self.config.policy_in_keys
-            if self.config.use_feature_extractor
-            else list(self.total_input_keys)
-        )
-        input_dim = self.policy_input_shape
-        action_dim = self.policy_output_shape
+        """Construct policy"""
+        # for PPO, we use a probabilistic actor
 
-        if policy_net is None:
-            net = MLP(
-                in_features=input_dim,
-                out_features=2 * action_dim,
-                num_cells=self.config.policy.num_cells,
-                activation_class=nn.ELU,
-                device=self.device,
-            )
-        else:
-            net = policy_net
-
-        net = nn.Sequential(
-            net, NormalParamExtractor(scale_mapping="biased_softplus_1.0")
-        )
-        module = TensorDictModule(  # type: ignore[arg-type]
-            module=net,
-            in_keys=list(in_keys),
-            out_keys=["loc", "scale"],
-        )
-        dist_kwargs = {
+        # Define policy output distribution class
+        distribution_class = TanhNormal
+        distribution_kwargs = {
             "low": self.env.action_spec_unbatched.space.low.to(self.device),  # type: ignore
             "high": self.env.action_spec_unbatched.space.high.to(self.device),  # type: ignore
             "tanh_loc": False,
         }
+
+        # Define policy architecture
+        if policy_net is None:
+            policy_mlp = MLP(
+                in_features=self.policy_input_shape,
+                activation_class=torch.nn.ELU,
+                out_features=self.policy_output_shape,
+                num_cells=self.config.policy.num_cells,
+                device=self.device,
+            )
+            # Initialize policy weights
+            for layer in policy_mlp.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
+                    layer.bias.data.zero_()
+        else:
+            policy_mlp = policy_net
+
+        # Add state-independent normal scale
+        policy_mlp = torch.nn.Sequential(
+            policy_mlp,
+            AddStateIndependentNormalScale(
+                self.policy_output_shape,
+                scale_lb=1e-8,  # type: ignore
+            ).to(self.device),
+        )
+
+        # Add probabilistic sampling of the actions
         return ProbabilisticActor(
-            module=module,
-            spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
+            TensorDictModule(
+                module=policy_mlp,
+                in_keys=list(self.config.policy_in_keys),
+                out_keys=["loc", "scale"],
+            ),
             in_keys=["loc", "scale"],
-            distribution_class=TanhNormal,
-            distribution_kwargs=dist_kwargs,
-            default_interaction_type=ExplorationType.RANDOM,
-            return_log_prob=False,
+            spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
+            distribution_class=distribution_class,
+            distribution_kwargs=distribution_kwargs,
+            return_log_prob=True,
+            default_interaction_type=ExplorationType.DETERMINISTIC,
         )
 
     def _construct_value_function(
         self, value_net: nn.Module | None = None
-    ) -> TensorDictModule:
+    ) -> TensorDictModule:  # type: ignore[override]
         """SAC does not use a state-value function explicitly.
         We return a minimal dummy ValueOperator (not used in loss) to satisfy
         ActorValueOperator structure.
         """
-        in_keys = (
-            self.config.value_net_in_keys
-            if self.config.use_feature_extractor
-            else list(self.total_input_keys)
-        )
-        if value_net is None:
-            net = MLP(
-                in_features=self.value_input_shape,
-                out_features=1,
-                num_cells=[64],
-                activation_class=nn.ELU,
-                device=self.device,
-            )
-        else:
-            net = value_net
-        return ValueOperator(net, in_keys=in_keys)
 
     def _construct_q_function(self, q_net: nn.Module | None = None) -> TensorDictModule:
         # Q-value network taking (obs, action) -> value
@@ -233,7 +192,7 @@ class SAC(BaseAlgorithm):
             net = MLP(
                 in_features=input_dim,
                 out_features=1,
-                num_cells=self.config.value_net.num_cells,
+                num_cells=self.config.action_value_net.num_cells,
                 activation_class=nn.ELU,
                 device=self.device,
             )
@@ -248,168 +207,211 @@ class SAC(BaseAlgorithm):
             value_operator=self.value_function,  # dummy / unused in SAC
         )
 
-    # ------------------------------------------------------------------
-    # Loss / Optim / Buffer
-    # ------------------------------------------------------------------
     def _construct_loss_module(self) -> nn.Module:
-        alpha_init_cfg = _get_cfg(self.config, "optim.alpha_init", 1.0)
-        alpha_init = (
-            float(alpha_init_cfg) if not isinstance(alpha_init_cfg, DictConfig) else 1.0
-        )
-        gamma_cfg = _get_cfg(self.config, "loss.gamma", 0.99)
-        gamma = float(gamma_cfg) if not isinstance(gamma_cfg, DictConfig) else 0.99
-        loss = SACLoss(
+        loss_module = SACLoss(
             actor_network=self.actor_critic.get_policy_operator(),
-            qvalue_network=self.q_function,
+            qvalue_network=self.actor_critic.get_value_operator(),
             num_qvalue_nets=2,
-            alpha_init=alpha_init,
-            loss_function=_get_cfg(self.config, "optim.loss_function", "l2"),
+            loss_function=self.config.optim.loss_function,
             delay_actor=False,
             delay_qvalue=True,
+            alpha_init=self.config.optim.alpha_init,
         )
-        loss.make_value_estimator(gamma=gamma)
-        return loss
+        loss_module.make_value_estimator(gamma=self.config.optim.gamma)
+
+        return loss_module
+
+    def _construct_target_net_updater(self) -> SoftUpdate:
+        return SoftUpdate(
+            self.loss_module,
+            eps=self.config.optim.target_update_polyak,
+        )
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
-        lr_cfg = _get_cfg(self.config, "optim.lr", 3e-4)
-        lr = float(lr_cfg) if not isinstance(lr_cfg, DictConfig) else 3e-4
-        wd_cfg = _get_cfg(self.config, "optim.weight_decay", 0.0)
-        weight_decay = float(wd_cfg) if not isinstance(wd_cfg, DictConfig) else 0.0
-        eps_cfg = _get_cfg(self.config, "optim.adam_eps", 1e-8)
-        adam_eps = float(eps_cfg) if not isinstance(eps_cfg, DictConfig) else 1e-8
-
-        actor_params = list(self.actor_critic.get_policy_operator().parameters())
-        q_params = list(self.q_function.parameters()) if self.q_function else []
-        alpha_params: list[torch.nn.Parameter] = []
-        if isinstance(getattr(self, "loss_module", None), SACLoss):
-            alpha_params = [self.loss_module.log_alpha]  # type: ignore[attr-defined]
-
+        """Configure optimizers"""
         actor_optim = torch.optim.Adam(
-            actor_params, lr=lr, weight_decay=weight_decay, eps=adam_eps
+            self.actor_critic.get_policy_head().parameters(),
+            lr=torch.tensor(self.config.optim.lr, device=self.device),
+            # eps=1e-5,
         )
-        critic_optim = torch.optim.Adam(
-            q_params, lr=lr, weight_decay=weight_decay, eps=adam_eps
+        critic_optim = torch.optim.AdamW(
+            self.actor_critic.get_value_head().parameters(),
+            lr=torch.tensor(self.config.optim.lr, device=self.device),
+            # eps=1e-5,
         )
-        if alpha_params:
-            alpha_optim = torch.optim.Adam(alpha_params, lr=3e-4)
-            return group_optimizers(actor_optim, critic_optim, alpha_optim)
-        return group_optimizers(actor_optim, critic_optim)
+        alpha_optim = torch.optim.AdamW(
+            [self.loss_module.log_alpha],
+            lr=torch.tensor(self.config.optim.lr, device=self.device),
+        )
+        if self.config.use_feature_extractor:
+            feature_optim = torch.optim.AdamW(
+                self.feature_extractor.parameters(),
+                lr=torch.tensor(self.config.optim.lr, device=self.device),
+                # eps=1e-5,
+            )
+            return group_optimizers(
+                actor_optim, critic_optim, feature_optim, alpha_optim
+            )
+
+        return group_optimizers(actor_optim, critic_optim, alpha_optim)
 
     def _construct_data_buffer(self) -> ReplayBuffer:
-        cap_cfg = _get_cfg(self.config, "replay_buffer.size", 1_000_000)
-        bs_cfg = _get_cfg(self.config, "optim.batch_size", 256)
-        capacity = int(cap_cfg) if not isinstance(cap_cfg, DictConfig) else 1_000_000
-        batch_size = int(bs_cfg) if not isinstance(bs_cfg, DictConfig) else 256
-        storage = LazyTensorStorage(capacity, device=self.device)
-        return TensorDictReplayBuffer(storage=storage, batch_size=batch_size)
+        """Construct data buffer"""
+        # Create data buffer
+        cfg = self.config
+        sampler = (
+            SamplerWithoutReplacement()
+        )  # Removed True parameter to match ppo_mujoco.py
+        return TensorDictReplayBuffer(
+            storage=LazyTensorStorage(
+                cfg.collector.frames_per_batch,
+                compilable=cfg.compile.compile,  # type: ignore
+                device=self.device,
+            ),
+            sampler=sampler,
+            batch_size=cfg.loss.mini_batch_size,
+            compilable=cfg.compile.compile,
+        )
 
     def _construct_trainer(self):  # type: ignore[override]
         return None
 
-    # ------------------------------------------------------------------
-    # Training Loop
-    # ------------------------------------------------------------------
     def train(self) -> None:  # type: ignore[override]
+        """
+        total_frames = self.config.collector.total_frames
+        frames_per_batch = self.config.collector.frames_per_batch
+        utd_ratio = float(self.config.optim.utd_ratio)
+        num_updates = int(frames_per_batch * utd_ratio)
+        init_random_frames = int(self.config.collector.init_random_frames)
+        """
+
         cfg = self.config
         frames_per_batch = cfg.collector.frames_per_batch
         total_frames = cfg.collector.total_frames
-        utd_ratio = float(_get_cfg(cfg, "optim.utd_ratio", 1.0))
-        init_random_frames = int(_get_cfg(cfg, "collector.init_random_frames", 0))
-        batch_size = int(_get_cfg(cfg, "optim.batch_size", 256))
+        utd_ratio = float(cfg.optim.utd_ratio)
+
+        init_random_frames = int(self.config.collector.init_random_frames)
+        batch_size = int(self.config.optim.batch_size)
+        num_updates = int(frames_per_batch * utd_ratio)
 
         collected_frames = 0
         collector_iter = iter(self.collector)
         pbar = tqdm.tqdm(total=total_frames)
-        updates_per_batch = max(1, int(frames_per_batch * utd_ratio / batch_size))
 
         while collected_frames < total_frames:
             with timeit("collect"):
-                tensordict = next(collector_iter)
+                data = next(collector_iter)
 
-            frames = tensordict.numel()
-            collected_frames += frames
-            pbar.update(frames)
-
-            with timeit("replay_extend"):
-                self.data_buffer.extend(tensordict.reshape(-1))  # type: ignore[arg-type]
+            metrics_to_log: dict[str, Any] = {}
+            frames_in_batch = data.numel()
+            collected_frames += frames_in_batch
+            pbar.update(frames_in_batch)
 
             self.collector.update_policy_weights_()
 
-            metrics: dict[str, Any] = {}
-
-            if collected_frames >= init_random_frames:
-                with timeit("train"):
-                    loss_list: list[TensorDict] = []
-                    for _ in range(updates_per_batch):
-                        batch = self.data_buffer.sample()
-                        loss_td = self.loss_module(batch)
-                        combined = (
-                            loss_td["loss_actor"]
-                            + loss_td["loss_qvalue"]
-                            + loss_td.get(
-                                "loss_alpha", torch.zeros_like(loss_td["loss_actor"])
-                            )
-                        )
-                        combined.backward()
-                        self.optim.step()
-                        self.optim.zero_grad(set_to_none=True)
-                        if self.target_net_updater is not None:
-                            self.target_net_updater.step()
-                        loss_list.append(loss_td.detach())
-                actor_stack = torch.stack(
-                    [td_loss["loss_actor"] for td_loss in loss_list]
+            # Get training rewards and episode lengths
+            episode_rewards = data["next", "episode_reward"][data["next", "done"]]
+            if len(episode_rewards) > 0:
+                episode_length = data["next", "step_count"][data["next", "done"]]
+                self.episode_lengths.extend(episode_length.cpu().tolist())
+                self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                metrics_to_log.update(
+                    {
+                        "episode/length": np.mean(self.episode_lengths),
+                        "episode/return": np.mean(self.episode_rewards),
+                        "train/reward": episode_rewards.mean().item(),
+                    }
                 )
-                metrics["train/actor_loss"] = actor_stack.mean()
-                q_stack = torch.stack([td_loss["loss_qvalue"] for td_loss in loss_list])
-                metrics["train/q_loss"] = q_stack.mean()
-                if "loss_alpha" in loss_list[0]:
-                    alpha_stack = torch.stack(
-                        [td_loss["loss_alpha"] for td_loss in loss_list]
-                    )
-                    metrics["train/alpha_loss"] = alpha_stack.mean()
-                    metrics["train/alpha"] = self.loss_module.alpha  # type: ignore[attr-defined]
-                    metrics["train/entropy"] = self.loss_module.target_entropy  # type: ignore[attr-defined]
 
-            done_mask = (
-                tensordict["next", "done"]
-                if tensordict["next", "done"].any()
-                else tensordict["next", "truncated"]
-            )
-            ep_rewards = tensordict["next", "episode_reward"][done_mask]
-            if len(ep_rewards) > 0:
-                metrics["train/reward"] = ep_rewards.mean()
-                if "step_count" in tensordict["next"]:
-                    ep_len = tensordict["next", "step_count"][done_mask]
-                    metrics["train/episode_length"] = ep_len.float().mean()
+            # Don't empty the buffer in off-policy setting
+            with timeit("replay_extend"):
+                self.data_buffer.extend(data.reshape(-1))  # type: ignore[arg-type]
 
-            if self.logger is not None and metrics:
-                for k, v in metrics.items():
+            with timeit("train"):
+                if collected_frames >= init_random_frames:
+                    losses = TensorDict(batch_size=[num_updates])
+                    for i in range(num_updates):
+                        with timeit("rb - sample"):
+                            # Sample from replay buffer
+                            sampled_tensordict = self.data_buffer.sample()
+
+                        with timeit("update"):
+                            torch.compiler.cudagraph_mark_step_begin()
+                            # Compute loss
+                            loss = self.loss_module(sampled_tensordict)
+
+                            actor_loss = loss["loss_actor"]
+                            q_loss = loss["loss_qvalue"]
+                            alpha_loss = loss["loss_alpha"]
+
+                            (actor_loss + q_loss + alpha_loss).sum().backward()
+                            self.optim.step()
+                            self.optim.zero_grad(set_to_none=True)
+
+                            # Update qnet_target params
+                            self.target_net_updater.step()
+                            loss = loss.detach()
+                        losses[i] = loss.select(
+                            "loss_actor", "loss_qvalue", "loss_alpha"
+                        )
+
+                        # Update priority
+                        if self.config.replay_buffer.prb:
+                            self.data_buffer.update_priority(sampled_tensordict)  # type: ignore[attr-defined]
+
+            # Get training losses and times
+            losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
+            for key, value in losses_mean.items():  # type: ignore
+                metrics_to_log.update({f"train/{key}": value.item()})
+
+            if self.logger is not None and metrics_to_log:
+                for k, v in metrics_to_log.items():
                     if isinstance(v, Tensor):
                         self.logger.log_scalar(k, float(v.item()), collected_frames)
                     else:
                         self.logger.log_scalar(k, v, collected_frames)
 
+            # for IsaacLab, we need to log the metrics from the environment
+            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
+                for _ in range(len(self.env.log_infos)):
+                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                    # log all the keys
+                    for key, value in log_info_dict.items():
+                        if "/" in key:
+                            metrics_to_log.update(
+                                {
+                                    key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
+                                }
+                            )
+                        else:
+                            metrics_to_log.update(
+                                {
+                                    "Episode/"
+                                    + key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
+                                }
+                            )
+            # Save model periodically
+            if (
+                self.config.save_interval > 0
+                and collected_frames % self.config.save_interval == 0
+            ):
+                self.save_model(
+                    path=Path(self.config.logger.get("log_dir", "logs"))
+                    / self.config.get("save_path", "models"),
+                    step=collected_frames,
+                )
+
         pbar.close()
         self.collector.shutdown()
 
-    # ------------------------------------------------------------------
-    # Unsupported base methods for SAC in this structure
-    # ------------------------------------------------------------------
-    def _update_policy(self, batch: TensorDict) -> dict[str, float]:  # pragma: no cover
-        msg = "SAC uses custom update inside train()."  # noqa: TRY003
-        raise NotImplementedError(msg)
-
-    def _compute_action(self, tensordict: TensorDict) -> TensorDict:  # pragma: no cover
-        msg = "Use actor_critic.get_policy_operator() instead."  # noqa: TRY003
-        raise NotImplementedError(msg)
-
-    def _compute_returns(self, rollout: Tensor) -> Tensor:  # pragma: no cover
-        msg = "Return computation handled by SACLoss value estimator."  # noqa: TRY003
-        raise NotImplementedError(msg)
-
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
         obs = torch.as_tensor([obs], device=self.device)
         policy_op = self.actor_critic.get_policy_operator()
