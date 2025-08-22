@@ -112,6 +112,25 @@ class L2T(BaseAlgorithm):
         # construct the advantage module
         self.adv_module = self._construct_adv_module()
 
+        # construct the student actor-critic
+        self.student_feature_extractor = self._construct_feature_extractor(
+            in_keys=tuple(self.config.student_keys_input),
+            out_keys=("student_hidden",),
+        )
+        self.student_policy = self._construct_policy(
+            in_keys=tuple(
+                "student_hidden",
+            ),
+            out_keys=("student_loc", "student_scale"),
+        )
+        self.student_value_function = self._construct_value_function(
+            in_keys=tuple(
+                "student_hidden",
+            ),
+            out_keys=("student_value",),
+        )
+        self.student_actor_critic = self._construct_student_actor_critic()
+
         # Compile if requested
         self._compile_components()
 
@@ -119,17 +138,25 @@ class L2T(BaseAlgorithm):
         self.total_network_updates = 0
 
     def _construct_feature_extractor(
-        self, feature_extractor_net: torch.nn.Module | None = None
+        self,
+        feature_extractor_net: torch.nn.Module | None = None,
+        in_keys: tuple[str, ...] = (),
+        out_keys: tuple[str, ...] = (),
     ) -> TensorDictModule:
         """Override to build your feature extractor network from config.
         Note that if you don't want to use a shared feature extractor,
         you can set `use_feature_extractor` to False, then this will be an identity map. Then do feature extraction separately in policy and value functions.
         """
+        if in_keys == ():
+            in_keys = tuple(self.total_input_keys)
+        if out_keys == ():
+            out_keys = ("hidden",)
+
         if feature_extractor_net is not None:
             return TensorDictModule(
                 module=feature_extractor_net,
-                in_keys=tuple(self.total_input_keys),
-                out_keys=["hidden"],
+                in_keys=in_keys,
+                out_keys=out_keys,
             )
 
         if self.config.use_feature_extractor:
@@ -148,8 +175,8 @@ class L2T(BaseAlgorithm):
 
             return TensorDictModule(
                 module=feature_extractor_mlp,
-                in_keys=tuple(self.total_input_keys),
-                out_keys=["hidden"],
+                in_keys=in_keys,
+                out_keys=out_keys,
             )
         return TensorDictModule(
             module=torch.nn.Identity(),
@@ -158,10 +185,17 @@ class L2T(BaseAlgorithm):
         )
 
     def _construct_policy(
-        self, policy_net: torch.nn.Module | None = None
+        self,
+        policy_net: torch.nn.Module | None = None,
+        in_keys: tuple[str, ...] = (),
+        out_keys: tuple[str, ...] = (),
     ) -> TensorDictModule:
         """Construct policy"""
         # for PPO, we use a probabilistic actor
+        if in_keys == ():
+            in_keys = tuple(self.config.policy_in_keys)
+        if out_keys == ():
+            out_keys = ("loc", "scale")
 
         # Define policy output distribution class
         distribution_class = TanhNormal
@@ -201,10 +235,10 @@ class L2T(BaseAlgorithm):
         return ProbabilisticActor(
             TensorDictModule(
                 module=policy_mlp,
-                in_keys=self.config.policy_in_keys,
-                out_keys=["loc", "scale"],
+                in_keys=in_keys,
+                out_keys=out_keys,
             ),
-            in_keys=["loc", "scale"],
+            in_keys=out_keys,
             spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
@@ -213,9 +247,17 @@ class L2T(BaseAlgorithm):
         )
 
     def _construct_value_function(
-        self, value_net: torch.nn.Module | None = None
+        self,
+        value_net: torch.nn.Module | None = None,
+        in_keys: tuple[str, ...] = (),
+        out_keys: tuple[str, ...] = (),
     ) -> TensorDictModule:
         """Construct value function"""
+        if in_keys == ():
+            in_keys = tuple(self.config.value_net_in_keys)
+        if out_keys == ():
+            out_keys = tuple(self.config.value_net_in_keys)
+
         # Define value architecture
         if value_net is None:
             value_mlp = MLP(
@@ -236,7 +278,7 @@ class L2T(BaseAlgorithm):
         # Define value module
         return ValueOperator(
             value_mlp,
-            in_keys=self.config.value_net_in_keys,
+            in_keys=in_keys,
         )
 
     def _construct_actor_critic(self) -> TensorDictModule:
@@ -247,8 +289,20 @@ class L2T(BaseAlgorithm):
             value_operator=self.value_function,
         )
 
+    def _construct_student_actor_critic(self) -> TensorDictModule:
+        """Construct student actor-critic, which contains a feature extractor, a policy, and a value function."""
+
+        return ActorValueOperator(
+            common_operator=self.student_feature_extractor,
+            policy_operator=self.student_policy,
+            value_operator=self.student_value_function,
+        )
+
     def _construct_q_function(
-        self, q_net: torch.nn.Module | None = None
+        self,
+        q_net: torch.nn.Module | None = None,
+        in_keys: tuple[str, ...] = (),
+        out_keys: tuple[str, ...] = (),
     ) -> TensorDictModule:
         """Construct Q-function module.
 
@@ -257,34 +311,40 @@ class L2T(BaseAlgorithm):
         `q_net` is provided we wrap it; otherwise we return an identity
         TensorDictModule that maps inputs to outputs unchanged.
         """
+        if in_keys == ():
+            in_keys = tuple(self.total_input_keys)
+        if out_keys == ():
+            out_keys = tuple(self.total_input_keys)
+
         if q_net is not None:
             return TensorDictModule(
                 module=q_net,
-                in_keys=tuple(self.total_input_keys),
-                out_keys=tuple(self.total_input_keys),
+                in_keys=in_keys,
+                out_keys=out_keys,
             )
 
         # default: identity mapping (no Q-function used)
         return TensorDictModule(
             module=torch.nn.Identity(),
-            in_keys=tuple(self.total_input_keys),
-            out_keys=tuple(self.total_input_keys),
+            in_keys=in_keys,
+            out_keys=out_keys,
         )
 
     def _construct_loss_module(self) -> torch.nn.Module:
         """Construct loss module"""
-        # loss_config = self.config.loss
-        # return ClipPPOLoss(
-        #     actor_network=self.actor_critic.get_policy_operator(),
-        #     critic_network=self.actor_critic.get_value_operator(),
-        #     clip_epsilon=loss_config.clip_epsilon,
-        #     loss_critic_type=loss_config.loss_critic_type,
-        #     entropy_coeff=loss_config.entropy_coeff,
-        #     critic_coeff=loss_config.critic_coeff,
-        #     normalize_advantage=False,
-        #     clip_value=loss_config.clip_value,
-        # )
-        raise NotImplementedError
+        loss_config = self.config.loss
+        return ClipL2TLoss(
+            actor_network=self.actor_critic.get_policy_operator(),
+            critic_network=self.actor_critic.get_value_operator(),
+            student_actor_network=self.student_actor_critic.get_policy_operator(),
+            student_critic_network=self.student_actor_critic.get_value_operator(),
+            clip_epsilon=loss_config.clip_epsilon,
+            loss_critic_type=loss_config.loss_critic_type,
+            entropy_coeff=loss_config.entropy_coeff,
+            critic_coeff=loss_config.critic_coeff,
+            normalize_advantage=False,
+            clip_value=loss_config.clip_value,
+        )
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers"""
@@ -518,17 +578,22 @@ class L2T(BaseAlgorithm):
                         if "/" in key:
                             metrics_to_log.update(
                                 {
-                                    key: value.item()
-                                    if isinstance(value, Tensor)
-                                    else value
+                                    key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
                                 }
                             )
                         else:
                             metrics_to_log.update(
                                 {
-                                    "Episode/" + key: value.item()
-                                    if isinstance(value, Tensor)
-                                    else value
+                                    "Episode/"
+                                    + key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
                                 }
                             )
 
@@ -782,7 +847,7 @@ class L2TR(L2T):
         return env
 
 
-class L2TLoss(ClipPPOLoss):
+class ClipL2TLoss(ClipPPOLoss):
     """L2T Loss where teacher has clipppo loss and
 
     Args:
