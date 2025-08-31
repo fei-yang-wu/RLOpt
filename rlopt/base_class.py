@@ -9,10 +9,7 @@ import numpy as np
 import torch
 import torch.nn
 import torch.optim
-from omegaconf import DictConfig
-from tensordict.nn import (
-    TensorDictModule,
-)
+from tensordict.nn import TensorDictModule
 from torch import Tensor
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
@@ -280,7 +277,7 @@ class BaseAlgorithm(ABC):
                 cfg.logger.backend,
                 logger_name="ppo",
                 experiment_name=exp_name,
-                log_dir=cfg.logger.get("log_dir", None),
+                log_dir=cfg.logger.log_dir,
                 wandb_kwargs={
                     "config": dict(cfg),
                     "project": cfg.logger.project_name,
@@ -305,11 +302,7 @@ class BaseAlgorithm(ABC):
     ) -> None:
         """Save the model and related parameters to a file."""
         assert self.logger is not None
-        prefix = (
-            f"{self.config.logger.get('log_dir', self.logger.log_dir)}"
-            if path is None
-            else path
-        )
+        prefix = f"{self.config.logger.log_dir}" if path is None else path
         # Include step in filename if provided
         if step is not None:
             path = f"{prefix}/model_step_{step}.pt"

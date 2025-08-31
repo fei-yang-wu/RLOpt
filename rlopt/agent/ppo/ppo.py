@@ -1,28 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn
 import torch.optim
 import tqdm
-from omegaconf import DictConfig
 from tensordict import TensorDict
 from tensordict.nn import (
     AddStateIndependentNormalScale,
     TensorDictModule,
-    TensorDictModuleBase,
 )
 from torch import Tensor
 from torchrl._utils import timeit
 
 # Import missing modules
-from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
+from torchrl.collectors import SyncDataCollector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
+from torchrl.envs.transforms import InitTracker
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
@@ -36,10 +36,14 @@ from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
+from rlopt.configs import RLOptConfig
+from rlopt.utils import log_info
 
 
 @dataclass
 class PPOConfig:
+    """PPO-specific configuration."""
+
     gae_lambda: float = 0.95
     """GAE lambda parameter."""
 
@@ -59,28 +63,45 @@ class PPOConfig:
     """Entropy coefficient."""
 
 
+@dataclass
+class PPORLOptConfig(RLOptConfig):
+    """PPO configuration that extends RLOptConfig."""
+
+    ppo: PPOConfig = field(default_factory=PPOConfig)
+    """PPO configuration."""
+
+    def _post_init(self):
+        self.use_value_function = True
+
+
 class PPO(BaseAlgorithm):
     def __init__(
         self,
         env: TransformedEnv,
-        config: DictConfig,
+        config: PPORLOptConfig,
         policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
+        feature_extractor_net: torch.nn.Module | None = None,
         **kwargs,
     ):
         super().__init__(
-            env,
-            config,
-            policy_net,
-            value_net,
-            q_net,
-            replay_buffer,
-            logger,
+            env=env,
+            config=config,
+            policy_net=policy_net,
+            value_net=value_net,
+            q_net=q_net,
+            replay_buffer=replay_buffer,
+            logger=logger,
+            feature_extractor_net=feature_extractor_net,
             **kwargs,
         )
+
+        # Narrow the type for static checkers
+        self.config = cast(PPORLOptConfig, self.config)
+        self.config: PPORLOptConfig
 
         # construct the advantage module
         self.adv_module = self._construct_adv_module()
@@ -101,7 +122,7 @@ class PPO(BaseAlgorithm):
         if feature_extractor_net is not None:
             return TensorDictModule(
                 module=feature_extractor_net,
-                in_keys=self.total_input_keys,
+                in_keys=list(self.total_input_keys),
                 out_keys=["hidden"],
             )
 
@@ -121,13 +142,13 @@ class PPO(BaseAlgorithm):
 
             return TensorDictModule(
                 module=feature_extractor_mlp,
-                in_keys=self.total_input_keys,
+                in_keys=list(self.total_input_keys),
                 out_keys=["hidden"],
             )
         return TensorDictModule(
             module=torch.nn.Identity(),
-            in_keys=self.total_input_keys,
-            out_keys=self.total_input_keys,
+            in_keys=list(self.total_input_keys),
+            out_keys=list(self.total_input_keys),
         )
 
     def _construct_policy(
@@ -174,7 +195,7 @@ class PPO(BaseAlgorithm):
         return ProbabilisticActor(
             TensorDictModule(
                 module=policy_mlp,
-                in_keys=self.config.policy_in_keys,
+                in_keys=list(self.config.policy_in_keys),
                 out_keys=["loc", "scale"],
             ),
             in_keys=["loc", "scale"],
@@ -209,7 +230,17 @@ class PPO(BaseAlgorithm):
         # Define value module
         return ValueOperator(
             value_mlp,
-            in_keys=self.config.value_net_in_keys,
+            in_keys=list(self.config.value_net_in_keys),
+        )
+
+    def _construct_q_function(self) -> TensorDictModule:  # type: ignore[override]
+        """PPO does not use a state-action value function explicitly.
+        This method is not used but required by BaseAlgorithm interface.
+        """
+        return TensorDictModule(
+            module=torch.nn.Identity(),
+            in_keys=[],
+            out_keys=[],
         )
 
     def _construct_actor_critic(self) -> TensorDictModule:
@@ -223,16 +254,18 @@ class PPO(BaseAlgorithm):
 
     def _construct_loss_module(self) -> torch.nn.Module:
         """Construct loss module"""
+        assert isinstance(self.config, PPORLOptConfig)
         loss_config = self.config.loss
+        ppo_config = self.config.ppo
         return ClipPPOLoss(
             actor_network=self.actor_critic.get_policy_operator(),
             critic_network=self.actor_critic.get_value_operator(),
-            clip_epsilon=loss_config.clip_epsilon,
+            clip_epsilon=ppo_config.clip_epsilon,
             loss_critic_type=loss_config.loss_critic_type,
-            entropy_coeff=loss_config.entropy_coeff,
-            critic_coeff=loss_config.critic_coeff,
+            entropy_coeff=ppo_config.entropy_coeff,
+            critic_coeff=ppo_config.critic_coeff,
             normalize_advantage=False,
-            clip_value=loss_config.clip_value,
+            clip_value=ppo_config.clip_value,
         )
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
@@ -260,10 +293,11 @@ class PPO(BaseAlgorithm):
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
+        assert isinstance(self.config, PPORLOptConfig)
         # Create advantage module
         return GAE(
             gamma=self.config.loss.gamma,
-            lmbda=self.config.loss.gae_lambda,
+            lmbda=self.config.ppo.gae_lambda,
             value_network=self.actor_critic.get_value_operator(),  # type: ignore
             average_gae=False,
             device=self.device,
@@ -308,7 +342,7 @@ class PPO(BaseAlgorithm):
     ) -> tuple[TensorDict, int]:
         """Update function"""
         self.optim.zero_grad(set_to_none=True)
-
+        assert isinstance(self.config, PPORLOptConfig)
         # Linearly decrease the learning rate and clip epsilon
         alpha = torch.ones((), device=self.device)
         if self.config.optim.anneal_lr:
@@ -316,8 +350,8 @@ class PPO(BaseAlgorithm):
             for group in self.optim.param_groups:
                 group["lr"] = self.config.optim.lr * alpha
 
-        if self.config.loss.anneal_clip_epsilon:
-            self.loss_module.clip_epsilon.copy_(self.config.loss.clip_epsilon * alpha)  # type: ignore
+        if self.config.ppo.anneal_clip_epsilon:
+            self.loss_module.clip_epsilon.copy_(self.config.ppo.clip_epsilon * alpha)  # type: ignore
 
         num_network_updates = num_network_updates + 1
 
@@ -339,7 +373,7 @@ class PPO(BaseAlgorithm):
         self.policy.eval()
         with torch.inference_mode():
             td = TensorDict(
-                dict.fromkeys(self.config.policy_in_keys, obs),
+                dict.fromkeys(list(self.config.policy_in_keys), obs),
                 batch_size=[1],
                 device=self.policy.device,  # type: ignore
             )
@@ -364,6 +398,8 @@ class PPO(BaseAlgorithm):
     def train(self) -> None:  # type: ignore
         """Train the agent"""
         cfg = self.config
+        assert isinstance(self.config, PPORLOptConfig)
+
         # Main loop
         collected_frames = 0
         num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -384,12 +420,12 @@ class PPO(BaseAlgorithm):
         cfg_optim_lr: torch.Tensor = torch.tensor(
             self.config.optim.lr, device=self.device
         )
-        cfg_loss_anneal_clip_eps: bool = self.config.loss.anneal_clip_epsilon
-        cfg_loss_clip_epsilon: float = self.config.loss.clip_epsilon
+        cfg_loss_anneal_clip_eps: bool = self.config.ppo.anneal_clip_epsilon
+        cfg_loss_clip_epsilon: float = self.config.ppo.clip_epsilon
 
         losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])  # type: ignore
 
-        self.collector: SyncDataCollector | MultiSyncDataCollector
+        self.collector: SyncDataCollector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
         for _i in range(total_iter):
@@ -460,38 +496,20 @@ class PPO(BaseAlgorithm):
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                for _ in range(len(self.env.log_infos)):
-                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                    # log all the keys
-                    for key, value in log_info_dict.items():
-                        if "/" in key:
-                            metrics_to_log.update(
-                                {
-                                    key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
-                        else:
-                            metrics_to_log.update(
-                                {
-                                    "Episode/"
-                                    + key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
+                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                log_info(log_info_dict, metrics_to_log)
 
             # Log metrics
             if self.logger:
                 metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
                 metrics_to_log["time/speed"] = pbar.format_dict["rate"]
                 for key, value in metrics_to_log.items():
-                    self.logger.log_scalar(key, value, collected_frames)
+                    if isinstance(value, Tensor):
+                        self.logger.log_scalar(
+                            key, float(value.item()), collected_frames
+                        )
+                    else:
+                        self.logger.log_scalar(key, value, collected_frames)
 
             self.collector.update_policy_weights_()
 
@@ -501,8 +519,8 @@ class PPO(BaseAlgorithm):
                 and collected_frames % self.config.save_interval == 0
             ):
                 self.save_model(
-                    path=Path(self.config.logger.get("log_dir", "logs"))
-                    / self.config.get("save_path", "models"),
+                    path=Path(self.config.logger.log_dir)
+                    / self.config.logger.save_path,
                     step=collected_frames,
                 )
 
@@ -537,13 +555,13 @@ class PPORecurrent(PPO):
     def __init__(
         self,
         env: TransformedEnv,
-        config: DictConfig,
+        config: PPORLOptConfig,
         policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,
-        reward_estimator_net: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
+        feature_extractor_net: torch.nn.Module | None = None,
         **kwargs,
     ):
         # Store LSTM module reference for primer creation
@@ -558,9 +576,9 @@ class PPORecurrent(PPO):
             policy_net,
             value_net,
             q_net,
-            reward_estimator_net,
             replay_buffer,
             logger,
+            feature_extractor_net,
             **kwargs,
         )
 
@@ -578,10 +596,14 @@ class PPORecurrent(PPO):
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
-    ) -> TensorDictModuleBase:
+    ) -> TensorDictModule:
         """Override to build LSTM-based feature extractor using TorchRL's LSTMModule."""
         if feature_extractor_net is not None:
-            return feature_extractor_net
+            return TensorDictModule(
+                module=feature_extractor_net,
+                in_keys=list(self.total_input_keys),
+                out_keys=["hidden"],
+            )
 
         if self.config.use_feature_extractor:
             # Get LSTM configuration with defaults
@@ -609,21 +631,22 @@ class PPORecurrent(PPO):
                 out_key="hidden",
             )
 
-            return self.lstm_module
+            return self.lstm_module  # type: ignore
 
         # If not using feature extractor, return identity
         return TensorDictModule(
             module=torch.nn.Identity(),
-            in_keys=self.total_input_keys,
-            out_keys=self.total_input_keys,
+            in_keys=list(self.total_input_keys),
+            out_keys=list(self.total_input_keys),
         )
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
+        assert isinstance(self.config, PPORLOptConfig)
         # Create advantage module
         return GAE(
             gamma=self.config.loss.gamma,
-            lmbda=self.config.loss.gae_lambda,
+            lmbda=self.config.ppo.gae_lambda,
             value_network=self.actor_critic.get_value_operator(),  # type: ignore
             average_gae=False,
             device=self.device,
@@ -639,7 +662,7 @@ class PPORecurrent(PPO):
 
         with torch.inference_mode():
             td = TensorDict(
-                dict.fromkeys(self.config.policy_in_keys, obs),
+                dict.fromkeys(list(self.config.policy_in_keys), obs),
                 batch_size=[1],
                 device=self.policy.device,  # type: ignore
             )
@@ -653,7 +676,7 @@ class PPORecurrent(PPO):
         # With TorchRL's LSTMModule, states are automatically managed
         # This method is provided for compatibility but may not be needed
         # as the InitTracker transform and proper episode boundaries handle this
-        pass
+        return
 
     @classmethod
     def check_environment_compatibility(
