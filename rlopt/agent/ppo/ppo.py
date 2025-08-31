@@ -1,11 +1,6 @@
-"""
-Only supports MuJoCo environments for now
-"""
-
 from __future__ import annotations
 
-import os
-from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +36,28 @@ from torchrl.objectives import ClipPPOLoss, KLPENPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
-from rlopt.common.base_class import BaseAlgorithm
+from rlopt.base_class import BaseAlgorithm
+
+
+@dataclass
+class PPOConfig:
+    gae_lambda: float = 0.95
+    """GAE lambda parameter."""
+
+    clip_epsilon: float = 0.2
+    """Clipping epsilon for PPO."""
+
+    clip_value: bool = True
+    """Whether to clip value function."""
+
+    anneal_clip_epsilon: bool = False
+    """Whether to anneal clip epsilon."""
+
+    critic_coeff: float = 1.0
+    """Critic coefficient."""
+
+    entropy_coeff: float = 0.005
+    """Entropy coefficient."""
 
 
 class PPO(BaseAlgorithm):
@@ -63,7 +79,6 @@ class PPO(BaseAlgorithm):
             policy_net,
             value_net,
             q_net,
-            reward_estimator_net,
             replay_buffer,
             logger,
             **kwargs,
@@ -201,14 +216,12 @@ class PPO(BaseAlgorithm):
 
     def _construct_actor_critic(self) -> TensorDictModule:
         """Construct actor-critic network"""
+        assert isinstance(self.value_function, TensorDictModule)
         return ActorValueOperator(
             common_operator=self.feature_extractor,
             policy_operator=self.policy,
             value_operator=self.value_function,
         )
-
-    def _construct_q_function(self, q_net: torch.nn.Module | None = None):
-        pass
 
     def _construct_loss_module(self) -> torch.nn.Module:
         """Construct loss module"""
@@ -456,17 +469,22 @@ class PPO(BaseAlgorithm):
                         if "/" in key:
                             metrics_to_log.update(
                                 {
-                                    key: value.item()
-                                    if isinstance(value, Tensor)
-                                    else value
+                                    key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
                                 }
                             )
                         else:
                             metrics_to_log.update(
                                 {
-                                    "Episode/" + key: value.item()
-                                    if isinstance(value, Tensor)
-                                    else value
+                                    "Episode/"
+                                    + key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
                                 }
                             )
 

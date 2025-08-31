@@ -1,7 +1,7 @@
-"""Soft Actor-Critic"""
-
 from __future__ import annotations
 
+import functools
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +14,10 @@ from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torch import Tensor, nn
 from torchrl._utils import timeit
 from torchrl.data import (
+    LazyMemmapStorage,
     LazyTensorStorage,
     ReplayBuffer,
+    TensorDictPrioritizedReplayBuffer,
     TensorDictReplayBuffer,
 )
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
@@ -32,6 +34,65 @@ from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 
 from rlopt.common.base_class import BaseAlgorithm
+from rlopt.configs import RLOptConfig
+
+
+@dataclass
+class SACConfig:
+    """SAC-specific configuration."""
+
+    alpha_init: float = 1.0
+    """Initial alpha value."""
+
+    min_alpha: float | None = None
+    """Minimum alpha value."""
+
+    max_alpha: float | None = None
+    """Maximum alpha value."""
+
+    num_qvalue_nets: int = 2
+    """Number of Q-value networks."""
+
+    fixed_alpha: bool = False
+    """Whether to fix alpha."""
+
+    target_entropy: float | str = "auto"
+    """Target entropy."""
+
+    delay_actor: bool = False
+    """Whether to delay the actor network."""
+
+    delay_qvalue: bool = True
+    """Whether to delay the Q-value network."""
+
+    delay_value: bool = True
+    """Whether to delay the value network."""
+
+    priority_key: str = "td_error"
+    """Priority key."""
+
+    separate_losses: bool = False
+    """Whether to separate losses."""
+
+    reduction: str = "mean"
+    """Reduction."""
+
+    skip_done_states: bool = False
+    """Whether to skip done states."""
+
+    deactivate_vmap: bool = False
+    """Whether to deactivate vmap."""
+
+    utd_ratio: float = 1.0
+    """Number of updates per batch."""
+
+
+@dataclass
+class SACRLOptConfig(RLOptConfig):
+    """SAC configuration that extends RLOptConfig."""
+
+    sac: SACConfig = field(default_factory=SACConfig)
+    """SAC configuration."""
 
 
 class SAC(BaseAlgorithm):
@@ -44,7 +105,7 @@ class SAC(BaseAlgorithm):
     def __init__(
         self,
         env,
-        config: DictConfig,
+        config: SACRLOptConfig,
         policy_net: nn.Module | None = None,
         value_net: (
             nn.Module | None
@@ -169,7 +230,7 @@ class SAC(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.DETERMINISTIC,
+            default_interaction_type=ExplorationType.MEAN,
         )
 
     def _construct_value_function(
@@ -208,14 +269,27 @@ class SAC(BaseAlgorithm):
         )
 
     def _construct_loss_module(self) -> nn.Module:
+        sac_cfg = self.config.sac
         loss_module = SACLoss(
             actor_network=self.actor_critic.get_policy_operator(),
             qvalue_network=self.actor_critic.get_value_operator(),
-            num_qvalue_nets=2,
+            num_qvalue_nets=sac_cfg.num_qvalue_nets,
+            alpha_init=sac_cfg.alpha_init,
             loss_function=self.config.optim.loss_function,
-            delay_actor=False,
-            delay_qvalue=True,
-            alpha_init=self.config.optim.alpha_init,
+            min_alpha=sac_cfg.min_alpha,
+            max_alpha=sac_cfg.max_alpha,
+            action_spec=None,
+            fixed_alpha=sac_cfg.fixed_alpha,
+            target_entropy=sac_cfg.target_entropy,
+            delay_actor=sac_cfg.delay_actor,
+            delay_qvalue=sac_cfg.delay_qvalue,
+            delay_value=sac_cfg.delay_value,
+            gamma=self.config.optim.gamma,
+            priority_key=sac_cfg.priority_key,
+            separate_losses=sac_cfg.separate_losses,
+            reduction=sac_cfg.reduction,
+            skip_done_states=sac_cfg.skip_done_states,
+            deactivate_vmap=sac_cfg.deactivate_vmap,
         )
         loss_module.make_value_estimator(gamma=self.config.optim.gamma)
 
@@ -259,9 +333,48 @@ class SAC(BaseAlgorithm):
         """Construct data buffer"""
         # Create data buffer
         cfg = self.config
-        sampler = (
-            SamplerWithoutReplacement()
-        )  # Removed True parameter to match ppo_mujoco.py
+        sampler = SamplerWithoutReplacement()
+        scratch_dir = cfg.collector.scratch_dir
+        device = cfg.device
+        buffer_size = cfg.collector.frames_per_batch
+        batch_size = cfg.loss.mini_batch_size
+        shared = cfg.collector.shared
+        prefetch = cfg.collector.prefetch
+        storage_cls = (
+            functools.partial(LazyTensorStorage, device=device)
+            if not scratch_dir
+            else functools.partial(
+                LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir
+            )
+        )
+        if cfg.collector.prb:
+            replay_buffer = TensorDictPrioritizedReplayBuffer(
+                alpha=0.7,
+                beta=0.5,
+                pin_memory=False,
+                prefetch=prefetch,
+                storage=storage_cls(
+                    max_size=buffer_size, compilable=cfg.compile.compile
+                ),
+                batch_size=batch_size,
+                shared=shared,
+            )
+        else:
+            replay_buffer = TensorDictReplayBuffer(
+                pin_memory=False,
+                prefetch=prefetch,
+                sampler=sampler,
+                storage=storage_cls(
+                    max_size=buffer_size, compilable=cfg.compile.compile
+                ),
+                batch_size=batch_size,
+                shared=shared,
+            )
+        if scratch_dir:
+            replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
+        return replay_buffer
+
+        # Removed True parameter to match ppo_mujoco.py
         return TensorDictReplayBuffer(
             storage=LazyTensorStorage(
                 cfg.collector.frames_per_batch,
@@ -276,27 +389,34 @@ class SAC(BaseAlgorithm):
     def _construct_trainer(self):  # type: ignore[override]
         return None
 
+    def update(self, sampled_tensordict: TensorDict) -> TensorDict:
+        # Compute loss
+        loss_td = self.loss_module(sampled_tensordict)
+
+        actor_loss = loss_td["loss_actor"]
+        q_loss = loss_td["loss_qvalue"]
+        alpha_loss = loss_td["loss_alpha"]
+
+        (actor_loss + q_loss + alpha_loss).sum().backward()
+        self.optim.step()
+        self.optim.zero_grad(set_to_none=True)
+
+        # Update qnet_target params
+        self.target_net_updater.step()
+        return loss_td.detach()
+
     def train(self) -> None:  # type: ignore[override]
-        """
-        total_frames = self.config.collector.total_frames
-        frames_per_batch = self.config.collector.frames_per_batch
-        utd_ratio = float(self.config.optim.utd_ratio)
-        num_updates = int(frames_per_batch * utd_ratio)
-        init_random_frames = int(self.config.collector.init_random_frames)
-        """
 
         cfg = self.config
         frames_per_batch = cfg.collector.frames_per_batch
         total_frames = cfg.collector.total_frames
-        utd_ratio = float(cfg.optim.utd_ratio)
-
+        utd_ratio = float(cfg.sac.utd_ratio)
         init_random_frames = int(self.config.collector.init_random_frames)
-        batch_size = int(self.config.optim.batch_size)
         num_updates = int(frames_per_batch * utd_ratio)
-
         collected_frames = 0
         collector_iter = iter(self.collector)
         pbar = tqdm.tqdm(total=total_frames)
+        prb = cfg.replay_buffer.prb
 
         while collected_frames < total_frames:
             with timeit("collect"):
@@ -356,7 +476,7 @@ class SAC(BaseAlgorithm):
                         )
 
                         # Update priority
-                        if self.config.replay_buffer.prb:
+                        if prb:
                             self.data_buffer.update_priority(sampled_tensordict)  # type: ignore[attr-defined]
 
             # Get training losses and times
@@ -373,31 +493,8 @@ class SAC(BaseAlgorithm):
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                for _ in range(len(self.env.log_infos)):
-                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                    # log all the keys
-                    for key, value in log_info_dict.items():
-                        if "/" in key:
-                            metrics_to_log.update(
-                                {
-                                    key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
-                        else:
-                            metrics_to_log.update(
-                                {
-                                    "Episode/"
-                                    + key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
+                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+
             # Save model periodically
             if (
                 self.config.save_interval > 0
@@ -424,6 +521,3 @@ class SAC(BaseAlgorithm):
             )
             td = policy_op(td)
             return td.get("action")
-
-
-__all__ = ["SAC"]

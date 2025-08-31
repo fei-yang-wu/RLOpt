@@ -305,3 +305,28 @@ class OnnxCheckpointCallback(CheckpointCallback):
                     print(f"Saving model VecNormalize to {vec_normalize_path}")
 
         return True
+
+def log_info(log_info_dict: dict, metrics_to_log: dict):
+    # log all the keys
+    for key, value in log_info_dict.items():
+        if "/" in key:
+            metrics_to_log.update(
+                {
+                    key: (
+                        value.item()
+                        if isinstance(value, Tensor)
+                        else value
+                    )
+                }
+            )
+        else:
+            metrics_to_log.update(
+                {
+                    "Episode/"
+                    + key: (
+                        value.item()
+                        if isinstance(value, Tensor)
+                        else value
+                    )
+                }
+            )

@@ -59,8 +59,8 @@ from rlopt.agent.l2t.policies import (
     MultiInputLstmPolicy,
     RecurrentActorCriticPolicy,
 )
-from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
-from rlopt.common.utils import (
+from rlopt.buffer import RLOptDictRecurrentReplayBuffer
+from rlopt.utils import (
     obs_as_tensor,
     unpad_trajectories,
 )
@@ -600,9 +600,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
         # Log the current learning rate
         self.logger.record(
             "train/learning_rate",
-            lr
-            if lr is not None
-            else self.lr_schedule(self._current_progress_remaining),
+            (
+                lr
+                if lr is not None
+                else self.lr_schedule(self._current_progress_remaining)
+            ),
         )
 
         if not isinstance(optimizers, list):
