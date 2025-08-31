@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union, Callable
 import os
 import warnings
+import logging
 
 import numpy as np
 import torch as th
@@ -18,6 +19,8 @@ from stable_baselines3.common.vec_env import (
     is_vecenv_wrapped,
 )
 import wandb
+
+logger = logging.getLogger(__name__)
 
 
 class EvalStudentCallback(EventCallback):
@@ -187,11 +190,13 @@ class EvalStudentCallback(EventCallback):
             self.last_mean_reward = mean_reward
 
             if self.verbose >= 1:
-                print(
+                logger.info(
                     f"Student Eval num_timesteps={self.num_timesteps}, "
                     f"episode_reward={mean_reward:.2f} +/- {std_reward:.2f}"
                 )
-                print(f"Episode length: {mean_ep_length:.2f} +/- {std_ep_length:.2f}")
+                logger.info(
+                    f"Episode length: {mean_ep_length:.2f} +/- {std_ep_length:.2f}"
+                )
             # Add to current Logger
             self.logger.record("eval/student_mean_reward", float(mean_reward))
             self.logger.record("eval/student_mean_ep_length", mean_ep_length)
@@ -199,7 +204,7 @@ class EvalStudentCallback(EventCallback):
             if len(self._is_success_buffer) > 0:
                 success_rate = np.mean(self._is_success_buffer)
                 if self.verbose >= 1:
-                    print(f"Success rate: {100 * success_rate:.2f}%")
+                    logger.info(f"Success rate: {100 * success_rate:.2f}%")
                 self.logger.record("eval/success_rate", success_rate)
 
             # Dump log so the evaluation results are printed with the correct timestep
@@ -210,7 +215,7 @@ class EvalStudentCallback(EventCallback):
 
             if mean_reward > self.best_mean_reward:
                 if self.verbose >= 1:
-                    print("New best mean reward!")
+                    logger.info("New best mean reward!")
                 if self.best_model_save_path is not None:
                     self.model.save(
                         os.path.join(self.best_model_save_path, "best_model")
@@ -550,11 +555,13 @@ class EvalTeacherCallback(EventCallback):
             self.last_mean_reward = mean_reward
 
             if self.verbose >= 1:
-                print(
+                logger.info(
                     f"Teacher Eval num_timesteps={self.num_timesteps}, "
                     f"episode_reward={mean_reward:.2f} +/- {std_reward:.2f}"
                 )
-                print(f"Episode length: {mean_ep_length:.2f} +/- {std_ep_length:.2f}")
+                logger.info(
+                    f"Episode length: {mean_ep_length:.2f} +/- {std_ep_length:.2f}"
+                )
             # Add to current Logger
             self.logger.record("eval/teacher_mean_reward", float(mean_reward))
             self.logger.record("eval/teacher_mean_ep_length", mean_ep_length)
@@ -562,7 +569,7 @@ class EvalTeacherCallback(EventCallback):
             if len(self._is_success_buffer) > 0:
                 success_rate = np.mean(self._is_success_buffer)
                 if self.verbose >= 1:
-                    print(f"Success rate: {100 * success_rate:.2f}%")
+                    logger.info(f"Success rate: {100 * success_rate:.2f}%")
                 self.logger.record("eval/success_rate", success_rate)
 
             # Dump log so the evaluation results are printed with the correct timestep
@@ -573,7 +580,7 @@ class EvalTeacherCallback(EventCallback):
 
             if mean_reward > self.best_mean_reward:
                 if self.verbose >= 1:
-                    print("New best mean reward!")
+                    logger.info("New best mean reward!")
                 if self.best_model_save_path is not None:
                     self.model.save(
                         os.path.join(self.best_model_save_path, "best_model")
@@ -758,7 +765,7 @@ class VideoEvalCallback(BaseCallback):
 
         self.metadata = metadata
         self.sub_prefix = sub_prefix
-        print(self.metadata)
+        logger.debug(self.metadata)
         # assert (
         #     self.eval_env.render_mode == "rgb_array"
         # ), f"The render_mode must be 'rgb_array', not {self.env.render_mode}"

@@ -105,8 +105,10 @@ class IsaacLabWrapper(GymWrapper):
         observations, reward, terminated, truncated, info = step_outputs_tuple
         for k, v in observations.items():
             if torch.isnan(v).any():
-                # print the first row with nan
-                print(
+                # log the first row with nan
+                import logging
+                _logger = logging.getLogger(__name__)
+                _logger.error(
                     f"NaN values found in observation {k} during step. First row: {v[0]}"
                 )
                 raise ValueError(

@@ -1,4 +1,5 @@
 import warnings
+import logging
 from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple, List
 from collections import deque
 import time
@@ -175,7 +176,7 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
 
         self.device = get_device(device)
         if verbose >= 1:
-            print(f"Using {self.device} device")
+            logger.info(f"Using {self.device} device")
 
         self.verbose = verbose
 
@@ -358,7 +359,7 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
         else:
             self.student_policy_class = student_policy
 
-        print("student policy kwargs", student_policy_kwargs)
+        logger.debug(f"student policy kwargs {student_policy_kwargs}")
         # partial_obversevation_space is from Environment's partial_observation_space
         self.partial_observation_space = self.observation_space["student"]  # type: ignore
         self.student_policy = self.student_policy_class(  # pytype:disable=not-instantiable
@@ -1012,7 +1013,7 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
 
         # print(self.policy)
 
-        print(self.student_policy)
+        logger.debug("%s", self.student_policy)
 
         return total_timesteps, callback
 
@@ -1109,7 +1110,7 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
         :return: new model instance with loaded parameters
         """
         if print_system_info:
-            print("== CURRENT SYSTEM INFO ==")
+            logger.info("== CURRENT SYSTEM INFO ==")
             get_system_info()
 
         data, params, pytorch_variables = load_from_zip_file(
@@ -1339,3 +1340,4 @@ class RslExpertRecurrentStudent(OnPolicyAlgorithm):
 #     #     "total_loss": loss,
 #     # }
 #     return policy_loss, entropy_loss, value_loss, clip_fraction, loss
+logger = logging.getLogger(__name__)

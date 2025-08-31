@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, field
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Literal
 
 
 @dataclass
 class EnvConfig:
     """Environment configuration for RLOpt  ."""
 
-    env_name: Any = MISSING
+    env_name: Any = "Pendulum-v1"
     """Name of the environment."""
 
-    device: str = "cuda:0"
-    """Device to run the environment on."""
-
-    num_envs: Any = MISSING
+    num_envs: int = 1
     """Number of environments to simulate."""
+
+    device: str = "cpu"
+    """Device to run the environment on."""
 
 
 @dataclass
@@ -77,7 +77,7 @@ class LoggerConfig:
     group_name: str | None = None
     """Group name for logging."""
 
-    exp_name: Any = MISSING
+    exp_name: Any = "RLOpt"
     """Experiment name for logging."""
 
     test_interval: int = 1_000_000
@@ -123,7 +123,7 @@ class LossConfig:
     gamma: float = 0.99
     """Discount factor."""
 
-    mini_batch_size: Any = MISSING
+    mini_batch_size: int = 256
     """Mini-batch size for training."""
 
     epochs: int = 4
@@ -146,6 +146,11 @@ class CompileConfig:
     cudagraphs: bool = False
     """Whether to use CUDA graphs."""
 
+    warmup: int = 1
+    """Number of warmup iterations when compiling policies.
+    Used by collectors that accept a warmup parameter.
+    """
+
 
 @dataclass
 class PolicyConfig:
@@ -164,6 +169,14 @@ class ValueNetConfig:
 
 
 @dataclass
+class ActionValueNetConfig:
+    """Action-value (Q) network configuration for RLOpt."""
+
+    num_cells: ClassVar[list[int]] = [512, 256, 128]
+    """Number of cells in each layer."""
+
+
+@dataclass
 class FeatureExtractorConfig:
     """Feature extractor configuration for RLOpt  ."""
 
@@ -172,6 +185,113 @@ class FeatureExtractorConfig:
 
     output_dim: int = 128
     """Output dimension of the feature extractor."""
+
+
+# ------------------------------
+# Advanced network configuration
+# ------------------------------
+
+
+@dataclass
+class MLPBlockConfig:
+    """Config for an MLP block (torso or head)."""
+
+    num_cells: list[int]
+    activation: Literal["relu", "elu", "tanh", "gelu"] = "elu"
+    init: Literal["orthogonal", "xavier_uniform", "kaiming_uniform"] = "orthogonal"
+    layer_norm: bool = False
+    dropout: float = 0.0
+
+
+@dataclass
+class LSTMBlockConfig:
+    """Config for an LSTM block (torso)."""
+
+    hidden_size: int
+    num_layers: int = 1
+    bidirectional: bool = False
+    dropout: float = 0.0
+
+
+@dataclass
+class CNNBlockConfig:
+    """Config for a CNN block (torso for pixel inputs)."""
+
+    channels: list[int]
+    kernels: list[int]
+    strides: list[int]
+    paddings: list[int]
+    activation: Literal["relu", "elu", "tanh", "gelu"] = "relu"
+
+
+@dataclass
+class FeatureBlockSpec:
+    """Feature block spec with type-discriminated config.
+
+    One of mlp, lstm, or cnn may be set depending on `type`.
+    """
+
+    type: Literal["mlp", "lstm", "cnn"] = "mlp"
+    mlp: MLPBlockConfig | None = None
+    lstm: LSTMBlockConfig | None = None
+    cnn: CNNBlockConfig | None = None
+    output_dim: int = 128
+
+
+@dataclass
+class ModuleNetConfig:
+    """Full module network config with optional feature sharing.
+
+    If `feature_ref` is provided, it references a named feature in `SharedFeatures.features`.
+    If `feature_ref` is None and `feature` is provided, a private feature is built.
+    The `head` typically refers to an MLP used after features (policy/value/Q head).
+    """
+
+    feature_ref: str | None = None
+    feature: FeatureBlockSpec | None = None
+    head: MLPBlockConfig | None = None
+    in_keys: list[str] = field(default_factory=lambda: ["hidden"])  # after FE
+    out_key: str = "hidden"
+
+
+@dataclass
+class SharedFeatures:
+    """Registry of shared feature extractors that modules can reference by name."""
+
+    features: dict[str, FeatureBlockSpec] = field(default_factory=dict)
+
+
+@dataclass
+class CriticConfig:
+    """Generic critic configuration (state-value or action-value).
+
+    - Supports multiple critics (e.g., twin Q for SAC) via `num_nets`.
+    - Supports shared or private torso across critics.
+    - Supports optional target networks and update strategies.
+    """
+
+    template: ModuleNetConfig = field(default_factory=ModuleNetConfig)
+    num_nets: int = 1
+    shared_feature_ref: str | None = None
+    # Target network options
+    use_target: bool = True
+    target_update: Literal["polyak", "hard"] = "polyak"
+    polyak_eps: float = 0.995
+    hard_update_interval: int = 1_000
+
+
+@dataclass
+class NetworkLayout:
+    """High-level network layout for an agent.
+
+    - PPO typically uses `policy` + `value` modules.
+    - SAC uses `policy` + `q_ensemble` modules.
+    """
+
+    shared: SharedFeatures = field(default_factory=SharedFeatures)
+    policy: ModuleNetConfig = field(default_factory=ModuleNetConfig)
+    value: ModuleNetConfig | None = None
+    critic: CriticConfig | None = None
 
 
 @dataclass
@@ -234,10 +354,17 @@ class RLOptConfig:
     value_net: ValueNetConfig = field(default_factory=ValueNetConfig)
     """Value network configuration."""
 
+    action_value_net: ActionValueNetConfig = field(default_factory=ActionValueNetConfig)
+    """Action-value network configuration (used by off-policy agents such as SAC)."""
+
     feature_extractor: FeatureExtractorConfig = field(
         default_factory=FeatureExtractorConfig
     )
     """Feature extractor configuration."""
+
+    # Optional advanced network layout. If provided, agents may use this
+    # to build shared/private feature extractors and heads.
+    network: NetworkLayout | None = None
 
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     """Trainer configuration."""

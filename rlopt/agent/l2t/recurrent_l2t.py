@@ -1180,7 +1180,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         :return: new model instance with loaded parameters
         """
         if print_system_info:
-            print("== CURRENT SYSTEM INFO ==")  # noqa: T201
+            import logging
+            logging.getLogger(__name__).info("== CURRENT SYSTEM INFO ==")
             get_system_info()
 
         data, params, pytorch_variables = load_from_zip_file(

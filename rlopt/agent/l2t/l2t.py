@@ -5,6 +5,7 @@ import time
 import warnings
 from collections import deque
 from typing import Any, ClassVar, TypeVar
+import logging
 
 import numpy as np
 import torch as th
@@ -32,6 +33,8 @@ from stable_baselines3.common.vec_env import (
     unwrap_vec_normalize,
 )
 from torch.nn import functional as F
+
+logger = logging.getLogger(__name__)
 
 from rlopt.buffer import DictRolloutBuffer as RLOptDictRolloutBuffer
 from rlopt.buffer import RolloutBuffer as RLOptRolloutBuffer
@@ -135,7 +138,7 @@ class L2T(OnPolicyAlgorithm):
 
         self.device = get_device(device)
         if verbose >= 1:
-            print(f"Using {self.device} device")
+            logger.info(f"Using {self.device} device")
 
         self.verbose = verbose
         self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
@@ -460,7 +463,7 @@ class L2T(OnPolicyAlgorithm):
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
                     continue_training = False
                     if self.verbose >= 1:
-                        print(
+                        logger.info(
                             f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}"
                         )
                     break

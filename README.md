@@ -1,6 +1,6 @@
 # RLOpt: A Research Framework for Reinforcement Learning
 
-RLOpt is a flexible and modular framework for Reinforcement Learning (RL) research, built on PyTorch and TorchRL. It is designed to facilitate the implementation, testing, and comparison of various RL agents and optimization techniques. The framework uses Hydra for configuration management, allowing for easy customization of experiments.
+RLOpt is a flexible and modular framework for Reinforcement Learning (RL) research, built on PyTorch and TorchRL. It is designed to facilitate the implementation, testing, and comparison of various RL agents and optimization techniques. The framework uses dataclass-based configs for library code and Hydra for experiment scripts, allowing convenient customization.
 
 ## Key Features
 
@@ -31,26 +31,14 @@ RLOpt is a flexible and modular framework for Reinforcement Learning (RL) resear
 
 ## How to Run Experiments
 
-Experiments are configured via YAML files in the `conf` directory and launched using a main script. The configuration is managed by Hydra, which allows you to override any parameter from the command line.
+Experiments are configured via YAML files in the `conf` directory and launched using a main script. The configuration is managed by Hydra, which allows you to override any parameter from the command line. Tests rely on dataclass configs defined in `rlopt/configs.py` and do not depend on Hydra.
 
 ### Example: Running a PPO agent on HalfCheetah
 
 The primary configuration is in `conf/config.yaml`. You can run an experiment using a training script. Based on the test setup, a training run can be initiated like this:
 
 ```bash
-python test/test_ppo.py
-```
-
-This will run the PPO agent on the `HalfCheetah-v4` environment using the parameters defined in `test/test_config.yaml`.
-
-To override parameters from the command line:
-
-```bash
-# Run with a different learning rate
-python test/test_ppo.py optim.lr=1e-4
-
-# Run on a different environment for 100,000 frames
-python test/test_ppo.py env.env_name=Hopper-v4 collector.total_frames=100_000
+pytest -q
 ```
 
 ## Project Structure
@@ -65,7 +53,7 @@ RLOpt/
 │   ├── envs/             # Environment wrappers
 │   └── opt/              # Custom optimizer implementations
 ├── scripts/              # Jupyter notebooks and utility scripts
-└── test/                 # Unit and integration tests
+└── tests/                # Unit and integration tests
 ```
 
 ## Contributing

@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union, Callable
 import os
 import warnings
+import logging
 
 import numpy as np
 import torch as th
@@ -256,7 +257,7 @@ def export_to_onnx(
     )
 
     if verbose > 0:
-        print(f"Model exported in {onnx_filename}")
+        logger.info(f"Model exported in {onnx_filename}")
 
 
 class OnnxCheckpointCallback(CheckpointCallback):
@@ -275,7 +276,7 @@ class OnnxCheckpointCallback(CheckpointCallback):
             onnx_filename = self._checkpoint_path(extension="onnx")
             self.model.export_onnx_policy(path=onnx_filename)
             if self.verbose >= 2:
-                print(f"Saving model checkpoint to {model_path}")
+                logger.info(f"Saving model checkpoint to {model_path}")
 
             if (
                 self.save_replay_buffer
@@ -288,7 +289,7 @@ class OnnxCheckpointCallback(CheckpointCallback):
                 )
                 self.model.save_replay_buffer(replay_buffer_path)  # type: ignore[attr-defined]
                 if self.verbose > 1:
-                    print(
+                    logger.info(
                         f"Saving model replay buffer checkpoint to {replay_buffer_path}"
                     )
 
@@ -302,7 +303,7 @@ class OnnxCheckpointCallback(CheckpointCallback):
                 )
                 self.model.get_vec_normalize_env().save(vec_normalize_path)  # type: ignore[union-attr]
                 if self.verbose >= 2:
-                    print(f"Saving model VecNormalize to {vec_normalize_path}")
+                    logger.info(f"Saving model VecNormalize to {vec_normalize_path}")
 
         return True
 
@@ -330,3 +331,4 @@ def log_info(log_info_dict: dict, metrics_to_log: dict):
                     )
                 }
             )
+logger = logging.getLogger(__name__)

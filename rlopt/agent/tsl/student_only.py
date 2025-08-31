@@ -1,18 +1,23 @@
-import warnings
-from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union, Tuple, List
-from collections import deque
-import time
-import statistics
-import pathlib
+from __future__ import annotations
+
 import io
+import pathlib
+import statistics
+import time
+import warnings
+from collections import deque
+from typing import Any, ClassVar, TypeVar
+import logging
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
-from torch.nn import functional as F
-from copy import deepcopy
-
-from stable_baselines3.common.buffers import RolloutBuffer, BaseBuffer
+from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
+from stable_baselines3.common import utils
+from stable_baselines3.common.base_class import maybe_make_env
+from stable_baselines3.common.buffers import BaseBuffer, RolloutBuffer
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import (
     ActorCriticCnnPolicy,
@@ -20,53 +25,46 @@ from stable_baselines3.common.policies import (
     BasePolicy,
     MultiInputActorCriticPolicy,
 )
-
-
-from sb3_contrib.common.recurrent.type_aliases import RNNStates  # type: ignore
 from stable_baselines3.common.save_util import (
     load_from_zip_file,
     recursive_getattr,
     recursive_setattr,
-    save_to_zip_file,
 )
-from stable_baselines3.common.utils import get_system_info
-from stable_baselines3.common.vec_env.patch_gym import _convert_space
 from stable_baselines3.common.type_aliases import (
     GymEnv,
     MaybeCallback,
     Schedule,
     TensorDict,
 )
-from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
-from stable_baselines3.common import utils
-from stable_baselines3.common.noise import ActionNoise
-from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.utils import (
     get_device,
+    get_schedule_fn,
+    get_system_info,
+    update_learning_rate,
 )
-from stable_baselines3.common.base_class import maybe_make_env
 from stable_baselines3.common.vec_env import (
     VecEnv,
     VecNormalize,
     unwrap_vec_normalize,
 )
+from stable_baselines3.common.vec_env.patch_gym import _convert_space
+from torch.nn import functional as F
 
-from rlopt.common.buffer import RLOptDictRecurrentReplayBuffer
-from rlopt.common.utils import (
-    obs_as_tensor,
-    unpad_trajectories,
-    swap_and_flatten,
-    export_to_onnx,
-)
 from rlopt.agent.l2t.policies import (
-    MlpLstmPolicy,
     CnnLstmPolicy,
+    MlpLstmPolicy,
     MultiInputLstmPolicy,
     RecurrentActorCriticPolicy,
 )
-
+from rlopt.buffer import RLOptDictRecurrentReplayBuffer
+from rlopt.utils import (
+    obs_as_tensor,
+    unpad_trajectories,
+)
 
 SelfRecurrentStudent = TypeVar("SelfRecurrentStudent", bound="RecurrentStudent")
+
+logger = logging.getLogger(__name__)
 
 
 class RecurrentStudent(OnPolicyAlgorithm):
@@ -118,12 +116,12 @@ class RecurrentStudent(OnPolicyAlgorithm):
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
-    policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
+    policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "MlpPolicy": ActorCriticPolicy,
         "CnnPolicy": ActorCriticCnnPolicy,
         "MultiInputPolicy": MultiInputActorCriticPolicy,
     }
-    student_policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
+    student_policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "MlpLstmPolicy": MlpLstmPolicy,
         "CnnLstmPolicy": CnnLstmPolicy,
         "MultiInputLstmPolicy": MultiInputLstmPolicy,
@@ -131,12 +129,12 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticPolicy]],
-        env: Union[GymEnv, str],
-        student_policy: Union[
-            str, Type[RecurrentActorCriticPolicy]
-        ] = RecurrentActorCriticPolicy,
-        learning_rate: Union[float, Schedule] = 3e-4,
+        policy: str | type[ActorCriticPolicy],
+        env: GymEnv | str,
+        student_policy: (
+            str | type[RecurrentActorCriticPolicy]
+        ) = RecurrentActorCriticPolicy,
+        learning_rate: float | Schedule = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 64,
         whole_sequences: bool = True,
@@ -144,29 +142,29 @@ class RecurrentStudent(OnPolicyAlgorithm):
         n_batches: int = 5,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_range: Union[float, Schedule] = 0.2,
-        clip_range_vf: Union[None, float, Schedule] = None,
+        clip_range: float | Schedule = 0.2,
+        clip_range_vf: None | float | Schedule = None,
         normalize_advantage: bool = True,
         ent_coef: float = 0.0,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
-        rollout_buffer_class: Optional[
-            type[RLOptDictRecurrentReplayBuffer]
-        ] = RLOptDictRecurrentReplayBuffer,
-        rollout_buffer_kwargs: Optional[Dict[str, Any]] = None,
-        target_kl: Optional[float] = None,
+        rollout_buffer_class: (
+            type[RLOptDictRecurrentReplayBuffer] | None
+        ) = RLOptDictRecurrentReplayBuffer,
+        rollout_buffer_kwargs: dict[str, Any] | None = None,
+        target_kl: float | None = None,
         stats_window_size: int = 100,
-        tensorboard_log: Optional[str] = None,
+        tensorboard_log: str | None = None,
         mixture_coeff: float = 0.0,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
-        student_policy_kwargs: Optional[Dict[str, Any]] = None,
+        policy_kwargs: dict[str, Any] | None = None,
+        student_policy_kwargs: dict[str, Any] | None = None,
         verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
+        seed: int | None = None,
+        device: th.device | str = "auto",
         _init_setup_model: bool = True,
-        teacher_policy: Union[str, Type[ActorCriticPolicy]] = ActorCriticPolicy,
+        teacher_policy: str | type[ActorCriticPolicy] = ActorCriticPolicy,
     ):
         # if isinstance(policy, str):
         #     self.policy_class = self._get_policy_from_name(policy)
@@ -175,7 +173,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
         self.device = get_device(device)
         if verbose >= 1:
-            print(f"Using {self.device} device")
+            logger.info(f"Using {self.device} device")
 
         self.verbose = verbose
 
@@ -185,7 +183,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
         # Used for computing fps, it is updated at each call of learn()
         self._num_timesteps_at_start = 0
         self.seed = seed
-        self.action_noise: Optional[ActionNoise] = None
+        self.action_noise: ActionNoise | None = None
         self.start_time = 0.0
         self.learning_rate = learning_rate
         self.tensorboard_log = tensorboard_log
@@ -215,8 +213,8 @@ class RecurrentStudent(OnPolicyAlgorithm):
         self._n_updates = 0  # type: int
         # Whether the user passed a custom logger or not
         self._custom_logger = False
-        self.env: Optional[VecEnv] = None
-        self._vec_normalize_env: Optional[VecNormalize] = None
+        self.env: VecEnv | None = None
+        self._vec_normalize_env: VecNormalize | None = None
         supported_action_spaces = (
             spaces.Box,
             spaces.Discrete,
@@ -348,17 +346,17 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def _init_student_policy(
         self,
-        student_policy: Union[
-            str, Type[ActorCriticPolicy], ActorCriticPolicy, BasePolicy
-        ] = ActorCriticPolicy,
-        student_policy_kwargs: Optional[Dict[str, Any]] = None,
+        student_policy: (
+            str | type[ActorCriticPolicy] | ActorCriticPolicy | BasePolicy
+        ) = ActorCriticPolicy,
+        student_policy_kwargs: dict[str, Any] | None = None,
     ) -> None:
         if isinstance(student_policy, str):
             self.student_policy_class = self._get_policy_from_name(student_policy)
         else:
             self.student_policy_class = student_policy
 
-        print("student policy kwargs", student_policy_kwargs)
+        logger.debug(f"student policy kwargs {student_policy_kwargs}")
         # partial_obversevation_space is from Environment's partial_observation_space
         self.partial_observation_space = self.observation_space["student"]  # type: ignore
         self.student_policy = self.student_policy_class(  # pytype:disable=not-instantiable
@@ -433,7 +431,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
         """
         assert self._last_obs is not None, "No previous observation was provided"
 
-        self._last_obs: Dict[str, th.Tensor]
+        self._last_obs: dict[str, th.Tensor]
         # Switch to eval mode (this affects batch norm / dropout)
         self.compiled_policy.set_training_mode(False)
         self.compiled_student_policy.set_training_mode(False)
@@ -585,8 +583,8 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def _update_learning_rate(
         self,
-        optimizers: Union[List[th.optim.Optimizer], th.optim.Optimizer],
-        lr: Optional[float] = None,
+        optimizers: list[th.optim.Optimizer] | th.optim.Optimizer,
+        lr: float | None = None,
     ) -> None:
         """
         Update the optimizers learning rate using the current learning rate schedule
@@ -898,14 +896,14 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
         return self
 
-    def _excluded_save_params(self) -> List[str]:
+    def _excluded_save_params(self) -> list[str]:
         return super()._excluded_save_params() + [
             "actor",
             "critic",
             "critic_target",
-        ]  # noqa: RUF005
+        ]
 
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         state_dicts = [
             "policy",
             "student_policy",
@@ -915,11 +913,11 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def student_predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -939,11 +937,11 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def student_predict_and_return_tensor(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -963,11 +961,11 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def teacher_predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -987,11 +985,11 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -1016,7 +1014,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         tb_log_name: str = "run",
         progress_bar: bool = False,
-    ) -> Tuple[int, BaseCallback]:
+    ) -> tuple[int, BaseCallback]:
         """
         Initialize different variables needed for training.
 
@@ -1076,7 +1074,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
         # print(self.policy)
 
-        print(self.student_policy)
+        logger.debug("%s", self.student_policy)
 
         return total_timesteps, callback
 
@@ -1138,12 +1136,12 @@ class RecurrentStudent(OnPolicyAlgorithm):
         self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
 
     @classmethod
-    def load(  # noqa: C901
-        cls: Type[SelfRecurrentStudent],
-        path: Union[str, pathlib.Path, io.BufferedIOBase],
-        env: Optional[GymEnv] = None,
-        device: Union[th.device, str] = "auto",
-        custom_objects: Optional[Dict[str, Any]] = None,
+    def load(
+        cls: type[SelfRecurrentStudent],
+        path: str | pathlib.Path | io.BufferedIOBase,
+        env: GymEnv | None = None,
+        device: th.device | str = "auto",
+        custom_objects: dict[str, Any] | None = None,
         print_system_info: bool = False,
         force_reset: bool = True,
         **kwargs,
@@ -1173,7 +1171,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
         :return: new model instance with loaded parameters
         """
         if print_system_info:
-            print("== CURRENT SYSTEM INFO ==")
+            logger.info("== CURRENT SYSTEM INFO ==")
             get_system_info()
 
         data, params, pytorch_variables = load_from_zip_file(
@@ -1216,7 +1214,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
             )
 
         # Gym -> Gymnasium space conversion
-        for key in {"observation_space", "action_space"}:
+        for key in ("observation_space", "action_space"):
             data[key] = _convert_space(data[key])
 
         if env is not None:
@@ -1233,10 +1231,9 @@ class RecurrentStudent(OnPolicyAlgorithm):
             # `n_envs` must be updated. See issue https://github.com/DLR-RM/stable-baselines3/issues/1018
             if data is not None:
                 data["n_envs"] = env.num_envs
-        else:
-            # Use stored env, if one exists. If not, continue as is (can be used for predict)
-            if "env" in data:
-                env = data["env"]
+        # Use stored env, if one exists. If not, continue as is (can be used for predict)
+        elif "env" in data:
+            env = data["env"]
 
         model = cls(
             policy=data["policy_class"],
@@ -1293,9 +1290,9 @@ class RecurrentStudent(OnPolicyAlgorithm):
 
     def set_parameters(
         self,
-        load_path_or_dict: Union[str, TensorDict],
+        load_path_or_dict: str | TensorDict,
         exact_match: bool = True,
-        device: Union[th.device, str] = "auto",
+        device: th.device | str = "auto",
     ) -> None:
         """
         Load parameters from a given zip-file or a nested dictionary containing parameters for

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -20,6 +21,8 @@ from torchrl.record.loggers import generate_exp_name, get_logger
 from torchrl.record.loggers.common import Logger
 
 from rlopt.configs import RLOptConfig
+
+logger = logging.getLogger(__name__)
 
 
 class BaseAlgorithm(ABC):
@@ -66,30 +69,36 @@ class BaseAlgorithm(ABC):
         self.feature_extractor = self._construct_feature_extractor(
             feature_extractor_net
         )
+        # Initialize component placeholders
+        self.policy: TensorDictModule | None = None
+        self.value_function: TensorDictModule | None = None
+        self.q_function: TensorDictModule | None = None
+
         self.policy = self._construct_policy(policy_net)
 
         # determine using value function or q function
         if self.config.use_value_function:
             self.value_function = (
-                value_net if value_net is not None else self._construct_value_function()
+                self._construct_value_function()
+                if value_net is None
+                else self._construct_value_function(value_net)
             )
         else:
             self.q_function = (
-                q_net if q_net is not None else self._construct_q_function()
+                self._construct_q_function()
+                if q_net is None
+                else self._construct_q_function(q_net)
             )
 
         self.actor_critic = self._construct_actor_critic()
 
         # Move them to device
-        if self.policy:
+        if self.policy is not None:
             self.policy.to(self.device)
-        if self.value_function:
+        if self.value_function is not None:
             self.value_function.to(self.device)
-        if self.q_function:
+        if self.q_function is not None:
             self.q_function.to(self.device)
-
-        # Create optimizers
-        self.optimizers = self._configure_optimizers()
 
         # Replay buffer / experience
         self.replay_buffer = replay_buffer
@@ -119,6 +128,13 @@ class BaseAlgorithm(ABC):
 
         # episode rewards
         self.episode_rewards = deque(maxlen=100)
+
+        # Print model overview once components are initialized
+        try:  # noqa: SIM105
+            self._print_model_overview()
+        except Exception:
+            # Avoid hard failures if summary printing hits an edge case
+            pass
 
     @property
     def value_input_shape(self) -> int:
@@ -202,7 +218,10 @@ class BaseAlgorithm(ABC):
             # exploration_type=ExplorationType.RANDOM,
             # We set the all the devices to be identical. Below is an example of
             compile_policy=(
-                {"mode": self.config.compile.compile_mode, "warmup": 1}
+                {
+                    "mode": self.config.compile.compile_mode,
+                    "warmup": int(getattr(self.config.compile, "warmup", 1)),
+                }
                 if self.config.compile.compile
                 else False
             ),
@@ -293,6 +312,171 @@ class BaseAlgorithm(ABC):
     def train(self) -> None:
         """Main training loop."""
 
+    # ---------------------------
+    # Architecture introspection
+    # ---------------------------
+    def _print_model_overview(self) -> None:
+        """Log an elegant, informative model summary with dims and details."""
+        algo = self.__class__.__name__
+
+        def _act_name(act) -> str:
+            try:
+                return act.__name__ if isinstance(act, type) else act.__class__.__name__
+            except Exception:
+                return str(act)
+
+        # Inputs
+        obs_keys = list(self.total_input_keys)
+        dims_by_key: dict[str, int] = {}
+        for k in obs_keys:
+            try:
+                dims_by_key[k] = int(self.env.observation_spec[k].shape[-1])  # type: ignore[index]
+            except Exception:
+                pass
+        obs_dim = (
+            sum(dims_by_key.values()) if dims_by_key else int(self.total_input_shape)
+        )
+        act_dim = int(self.policy_output_shape)
+
+        # Feature extractor
+        fe_td = self.feature_extractor
+        fe_mod = getattr(fe_td, "module", fe_td)
+        fe_cls = fe_mod.__class__.__name__
+        uses_fe = bool(self.config.use_feature_extractor)
+        fe_is_identity = fe_cls == "Identity"
+        fe_shared = uses_fe and not fe_is_identity
+        fe_out_key = "hidden" if uses_fe else ", ".join(obs_keys)
+        fe_out_dim = (
+            int(getattr(self.config.feature_extractor, "output_dim", -1))
+            if uses_fe and not fe_is_identity
+            else obs_dim
+        )
+        # FE layers (best-effort from config)
+        fe_layers = []
+        fe_act = ""
+        try:
+            fe_layers = list(getattr(self.config.feature_extractor, "num_cells", []))
+            fe_act = "ELU"
+        except Exception:
+            pass
+
+        # Actor
+        policy_op = self.actor_critic.get_policy_operator()
+        policy_in_keys = list(getattr(self.config, "policy_in_keys", []))
+        actor_dist = getattr(policy_op, "distribution_class", None)
+        actor_dist_name = actor_dist.__name__ if actor_dist is not None else "Unknown"
+        actor_interaction = getattr(policy_op, "default_interaction_type", "?")
+        actor_layers = []
+        actor_act = ""
+        try:
+            if (
+                getattr(self.config, "network", None)
+                and getattr(self.config.network, "policy", None)
+                and getattr(self.config.network.policy, "head", None)
+            ):
+                actor_layers = list(self.config.network.policy.head.num_cells)  # type: ignore[attr-defined]
+                actor_act = _act_name(self._get_activation_class(self.config.network.policy.head.activation))  # type: ignore[attr-defined]
+            else:
+                actor_layers = list(getattr(self.config.policy, "num_cells", []))
+                actor_act = "ELU"
+        except Exception:
+            pass
+
+        # Critic / Q
+        using_value = bool(self.config.use_value_function)
+        if using_value:
+            critic_type = "state-value"
+            value_in_keys = list(getattr(self.config, "value_net_in_keys", []))
+            critic_layers = []
+            critic_act = ""
+            try:
+                if (
+                    getattr(self.config, "network", None)
+                    and getattr(self.config.network, "value", None)
+                    and getattr(self.config.network.value, "head", None)
+                ):
+                    critic_layers = list(self.config.network.value.head.num_cells)  # type: ignore[attr-defined]
+                    critic_act = _act_name(self._get_activation_class(self.config.network.value.head.activation))  # type: ignore[attr-defined]
+                else:
+                    critic_layers = list(
+                        getattr(self.config.value_net, "num_cells", [])
+                    )
+                    critic_act = "ELU"
+            except Exception:
+                pass
+            critic_in_dim = int(self.value_input_shape)
+            critic_out_dim = 1
+        else:
+            # SAC Q(s)
+            num_q = None
+            try:
+                if getattr(self.config, "network", None) and getattr(
+                    self.config.network, "critic", None
+                ):
+                    num_q = int(getattr(self.config.network.critic, "num_nets", 1))
+            except Exception:
+                pass
+            if num_q is None:
+                try:
+                    num_q = int(getattr(self.config.sac, "num_qvalue_nets", 1))
+                except Exception:
+                    num_q = 1
+            critic_type = (
+                f"Q-value x{num_q}"
+                if (isinstance(num_q, int) and num_q > 1)
+                else "Q-value"
+            )
+            value_in_keys = ["action"] + (
+                policy_in_keys if self.config.use_feature_extractor else obs_keys
+            )
+            critic_layers = list(getattr(self.config.action_value_net, "num_cells", []))
+            critic_act = "ELU"
+            critic_in_dim = int(self.policy_input_shape + act_dim)
+            critic_out_dim = 1
+
+        # Build message
+        title = f"RLOpt Model Summary [{algo}] — Device: {self.device}"
+        bar = "=" * len(title)
+        parts: list[str] = [bar, title, bar]
+
+        parts.append("Inputs")
+        parts.append(f"- Keys: {obs_keys}")
+        if dims_by_key:
+            parts.append(f"- Dims: {dims_by_key} (sum={obs_dim})")
+        else:
+            parts.append(f"- Total dim: {obs_dim}")
+        parts.append(f"- Action dim: {act_dim}")
+        parts.append("")
+
+        parts.append("Feature Extractor")
+        parts.append(f"- Shared: {bool(fe_shared)}")
+        parts.append(f"- Type: {fe_cls}")
+        parts.append(f"- Out: key='{fe_out_key}', dim={fe_out_dim}")
+        if fe_layers:
+            parts.append(f"- Layers: {fe_layers}; act: {fe_act}")
+        parts.append("")
+
+        parts.append("Actor")
+        parts.append(f"- In keys: {policy_in_keys}")
+        parts.append(
+            f"- Head: {policy_op.__class__.__name__} (dist={actor_dist_name}, interaction={actor_interaction})"
+        )
+        if actor_layers:
+            parts.append(
+                f"- Net: MLP(in={int(self.policy_input_shape)} → out={act_dim}, layers={actor_layers}, act={actor_act})"
+            )
+        parts.append("")
+
+        parts.append("Critic")
+        parts.append(f"- Type: {critic_type}")
+        parts.append(f"- In keys: {value_in_keys}")
+        if critic_layers:
+            parts.append(
+                f"- Net: MLP(in={critic_in_dim} → out={critic_out_dim}, layers={critic_layers}, act={critic_act})"
+            )
+
+        logger.info("\n".join(parts))
+
     @abstractmethod
     def predict(self, obs: Tensor) -> Tensor:
         """Predict action given observation."""
@@ -301,18 +485,44 @@ class BaseAlgorithm(ABC):
         self, path: str | Path | None = None, step: int | None = None
     ) -> None:
         """Save the model and related parameters to a file."""
-        assert self.logger is not None
-        prefix = f"{self.config.logger.log_dir}" if path is None else path
+        # Handle case where no logger is provided (e.g., in testing)
+        if path is None and self.logger is None:
+            # Default to current directory if no logger and no path provided
+            prefix = "."
+        elif path is None:
+            prefix = f"{self.config.logger.log_dir}"
+        else:
+            prefix = path
+
         # Include step in filename if provided
         if step is not None:
-            path = f"{prefix}/model_step_{step}.pt"
+            if Path(prefix).is_file():
+                # If prefix is a file, add step to the filename
+                path = str(prefix).rsplit(".", 1)[0] + f"_step_{step}.pt"
+            else:
+                # If prefix is a directory, create filename with step
+                path = f"{prefix}/model_step_{step}.pt"
+        elif Path(prefix).is_file():
+            # If prefix is a file, use it directly
+            path = prefix
         else:
+            # If prefix is a directory, create default filename
             path = f"{prefix}/model.pt"
-        data_to_save = {
-            "policy_state_dict": self.policy.state_dict(),
-            "value_state_dict": self.value_function.state_dict(),
+
+        # Ensure directory exists only if we're creating a new path
+        if path != prefix or Path(prefix).is_dir():
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+        data_to_save: dict[str, torch.Tensor | dict] = {
+            "policy_state_dict": (
+                self.policy.state_dict() if self.policy is not None else {}
+            ),
             "optimizer_state_dict": self.optim.state_dict(),
         }
+        if self.value_function is not None:
+            data_to_save["value_state_dict"] = self.value_function.state_dict()
+        if self.q_function is not None:
+            data_to_save["q_state_dict"] = self.q_function.state_dict()
         if self.config.use_feature_extractor:
             data_to_save["feature_extractor_state_dict"] = (
                 self.feature_extractor.state_dict()
@@ -330,10 +540,15 @@ class BaseAlgorithm(ABC):
     def load_model(self, path: str) -> None:
         """Load the model and related parameters from a file."""
         data = torch.load(path, map_location=self.device)
-        self.policy.load_state_dict(data["policy_state_dict"])
-        self.value_function.load_state_dict(data["value_state_dict"])
-        self.optim.load_state_dict(data["optimizer_state_dict"])
+        if self.policy is not None and "policy_state_dict" in data:
+            self.policy.load_state_dict(data["policy_state_dict"])  # type: ignore[arg-type]
+        if self.value_function is not None and "value_state_dict" in data:
+            self.value_function.load_state_dict(data["value_state_dict"])  # type: ignore[arg-type]
+        if self.q_function is not None and "q_state_dict" in data:
+            self.q_function.load_state_dict(data["q_state_dict"])  # type: ignore[arg-type]
+        if "optimizer_state_dict" in data:
+            self.optim.load_state_dict(data["optimizer_state_dict"])  # type: ignore[arg-type]
         if self.config.use_feature_extractor and "feature_extractor_state_dict" in data:
-            self.feature_extractor.load_state_dict(data["feature_extractor_state_dict"])
+            self.feature_extractor.load_state_dict(data["feature_extractor_state_dict"])  # type: ignore[arg-type]
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
-            self.env.load_state_dict(data["vec_norm_msg"])
+            self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]

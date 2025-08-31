@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -16,7 +17,6 @@ from torchrl.data import (
     LazyMemmapStorage,
     LazyTensorStorage,
     ReplayBuffer,
-    TensorDictPrioritizedReplayBuffer,
     TensorDictReplayBuffer,
 )
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
@@ -155,6 +155,41 @@ class SAC(BaseAlgorithm):
                 out_keys=["hidden"],
             )
 
+        # Use NetworkLayout if provided, otherwise fall back to legacy config
+        if self.config.network is not None and self.config.use_feature_extractor:
+            # Try to find a shared feature extractor
+            shared_name = None
+            if self.config.network.policy and self.config.network.policy.feature_ref:
+                shared_name = self.config.network.policy.feature_ref
+            elif (
+                self.config.network.critic
+                and self.config.network.critic.shared_feature_ref
+            ):
+                shared_name = self.config.network.critic.shared_feature_ref
+
+            if shared_name and shared_name in self.config.network.shared.features:
+                spec = self.config.network.shared.features[shared_name]
+                if spec.type == "mlp" and spec.mlp is not None:
+                    feature_extractor_mlp = MLP(
+                        in_features=self.total_input_shape,
+                        out_features=spec.output_dim,
+                        num_cells=list(spec.mlp.num_cells),
+                        activation_class=self._get_activation_class(
+                            spec.mlp.activation
+                        ),
+                        device=self.device,
+                    )
+                    self._initialize_weights(feature_extractor_mlp, spec.mlp.init)
+                    return TensorDictModule(
+                        module=feature_extractor_mlp,
+                        in_keys=list(self.total_input_keys),
+                        out_keys=["hidden"],
+                    )
+
+                msg = f"Feature type {spec.type} not supported in SAC layout"
+                raise NotImplementedError(msg)
+
+        # Fallback to legacy config
         if self.config.use_feature_extractor:
             feature_extractor_mlp = MLP(
                 in_features=self.total_input_shape,
@@ -163,11 +198,7 @@ class SAC(BaseAlgorithm):
                 activation_class=torch.nn.ELU,
                 device=self.device,
             )
-
-            for layer in feature_extractor_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
-                    layer.bias.data.zero_()
+            self._initialize_weights(feature_extractor_mlp, "orthogonal")
 
             return TensorDictModule(
                 module=feature_extractor_mlp,
@@ -184,7 +215,7 @@ class SAC(BaseAlgorithm):
         self, policy_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
         """Construct policy"""
-        # for PPO, we use a probabilistic actor
+        # for SAC, we use a probabilistic actor
 
         # Define policy output distribution class
         distribution_class = TanhNormal
@@ -196,18 +227,41 @@ class SAC(BaseAlgorithm):
 
         # Define policy architecture
         if policy_net is None:
+            # Use NetworkLayout if provided, otherwise fall back to legacy config
+            if self.config.network and self.config.network.policy:
+                policy_config = self.config.network.policy
+                if policy_config.head:
+                    num_cells = list(policy_config.head.num_cells)
+                    activation_class = self._get_activation_class(
+                        policy_config.head.activation
+                    )
+                else:
+                    # Fallback to legacy config
+                    num_cells = self.config.policy.num_cells
+                    activation_class = torch.nn.ELU
+            else:
+                # Fallback to legacy config
+                num_cells = self.config.policy.num_cells
+                activation_class = torch.nn.ELU
+
             policy_mlp = MLP(
                 in_features=self.policy_input_shape,
-                activation_class=torch.nn.ELU,
+                activation_class=activation_class,
                 out_features=self.policy_output_shape,
-                num_cells=self.config.policy.num_cells,
+                num_cells=num_cells,
                 device=self.device,
             )
             # Initialize policy weights
-            for layer in policy_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
-                    layer.bias.data.zero_()
+            if (
+                self.config.network
+                and self.config.network.policy
+                and self.config.network.policy.head
+            ):
+                self._initialize_weights(
+                    policy_mlp, self.config.network.policy.head.init
+                )
+            else:
+                self._initialize_weights(policy_mlp, "orthogonal")
         else:
             policy_mlp = policy_net
 
@@ -232,7 +286,7 @@ class SAC(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.MEAN,
+            default_interaction_type=ExplorationType.RANDOM,
         )
 
     def _construct_value_function(
@@ -252,13 +306,37 @@ class SAC(BaseAlgorithm):
         )
         input_dim = self.policy_output_shape + self.policy_input_shape
         if q_net is None:
+            # Use NetworkLayout if provided, otherwise fall back to legacy config
+            if (
+                self.config.network
+                and self.config.network.critic
+                and self.config.network.critic.template.head
+            ):
+                critic_config = self.config.network.critic.template.head
+                num_cells = list(critic_config.num_cells)
+                activation_class = self._get_activation_class(critic_config.activation)
+            else:
+                # Fallback to legacy config
+                num_cells = self.config.action_value_net.num_cells  # type: ignore
+                activation_class = nn.ELU
+
             net = MLP(
                 in_features=input_dim,
                 out_features=1,
-                num_cells=self.config.action_value_net.num_cells,  # type: ignore
-                activation_class=nn.ELU,
+                num_cells=num_cells,  # type: ignore[arg-type]
+                activation_class=activation_class,
                 device=self.device,
             )
+
+            # Initialize weights if using network layout
+            if (
+                self.config.network
+                and self.config.network.critic
+                and self.config.network.critic.template.head
+            ):
+                self._initialize_weights(
+                    net, self.config.network.critic.template.head.init
+                )
         else:
             net = q_net
         return ValueOperator(module=net, in_keys=in_keys)
@@ -267,6 +345,9 @@ class SAC(BaseAlgorithm):
         assert isinstance(
             self.q_function, TensorDictModule
         ), "Q-function must be a TensorDictModule"
+        assert isinstance(
+            self.policy, TensorDictModule
+        ), "Policy must be a TensorDictModule"
 
         return ActorValueOperator(
             common_operator=self.feature_extractor,
@@ -277,6 +358,10 @@ class SAC(BaseAlgorithm):
     def _construct_loss_module(self) -> nn.Module:
         assert isinstance(self.config, SACRLOptConfig)
         sac_cfg = self.config.sac
+        # Read num critics from network layout if provided
+        if self.config.network and self.config.network.critic:
+            sac_cfg.num_qvalue_nets = self.config.network.critic.num_nets
+
         loss_module = SACLoss(
             actor_network=self.actor_critic.get_policy_operator(),
             qvalue_network=self.actor_critic.get_value_operator(),
@@ -291,8 +376,6 @@ class SAC(BaseAlgorithm):
             delay_actor=sac_cfg.delay_actor,
             delay_qvalue=sac_cfg.delay_qvalue,
             delay_value=sac_cfg.delay_value,
-            gamma=self.config.loss.gamma,
-            priority_key=sac_cfg.priority_key,
             separate_losses=sac_cfg.separate_losses,
             reduction=sac_cfg.reduction,
             skip_done_states=sac_cfg.skip_done_states,
@@ -303,14 +386,37 @@ class SAC(BaseAlgorithm):
         return loss_module
 
     def _construct_target_net_updater(self) -> SoftUpdate:
-        return SoftUpdate(
-            self.loss_module,
-            eps=self.config.optim.target_update_polyak,
-        )
+        # Prefer polyak parameter from network layout critic if present
+        eps = self.config.optim.target_update_polyak
+        if self.config.network and self.config.network.critic:
+            eps = self.config.network.critic.polyak_eps
+        return SoftUpdate(self.loss_module, eps=eps)
+
+    def _get_activation_class(self, activation_name: str) -> type[torch.nn.Module]:
+        """Get activation class from activation name."""
+        activation_map = {
+            "relu": torch.nn.ReLU,
+            "elu": torch.nn.ELU,
+            "tanh": torch.nn.Tanh,
+            "gelu": torch.nn.GELU,
+        }
+        return activation_map.get(activation_name, torch.nn.ELU)
+
+    def _initialize_weights(self, module: torch.nn.Module, init_type: str):
+        """Initialize weights based on initialization type."""
+        for layer in module.modules():
+            if isinstance(layer, torch.nn.Linear):
+                if init_type == "orthogonal":
+                    torch.nn.init.orthogonal_(layer.weight, 1.0)
+                elif init_type == "xavier_uniform":
+                    torch.nn.init.xavier_uniform_(layer.weight)
+                elif init_type == "kaiming_uniform":
+                    torch.nn.init.kaiming_uniform_(layer.weight)
+                layer.bias.data.zero_()
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers"""
-        actor_optim = torch.optim.Adam(
+        actor_optim = torch.optim.AdamW(
             self.actor_critic.get_policy_head().parameters(),
             lr=torch.tensor(self.config.optim.lr, device=self.device),
             # eps=1e-5,
@@ -355,28 +461,17 @@ class SAC(BaseAlgorithm):
             )
         )
         if cfg.replay_buffer.prb:
-            replay_buffer = TensorDictPrioritizedReplayBuffer(
-                alpha=0.7,
-                beta=0.5,
-                pin_memory=False,
-                prefetch=prefetch,
-                storage=storage_cls(
-                    max_size=buffer_size, compilable=cfg.compile.compile
-                ),
-                batch_size=batch_size,
-                shared=shared,
+            logging.getLogger(__name__).warning(
+                "Prioritized replay buffer (prb) is not supported; using uniform replay."
             )
-        else:
-            replay_buffer = TensorDictReplayBuffer(
-                pin_memory=False,
-                prefetch=prefetch,
-                sampler=sampler,
-                storage=storage_cls(
-                    max_size=buffer_size, compilable=cfg.compile.compile
-                ),
-                batch_size=batch_size,
-                shared=shared,
-            )
+        replay_buffer = TensorDictReplayBuffer(
+            pin_memory=False,
+            prefetch=prefetch,
+            sampler=sampler,
+            storage=storage_cls(max_size=buffer_size, compilable=cfg.compile.compile),
+            batch_size=batch_size,
+            shared=shared,
+        )
         if scratch_dir:
             replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
         return replay_buffer
@@ -423,7 +518,7 @@ class SAC(BaseAlgorithm):
         collected_frames = 0
         collector_iter = iter(self.collector)
         pbar = tqdm.tqdm(total=total_frames)
-        prb = cfg.replay_buffer.prb
+        # Prioritized replay buffer is currently not supported/dormant
 
         while collected_frames < total_frames:
             with timeit("collect"):
@@ -454,6 +549,9 @@ class SAC(BaseAlgorithm):
             with timeit("replay_extend"):
                 self.data_buffer.extend(data.reshape(-1))  # type: ignore[arg-type]
 
+            # Initialize losses variable
+            losses = TensorDict(batch_size=[num_updates])
+
             with timeit("train"):
                 if collected_frames >= init_random_frames:
                     losses = TensorDict(batch_size=[num_updates])
@@ -465,31 +563,18 @@ class SAC(BaseAlgorithm):
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
                             # Compute loss
-                            loss = self.loss_module(sampled_tensordict)
-
-                            actor_loss = loss["loss_actor"]
-                            q_loss = loss["loss_qvalue"]
-                            alpha_loss = loss["loss_alpha"]
-
-                            (actor_loss + q_loss + alpha_loss).sum().backward()
-                            self.optim.step()
-                            self.optim.zero_grad(set_to_none=True)
-
-                            # Update qnet_target params
-                            self.target_net_updater.step()
-                            loss = loss.detach()
+                            loss = self.update(sampled_tensordict).clone()
                         losses[i] = loss.select(
                             "loss_actor", "loss_qvalue", "loss_alpha"
                         )
 
-                        # Update priority
-                        if prb:
-                            self.data_buffer.update_priority(sampled_tensordict)  # type: ignore[attr-defined]
+                    # PRB updates disabled
 
             # Get training losses and times
-            losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
-            for key, value in losses_mean.items():  # type: ignore
-                metrics_to_log.update({f"train/{key}": value.item()})
+            if losses is not None:
+                losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
+                for key, value in losses_mean.items():  # type: ignore
+                    metrics_to_log.update({f"train/{key}": value.item()})
 
             if self.logger is not None and metrics_to_log:
                 for k, v in metrics_to_log.items():

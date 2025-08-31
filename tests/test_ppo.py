@@ -1,108 +1,18 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import torchrl.envs.libs.gym
-from omegaconf import OmegaConf
-from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from tensordict import TensorDict
-from torchrl.envs import EnvCreator, ParallelEnv, TransformedEnv
+from torchrl.envs import TransformedEnv
 from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
 from torchrl.envs.transforms import Compose, InitTracker
 
 from rlopt.agent.ppo import PPO, PPORecurrent
-from rlopt.common.base_class import BaseAlgorithm
-
-# We avoid using the library helper to skip DoubleToFloat, which expects float64
-
-
-def make_test_env(env_name: str, device: str = "cpu") -> TransformedEnv:
-    base = TorchRLGymEnv(env_name, device=device)
-    env = TransformedEnv(base)
-    from torchrl.envs import ClipTransform, RewardSum, StepCounter
-
-    env.append_transform(ClipTransform(in_keys=["observation"], low=-10, high=10))
-    env.append_transform(RewardSum())
-    env.append_transform(StepCounter())
-    return env
-
-
-def make_test_env_parallel(
-    env_name: str, num_workers: int, device: str = "cpu"
-) -> TransformedEnv:
-    def maker():
-        return TorchRLGymEnv(env_name, device=device)
-
-    base = ParallelEnv(
-        num_workers,
-        EnvCreator(maker),
-        serial_for_single=True,
-        mp_start_method="fork",
-    )
-    env = TransformedEnv(base)
-    from torchrl.envs import ClipTransform, RewardSum, StepCounter
-
-    env.append_transform(ClipTransform(in_keys=["observation"], low=-10, high=10))
-    env.append_transform(RewardSum())
-    env.append_transform(StepCounter())
-    return env
-
-
-# -------------------------
-# Global fixtures/utilities
-# -------------------------
-
-
-# Ensure torchrl's GymEnv treats VecEnv as batched; avoids isaaclab import issues
-torchrl.envs.libs.gym.GymEnv._is_batched = property(  # type: ignore[attr-defined]
-    lambda self: isinstance(self._env, VecEnv)
-)
-
-# Ensure list-like config keys become plain lists for modules expecting list/tuple
-BaseAlgorithm.total_input_keys = property(  # type: ignore[assignment]
-    lambda self: list(self.config.total_input_keys)
-)
-
-
-def _load_base_cfg() -> DictConfig:
-    cfg_path = Path(__file__).with_name("test_config.yaml")
-    cfg = OmegaConf.load(str(cfg_path))
-    OmegaConf.set_struct(cfg, False)
-    # Keep logging off for tests
-    cfg.logger.backend = None
-    cfg.device = "cpu"
-    cfg.compile.compile = False
-    cfg.use_feature_extractor = True
-    # Use continuous control env that is light-weight
-    cfg.env.env_name = "Pendulum-v1"
-    return cfg
-
-
-def _configure_for_fast_training(
-    cfg, num_envs: int = 100, frames_per_batch: int = 4000, total_frames: int = 12000
-):
-    cfg.env.num_envs = num_envs
-    cfg.collector.frames_per_batch = frames_per_batch
-    cfg.collector.total_frames = total_frames
-    cfg.collector.set_truncated = False
-    # Avoid periodic save_model when logger is disabled in tests
-    cfg.save_interval = 0
-    # Smaller nets for speed
-    cfg.policy.num_cells = [64, 64]
-    cfg.value_net.num_cells = [64, 64]
-    # Larger minibatch to do fewer updates; few epochs
-    cfg.loss.mini_batch_size = 1024
-    cfg.loss.epochs = 2
-    cfg.optim.lr = 3e-4
-    # Feature-extractor shape alignment
-    cfg.feature_extractor.output_dim = 64
-    cfg.policy_in_keys = ["hidden"]
-    cfg.value_net_in_keys = ["hidden"]
-    cfg.total_input_keys = ["observation"]
-    return cfg
+from tests.conftest import is_env_available
 
 
 def _configure_recurrent(cfg, hidden_size: int = 64):
@@ -122,7 +32,23 @@ def evaluate_policy_average_return(
     num_episodes: int = 5,
     max_steps: int = 200,
 ) -> float:
-    eval_env = make_test_env(env_name, device="cpu")
+    base = TorchRLGymEnv(env_name, device="cpu")
+    eval_env = TransformedEnv(base)
+    from torchrl.envs import ClipTransform, RewardSum, StepCounter
+
+    eval_env.append_transform(ClipTransform(in_keys=["observation"], low=-10, high=10))
+    eval_env.append_transform(RewardSum())
+    eval_env.append_transform(StepCounter())
+    # Cast observations to float32 to match model params
+    # Cast to float32 only when observations are float64 (e.g., MuJoCo)
+    try:
+        obs_dtype = eval_env.observation_spec["observation"].dtype
+    except Exception:
+        obs_dtype = None
+    if obs_dtype is not None and obs_dtype == torch.float64:
+        from torchrl.envs import DoubleToFloat
+
+        eval_env.append_transform(DoubleToFloat(in_keys=["observation"]))
     if isinstance(agent, PPORecurrent):
         eval_env = PPORecurrent.add_required_transforms(eval_env)
 
@@ -184,11 +110,9 @@ def test_pporecurrent_add_required_transforms():
     assert has_init_tracker(env.transform)
 
 
-def test_ppo_instantiation_and_predict_shapes():
-    cfg = _configure_for_fast_training(
-        _load_base_cfg(), num_envs=4, frames_per_batch=64, total_frames=64
-    )
-    env = make_test_env(cfg.env.env_name, device="cpu")
+def test_ppo_instantiation_and_predict_shapes(ppo_cfg_factory, make_env):  # type: ignore
+    cfg = ppo_cfg_factory(env_name="Pendulum-v1", num_envs=4, frames_per_batch=64, total_frames=64)  # type: ignore
+    env = make_env(cfg.env.env_name, device="cpu")  # type: ignore
     agent = PPO(env=env, config=cfg)
 
     # Single-step policy forward via ActorValueOperator ensures feature extractor is applied
@@ -206,14 +130,17 @@ def test_ppo_instantiation_and_predict_shapes():
     assert torch.all(action <= torch.as_tensor(high, device=action.device) + 1e-6)
 
 
-def test_pporecurrent_instantiation_and_predict_shapes():
-    cfg = _configure_recurrent(
-        _configure_for_fast_training(
-            _load_base_cfg(), num_envs=4, frames_per_batch=64, total_frames=64
-        ),
-        hidden_size=32,
-    )
-    env = make_test_env(cfg.env.env_name, device="cpu")
+def test_pporecurrent_instantiation_and_predict_shapes(ppo_cfg_factory, make_env):  # type: ignore
+    cfg = ppo_cfg_factory(env_name="Pendulum-v1", num_envs=4, frames_per_batch=64, total_frames=64)  # type: ignore
+    # Inject recurrent config for feature extractor
+    cfg.feature_extractor.lstm = {
+        "hidden_size": 32,
+        "num_layers": 1,
+        "dropout": 0.0,
+        "bidirectional": False,
+    }
+    cfg.feature_extractor.output_dim = 32
+    env = make_env(cfg.env.env_name, device="cpu")  # type: ignore
     env = PPORecurrent.add_required_transforms(env)
     agent = PPORecurrent(env=env, config=cfg)
 
@@ -236,13 +163,10 @@ def test_pporecurrent_instantiation_and_predict_shapes():
 # -------------------------
 
 
-def test_training_improves_return_ppo():
-    cfg = _configure_for_fast_training(
-        _load_base_cfg(), num_envs=10, frames_per_batch=4000, total_frames=100000
-    )
-    env = make_test_env_parallel(
-        cfg.env.env_name, num_workers=cfg.env.num_envs, device="cpu"
-    )
+@pytest.mark.slow
+def test_training_improves_return_ppo(ppo_cfg_factory, make_env_parallel):  # type: ignore
+    cfg = ppo_cfg_factory(env_name="Pendulum-v1", num_envs=10, frames_per_batch=4000, total_frames=100000)  # type: ignore
+    env = make_env_parallel(cfg.env.env_name, num_workers=cfg.env.num_envs, device="cpu")  # type: ignore
     agent = PPO(env=env, config=cfg)
 
     before = evaluate_policy_average_return(
@@ -261,17 +185,19 @@ def test_training_improves_return_ppo():
     assert after > before + 0.01
 
 
-def test_training_improves_return_pporecurrent():
-    cfg = _configure_recurrent(
-        _configure_for_fast_training(
-            _load_base_cfg(), num_envs=10, frames_per_batch=4000, total_frames=100000
-        ),
-        hidden_size=64,
-    )
+@pytest.mark.slow
+def test_training_improves_return_pporecurrent(ppo_cfg_factory, make_env_parallel):  # type: ignore
+    cfg = ppo_cfg_factory(env_name="Pendulum-v1", num_envs=10, frames_per_batch=4000, total_frames=100000)  # type: ignore
+    # recurrent
+    cfg.feature_extractor.lstm = {
+        "hidden_size": 64,
+        "num_layers": 1,
+        "dropout": 0.0,
+        "bidirectional": False,
+    }
+    cfg.feature_extractor.output_dim = 64
 
-    env = make_test_env_parallel(
-        cfg.env.env_name, num_workers=cfg.env.num_envs, device="cpu"
-    )
+    env = make_env_parallel(cfg.env.env_name, num_workers=cfg.env.num_envs, device="cpu")  # type: ignore
     env = PPORecurrent.add_required_transforms(env)
 
     agent = PPORecurrent(env=env, config=cfg)
@@ -288,3 +214,27 @@ def test_training_improves_return_pporecurrent():
 
     assert duration < 120.0
     assert after > before + 0.01
+
+
+@pytest.mark.mujoco("HalfCheetah-v5")
+def test_ppo_halfcheetah_v5_smoke(ppo_cfg_factory, make_env_parallel):  # type: ignore
+    """Lightweight PPO smoke run on HalfCheetah-v5 to validate integration.
+
+    This keeps frames small to avoid long CI times and only checks that
+    training runs without error on a MuJoCo continuous control task.
+    """
+    # Skip if MuJoCo/Gymnasium env is unavailable in the environment
+    try:
+        _ = TorchRLGymEnv("HalfCheetah-v5", device="cpu")
+    except Exception as e:  # pragma: no cover - env availability varies
+        pytest.skip(f"HalfCheetah-v5 unavailable: {e}")
+
+    # Use fixture-injected factories; do not import fixtures directly
+    cfg = ppo_cfg_factory(env_name="HalfCheetah-v5", num_envs=8, frames_per_batch=2040, total_frames=2040)  # type: ignore
+    env = make_env_parallel(cfg.env.env_name, num_workers=cfg.env.num_envs, device="cpu")  # type: ignore
+    agent = PPO(env=env, config=cfg)
+
+    start = time.time()
+    agent.train()
+    duration = time.time() - start
+    assert duration < 180.0

@@ -1,13 +1,19 @@
-# The implementation is borrowed from Stable Baselines 3 [https://github.com/DLR-RM/stable-baselines3/blob/master/stable_baselines3/common/buffers.py]
+from __future__ import annotations
+
 import warnings
-from functools import partial
 from abc import ABC, abstractmethod
-from typing import Callable, Any, Dict, Generator, List, Optional, Tuple, Union
+from collections.abc import Callable, Generator
+from functools import partial
+from typing import Any
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
-
+from sb3_contrib.common.recurrent.type_aliases import (
+    RecurrentDictRolloutBufferSamples,
+    RecurrentRolloutBufferSamples,
+    RNNStates,
+)
 from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.vec_env import VecNormalize
@@ -15,18 +21,11 @@ from tensordict import TensorDict
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
-from sb3_contrib.common.recurrent.type_aliases import (
-    RecurrentDictRolloutBufferSamples,
-    RecurrentRolloutBufferSamples,
-    RNNStates,
-)
-
-from rlopt.common.type_aliases import (
-    RecurrentRolloutBufferSequenceSamples,
+from rlopt.type_aliases import (
     RecurrentDictRolloutBufferSequenceSamples,
+    RecurrentRolloutBufferSequenceSamples,
 )
-
-from rlopt.common.utils import split_and_pad_trajectories, unpad_trajectories
+from rlopt.utils import split_and_pad_trajectories
 
 try:
     # Check memory used by replay buffer when possible
@@ -54,14 +53,14 @@ class BaseBuffer(ABC):
     """
 
     observation_space: spaces.Space
-    obs_shape: Tuple[int, ...]
+    obs_shape: tuple[int, ...]
 
     def __init__(
         self,
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
+        device: th.device | str = "auto",
         n_envs: int = 1,
     ):
         super().__init__()
@@ -77,9 +76,7 @@ class BaseBuffer(ABC):
         self.n_envs = n_envs
 
     @staticmethod
-    def swap_and_flatten(
-        arr: Union[th.Tensor, TensorDict]
-    ) -> Union[th.Tensor, TensorDict]:
+    def swap_and_flatten(arr: th.Tensor | TensorDict) -> th.Tensor | TensorDict:
         """
         Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
         to convert shape from [n_steps, n_envs, ...] (when ... is the shape of the features)
@@ -111,7 +108,7 @@ class BaseBuffer(ABC):
         Add a new batch of transitions to the buffer
         """
         # Do a for loop along the batch axis
-        for data in zip(*args):
+        for data in zip(*args, strict=False):
             self.add(*data)
 
     def reset(self) -> None:
@@ -121,7 +118,7 @@ class BaseBuffer(ABC):
         self.pos = 0
         self.full = False
 
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None):
+    def sample(self, batch_size: int, env: VecNormalize | None = None):
         """
         :param batch_size: Number of element to sample
         :param env: associated gym VecEnv
@@ -134,8 +131,8 @@ class BaseBuffer(ABC):
 
     @abstractmethod
     def _get_samples(
-        self, batch_inds: th.Tensor, env: Optional[VecNormalize] = None
-    ) -> Union[ReplayBufferSamples, RolloutBufferSamples]:
+        self, batch_inds: th.Tensor, env: VecNormalize | None = None
+    ) -> ReplayBufferSamples | RolloutBufferSamples:
         """
         :param batch_inds:
         :param env:
@@ -158,16 +155,16 @@ class BaseBuffer(ABC):
 
     @staticmethod
     def _normalize_obs(
-        obs: Union[th.Tensor, Dict[str, th.Tensor]],
-        env: Optional[VecNormalize] = None,
-    ) -> Union[th.Tensor, Dict[str, th.Tensor]]:
+        obs: th.Tensor | dict[str, th.Tensor],
+        env: VecNormalize | None = None,
+    ) -> th.Tensor | dict[str, th.Tensor]:
         if env is not None:
             return env.normalize_obs(obs)  # type: ignore
         return obs
 
     @staticmethod
     def _normalize_reward(
-        reward: th.Tensor, env: Optional[VecNormalize] = None
+        reward: th.Tensor, env: VecNormalize | None = None
     ) -> th.Tensor:
         if env is not None:
             return env.normalize_reward(reward).astype(th.float32)  # type: ignore
@@ -205,7 +202,7 @@ class ReplayBuffer(BaseBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
+        device: th.device | str = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = True,
@@ -290,7 +287,7 @@ class ReplayBuffer(BaseBuffer):
         action: th.Tensor,
         reward: th.Tensor,
         done: th.Tensor,
-        infos: List[Dict[str, Any]],
+        infos: list[dict[str, Any]],
     ) -> None:
         # Reshape needed when using multiple envs with discrete observations
         # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
@@ -324,7 +321,7 @@ class ReplayBuffer(BaseBuffer):
             self.pos = 0
 
     def sample(
-        self, batch_size: int, env: Optional[VecNormalize] = None
+        self, batch_size: int, env: VecNormalize | None = None
     ) -> ReplayBufferSamples:
         """
         Sample elements from the replay buffer.
@@ -351,7 +348,7 @@ class ReplayBuffer(BaseBuffer):
         return self._get_samples(batch_inds, env=env)
 
     def _get_samples(
-        self, batch_inds: th.Tensor, env: Optional[VecNormalize] = None
+        self, batch_inds: th.Tensor, env: VecNormalize | None = None
     ) -> ReplayBufferSamples:
         # Sample randomly the env idx
         env_indices = th.randint(0, high=self.n_envs, size=(len(batch_inds),))
@@ -432,7 +429,7 @@ class RolloutBuffer(BaseBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
+        device: th.device | str = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
@@ -559,7 +556,7 @@ class RolloutBuffer(BaseBuffer):
             self.full = True
 
     def get(
-        self, batch_size: Optional[int] = None
+        self, batch_size: int | None = None
     ) -> Generator[RolloutBufferSamples, None, None]:
 
         assert self.full, ""
@@ -593,7 +590,7 @@ class RolloutBuffer(BaseBuffer):
     def _get_samples(
         self,
         batch_inds: th.Tensor,
-        env: Optional[VecNormalize] = None,
+        env: VecNormalize | None = None,
     ) -> RolloutBufferSamples:
 
         data = (
@@ -625,16 +622,16 @@ class DictReplayBuffer(ReplayBuffer):
     """
 
     observation_space: spaces.Dict
-    obs_shape: Dict[str, Tuple[int, ...]]  # type: ignore[assignment]
-    observations: Dict[str, th.Tensor]  # type: ignore[assignment]
-    next_observations: Dict[str, th.Tensor]  # type: ignore[assignment]
+    obs_shape: dict[str, tuple[int, ...]]  # type: ignore[assignment]
+    observations: dict[str, th.Tensor]  # type: ignore[assignment]
+    next_observations: dict[str, th.Tensor]  # type: ignore[assignment]
 
     def __init__(
         self,
         buffer_size: int,
         observation_space: spaces.Dict,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
+        device: th.device | str = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = True,
@@ -723,12 +720,12 @@ class DictReplayBuffer(ReplayBuffer):
 
     def add(  # type: ignore[override]
         self,
-        obs: Dict[str, th.Tensor],
-        next_obs: Dict[str, th.Tensor],
+        obs: dict[str, th.Tensor],
+        next_obs: dict[str, th.Tensor],
         action: th.Tensor,
         reward: th.Tensor,
         done: th.Tensor,
-        infos: List[Dict[str, Any]],
+        infos: list[dict[str, Any]],
     ) -> None:
         # Copy to avoid modification by reference
         for key in self.observations.keys():
@@ -768,7 +765,7 @@ class DictReplayBuffer(ReplayBuffer):
     def sample(  # type: ignore[override]
         self,
         batch_size: int,
-        env: Optional[VecNormalize] = None,
+        env: VecNormalize | None = None,
     ) -> DictReplayBufferSamples:
         """
         Sample elements from the replay buffer.
@@ -782,7 +779,7 @@ class DictReplayBuffer(ReplayBuffer):
     def _get_samples(  # type: ignore[override]
         self,
         batch_inds: th.Tensor,
-        env: Optional[VecNormalize] = None,
+        env: VecNormalize | None = None,
     ) -> DictReplayBufferSamples:
         # Sample randomly the env idx
         env_indices = th.randint(
@@ -864,7 +861,7 @@ class DictRolloutBuffer(RolloutBuffer):
     """
 
     observation_space: spaces.Dict
-    obs_shape: Dict[str, Tuple[int, ...]]  # type: ignore[assignment]
+    obs_shape: dict[str, tuple[int, ...]]  # type: ignore[assignment]
     observations: TensorDict  # type: ignore[assignment]
 
     def __init__(
@@ -872,7 +869,7 @@ class DictRolloutBuffer(RolloutBuffer):
         buffer_size: int,
         observation_space: spaces.Dict,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
+        device: th.device | str = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
@@ -951,7 +948,7 @@ class DictRolloutBuffer(RolloutBuffer):
 
     def add(  # type: ignore[override]
         self,
-        obs: Dict[str, th.Tensor],
+        obs: dict[str, th.Tensor],
         action: th.Tensor,
         reward: th.Tensor,
         episode_start: th.Tensor,
@@ -994,7 +991,7 @@ class DictRolloutBuffer(RolloutBuffer):
 
     def get(  # type: ignore[override]
         self,
-        batch_size: Optional[int] = None,
+        batch_size: int | None = None,
     ) -> Generator[DictRolloutBufferSamples, None, None]:
         assert self.full, ""
         indices = th.randperm(self.buffer_size * self.n_envs)
@@ -1030,7 +1027,7 @@ class DictRolloutBuffer(RolloutBuffer):
     def _get_samples(  # type: ignore[override]
         self,
         batch_inds: th.Tensor,
-        env: Optional[VecNormalize] = None,
+        env: VecNormalize | None = None,
     ) -> DictRolloutBufferSamples:
         data = (
             self.observations[batch_inds],
@@ -1045,10 +1042,10 @@ class DictRolloutBuffer(RolloutBuffer):
 
 
 def pad(
-    seq_start_indices: Union[np.ndarray, th.Tensor],
-    seq_end_indices: Union[np.ndarray, th.Tensor],
+    seq_start_indices: np.ndarray | th.Tensor,
+    seq_end_indices: np.ndarray | th.Tensor,
     device: th.device,
-    tensor: Union[np.ndarray, th.Tensor],
+    tensor: np.ndarray | th.Tensor,
     padding_value: float = 0.0,
 ) -> th.Tensor:
     """
@@ -1075,7 +1072,7 @@ def pad(
         return th.nn.utils.rnn.pad_sequence(
             seq, batch_first=True, padding_value=padding_value
         )
-    elif isinstance(tensor, np.ndarray):
+    if isinstance(tensor, np.ndarray):
         # Convert seq_start_indices and seq_end_indices to numpy arrays
         seq_start_indices = seq_start_indices.cpu().numpy()
         seq_end_indices = seq_end_indices.cpu().numpy()
@@ -1083,7 +1080,7 @@ def pad(
         # Create sequences given start and end
         seq = [
             th.tensor(tensor[start : end + 1], device=device)
-            for start, end in zip(seq_start_indices, seq_end_indices)
+            for start, end in zip(seq_start_indices, seq_end_indices, strict=False)
         ]
         return th.nn.utils.rnn.pad_sequence(
             seq, batch_first=True, padding_value=padding_value
@@ -1091,10 +1088,10 @@ def pad(
 
 
 def pad_and_flatten(
-    seq_start_indices: Union[np.ndarray, th.Tensor],
-    seq_end_indices: Union[np.ndarray, th.Tensor],
+    seq_start_indices: np.ndarray | th.Tensor,
+    seq_end_indices: np.ndarray | th.Tensor,
     device: th.device,
-    tensor: Union[np.ndarray, th.Tensor],
+    tensor: np.ndarray | th.Tensor,
     padding_value: float = 0.0,
 ) -> th.Tensor:
     """
@@ -1116,10 +1113,10 @@ def pad_and_flatten(
 
 
 def create_sequencers(
-    episode_starts: Union[np.ndarray, th.Tensor],
-    env_change: Union[np.ndarray, th.Tensor],
+    episode_starts: np.ndarray | th.Tensor,
+    env_change: np.ndarray | th.Tensor,
     device: th.device,
-) -> Tuple[np.ndarray, Callable, Callable]:
+) -> tuple[np.ndarray, Callable, Callable]:
     """
     Create the utility function to chunk data into
     sequences and pad them to create fixed size tensors.
@@ -1185,8 +1182,8 @@ class RecurrentRolloutBuffer(RolloutBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        hidden_state_shape: Tuple[int, int, int, int],
-        device: Union[th.device, str] = "auto",
+        hidden_state_shape: tuple[int, int, int, int],
+        device: th.device | str = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
@@ -1230,7 +1227,7 @@ class RecurrentRolloutBuffer(RolloutBuffer):
         super().add(*args, **kwargs)
 
     def get(
-        self, batch_size: Optional[int] = None
+        self, batch_size: int | None = None
     ) -> Generator[RecurrentRolloutBufferSamples, None, None]:
         assert self.full, "Rollout buffer must be full before sampling from it"
 
@@ -1294,7 +1291,7 @@ class RecurrentRolloutBuffer(RolloutBuffer):
         self,
         batch_inds: th.Tensor,
         env_change: th.Tensor,
-        env: Optional[VecNormalize] = None,
+        env: VecNormalize | None = None,
     ) -> RecurrentRolloutBufferSamples:
         # Retrieve sequence starts and utility function
         self.seq_start_indices, self.pad, self.pad_and_flatten = create_sequencers(
@@ -1367,8 +1364,8 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        hidden_state_shape: Tuple[int, int, int, int],
-        device: Union[th.device, str] = "auto",
+        hidden_state_shape: tuple[int, int, int, int],
+        device: th.device | str = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
@@ -1412,7 +1409,7 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
         super().add(*args, **kwargs)
 
     def get(
-        self, batch_size: Optional[int] = None
+        self, batch_size: int | None = None
     ) -> Generator[RecurrentDictRolloutBufferSamples, None, None]:
         assert self.full, "Rollout buffer must be full before sampling from it"
 
@@ -1472,7 +1469,7 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
         self,
         batch_inds: th.Tensor,
         env_change: th.Tensor,
-        env: Optional[VecNormalize] = None,
+        env: VecNormalize | None = None,
     ) -> RecurrentDictRolloutBufferSamples:
         # Retrieve sequence starts and utility function
         self.seq_start_indices, self.pad, self.pad_and_flatten = create_sequencers(
@@ -1530,10 +1527,10 @@ class RecurrentDictRolloutBuffer(DictRolloutBuffer):
 
 # utility function for creating RecurrentSequenceRolloutBuffer
 def create_sequence_slicer(
-    episode_start_indices: np.ndarray, device: Union[th.device, str]
-) -> Callable[[Union[np.ndarray, th.Tensor], List[int]], th.Tensor]:
+    episode_start_indices: np.ndarray, device: th.device | str
+) -> Callable[[np.ndarray | th.Tensor, list[int]], th.Tensor]:
     def create_sequence_minibatch(
-        tensor: np.ndarray | th.Tensor, seq_indices: List[int]
+        tensor: np.ndarray | th.Tensor, seq_indices: list[int]
     ) -> th.Tensor:
         """
         Create minibatch of whole sequence.
@@ -1578,8 +1575,8 @@ class RecurrentSequenceRolloutBuffer(RecurrentRolloutBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        hidden_state_shape: Tuple[int, int, int, int],
-        device: Union[th.device, str] = "auto",
+        hidden_state_shape: tuple[int, int, int, int],
+        device: th.device | str = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
@@ -1668,8 +1665,8 @@ class RecurrentSequenceDictRolloutBuffer(RecurrentDictRolloutBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        hidden_state_shape: Tuple[int, int, int, int],
-        device: Union[th.device, str] = "auto",
+        hidden_state_shape: tuple[int, int, int, int],
+        device: th.device | str = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
@@ -1743,7 +1740,7 @@ class RecurrentSequenceDictRolloutBuffer(RecurrentDictRolloutBuffer):
 
 class RLOptDictRecurrentReplayBuffer(ABC):
     observation_space: spaces.Dict
-    obs_shape: Dict[str, Tuple[int, ...]]  # type: ignore[assignment]
+    obs_shape: dict[str, tuple[int, ...]]  # type: ignore[assignment]
     observations: TensorDict  # type: ignore[assignment]
     actions: th.Tensor
     rewards: th.Tensor
@@ -1758,8 +1755,8 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        hidden_state_shape: Tuple[int, int, int, int],
-        device: Union[th.device, str] = "auto",
+        hidden_state_shape: tuple[int, int, int, int],
+        device: th.device | str = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
@@ -1858,21 +1855,21 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         Add a new batch of transitions to the buffer
         """
         # Do a for loop along the batch axis
-        for data in zip(*args):
+        for data in zip(*args, strict=False):
             self.add(*data)
 
     @staticmethod
     def _normalize_obs(
-        obs: Union[th.Tensor, Dict[str, th.Tensor]],
-        env: Optional[VecNormalize] = None,
-    ) -> Union[th.Tensor, Dict[str, th.Tensor]]:
+        obs: th.Tensor | dict[str, th.Tensor],
+        env: VecNormalize | None = None,
+    ) -> th.Tensor | dict[str, th.Tensor]:
         if env is not None:
             return env.normalize_obs(obs)  # type: ignore
         return obs
 
     @staticmethod
     def _normalize_reward(
-        reward: th.Tensor, env: Optional[VecNormalize] = None
+        reward: th.Tensor, env: VecNormalize | None = None
     ) -> th.Tensor:
         if env is not None:
             return env.normalize_reward(reward).astype(th.float32)  # type: ignore
@@ -1929,7 +1926,7 @@ class RLOptDictRecurrentReplayBuffer(ABC):
 
     def add(
         self,
-        obs: Dict[str, th.Tensor],
+        obs: dict[str, th.Tensor],
         action: th.Tensor,
         reward: th.Tensor,
         episode_start: th.Tensor,

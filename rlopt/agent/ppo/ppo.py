@@ -126,6 +126,39 @@ class PPO(BaseAlgorithm):
                 out_keys=["hidden"],
             )
 
+        # Use NetworkLayout if provided, otherwise fall back to legacy config
+        if self.config.network is not None and self.config.use_feature_extractor:
+            # Try to find a shared feature extractor
+            shared_name = None
+            if self.config.network.policy and self.config.network.policy.feature_ref:
+                shared_name = self.config.network.policy.feature_ref
+            elif self.config.network.value and self.config.network.value.feature_ref:
+                shared_name = self.config.network.value.feature_ref
+
+            if shared_name and shared_name in self.config.network.shared.features:
+                spec = self.config.network.shared.features[shared_name]
+                if spec.type == "mlp" and spec.mlp is not None:
+                    feature_extractor_mlp = MLP(
+                        in_features=self.total_input_shape,
+                        out_features=spec.output_dim,
+                        num_cells=list(spec.mlp.num_cells),
+                        activation_class=self._get_activation_class(
+                            spec.mlp.activation
+                        ),
+                        device=self.device,
+                    )
+                    self._initialize_weights(feature_extractor_mlp, spec.mlp.init)
+                    return TensorDictModule(
+                        module=feature_extractor_mlp,
+                        in_keys=list(self.total_input_keys),
+                        out_keys=["hidden"],
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Feature type {spec.type} not supported in PPO layout"
+                    )
+
+        # Fallback to legacy config
         if self.config.use_feature_extractor:
             feature_extractor_mlp = MLP(
                 in_features=self.total_input_shape,
@@ -134,11 +167,7 @@ class PPO(BaseAlgorithm):
                 activation_class=torch.nn.ELU,
                 device=self.device,
             )
-
-            for layer in feature_extractor_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
-                    layer.bias.data.zero_()
+            self._initialize_weights(feature_extractor_mlp, "orthogonal")
 
             return TensorDictModule(
                 module=feature_extractor_mlp,
@@ -167,18 +196,41 @@ class PPO(BaseAlgorithm):
 
         # Define policy architecture
         if policy_net is None:
+            # Use NetworkLayout if provided, otherwise fall back to legacy config
+            if self.config.network and self.config.network.policy:
+                policy_config = self.config.network.policy
+                if policy_config.head:
+                    num_cells = list(policy_config.head.num_cells)
+                    activation_class = self._get_activation_class(
+                        policy_config.head.activation
+                    )
+                else:
+                    # Fallback to legacy config
+                    num_cells = self.config.policy.num_cells
+                    activation_class = torch.nn.ELU
+            else:
+                # Fallback to legacy config
+                num_cells = self.config.policy.num_cells
+                activation_class = torch.nn.ELU
+
             policy_mlp = MLP(
                 in_features=self.policy_input_shape,
-                activation_class=torch.nn.ELU,
+                activation_class=activation_class,
                 out_features=self.policy_output_shape,
-                num_cells=self.config.policy.num_cells,
+                num_cells=num_cells,
                 device=self.device,
             )
             # Initialize policy weights
-            for layer in policy_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
-                    layer.bias.data.zero_()
+            if (
+                self.config.network
+                and self.config.network.policy
+                and self.config.network.policy.head
+            ):
+                self._initialize_weights(
+                    policy_mlp, self.config.network.policy.head.init
+                )
+            else:
+                self._initialize_weights(policy_mlp, "orthogonal")
         else:
             policy_mlp = policy_net
 
@@ -212,18 +264,39 @@ class PPO(BaseAlgorithm):
         """Construct value function"""
         # Define value architecture
         if value_net is None:
+            # Use NetworkLayout if provided, otherwise fall back to legacy config
+            if self.config.network and self.config.network.value:
+                value_config = self.config.network.value
+                if value_config.head:
+                    num_cells = list(value_config.head.num_cells)
+                    activation_class = self._get_activation_class(
+                        value_config.head.activation
+                    )
+                else:
+                    # Fallback to legacy config
+                    num_cells = self.config.value_net.num_cells
+                    activation_class = torch.nn.ELU
+            else:
+                # Fallback to legacy config
+                num_cells = self.config.value_net.num_cells
+                activation_class = torch.nn.ELU
+
             value_mlp = MLP(
                 in_features=self.value_input_shape,
-                activation_class=torch.nn.ELU,
+                activation_class=activation_class,
                 out_features=self.value_output_shape,
-                num_cells=self.config.value_net.num_cells,
+                num_cells=num_cells,
                 device=self.device,
             )
             # Initialize value weights
-            for layer in value_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 0.01)  # type: ignore
-                    layer.bias.data.zero_()
+            if (
+                self.config.network
+                and self.config.network.value
+                and self.config.network.value.head
+            ):
+                self._initialize_weights(value_mlp, self.config.network.value.head.init)
+            else:
+                self._initialize_weights(value_mlp, "orthogonal")
         else:
             value_mlp = value_net
 
@@ -290,6 +363,28 @@ class PPO(BaseAlgorithm):
             return group_optimizers(actor_optim, critic_optim, feature_optim)
 
         return group_optimizers(actor_optim, critic_optim)
+
+    def _get_activation_class(self, activation_name: str) -> type[torch.nn.Module]:
+        """Get activation class from activation name."""
+        activation_map = {
+            "relu": torch.nn.ReLU,
+            "elu": torch.nn.ELU,
+            "tanh": torch.nn.Tanh,
+            "gelu": torch.nn.GELU,
+        }
+        return activation_map.get(activation_name, torch.nn.ELU)
+
+    def _initialize_weights(self, module: torch.nn.Module, init_type: str):
+        """Initialize weights based on initialization type."""
+        for layer in module.modules():
+            if isinstance(layer, torch.nn.Linear):
+                if init_type == "orthogonal":
+                    torch.nn.init.orthogonal_(layer.weight, 1.0)
+                elif init_type == "xavier_uniform":
+                    torch.nn.init.xavier_uniform_(layer.weight)
+                elif init_type == "kaiming_uniform":
+                    torch.nn.init.kaiming_uniform_(layer.weight)
+                layer.bias.data.zero_()
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
