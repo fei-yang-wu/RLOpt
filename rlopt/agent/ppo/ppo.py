@@ -23,7 +23,6 @@ from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
-from torchrl.envs.transforms import InitTracker, TensorDictPrimer
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
@@ -32,7 +31,7 @@ from torchrl.modules import (
     TanhNormal,
     ValueOperator,
 )
-from torchrl.objectives import ClipPPOLoss, KLPENPPOLoss, group_optimizers
+from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
@@ -68,7 +67,6 @@ class PPO(BaseAlgorithm):
         policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,
-        reward_estimator_net: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
         **kwargs,

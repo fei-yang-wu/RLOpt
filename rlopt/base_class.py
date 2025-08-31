@@ -22,6 +22,8 @@ from torchrl.envs import TransformedEnv
 from torchrl.record.loggers import generate_exp_name, get_logger
 from torchrl.record.loggers.common import Logger
 
+from rlopt.configs import RLOptConfig
+
 
 class BaseAlgorithm(ABC):
     """
@@ -43,7 +45,7 @@ class BaseAlgorithm(ABC):
     def __init__(
         self,
         env: TransformedEnv,
-        config: DictConfig,
+        config: RLOptConfig,
         policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,

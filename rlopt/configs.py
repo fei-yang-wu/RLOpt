@@ -37,6 +37,15 @@ class CollectorConfig:
     init_random_frames: int = 1000
     """Number of random frames to collect."""
 
+    scratch_dir: str | None = None
+    """Directory to save scratch data."""
+
+    shared: bool = False
+    """Whether the buffer will be shared using multiprocessing or not.."""
+
+    prefetch: int | None = None
+    """Number of prefetch batches."""
+
 
 @dataclass
 class ReplayBufferConfig:
@@ -83,6 +92,9 @@ class LoggerConfig:
     log_dir: str = "logs"
     """Directory to save logs."""
 
+    save_path: str = "models"
+    """Path to save the model."""
+
 
 @dataclass
 class OptimizerConfig:
@@ -99,6 +111,9 @@ class OptimizerConfig:
 
     device: str = "cuda:0"
     """Device for optimizer."""
+
+    target_update_polyak: float = 0.995
+    """Polyak averaging coefficient for target network updates."""
 
 
 @dataclass
@@ -198,6 +213,9 @@ class RLOptConfig:
     collector: CollectorConfig = field(default_factory=CollectorConfig)
     """Data collector configuration."""
 
+    replay_buffer: ReplayBufferConfig = field(default_factory=ReplayBufferConfig)
+    """Replay buffer configuration."""
+
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     """Logger configuration."""
 
@@ -227,6 +245,10 @@ class RLOptConfig:
     use_feature_extractor: bool = True
     """Whether to use a feature extractor."""
 
+    use_value_function: bool = True
+    """Whether to use a value function. 
+    If use action_value function, then q network is used."""
+
     device: str = "cuda:0"
     """Device for training."""
 
@@ -235,9 +257,6 @@ class RLOptConfig:
 
     save_interval: int = 500
     """Interval for saving the model."""
-
-    save_path: str = "models"
-    """Path to save the model."""
 
     policy_in_keys: ClassVar[list[str]] = ["hidden"]
     """Keys to use for the policy."""

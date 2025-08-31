@@ -3,12 +3,11 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
 import tqdm
-from omegaconf import DictConfig
 from tensordict import TensorDict
 from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torch import Tensor, nn
@@ -33,8 +32,9 @@ from torchrl.objectives import SoftUpdate, group_optimizers
 from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 
-from rlopt.common.base_class import BaseAlgorithm
+from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import RLOptConfig
+from rlopt.utils import log_info
 
 
 @dataclass
@@ -94,6 +94,9 @@ class SACRLOptConfig(RLOptConfig):
     sac: SACConfig = field(default_factory=SACConfig)
     """SAC configuration."""
 
+    def _post_init(self):
+        self.use_value_function = False
+
 
 class SAC(BaseAlgorithm):
     """Soft Actor-Critic algorithm.
@@ -107,11 +110,7 @@ class SAC(BaseAlgorithm):
         env,
         config: SACRLOptConfig,
         policy_net: nn.Module | None = None,
-        value_net: (
-            nn.Module | None
-        ) = None,  # (unused; placeholder for ActorValueOperator)
         q_net: nn.Module | None = None,  # optional external Q-value module
-        reward_estimator_net: nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
         feature_extractor_net: nn.Module | None = None,
@@ -121,14 +120,17 @@ class SAC(BaseAlgorithm):
             env=env,
             config=config,
             policy_net=policy_net,
-            value_net=value_net,
+            value_net=None,
             q_net=q_net,
-            reward_estimator_net=reward_estimator_net,
             replay_buffer=replay_buffer,
             logger=logger,
             feature_extractor_net=feature_extractor_net,
             **kwargs,
         )
+
+        # Narrow the type for static checkers
+        self.config = cast(SACRLOptConfig, self.config)
+        self.config: SACRLOptConfig
 
         # Compile if requested
         self._compile_components()
@@ -253,7 +255,7 @@ class SAC(BaseAlgorithm):
             net = MLP(
                 in_features=input_dim,
                 out_features=1,
-                num_cells=self.config.action_value_net.num_cells,
+                num_cells=self.config.action_value_net.num_cells,  # type: ignore
                 activation_class=nn.ELU,
                 device=self.device,
             )
@@ -262,20 +264,25 @@ class SAC(BaseAlgorithm):
         return ValueOperator(module=net, in_keys=in_keys)
 
     def _construct_actor_critic(self) -> TensorDictModule:
+        assert isinstance(
+            self.q_function, TensorDictModule
+        ), "Q-function must be a TensorDictModule"
+
         return ActorValueOperator(
             common_operator=self.feature_extractor,
             policy_operator=self.policy,
-            value_operator=self.value_function,  # dummy / unused in SAC
+            value_operator=self.q_function,  # dummy / unused in SAC
         )
 
     def _construct_loss_module(self) -> nn.Module:
+        assert isinstance(self.config, SACRLOptConfig)
         sac_cfg = self.config.sac
         loss_module = SACLoss(
             actor_network=self.actor_critic.get_policy_operator(),
             qvalue_network=self.actor_critic.get_value_operator(),
             num_qvalue_nets=sac_cfg.num_qvalue_nets,
             alpha_init=sac_cfg.alpha_init,
-            loss_function=self.config.optim.loss_function,
+            loss_function=self.config.loss.loss_critic_type,
             min_alpha=sac_cfg.min_alpha,
             max_alpha=sac_cfg.max_alpha,
             action_spec=None,
@@ -284,14 +291,14 @@ class SAC(BaseAlgorithm):
             delay_actor=sac_cfg.delay_actor,
             delay_qvalue=sac_cfg.delay_qvalue,
             delay_value=sac_cfg.delay_value,
-            gamma=self.config.optim.gamma,
+            gamma=self.config.loss.gamma,
             priority_key=sac_cfg.priority_key,
             separate_losses=sac_cfg.separate_losses,
             reduction=sac_cfg.reduction,
             skip_done_states=sac_cfg.skip_done_states,
             deactivate_vmap=sac_cfg.deactivate_vmap,
         )
-        loss_module.make_value_estimator(gamma=self.config.optim.gamma)
+        loss_module.make_value_estimator(gamma=self.config.loss.gamma)
 
         return loss_module
 
@@ -347,7 +354,7 @@ class SAC(BaseAlgorithm):
                 LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir
             )
         )
-        if cfg.collector.prb:
+        if cfg.replay_buffer.prb:
             replay_buffer = TensorDictPrioritizedReplayBuffer(
                 alpha=0.7,
                 beta=0.5,
@@ -406,7 +413,7 @@ class SAC(BaseAlgorithm):
         return loss_td.detach()
 
     def train(self) -> None:  # type: ignore[override]
-
+        assert isinstance(self.config, SACRLOptConfig)
         cfg = self.config
         frames_per_batch = cfg.collector.frames_per_batch
         total_frames = cfg.collector.total_frames
@@ -494,6 +501,7 @@ class SAC(BaseAlgorithm):
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
                 log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                log_info(log_info_dict, metrics_to_log)
 
             # Save model periodically
             if (
@@ -501,8 +509,8 @@ class SAC(BaseAlgorithm):
                 and collected_frames % self.config.save_interval == 0
             ):
                 self.save_model(
-                    path=Path(self.config.logger.get("log_dir", "logs"))
-                    / self.config.get("save_path", "models"),
+                    path=Path(self.config.logger.log_dir)
+                    / self.config.logger.save_path,
                     step=collected_frames,
                 )
 
