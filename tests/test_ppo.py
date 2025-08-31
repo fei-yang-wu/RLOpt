@@ -5,14 +5,12 @@ import time
 import numpy as np
 import pytest
 import torch
-import torchrl.envs.libs.gym
 from tensordict import TensorDict
 from torchrl.envs import TransformedEnv
 from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
 from torchrl.envs.transforms import Compose, InitTracker
 
 from rlopt.agent.ppo import PPO, PPORecurrent
-from tests.conftest import is_env_available
 
 
 def _configure_recurrent(cfg, hidden_size: int = 64):
