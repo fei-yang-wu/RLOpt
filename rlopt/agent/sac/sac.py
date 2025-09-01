@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import tqdm
 from tensordict import TensorDict
-from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
+from tensordict.nn import TensorDictModule
 from torch import Tensor, nn
 from torchrl._utils import timeit
 from torchrl.data import (
@@ -26,7 +26,6 @@ from torchrl.modules import (
     ActorValueOperator,
     ProbabilisticActor,
     TanhNormal,
-    ValueOperator,
 )
 from torchrl.objectives import SoftUpdate, group_optimizers
 from torchrl.objectives.sac import SACLoss
@@ -144,71 +143,12 @@ class SAC(BaseAlgorithm):
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        """Override to build your feature extractor network from config.
-        Note that if you don't want to use a shared feature extractor,
-        you can set `use_feature_extractor` to False, then this will be an identity map. Then do feature extraction separately in policy and value functions.
-        """
-        if feature_extractor_net is not None:
-            return TensorDictModule(
-                module=feature_extractor_net,
-                in_keys=list(self.total_input_keys),
-                out_keys=["hidden"],
-            )
-
-        # Use NetworkLayout if provided, otherwise fall back to legacy config
-        if self.config.network is not None and self.config.use_feature_extractor:
-            # Try to find a shared feature extractor
-            shared_name = None
-            if self.config.network.policy and self.config.network.policy.feature_ref:
-                shared_name = self.config.network.policy.feature_ref
-            elif (
-                self.config.network.critic
-                and self.config.network.critic.shared_feature_ref
-            ):
-                shared_name = self.config.network.critic.shared_feature_ref
-
-            if shared_name and shared_name in self.config.network.shared.features:
-                spec = self.config.network.shared.features[shared_name]
-                if spec.type == "mlp" and spec.mlp is not None:
-                    feature_extractor_mlp = MLP(
-                        in_features=self.total_input_shape,
-                        out_features=spec.output_dim,
-                        num_cells=list(spec.mlp.num_cells),
-                        activation_class=self._get_activation_class(
-                            spec.mlp.activation
-                        ),
-                        device=self.device,
-                    )
-                    self._initialize_weights(feature_extractor_mlp, spec.mlp.init)
-                    return TensorDictModule(
-                        module=feature_extractor_mlp,
-                        in_keys=list(self.total_input_keys),
-                        out_keys=["hidden"],
-                    )
-
-                msg = f"Feature type {spec.type} not supported in SAC layout"
-                raise NotImplementedError(msg)
-
-        # Fallback to legacy config
-        if self.config.use_feature_extractor:
-            feature_extractor_mlp = MLP(
-                in_features=self.total_input_shape,
-                out_features=self.config.feature_extractor.output_dim,
-                num_cells=self.config.feature_extractor.num_cells,
-                activation_class=torch.nn.ELU,
-                device=self.device,
-            )
-            self._initialize_weights(feature_extractor_mlp, "orthogonal")
-
-            return TensorDictModule(
-                module=feature_extractor_mlp,
-                in_keys=list(self.total_input_keys),
-                out_keys=["hidden"],
-            )
-        return TensorDictModule(
-            module=torch.nn.Identity(),
+        """Build shared feature extractor via base helper."""
+        return self._build_feature_extractor_module(
+            feature_extractor_net=feature_extractor_net,
             in_keys=list(self.total_input_keys),
-            out_keys=list(self.total_input_keys),
+            out_key="hidden",
+            layout=self.config.network,
         )
 
     def _construct_policy(
@@ -265,22 +205,15 @@ class SAC(BaseAlgorithm):
         else:
             policy_mlp = policy_net
 
-        # Add state-independent normal scale
-        policy_mlp = torch.nn.Sequential(
-            policy_mlp,
-            AddStateIndependentNormalScale(
-                self.policy_output_shape,
-                scale_lb=1e-8,  # type: ignore
-            ).to(self.device),
+        # Build policy head via base helper and wrap
+        policy_td = self._build_policy_head_module(
+            policy_net=policy_net,
+            in_keys=list(self.config.policy_in_keys),
+            out_keys=["loc", "scale"],
+            layout=self.config.network,
         )
-
-        # Add probabilistic sampling of the actions
         return ProbabilisticActor(
-            TensorDictModule(
-                module=policy_mlp,
-                in_keys=list(self.config.policy_in_keys),
-                out_keys=["loc", "scale"],
-            ),
+            policy_td,
             in_keys=["loc", "scale"],
             spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
@@ -298,48 +231,8 @@ class SAC(BaseAlgorithm):
         """
 
     def _construct_q_function(self, q_net: nn.Module | None = None) -> TensorDictModule:
-        # Q-value network taking (obs, action) -> value
-        in_keys = ["action"] + (
-            self.config.policy_in_keys
-            if self.config.use_feature_extractor
-            else list(self.total_input_keys)
-        )
-        input_dim = self.policy_output_shape + self.policy_input_shape
-        if q_net is None:
-            # Use NetworkLayout if provided, otherwise fall back to legacy config
-            if (
-                self.config.network
-                and self.config.network.critic
-                and self.config.network.critic.template.head
-            ):
-                critic_config = self.config.network.critic.template.head
-                num_cells = list(critic_config.num_cells)
-                activation_class = self._get_activation_class(critic_config.activation)
-            else:
-                # Fallback to legacy config
-                num_cells = self.config.action_value_net.num_cells  # type: ignore
-                activation_class = nn.ELU
-
-            net = MLP(
-                in_features=input_dim,
-                out_features=1,
-                num_cells=num_cells,  # type: ignore[arg-type]
-                activation_class=activation_class,
-                device=self.device,
-            )
-
-            # Initialize weights if using network layout
-            if (
-                self.config.network
-                and self.config.network.critic
-                and self.config.network.critic.template.head
-            ):
-                self._initialize_weights(
-                    net, self.config.network.critic.template.head.init
-                )
-        else:
-            net = q_net
-        return ValueOperator(module=net, in_keys=in_keys)
+        # Delegate to base helper
+        return self._build_qvalue_module(q_net=q_net, layout=self.config.network)
 
     def _construct_actor_critic(self) -> TensorDictModule:
         assert isinstance(

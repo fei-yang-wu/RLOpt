@@ -10,7 +10,6 @@ import torch.optim
 import tqdm
 from tensordict import TensorDict, TensorDictParams
 from tensordict.nn import (
-    AddStateIndependentNormalScale,
     TensorDictModule,
 )
 from torch import Tensor
@@ -23,7 +22,6 @@ from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
 from torchrl.envs.transforms import InitTracker
 from torchrl.modules import (
-    MLP,
     ActorValueOperator,
     LSTMModule,
     ProbabilisticActor,
@@ -37,8 +35,6 @@ from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import (
-    FeatureBlockSpec,
-    ModuleNetConfig,
     NetworkLayout,
     RLOptConfig,
 )
@@ -140,9 +136,9 @@ class L2T(BaseAlgorithm):
         self.env = env
 
         # construct the student actor-critic (separate layout and keys)
-        self.student_feature_extractor = self._construct_feature_extractor()
-        self.student_policy = self._construct_policy()
-        self.student_value_function = self._construct_value_function()
+        self.student_feature_extractor = self._construct_student_feature_extractor()
+        self.student_policy = self._construct_student_policy()
+        self.student_value_function = self._construct_student_value_function()
         self.student_actor_critic = self._construct_student_actor_critic()
 
         super().__init__(
@@ -170,64 +166,12 @@ class L2T(BaseAlgorithm):
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        """Teacher feature extractor (PPO-style), using RLOptConfig.network if present."""
-        if feature_extractor_net is not None:
-            return TensorDictModule(
-                module=feature_extractor_net,
-                in_keys=list(self.total_input_keys),
-                out_keys=["hidden"],
-            )
-
-        if self.config.network is not None and self.config.use_feature_extractor:
-            shared_name: str | None = None
-            if self.config.network.policy and self.config.network.policy.feature_ref:
-                shared_name = self.config.network.policy.feature_ref
-            elif self.config.network.value and self.config.network.value.feature_ref:
-                shared_name = self.config.network.value.feature_ref
-
-            if shared_name and shared_name in self.config.network.shared.features:
-                spec: FeatureBlockSpec = self.config.network.shared.features[
-                    shared_name
-                ]
-                if spec.type == "mlp" and spec.mlp is not None:
-                    feature_extractor_mlp = MLP(
-                        in_features=self.total_input_shape,
-                        out_features=spec.output_dim,
-                        num_cells=list(spec.mlp.num_cells),
-                        activation_class=self._get_activation_class(
-                            spec.mlp.activation
-                        ),
-                        device=self.device,
-                    )
-                    self._initialize_weights(feature_extractor_mlp, spec.mlp.init)
-                    return TensorDictModule(
-                        module=feature_extractor_mlp,
-                        in_keys=list(self.total_input_keys),
-                        out_keys=["hidden"],
-                    )
-                msg = f"Feature type {spec.type} not supported in L2T teacher layout"
-                raise NotImplementedError(msg)
-
-        # Fallback to legacy config
-        if self.config.use_feature_extractor:
-            feature_extractor_mlp = MLP(
-                in_features=self.total_input_shape,
-                out_features=self.config.feature_extractor.output_dim,
-                num_cells=self.config.feature_extractor.num_cells,
-                activation_class=torch.nn.ELU,
-                device=self.device,
-            )
-            self._initialize_weights(feature_extractor_mlp, "orthogonal")
-
-            return TensorDictModule(
-                module=feature_extractor_mlp,
-                in_keys=list(self.total_input_keys),
-                out_keys=["hidden"],
-            )
-        return TensorDictModule(
-            module=torch.nn.Identity(),
+        """Teacher feature extractor using base helper with teacher layout."""
+        return self._build_feature_extractor_module(
+            feature_extractor_net=feature_extractor_net,
             in_keys=list(self.total_input_keys),
-            out_keys=list(self.total_input_keys),
+            out_key="hidden",
+            layout=self.config.network,
         )
 
     def _construct_policy(
@@ -241,55 +185,14 @@ class L2T(BaseAlgorithm):
             "tanh_loc": False,
         }
 
-        if policy_net is None:
-            if self.config.network and self.config.network.policy:
-                policy_config: ModuleNetConfig = self.config.network.policy
-                if policy_config.head:
-                    num_cells = list(policy_config.head.num_cells)
-                    activation_class = self._get_activation_class(
-                        policy_config.head.activation
-                    )
-                else:
-                    num_cells = self.config.policy.num_cells
-                    activation_class = torch.nn.ELU
-            else:
-                num_cells = self.config.policy.num_cells
-                activation_class = torch.nn.ELU
-
-            policy_mlp = MLP(
-                in_features=self.policy_input_shape,
-                activation_class=activation_class,
-                out_features=self.policy_output_shape,
-                num_cells=num_cells,
-                device=self.device,
-            )
-            if (
-                self.config.network
-                and self.config.network.policy
-                and self.config.network.policy.head
-            ):
-                self._initialize_weights(
-                    policy_mlp, self.config.network.policy.head.init
-                )
-            else:
-                self._initialize_weights(policy_mlp, "orthogonal")
-        else:
-            policy_mlp = policy_net
-
-        policy_mlp = torch.nn.Sequential(
-            policy_mlp,
-            AddStateIndependentNormalScale(
-                self.policy_output_shape,
-                scale_lb=1e-8,  # type: ignore
-            ).to(self.device),
+        policy_td = self._build_policy_head_module(
+            policy_net=policy_net,
+            in_keys=list(self.config.policy_in_keys),
+            out_keys=["loc", "scale"],
+            layout=self.config.network,
         )
-
         return ProbabilisticActor(
-            TensorDictModule(
-                module=policy_mlp,
-                in_keys=list(self.config.policy_in_keys),
-                out_keys=["loc", "scale"],
-            ),
+            policy_td,
             in_keys=["loc", "scale"],
             spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
@@ -302,42 +205,10 @@ class L2T(BaseAlgorithm):
         self, value_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
         """Teacher value function (PPO-style), honoring advanced layout if provided."""
-        if value_net is None:
-            if self.config.network and self.config.network.value:
-                value_config: ModuleNetConfig = self.config.network.value
-                if value_config.head:
-                    num_cells = list(value_config.head.num_cells)
-                    activation_class = self._get_activation_class(
-                        value_config.head.activation
-                    )
-                else:
-                    num_cells = self.config.value_net.num_cells
-                    activation_class = torch.nn.ELU
-            else:
-                num_cells = self.config.value_net.num_cells
-                activation_class = torch.nn.ELU
-
-            value_mlp = MLP(
-                in_features=self.value_input_shape,
-                activation_class=activation_class,
-                out_features=self.value_output_shape,
-                num_cells=num_cells,
-                device=self.device,
-            )
-            if (
-                self.config.network
-                and self.config.network.value
-                and self.config.network.value.head
-            ):
-                self._initialize_weights(value_mlp, self.config.network.value.head.init)
-            else:
-                self._initialize_weights(value_mlp, "orthogonal")
-        else:
-            value_mlp = value_net
-
-        return ValueOperator(
-            value_mlp,
+        return self._build_value_module(
+            value_net=value_net,
             in_keys=list(self.config.value_net_in_keys),
+            layout=self.config.network,
         )
 
     def _construct_actor_critic(self) -> TensorDictModule:
@@ -356,36 +227,48 @@ class L2T(BaseAlgorithm):
             value_operator=self.student_value_function,
         )
 
+    # ------------------------------
+    # Student builders (MLP variant)
+    # ------------------------------
+    def _construct_student_feature_extractor(self) -> TensorDictModule:
+        assert isinstance(self.config, L2TRLOptConfig)
+        return self._build_feature_extractor_module(
+            in_keys=list(self.total_input_keys),
+            out_key=self.config.l2t.student_hidden_key,
+            layout=self.config.l2t.student,
+        )
+
+    def _construct_student_policy(self) -> TensorDictModule:
+        assert isinstance(self.config, L2TRLOptConfig)
+        return self._build_policy_head_module(
+            in_keys=[self.config.l2t.student_hidden_key],
+            out_keys=[
+                self.config.l2t.student_loc_key,
+                self.config.l2t.student_scale_key,
+            ],
+            layout=self.config.l2t.student,
+        )
+
+    def _construct_student_value_function(self) -> TensorDictModule:
+        assert isinstance(self.config, L2TRLOptConfig)
+        return self._build_value_module(
+            in_keys=[self.config.l2t.student_hidden_key],
+            layout=self.config.l2t.student,
+        )
+
     def _construct_q_function(
         self,
         q_net: torch.nn.Module | None = None,
         in_keys: tuple[str, ...] = (),
         out_keys: tuple[str, ...] = (),
     ) -> TensorDictModule:
-        """Construct Q-function module.
-
-        For PPO we typically don't use a Q-function. To satisfy the base-class
-        contract and static type checkers we return a TensorDictModule. If a
-        `q_net` is provided we wrap it; otherwise we return an identity
-        TensorDictModule that maps inputs to outputs unchanged.
-        """
-        if in_keys == ():
-            in_keys = tuple(self.total_input_keys)
-        if out_keys == ():
-            out_keys = tuple(self.total_input_keys)
-
+        """Construct Q-function module (unused in PPO-style; returns identity)."""
+        in_keys = list(in_keys) if in_keys else list(self.total_input_keys)
+        out_keys = list(out_keys) if out_keys else list(self.total_input_keys)
         if q_net is not None:
-            return TensorDictModule(
-                module=q_net,
-                in_keys=in_keys,
-                out_keys=out_keys,
-            )
-
-        # default: identity mapping (no Q-function used)
+            return TensorDictModule(module=q_net, in_keys=in_keys, out_keys=out_keys)
         return TensorDictModule(
-            module=torch.nn.Identity(),
-            in_keys=in_keys,
-            out_keys=out_keys,
+            module=torch.nn.Identity(), in_keys=in_keys, out_keys=out_keys
         )
 
     def _construct_loss_module(self) -> torch.nn.Module:
@@ -812,11 +695,8 @@ class L2TR(L2T):
                 in_key=self.total_input_keys[0],
                 out_key=out_key,
             )
-            return TensorDictModule(
-                module=self.lstm_module,
-                in_keys=[self.total_input_keys[0]],
-                out_keys=[out_key],
-            )
+            # Return the LSTMModule directly (it is a TensorDictModule)
+            return self.lstm_module  # type: ignore[return-value]
         # Identity if not using FE
         return TensorDictModule(
             module=torch.nn.Identity(),
@@ -852,49 +732,15 @@ class L2TR(L2T):
         )
 
     def _construct_student_policy(self) -> TensorDictModule:
-        """Student policy head producing loc/scale under student keys.
-
-        We build only the head (TensorDictModule) so we can compute imitation losses
-        without overwriting the teacher's "action" key in the tensordict.
-        """
+        """Student policy head producing loc/scale under student keys."""
         assert isinstance(self.config, L2TRLOptConfig)
-        student_cfg = self.config.l2t.student
-        loc_key = self.config.l2t.student_loc_key
-        scale_key = self.config.l2t.student_scale_key
-
-        if student_cfg and student_cfg.policy and student_cfg.policy.head:
-            num_cells = list(student_cfg.policy.head.num_cells)
-            activation_class = self._get_activation_class(
-                student_cfg.policy.head.activation
-            )
-        else:
-            num_cells = self.config.policy.num_cells
-            activation_class = torch.nn.ELU
-
-        net = MLP(
-            in_features=self._student_policy_input_dim(),
-            out_features=self.policy_output_shape,
-            num_cells=num_cells,
-            activation_class=activation_class,
-            device=self.device,
-        )
-        if student_cfg and student_cfg.policy and student_cfg.policy.head:
-            self._initialize_weights(net, student_cfg.policy.head.init)
-        else:
-            self._initialize_weights(net, "orthogonal")
-
-        net = torch.nn.Sequential(
-            net,
-            AddStateIndependentNormalScale(
-                self.policy_output_shape,
-                scale_lb=1e-8,  # type: ignore
-            ).to(self.device),
-        )
-        in_keys = [self.config.l2t.student_hidden_key]
-        return TensorDictModule(
-            module=net,
-            in_keys=in_keys,  # type: ignore
-            out_keys=[loc_key, scale_key],
+        return self._build_policy_head_module(
+            in_keys=[self.config.l2t.student_hidden_key],
+            out_keys=[
+                self.config.l2t.student_loc_key,
+                self.config.l2t.student_scale_key,
+            ],
+            layout=self.config.l2t.student,
         )
 
     def _student_value_input_dim(self) -> int:
@@ -904,31 +750,9 @@ class L2TR(L2T):
     def _construct_student_value_function(self) -> TensorDictModule:
         """Student value function using student layout if provided."""
         assert isinstance(self.config, L2TRLOptConfig)
-        student_cfg = self.config.l2t.student
-        if student_cfg and student_cfg.value and student_cfg.value.head:
-            num_cells = list(student_cfg.value.head.num_cells)
-            activation_class = self._get_activation_class(
-                student_cfg.value.head.activation
-            )
-        else:
-            num_cells = self.config.value_net.num_cells
-            activation_class = torch.nn.ELU
-
-        value_mlp = MLP(
-            in_features=self._student_value_input_dim(),
-            out_features=self.value_output_shape,
-            num_cells=num_cells,
-            activation_class=activation_class,
-            device=self.device,
-        )
-        if student_cfg and student_cfg.value and student_cfg.value.head:
-            self._initialize_weights(value_mlp, student_cfg.value.head.init)
-        else:
-            self._initialize_weights(value_mlp, "orthogonal")
-
-        return ValueOperator(
-            value_mlp,
+        return self._build_value_module(
             in_keys=[self.config.l2t.student_hidden_key],
+            layout=self.config.l2t.student,
         )
 
     def _construct_adv_module(self) -> torch.nn.Module:

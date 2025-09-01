@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
-import torchrl.envs.libs.gym
-from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from tensordict import TensorDict
 from torchrl.envs import TransformedEnv
 from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
 
 from rlopt.agent.sac import SAC
-from tests.conftest import is_env_available
 
 
 def evaluate_policy_average_return(

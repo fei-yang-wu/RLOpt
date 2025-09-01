@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import warnings
 import logging
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import gymnasium as gym
 import numpy as np
@@ -333,3 +334,248 @@ def log_info(log_info_dict: dict, metrics_to_log: dict):
                 }
             )
 logger = logging.getLogger(__name__)
+
+
+# -------------------------------
+# Model/Agent overview utilities
+# -------------------------------
+try:
+    import torch
+    import torch.optim as optim
+    from tensordict.nn import TensorDictModule
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+    optim = None  # type: ignore[assignment]
+    TensorDictModule = nn.Module  # type: ignore[assignment]
+
+
+def _describe_object(obj: Any) -> str:
+    """Compact per-type description for logging."""
+    # Tensor
+    if torch is not None and isinstance(obj, torch.Tensor):
+        return f"Tensor shape={tuple(obj.shape)} dtype={obj.dtype} device={obj.device}"
+    if isinstance(obj, np.ndarray):
+        return f"ndarray shape={obj.shape} dtype={obj.dtype}"
+
+    # Gym space
+    if hasattr(gym, "Space") and isinstance(obj, gym.Space):
+        shape = getattr(obj, "shape", None)
+        dtype = getattr(obj, "dtype", None)
+        low = getattr(obj, "low", None)
+        high = getattr(obj, "high", None)
+        rng = ""
+        try:
+            if low is not None and high is not None and np is not None:
+                lo = float(np.min(low))
+                hi = float(np.max(high))
+                rng = f" range=[{lo:g}, {hi:g}]"
+        except Exception:
+            pass
+        return f"{type(obj).__name__} shape={shape} dtype={dtype}{rng}"
+
+    # Torch/TensorDict modules
+    if torch is not None and isinstance(obj, nn.Module):
+        total = 0
+        trainable = 0
+        device: Optional[str] = None
+        try:
+            for p in obj.parameters():
+                n = int(p.numel())
+                total += n
+                if getattr(p, "requires_grad", False):
+                    trainable += n
+                if device is None:
+                    device = str(getattr(p, "device", None))
+        except Exception:
+            pass
+        extras = []
+        if total:
+            extras.append(f"params={total:,}")
+        if trainable:
+            extras.append(f"trainable={trainable:,}")
+        if device:
+            extras.append(f"device={device}")
+        return f"{type(obj).__name__}" + (" (" + ", ".join(extras) + ")" if extras else "")
+
+    # Optimizer
+    if optim is not None and isinstance(obj, optim.Optimizer):
+        try:
+            lrs = {pg.get("lr") for pg in obj.param_groups if "lr" in pg}
+            return f"{type(obj).__name__} groups={len(obj.param_groups)} lrs={sorted(lrs)}"
+        except Exception:
+            return type(obj).__name__
+
+    # Mapping / list summarization
+    if isinstance(obj, Mapping):
+        return f"Mapping[{len(obj)}]"
+    if isinstance(obj, (list, tuple)):
+        return f"{type(obj).__name__}[{len(obj)}]"
+
+    # Fallback to short str or type
+    try:
+        s = str(obj)
+        if len(s) <= 120:
+            return s
+    except Exception:
+        pass
+    return type(obj).__name__
+
+
+def log_model_overview(
+    components: Union[Mapping[str, Any], Sequence[Tuple[str, Any]]],
+    title: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    *,
+    max_depth: int = 0,
+    indent: int = 0,
+) -> None:
+    """Log a clean, tree-style overview of model components.
+
+    - components: mapping or sequence of (name, obj)
+    - title: optional title header
+    - logger: optional logger (defaults to print)
+    - max_depth: recurse into nested mappings up to this depth
+    - indent: initial left padding in spaces
+    """
+    if isinstance(components, Mapping):
+        items: Sequence[Tuple[str, Any]] = list(components.items())
+    else:
+        items = list(components)
+
+    emit = (logger.info if logger is not None else print)
+    pad = " " * indent
+
+    if title:
+        bar = "─" * len(title)
+        emit(f"{pad}{title}")
+        emit(f"{pad}{bar}")
+
+    def _as_items(obj: Any) -> Optional[Sequence[Tuple[str, Any]]]:
+        if isinstance(obj, Mapping):
+            return list(obj.items())
+        return None
+
+    def _print(items: Sequence[Tuple[str, Any]], depth: int, base_prefix: str) -> None:
+        n = len(items)
+        for i, (name, obj) in enumerate(items):
+            last = (i == n - 1)
+            branch = "└─" if last else "├─"
+            cont = "  " if last else "│ "
+            prefix = base_prefix + branch + " "
+            emit(f"{pad}{prefix}{name}: {_describe_object(obj)}")
+            if depth < max_depth:
+                nested = _as_items(obj)
+                if nested:
+                    _print(nested, depth + 1, base_prefix + cont)
+
+    _print(items, depth=0, base_prefix="")
+
+
+def log_agent_overview(
+    agent: Any,
+    title: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    *,
+    include: Optional[Iterable[str]] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+    max_depth: int = 0,
+    indent: int = 0,
+) -> None:
+    """Gather common RL components on an agent and log them.
+
+    Auto-detects attributes like feature extractors, policies, values/Qs,
+    actor-critics, and L2T student components. Additional attributes can
+    be included via `include` or `extra`.
+    """
+    components: Dict[str, Any] = {}
+
+    # Detect teacher-student pattern and group if present
+    has_student = any(
+        hasattr(agent, nm)
+        for nm in (
+            "student_feature_extractor",
+            "student_policy",
+            "student_value_function",
+            "student_actor_critic",
+            "student",
+        )
+    )
+
+    if has_student:
+        teacher_map: Dict[str, Any] = {}
+        student_map: Dict[str, Any] = {}
+
+        # Teacher components (BaseAlgorithm standard names)
+        for name, label in (
+            ("feature_extractor", "Feature Extractor"),
+            ("policy", "Policy"),
+            ("value_function", "Value Function"),
+            ("q_function", "Q Function"),
+            ("actor_critic", "Actor-Critic"),
+        ):
+            if hasattr(agent, name):
+                try:
+                    teacher_map[label] = getattr(agent, name)
+                except Exception:
+                    pass
+
+        # Student components
+        for name, label in (
+            ("student_feature_extractor", "Feature Extractor"),
+            ("student_policy", "Policy"),
+            ("student_value_function", "Value Function"),
+            ("student_actor_critic", "Actor-Critic"),
+        ):
+            if hasattr(agent, name):
+                try:
+                    student_map[label] = getattr(agent, name)
+                except Exception:
+                    pass
+
+        # Explicit teacher/student attributes if present
+        if hasattr(agent, "teacher"):
+            teacher_map.setdefault("Teacher", getattr(agent, "teacher"))
+        if hasattr(agent, "student"):
+            student_map.setdefault("Student", getattr(agent, "student"))
+
+        components["Teacher"] = teacher_map
+        components["Student"] = student_map
+
+    else:
+        # Flat components for standard agents
+        for name, label in (
+            ("feature_extractor", "Feature Extractor"),
+            ("policy", "Policy"),
+            ("value_function", "Value Function"),
+            ("q_function", "Q Function"),
+            ("actor_critic", "Actor-Critic"),
+        ):
+            if hasattr(agent, name):
+                try:
+                    components[label] = getattr(agent, name)
+                except Exception:
+                    pass
+
+    # User-included attributes
+    if include:
+        for name in include:
+            if hasattr(agent, name) and name not in components:
+                try:
+                    components[name] = getattr(agent, name)
+                except Exception:
+                    pass
+
+    # Extra components mapping
+    if extra:
+        components.update(extra)
+
+    if not title:
+        title = f"{agent.__class__.__name__} Overview"
+
+    log_model_overview(
+        components,
+        title=title,
+        logger=logger or logging.getLogger(getattr(agent, "__module__", __name__)),
+        max_depth=max_depth,
+        indent=indent,
+    )

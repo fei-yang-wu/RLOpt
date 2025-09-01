@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import numpy as np
 import torch
@@ -11,7 +11,6 @@ import torch.optim
 import tqdm
 from tensordict import TensorDict
 from tensordict.nn import (
-    AddStateIndependentNormalScale,
     TensorDictModule,
 )
 from torch import Tensor
@@ -24,12 +23,10 @@ from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
 from torchrl.envs.transforms import InitTracker
 from torchrl.modules import (
-    MLP,
     ActorValueOperator,
     LSTMModule,
     ProbabilisticActor,
     TanhNormal,
-    ValueOperator,
 )
 from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
@@ -115,69 +112,12 @@ class PPO(BaseAlgorithm):
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        """Override to build your feature extractor network from config.
-        Note that if you don't want to use a shared feature extractor,
-        you can set `use_feature_extractor` to False, then this will be an identity map. Then do feature extraction separately in policy and value functions.
-        """
-        if feature_extractor_net is not None:
-            return TensorDictModule(
-                module=feature_extractor_net,
-                in_keys=list(self.total_input_keys),
-                out_keys=["hidden"],
-            )
-
-        # Use NetworkLayout if provided, otherwise fall back to legacy config
-        if self.config.network is not None and self.config.use_feature_extractor:
-            # Try to find a shared feature extractor
-            shared_name = None
-            if self.config.network.policy and self.config.network.policy.feature_ref:
-                shared_name = self.config.network.policy.feature_ref
-            elif self.config.network.value and self.config.network.value.feature_ref:
-                shared_name = self.config.network.value.feature_ref
-
-            if shared_name and shared_name in self.config.network.shared.features:
-                spec = self.config.network.shared.features[shared_name]
-                if spec.type == "mlp" and spec.mlp is not None:
-                    feature_extractor_mlp = MLP(
-                        in_features=self.total_input_shape,
-                        out_features=spec.output_dim,
-                        num_cells=list(spec.mlp.num_cells),
-                        activation_class=self._get_activation_class(
-                            spec.mlp.activation
-                        ),
-                        device=self.device,
-                    )
-                    self._initialize_weights(feature_extractor_mlp, spec.mlp.init)
-                    return TensorDictModule(
-                        module=feature_extractor_mlp,
-                        in_keys=list(self.total_input_keys),
-                        out_keys=["hidden"],
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Feature type {spec.type} not supported in PPO layout"
-                    )
-
-        # Fallback to legacy config
-        if self.config.use_feature_extractor:
-            feature_extractor_mlp = MLP(
-                in_features=self.total_input_shape,
-                out_features=self.config.feature_extractor.output_dim,
-                num_cells=self.config.feature_extractor.num_cells,
-                activation_class=torch.nn.ELU,
-                device=self.device,
-            )
-            self._initialize_weights(feature_extractor_mlp, "orthogonal")
-
-            return TensorDictModule(
-                module=feature_extractor_mlp,
-                in_keys=list(self.total_input_keys),
-                out_keys=["hidden"],
-            )
-        return TensorDictModule(
-            module=torch.nn.Identity(),
+        """Build feature extractor via base reusable helper."""
+        return self._build_feature_extractor_module(
+            feature_extractor_net=feature_extractor_net,
             in_keys=list(self.total_input_keys),
-            out_keys=list(self.total_input_keys),
+            out_key="hidden",
+            layout=self.config.network,
         )
 
     def _construct_policy(
@@ -194,62 +134,16 @@ class PPO(BaseAlgorithm):
             "tanh_loc": False,
         }
 
-        # Define policy architecture
-        if policy_net is None:
-            # Use NetworkLayout if provided, otherwise fall back to legacy config
-            if self.config.network and self.config.network.policy:
-                policy_config = self.config.network.policy
-                if policy_config.head:
-                    num_cells = list(policy_config.head.num_cells)
-                    activation_class = self._get_activation_class(
-                        policy_config.head.activation
-                    )
-                else:
-                    # Fallback to legacy config
-                    num_cells = self.config.policy.num_cells
-                    activation_class = torch.nn.ELU
-            else:
-                # Fallback to legacy config
-                num_cells = self.config.policy.num_cells
-                activation_class = torch.nn.ELU
-
-            policy_mlp = MLP(
-                in_features=self.policy_input_shape,
-                activation_class=activation_class,
-                out_features=self.policy_output_shape,
-                num_cells=num_cells,
-                device=self.device,
-            )
-            # Initialize policy weights
-            if (
-                self.config.network
-                and self.config.network.policy
-                and self.config.network.policy.head
-            ):
-                self._initialize_weights(
-                    policy_mlp, self.config.network.policy.head.init
-                )
-            else:
-                self._initialize_weights(policy_mlp, "orthogonal")
-        else:
-            policy_mlp = policy_net
-
-        # Add state-independent normal scale
-        policy_mlp = torch.nn.Sequential(
-            policy_mlp,
-            AddStateIndependentNormalScale(
-                self.policy_output_shape,
-                scale_lb=1e-8,  # type: ignore
-            ).to(self.device),
+        # Build policy head via base helper (produces loc/scale)
+        policy_mlp = self._build_policy_head_module(
+            policy_net=policy_net,
+            in_keys=list(self.config.policy_in_keys),
+            out_keys=["loc", "scale"],
+            layout=self.config.network,
         )
-
         # Add probabilistic sampling of the actions
         return ProbabilisticActor(
-            TensorDictModule(
-                module=policy_mlp,
-                in_keys=list(self.config.policy_in_keys),
-                out_keys=["loc", "scale"],
-            ),
+            policy_mlp,
             in_keys=["loc", "scale"],
             spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
@@ -262,48 +156,11 @@ class PPO(BaseAlgorithm):
         self, value_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
         """Construct value function"""
-        # Define value architecture
-        if value_net is None:
-            # Use NetworkLayout if provided, otherwise fall back to legacy config
-            if self.config.network and self.config.network.value:
-                value_config = self.config.network.value
-                if value_config.head:
-                    num_cells = list(value_config.head.num_cells)
-                    activation_class = self._get_activation_class(
-                        value_config.head.activation
-                    )
-                else:
-                    # Fallback to legacy config
-                    num_cells = self.config.value_net.num_cells
-                    activation_class = torch.nn.ELU
-            else:
-                # Fallback to legacy config
-                num_cells = self.config.value_net.num_cells
-                activation_class = torch.nn.ELU
-
-            value_mlp = MLP(
-                in_features=self.value_input_shape,
-                activation_class=activation_class,
-                out_features=self.value_output_shape,
-                num_cells=num_cells,
-                device=self.device,
-            )
-            # Initialize value weights
-            if (
-                self.config.network
-                and self.config.network.value
-                and self.config.network.value.head
-            ):
-                self._initialize_weights(value_mlp, self.config.network.value.head.init)
-            else:
-                self._initialize_weights(value_mlp, "orthogonal")
-        else:
-            value_mlp = value_net
-
-        # Define value module
-        return ValueOperator(
-            value_mlp,
+        # Build value via base helper
+        return self._build_value_module(
+            value_net=value_net,
             in_keys=list(self.config.value_net_in_keys),
+            layout=self.config.network,
         )
 
     def _construct_q_function(self) -> TensorDictModule:  # type: ignore[override]
@@ -453,22 +310,6 @@ class PPO(BaseAlgorithm):
                 device=self.policy.device,  # type: ignore
             )
             return self.policy(td).get("action")
-
-    def _construct_trainer(self) -> None:  # type: ignore
-        """Override to return None since we implement custom training loop"""
-        return
-
-    def _update_policy(self, batch: TensorDict) -> dict[str, float]:
-        msg = "PPO does not support _update_policy"
-        raise NotImplementedError(msg)
-
-    def _compute_action(self, tensordict: TensorDict) -> TensorDict:
-        msg = "PPO does not support _compute_action"
-        raise NotImplementedError(msg)
-
-    def _compute_returns(self, rollout: Tensor) -> Tensor:
-        msg = "PPO does not support _compute_returns"
-        raise NotImplementedError(msg)
 
     def train(self) -> None:  # type: ignore
         """Train the agent"""

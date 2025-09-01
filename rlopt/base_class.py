@@ -10,17 +10,24 @@ import numpy as np
 import torch
 import torch.nn
 import torch.optim
-from tensordict.nn import TensorDictModule
+from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torch import Tensor
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
     ReplayBuffer,
 )
 from torchrl.envs import TransformedEnv
+from torchrl.modules import MLP, ValueOperator
 from torchrl.record.loggers import generate_exp_name, get_logger
 from torchrl.record.loggers.common import Logger
 
-from rlopt.configs import RLOptConfig
+from rlopt.configs import (
+    FeatureBlockSpec,
+    ModuleNetConfig,
+    NetworkLayout,
+    RLOptConfig,
+)
+from rlopt.utils import log_agent_overview
 
 logger = logging.getLogger(__name__)
 
@@ -342,20 +349,11 @@ class BaseAlgorithm(ABC):
     # Architecture introspection
     # ---------------------------
     def _print_model_overview(self) -> None:
-        """Log an elegant, informative model summary with dims and details."""
-        algo = self.__class__.__name__
-
-        def _act_name(act) -> str:
-            try:
-                return act.__name__ if isinstance(act, type) else act.__class__.__name__
-            except Exception:
-                return str(act)
-
-        # Inputs
+        """Use shared utils to print a concise, customizable overview."""
         obs_keys = list(self.total_input_keys)
         dims_by_key: dict[str, int] = {}
         for k in obs_keys:
-            try:
+            try:  # noqa: SIM105
                 dims_by_key[k] = int(self.env.observation_spec[k].shape[-1])  # type: ignore[index]
             except Exception:
                 pass
@@ -364,144 +362,299 @@ class BaseAlgorithm(ABC):
         )
         act_dim = int(self.policy_output_shape)
 
-        # Feature extractor
-        fe_td = self.feature_extractor
-        fe_mod = getattr(fe_td, "module", fe_td)
-        fe_cls = fe_mod.__class__.__name__
-        uses_fe = bool(self.config.use_feature_extractor)
-        fe_is_identity = fe_cls == "Identity"
-        fe_shared = uses_fe and not fe_is_identity
-        fe_out_key = "hidden" if uses_fe else ", ".join(obs_keys)
-        fe_out_dim = (
-            int(getattr(self.config.feature_extractor, "output_dim", -1))
-            if uses_fe and not fe_is_identity
-            else obs_dim
+        extra = {
+            "Inputs": {
+                "Keys": ", ".join(obs_keys),
+                "Dims": dims_by_key if dims_by_key else obs_dim,
+                "Action dim": act_dim,
+            },
+            "Device": str(self.device),
+        }
+
+        title = f"RLOpt Model Summary [{self.__class__.__name__}]"
+        log_agent_overview(
+            self,
+            title=title,
+            logger=logger,
+            extra=extra,
+            max_depth=1,
+            indent=0,
         )
-        # FE layers (best-effort from config)
-        fe_layers = []
-        fe_act = ""
-        try:
-            fe_layers = list(getattr(self.config.feature_extractor, "num_cells", []))
-            fe_act = "ELU"
-        except Exception:
-            pass
 
-        # Actor
-        policy_op = self.actor_critic.get_policy_operator()
-        policy_in_keys = list(getattr(self.config, "policy_in_keys", []))
-        actor_dist = getattr(policy_op, "distribution_class", None)
-        actor_dist_name = actor_dist.__name__ if actor_dist is not None else "Unknown"
-        actor_interaction = getattr(policy_op, "default_interaction_type", "?")
-        actor_layers = []
-        actor_act = ""
-        try:
-            if (
-                getattr(self.config, "network", None)
-                and getattr(self.config.network, "policy", None)
-                and getattr(self.config.network.policy, "head", None)
-            ):
-                actor_layers = list(self.config.network.policy.head.num_cells)  # type: ignore[attr-defined]
-                actor_act = _act_name(self._get_activation_class(self.config.network.policy.head.activation))  # type: ignore[attr-defined]
-            else:
-                actor_layers = list(getattr(self.config.policy, "num_cells", []))
-                actor_act = "ELU"
-        except Exception:
-            pass
-
-        # Critic / Q
-        using_value = bool(self.config.use_value_function)
-        if using_value:
-            critic_type = "state-value"
-            value_in_keys = list(getattr(self.config, "value_net_in_keys", []))
-            critic_layers = []
-            critic_act = ""
+    # ---------------------------
+    # Reusable builders (MLP-based)
+    # ---------------------------
+    def _sum_input_dim(self, keys: list[str]) -> int:
+        dims = []
+        for k in keys:
             try:
-                if (
-                    getattr(self.config, "network", None)
-                    and getattr(self.config.network, "value", None)
-                    and getattr(self.config.network.value, "head", None)
-                ):
-                    critic_layers = list(self.config.network.value.head.num_cells)  # type: ignore[attr-defined]
-                    critic_act = _act_name(self._get_activation_class(self.config.network.value.head.activation))  # type: ignore[attr-defined]
-                else:
-                    critic_layers = list(
-                        getattr(self.config.value_net, "num_cells", [])
+                dims.append(int(self.env.observation_spec[k].shape[-1]))  # type: ignore[index]
+            except Exception:
+                # Unknown key (e.g., hidden); caller should override in_dim
+                pass
+        if dims:
+            return int(torch.tensor(dims).sum().item())
+        # Fallback to total_input_shape if nothing matched
+        return int(self.total_input_shape)
+
+    def _resolve_shared_feature_spec(
+        self, layout: NetworkLayout | None
+    ) -> FeatureBlockSpec | None:
+        if not layout:
+            return None
+        shared_name: str | None = None
+        if (
+            getattr(layout, "policy", None)
+            and layout.policy
+            and layout.policy.feature_ref
+        ):
+            shared_name = layout.policy.feature_ref
+        elif (
+            getattr(layout, "value", None) and layout.value and layout.value.feature_ref
+        ):
+            shared_name = layout.value.feature_ref
+        if shared_name and shared_name in layout.shared.features:
+            return layout.shared.features[shared_name]
+        return None
+
+    def _resolve_head_config(
+        self,
+        module_cfg: ModuleNetConfig | None,
+        fallback_cells: list[int],
+        fallback_activation: type[torch.nn.Module],
+        fallback_init: str = "orthogonal",
+    ) -> tuple[list[int], type[torch.nn.Module], str]:
+        if module_cfg and module_cfg.head:
+            return (
+                list(module_cfg.head.num_cells),
+                self._get_activation_class(module_cfg.head.activation),
+                module_cfg.head.init,
+            )
+        return (list(fallback_cells), fallback_activation, fallback_init)
+
+    def _build_feature_extractor_module(
+        self,
+        *,
+        feature_extractor_net: torch.nn.Module | None = None,
+        in_keys: list[str] | None = None,
+        out_key: str = "hidden",
+        layout: NetworkLayout | None = None,
+        use_feature_extractor: bool | None = None,
+    ) -> TensorDictModule:
+        in_keys = list(in_keys) if in_keys is not None else list(self.total_input_keys)
+        if feature_extractor_net is not None:
+            return TensorDictModule(
+                module=feature_extractor_net, in_keys=in_keys, out_keys=[out_key]
+            )
+
+        if use_feature_extractor is None:
+            use_feature_extractor = bool(self.config.use_feature_extractor)
+
+        if use_feature_extractor:
+            # Prefer advanced layout spec, else legacy config
+            spec = self._resolve_shared_feature_spec(layout)
+            if spec is not None:
+                if spec.type == "mlp" and spec.mlp is not None:
+                    in_dim = self._sum_input_dim(in_keys)
+                    fe = MLP(
+                        in_features=in_dim,
+                        out_features=int(spec.output_dim),
+                        num_cells=list(spec.mlp.num_cells),
+                        activation_class=self._get_activation_class(
+                            spec.mlp.activation
+                        ),
+                        device=self.device,
                     )
-                    critic_act = "ELU"
-            except Exception:
-                pass
-            critic_in_dim = int(self.value_input_shape)
-            critic_out_dim = 1
-        else:
-            # SAC Q(s)
-            num_q = None
-            try:
-                if getattr(self.config, "network", None) and getattr(
-                    self.config.network, "critic", None
-                ):
-                    num_q = int(getattr(self.config.network.critic, "num_nets", 1))
-            except Exception:
-                pass
-            if num_q is None:
-                try:
-                    num_q = int(getattr(self.config.sac, "num_qvalue_nets", 1))
-                except Exception:
-                    num_q = 1
-            critic_type = (
-                f"Q-value x{num_q}"
-                if (isinstance(num_q, int) and num_q > 1)
-                else "Q-value"
+                    self._initialize_weights(fe, spec.mlp.init)
+                    return TensorDictModule(
+                        module=fe, in_keys=in_keys, out_keys=[out_key]
+                    )
+                msg = f"Feature type {spec.type} not supported (expected mlp)"
+                raise NotImplementedError(msg)
+
+            # Legacy feature-extractor config
+            in_dim = self._sum_input_dim(in_keys)
+            fe = MLP(
+                in_features=in_dim,
+                out_features=int(self.config.feature_extractor.output_dim),
+                num_cells=list(self.config.feature_extractor.num_cells),
+                activation_class=torch.nn.ELU,
+                device=self.device,
             )
-            value_in_keys = ["action"] + (
-                policy_in_keys if self.config.use_feature_extractor else obs_keys
-            )
-            critic_layers = list(getattr(self.config.action_value_net, "num_cells", []))
-            critic_act = "ELU"
-            critic_in_dim = int(self.policy_input_shape + act_dim)
-            critic_out_dim = 1
+            self._initialize_weights(fe, "orthogonal")
+            return TensorDictModule(module=fe, in_keys=in_keys, out_keys=[out_key])
 
-        # Build message
-        title = f"RLOpt Model Summary [{algo}] — Device: {self.device}"
-        bar = "=" * len(title)
-        parts: list[str] = [bar, title, bar]
-
-        parts.append("Inputs")
-        parts.append(f"- Keys: {obs_keys}")
-        if dims_by_key:
-            parts.append(f"- Dims: {dims_by_key} (sum={obs_dim})")
-        else:
-            parts.append(f"- Total dim: {obs_dim}")
-        parts.append(f"- Action dim: {act_dim}")
-        parts.append("")
-
-        parts.append("Feature Extractor")
-        parts.append(f"- Shared: {bool(fe_shared)}")
-        parts.append(f"- Type: {fe_cls}")
-        parts.append(f"- Out: key='{fe_out_key}', dim={fe_out_dim}")
-        if fe_layers:
-            parts.append(f"- Layers: {fe_layers}; act: {fe_act}")
-        parts.append("")
-
-        parts.append("Actor")
-        parts.append(f"- In keys: {policy_in_keys}")
-        parts.append(
-            f"- Head: {policy_op.__class__.__name__} (dist={actor_dist_name}, interaction={actor_interaction})"
+        # No feature extractor: identity mapping
+        return TensorDictModule(
+            module=torch.nn.Identity(), in_keys=in_keys, out_keys=in_keys
         )
-        if actor_layers:
-            parts.append(
-                f"- Net: MLP(in={int(self.policy_input_shape)} → out={act_dim}, layers={actor_layers}, act={actor_act})"
-            )
-        parts.append("")
 
-        parts.append("Critic")
-        parts.append(f"- Type: {critic_type}")
-        parts.append(f"- In keys: {value_in_keys}")
-        if critic_layers:
-            parts.append(
-                f"- Net: MLP(in={critic_in_dim} → out={critic_out_dim}, layers={critic_layers}, act={critic_act})"
+    def _build_policy_head_module(
+        self,
+        *,
+        policy_net: torch.nn.Module | None = None,
+        in_keys: list[str] | None = None,
+        out_keys: list[str] | tuple[str, str] = ("loc", "scale"),
+        layout: NetworkLayout | None = None,
+    ) -> TensorDictModule:
+        in_keys = (
+            list(in_keys) if in_keys is not None else list(self.config.policy_in_keys)
+        )
+
+        if policy_net is None:
+            # Read head config
+            module_cfg = (
+                layout.policy if layout and getattr(layout, "policy", None) else None
+            )
+            num_cells, activation_class, init = self._resolve_head_config(
+                module_cfg,
+                fallback_cells=list(self.config.policy.num_cells),
+                fallback_activation=torch.nn.ELU,
+                fallback_init="orthogonal",
+            )
+            # Infer input dim: prefer feature spec output dim if using FE
+            if self.config.use_feature_extractor:
+                spec = self._resolve_shared_feature_spec(layout)
+                in_dim = (
+                    int(spec.output_dim)
+                    if spec is not None
+                    else int(self.config.feature_extractor.output_dim)
+                )
+            else:
+                # Sum over raw observation keys (policy+value in_keys when no FE)
+                raw_keys = in_keys
+                in_dim = self._sum_input_dim(raw_keys)
+
+            net = MLP(
+                in_features=in_dim,
+                activation_class=activation_class,
+                out_features=int(self.policy_output_shape),
+                num_cells=list(num_cells),
+                device=self.device,
+            )
+            self._initialize_weights(net, init)
+        else:
+            net = policy_net
+
+        net = torch.nn.Sequential(
+            net,
+            AddStateIndependentNormalScale(
+                int(self.policy_output_shape), scale_lb=1e-8
+            ).to(self.device),
+        )
+        return TensorDictModule(module=net, in_keys=in_keys, out_keys=list(out_keys))
+
+    def _build_value_module(
+        self,
+        *,
+        value_net: torch.nn.Module | None = None,
+        in_keys: list[str] | None = None,
+        out_key: str | None = None,
+        layout: NetworkLayout | None = None,
+    ) -> TensorDictModule:
+        in_keys = (
+            list(in_keys)
+            if in_keys is not None
+            else list(self.config.value_net_in_keys)
+        )
+
+        if value_net is None:
+            module_cfg = (
+                layout.value if layout and getattr(layout, "value", None) else None
+            )
+            num_cells, activation_class, init = self._resolve_head_config(
+                module_cfg,
+                fallback_cells=list(self.config.value_net.num_cells),
+                fallback_activation=torch.nn.ELU,
+                fallback_init="orthogonal",
             )
 
-        logger.info("\n".join(parts))
+            if self.config.use_feature_extractor:
+                spec = self._resolve_shared_feature_spec(layout)
+                in_dim = (
+                    int(spec.output_dim)
+                    if spec is not None
+                    else int(self.config.feature_extractor.output_dim)
+                )
+            else:
+                in_dim = self._sum_input_dim(in_keys)
+
+            net = MLP(
+                in_features=in_dim,
+                activation_class=activation_class,
+                out_features=int(self.value_output_shape),
+                num_cells=list(num_cells),
+                device=self.device,
+            )
+            self._initialize_weights(net, init)
+        else:
+            net = value_net
+
+        # ValueOperator allows optional out_keys override
+        if out_key is not None:
+            return ValueOperator(net, in_keys=in_keys, out_keys=[out_key])
+        return ValueOperator(net, in_keys=in_keys)
+
+    def _build_qvalue_module(
+        self,
+        *,
+        q_net: torch.nn.Module | None = None,
+        in_keys: list[str] | None = None,
+        layout: NetworkLayout | None = None,
+    ) -> TensorDictModule:
+        # Default in_keys: ["action"] + (policy_in_keys if FE else total_input_keys)
+        if in_keys is None:
+            in_keys = ["action"] + (
+                list(self.config.policy_in_keys)
+                if self.config.use_feature_extractor
+                else list(self.total_input_keys)
+            )
+
+        if q_net is None:
+            # Read critic head config if present
+            head_cfg = None
+            if (
+                layout
+                and getattr(layout, "critic", None)
+                and layout.critic
+                and layout.critic.template
+                and layout.critic.template.head
+            ):
+                head_cfg = layout.critic.template.head
+                num_cells = list(head_cfg.num_cells)
+                activation_class = self._get_activation_class(head_cfg.activation)
+                init = head_cfg.init
+            else:
+                num_cells = list(getattr(self.config.action_value_net, "num_cells", []))
+                activation_class = torch.nn.ELU
+                init = "orthogonal"
+
+            # Input dim: action + obs/hidden
+            if self.config.use_feature_extractor:
+                spec = self._resolve_shared_feature_spec(layout)
+                obs_dim = (
+                    int(spec.output_dim)
+                    if spec is not None
+                    else int(self.config.feature_extractor.output_dim)
+                )
+            else:
+                # Remove action before summing
+                obs_keys = [k for k in in_keys if k != "action"]
+                obs_dim = self._sum_input_dim(obs_keys)
+            in_dim = int(self.policy_output_shape) + obs_dim
+
+            net = MLP(
+                in_features=in_dim,
+                out_features=1,
+                num_cells=list(num_cells),
+                activation_class=activation_class,
+                device=self.device,
+            )
+            self._initialize_weights(net, init)
+        else:
+            net = q_net
+
+        return ValueOperator(module=net, in_keys=in_keys)
 
     @abstractmethod
     def predict(self, obs: Tensor) -> Tensor:
