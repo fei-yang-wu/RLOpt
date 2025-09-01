@@ -203,6 +203,32 @@ class BaseAlgorithm(ABC):
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(device_str)
 
+    # ---------------------
+    # Common NN utilities
+    # ---------------------
+    def _get_activation_class(self, activation_name: str) -> type[torch.nn.Module]:
+        """Get activation class from activation name across agents."""
+        activation_map = {
+            "relu": torch.nn.ReLU,
+            "elu": torch.nn.ELU,
+            "tanh": torch.nn.Tanh,
+            "gelu": torch.nn.GELU,
+        }
+        return activation_map.get(activation_name, torch.nn.ELU)
+
+    def _initialize_weights(self, module: torch.nn.Module, init_type: str) -> None:
+        """Initialize linear layer weights based on initialization type."""
+        for layer in module.modules():
+            if isinstance(layer, torch.nn.Linear):
+                if init_type == "orthogonal":
+                    torch.nn.init.orthogonal_(layer.weight, 1.0)
+                elif init_type == "xavier_uniform":
+                    torch.nn.init.xavier_uniform_(layer.weight)
+                elif init_type == "kaiming_uniform":
+                    torch.nn.init.kaiming_uniform_(layer.weight)
+                # bias exists for Linear by default
+                layer.bias.data.zero_()
+
     def _construct_collector(
         self,
         env: TransformedEnv,

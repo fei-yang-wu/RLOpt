@@ -392,27 +392,7 @@ class SAC(BaseAlgorithm):
             eps = self.config.network.critic.polyak_eps
         return SoftUpdate(self.loss_module, eps=eps)
 
-    def _get_activation_class(self, activation_name: str) -> type[torch.nn.Module]:
-        """Get activation class from activation name."""
-        activation_map = {
-            "relu": torch.nn.ReLU,
-            "elu": torch.nn.ELU,
-            "tanh": torch.nn.Tanh,
-            "gelu": torch.nn.GELU,
-        }
-        return activation_map.get(activation_name, torch.nn.ELU)
-
-    def _initialize_weights(self, module: torch.nn.Module, init_type: str):
-        """Initialize weights based on initialization type."""
-        for layer in module.modules():
-            if isinstance(layer, torch.nn.Linear):
-                if init_type == "orthogonal":
-                    torch.nn.init.orthogonal_(layer.weight, 1.0)
-                elif init_type == "xavier_uniform":
-                    torch.nn.init.xavier_uniform_(layer.weight)
-                elif init_type == "kaiming_uniform":
-                    torch.nn.init.kaiming_uniform_(layer.weight)
-                layer.bias.data.zero_()
+    # _get_activation_class and _initialize_weights now provided by BaseAlgorithm
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers"""

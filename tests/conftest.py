@@ -9,8 +9,16 @@ import torchrl.envs.libs.gym
 from torchrl.envs import DoubleToFloat, EnvCreator, ParallelEnv, TransformedEnv
 from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
 
+from rlopt.agent.l2t.l2t import L2TRLOptConfig
 from rlopt.agent.ppo.ppo import PPORLOptConfig
 from rlopt.agent.sac.sac import SACRLOptConfig
+from rlopt.configs import (
+    FeatureBlockSpec,
+    LSTMBlockConfig,
+    MLPBlockConfig,
+    ModuleNetConfig,
+    NetworkLayout,
+)
 
 
 def is_env_available(env_name: str) -> bool:
@@ -243,6 +251,101 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         # q net cells expected by SAC implementation
         cfg.action_value_net.num_cells = [64, 64]
         cfg.use_value_function = False
+        return cfg
+
+    return _make
+
+
+@pytest.fixture
+def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
+    def _make(
+        *,
+        env_name: str = "Pendulum-v1",
+        num_envs: int = 4,
+        frames_per_batch: int = 128,
+        total_frames: int = 128,
+        feature_dim: int = 64,
+        lr: float = 3e-4,
+        mini_batch_size: int = 64,
+        epochs: int = 1,
+        student_recurrent: bool = False,
+        imitation: str = "l2",
+        mixture_coeff: float = 0.2,
+    ) -> L2TRLOptConfig:
+        cfg = L2TRLOptConfig()
+        # env
+        cfg.env.env_name = env_name
+        cfg.env.device = "cpu"
+        cfg.env.num_envs = num_envs
+        # collector
+        cfg.collector.frames_per_batch = frames_per_batch
+        cfg.collector.total_frames = total_frames
+        cfg.collector.set_truncated = False
+        # optimization
+        cfg.optim.lr = lr
+        # loss
+        cfg.loss.mini_batch_size = mini_batch_size
+        cfg.loss.epochs = epochs
+        cfg.loss.gamma = 0.99
+        # use feature extractor
+        cfg.use_feature_extractor = True
+        cfg.feature_extractor.output_dim = feature_dim
+        # io keys
+        cfg.policy_in_keys = ["hidden"]
+        cfg.value_net_in_keys = ["hidden"]
+        cfg.total_input_keys = ["observation"]
+        # logger
+        cfg.logger.backend = None
+        cfg.device = "cpu"
+        cfg.compile.compile = False
+
+        # Teacher layout (MLP shared features)
+        teacher = NetworkLayout()
+        teacher.shared.features["shared_mlp"] = FeatureBlockSpec(
+            type="mlp",
+            mlp=MLPBlockConfig(num_cells=[64, 64], activation="elu"),
+            output_dim=feature_dim,
+        )
+        teacher.policy.feature_ref = "shared_mlp"
+        teacher.policy.head = MLPBlockConfig(num_cells=[64], activation="elu")
+        # Value
+        teacher.value = teacher.value or ModuleNetConfig()
+        teacher.value.feature_ref = "shared_mlp"  # type: ignore[attr-defined]
+        teacher.value.head = MLPBlockConfig(num_cells=[64], activation="elu")  # type: ignore[attr-defined]
+        cfg.network = teacher
+
+        # Student layout
+        student = NetworkLayout()
+        if student_recurrent:
+            student.shared.features["student_lstm"] = FeatureBlockSpec(
+                type="lstm",
+                lstm=LSTMBlockConfig(hidden_size=feature_dim),
+                output_dim=feature_dim,
+            )
+            student.policy.feature_ref = "student_lstm"
+            student.value = student.value or ModuleNetConfig()
+            student.value.feature_ref = "student_lstm"  # type: ignore[attr-defined]
+        else:
+            student.shared.features["student_mlp"] = FeatureBlockSpec(
+                type="mlp",
+                mlp=MLPBlockConfig(num_cells=[64, 64], activation="elu"),
+                output_dim=feature_dim,
+            )
+            student.policy.feature_ref = "student_mlp"
+            student.value = student.value or ModuleNetConfig()
+            student.value.feature_ref = "student_mlp"  # type: ignore[attr-defined]
+        student.policy.head = MLPBlockConfig(num_cells=[64], activation="elu")
+        student.value.head = MLPBlockConfig(num_cells=[64], activation="elu")  # type: ignore[attr-defined]
+        cfg.l2t.student = student
+
+        # L2T specifics
+        cfg.l2t.imitation_type = imitation
+        cfg.l2t.imitation_coeff = 1.0
+        cfg.l2t.mixture_coeff = mixture_coeff
+        cfg.l2t.clip_epsilon = 0.2
+        cfg.l2t.critic_coeff = 1.0
+        cfg.l2t.entropy_coeff = 0.0
+
         return cfg
 
     return _make
