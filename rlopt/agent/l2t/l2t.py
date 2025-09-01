@@ -26,7 +26,6 @@ from torchrl.modules import (
     LSTMModule,
     ProbabilisticActor,
     TanhNormal,
-    ValueOperator,
 )
 from torchrl.modules.tensordict_module.sequence import SafeSequential
 from torchrl.objectives import ClipPPOLoss, group_optimizers
@@ -49,28 +48,48 @@ class L2TConfig:
     - Provides a separate ``student`` layout and imitation loss options.
     """
 
-    # Student network layout (separate from teacher, which uses RLOptConfig.network)
     student: NetworkLayout = field(default_factory=NetworkLayout)
+    """Student network layout (separate from teacher, which uses RLOptConfig.network)"""
 
-    # Mixture coefficient for potential teacher-student action mixing (not required for training)
     mixture_coeff: float = 0.2
+    """Mixture coefficient for potential teacher-student action mixing (not required for training)"""
 
-    # Imitation loss settings
     imitation_type: Literal["l2", "asymmetric", "bc"] = "l2"
+    """Imitation loss settings"""
+
     imitation_coeff: float = 1.0
+    """Coefficient for imitation loss"""
 
     # PPO-style hyperparameters for teacher training
     gae_lambda: float = 0.95
-    clip_epsilon: float = 0.2
-    clip_value: bool = True
-    anneal_clip_epsilon: bool = False
-    critic_coeff: float = 1.0
-    entropy_coeff: float = 0.005
+    """Generalized Advantage Estimation (GAE) lambda"""
 
-    # TensorDict keying for student branch
+    clip_epsilon: float = 0.2
+    """Clipping epsilon for PPO"""
+
+    clip_value: bool = True
+    """Whether to clip the value function"""
+
+    anneal_clip_epsilon: bool = False
+    """Whether to anneal the clipping epsilon"""
+
+    critic_coeff: float = 1.0
+    """Coefficient for critic loss"""
+
+    entropy_coeff: float = 0.005
+    """Coefficient for entropy loss"""
+
+    normalize_advantage: bool = False
+    """Whether to normalize the advantage estimates"""
+
     student_hidden_key: str = "student_hidden"
+    """TensorDict keying for student branch"""
+
     student_loc_key: str = "student_loc"
+    """TensorDict keying for student location"""
+
     student_scale_key: str = "student_scale"
+    """TensorDict keying for student scale"""
 
 
 @dataclass
@@ -85,7 +104,7 @@ class L2TActorValueOperatorWrapper(SafeSequential):
     def __init__(
         self,
         teacher_operator: ActorValueOperator,
-        student_operator: ValueOperator,
+        student_operator: ActorValueOperator,
         rng: torch.Generator,
         mixture_coeff: float = 0.2,
     ):
@@ -98,12 +117,12 @@ class L2TActorValueOperatorWrapper(SafeSequential):
         assert isinstance(self.module[0], TensorDictModule)
         assert isinstance(self.module[1], TensorDictModule)
 
-    def get_teacher_head(self):
-        """Get the teacher head of the actor-value operator."""
+    def get_teacher_operator(self):
+        """Get the teacher operator of the actor-value operator."""
         return self.module[0]
 
-    def get_student_head(self):
-        """Get the student head of the actor-value operator."""
+    def get_student_operator(self):
+        """Get the student operator of the actor-value operator."""
         return self.module[1]
 
     def forward(
@@ -113,8 +132,8 @@ class L2TActorValueOperatorWrapper(SafeSequential):
         sample = torch.rand((), generator=self._rng, device=self.device)
 
         if sample.item() < float(self.mixture_coeff):
-            return self.get_teacher_head()(**kwargs)
-        return self.get_student_head()(**kwargs)
+            return self.get_teacher_operator()(**kwargs)
+        return self.get_student_operator()(**kwargs)
 
 
 class L2T(BaseAlgorithm):
@@ -161,7 +180,23 @@ class L2T(BaseAlgorithm):
         # Initialize total network updates
         self.total_network_updates = 0
 
-    # Common utils inherited from BaseAlgorithm: _get_activation_class, _initialize_weights
+    @property
+    def collector_policy(self) -> TensorDictModule:
+        """By default, the collector_policy is self.policy or self.actor_critic.policy_operator()"""
+        assert isinstance(self.config, L2TRLOptConfig)
+        assert isinstance(self.actor_critic, ActorValueOperator), (
+            "Actor critic is not an instance of ActorValueOperator"
+        )
+        assert isinstance(self.student_actor_critic, ActorValueOperator), (
+            "Student actor critic is not an instance of ActorValueOperator"
+        )
+
+        return L2TActorValueOperatorWrapper(
+            teacher_operator=self.actor_critic,
+            student_operator=self.student_actor_critic,
+            rng=self.th_rng,
+            mixture_coeff=self.config.l2t.mixture_coeff,
+        )
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
@@ -284,7 +319,7 @@ class L2T(BaseAlgorithm):
             loss_critic_type=self.config.loss.loss_critic_type,
             entropy_coeff=l2t_cfg.entropy_coeff,
             critic_coeff=l2t_cfg.critic_coeff,
-            normalize_advantage=False,
+            normalize_advantage=l2t_cfg.normalize_advantage,
             clip_value=l2t_cfg.clip_value,
             imitation_type=l2t_cfg.imitation_type,
             imitation_coeff=l2t_cfg.imitation_coeff,
@@ -561,8 +596,7 @@ class L2T(BaseAlgorithm):
                         else:
                             metrics_to_log.update(
                                 {
-                                    "Episode/"
-                                    + key: (
+                                    "Episode/" + key: (
                                         value.item()
                                         if isinstance(value, Tensor)
                                         else value

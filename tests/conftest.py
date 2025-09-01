@@ -84,7 +84,7 @@ def _parse_compile_modes(config: pytest.Config) -> list[str]:
             val = item.strip()
             if val:
                 modes.append(val)
-    # Deduplicate presering order
+    # Deduplicate preserving order
     seen: set[str] = set()
     result: list[str] = []
     for m in modes:

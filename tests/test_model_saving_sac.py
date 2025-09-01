@@ -9,7 +9,9 @@ from rlopt.agent.sac import SAC
 
 
 def test_sac_model_saving_and_loading(sac_cfg_factory, make_env):  # type: ignore
-    cfg = sac_cfg_factory(env_name="Pendulum-v1", num_envs=1, frames_per_batch=128, total_frames=128)  # type: ignore
+    cfg = sac_cfg_factory(
+        env_name="Pendulum-v1", num_envs=1, frames_per_batch=128, total_frames=128
+    )  # type: ignore
     env = make_env(cfg.env.env_name, device="cpu")  # type: ignore
 
     agent = SAC(env=env, config=cfg)

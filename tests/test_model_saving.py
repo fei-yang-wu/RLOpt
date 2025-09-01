@@ -40,9 +40,7 @@ def test_model_saving_and_loading(ppo_cfg_factory, make_env):  # type: ignore
         )
 
     for key in value_state_dict_before:
-        assert torch.allclose(
-            value_state_dict_before[key], value_state_dict_after[key]
-        )
+        assert torch.allclose(value_state_dict_before[key], value_state_dict_after[key])
 
     # Clean up the temporary file
     os.remove(saved_model_path)

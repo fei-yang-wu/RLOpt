@@ -59,6 +59,9 @@ class PPOConfig:
     entropy_coeff: float = 0.005
     """Entropy coefficient."""
 
+    normalize_advantage: bool = False
+    """Whether to normalize the advantage estimates."""
+
 
 @dataclass
 class PPORLOptConfig(RLOptConfig):
@@ -176,6 +179,7 @@ class PPO(BaseAlgorithm):
     def _construct_actor_critic(self) -> TensorDictModule:
         """Construct actor-critic network"""
         assert isinstance(self.value_function, TensorDictModule)
+        assert isinstance(self.policy, TensorDictModule)
         return ActorValueOperator(
             common_operator=self.feature_extractor,
             policy_operator=self.policy,
@@ -194,7 +198,7 @@ class PPO(BaseAlgorithm):
             loss_critic_type=loss_config.loss_critic_type,
             entropy_coeff=ppo_config.entropy_coeff,
             critic_coeff=ppo_config.critic_coeff,
-            normalize_advantage=False,
+            normalize_advantage=ppo_config.normalize_advantage,
             clip_value=ppo_config.clip_value,
         )
 

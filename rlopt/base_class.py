@@ -68,8 +68,7 @@ class BaseAlgorithm(ABC):
         self.kwargs = kwargs
 
         # Seed for reproducibility
-        torch.manual_seed(config.seed)
-        self.np_rng = np.random.default_rng(config.seed)
+        self.manual_seed(config.seed)
         self.mp_context = "fork"
 
         # Construct or attach networks based on existence in config
@@ -112,8 +111,8 @@ class BaseAlgorithm(ABC):
         self.step_count = 0
         self.start_time = time.time()
 
-        # build collector
-        self.collector = self._construct_collector(self.env)
+        # build collector, collector_policy can be customized
+        self.collector = self._construct_collector(self.env, self.collector_policy)
 
         # build loss module
         self.loss_module = self._construct_loss_module()
@@ -142,6 +141,19 @@ class BaseAlgorithm(ABC):
         except Exception:
             # Avoid hard failures if summary printing hits an edge case
             pass
+
+    def manual_seed(self, seed: int) -> None:
+        torch.manual_seed(seed)
+        self.np_rng = np.random.default_rng(seed)
+        self.th_rng = torch.Generator()
+        self.th_rng.manual_seed(seed)
+        # save for non-cuda device
+        torch.cuda.manual_seed_all(seed)
+
+    @property
+    def collector_policy(self) -> TensorDictModule:
+        """By default, the collector_policy is self.policy or self.actor_critic.policy_operator()"""
+        return self.actor_critic.get_policy_operator()
 
     @property
     def value_input_shape(self) -> int:
@@ -237,14 +249,13 @@ class BaseAlgorithm(ABC):
                 layer.bias.data.zero_()
 
     def _construct_collector(
-        self,
-        env: TransformedEnv,
+        self, env: TransformedEnv, policy: TensorDictModule
     ) -> SyncDataCollector:
         # We can't use nested child processes with mp_start_method="fork"
 
         return SyncDataCollector(
             create_env_fn=env,
-            policy=self.actor_critic.get_policy_operator(),
+            policy=policy,
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
             # this is the default behavior: the collector runs in ``"random"`` (or explorative) mode

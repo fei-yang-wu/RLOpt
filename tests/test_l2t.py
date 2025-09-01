@@ -18,7 +18,9 @@ def _action_bounds(env):
 
 
 def test_l2t_instantiation_and_shapes(l2t_cfg_factory, make_env):  # type: ignore
-    cfg = l2t_cfg_factory(env_name="Pendulum-v1", num_envs=4, frames_per_batch=64, total_frames=64)  # type: ignore
+    cfg = l2t_cfg_factory(
+        env_name="Pendulum-v1", num_envs=4, frames_per_batch=64, total_frames=64
+    )  # type: ignore
     env = make_env(cfg.env.env_name, device="cpu")  # type: ignore
     agent = L2T(env=env, config=cfg)
 
@@ -56,7 +58,13 @@ def test_l2t_instantiation_and_shapes(l2t_cfg_factory, make_env):  # type: ignor
 
 
 def test_l2t_loss_forward_smoke(l2t_cfg_factory, make_env):  # type: ignore
-    cfg = l2t_cfg_factory(env_name="Pendulum-v1", num_envs=4, frames_per_batch=64, total_frames=64, imitation="bc")  # type: ignore
+    cfg = l2t_cfg_factory(
+        env_name="Pendulum-v1",
+        num_envs=4,
+        frames_per_batch=64,
+        total_frames=64,
+        imitation="bc",
+    )  # type: ignore
     env = make_env(cfg.env.env_name, device="cpu")  # type: ignore
     agent = L2T(env=env, config=cfg)
 
@@ -120,7 +128,9 @@ def test_l2t_halfcheetah_mujoco_smoke(l2t_cfg_factory, make_env_parallel):  # ty
         imitation="l2",
         mixture_coeff=0.2,
     )  # type: ignore
-    env = make_env_parallel(cfg.env.env_name, num_workers=cfg.env.num_envs, device="cpu")  # type: ignore
+    env = make_env_parallel(
+        cfg.env.env_name, num_workers=cfg.env.num_envs, device="cpu"
+    )  # type: ignore
     agent = L2T(env=env, config=cfg)
 
     # Run a tiny training iteration
