@@ -12,6 +12,7 @@ from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
 from rlopt.agent.l2t.l2t import L2TRLOptConfig
 from rlopt.agent.ppo.ppo import PPORLOptConfig
 from rlopt.agent.sac.sac import SACRLOptConfig
+from rlopt.agent.ipmd.ipmd import IPMDRLOptConfig
 from rlopt.configs import (
     FeatureBlockSpec,
     LSTMBlockConfig,
@@ -255,6 +256,57 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
 
     return _make
 
+
+@pytest.fixture
+def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
+    def _make(
+        *,
+        env_name: str = "Pendulum-v1",
+        num_envs: int = 8,
+        frames_per_batch: int = 1024,
+        total_frames: int = 2048,
+        feature_dim: int = 64,
+        lr: float = 3e-4,
+        mini_batch_size: int = 256,
+        utd_ratio: float = 0.25,
+        init_random_frames: int = 256,
+    ) -> IPMDRLOptConfig:
+        cfg = IPMDRLOptConfig()
+        # env
+        cfg.env.env_name = env_name
+        cfg.env.device = "cpu"
+        cfg.env.num_envs = num_envs
+        # collector
+        cfg.collector.frames_per_batch = frames_per_batch
+        cfg.collector.total_frames = total_frames
+        cfg.collector.set_truncated = False
+        cfg.collector.init_random_frames = init_random_frames
+        # optimization
+        cfg.optim.lr = lr
+        # loss
+        cfg.loss.mini_batch_size = mini_batch_size
+        # feature extractor + io keys
+        cfg.use_feature_extractor = True
+        cfg.feature_extractor.output_dim = feature_dim
+        cfg.policy.num_cells = [64, 64]
+        cfg.value_net.num_cells = [64, 64]
+        cfg.policy_in_keys = ["hidden"]
+        cfg.value_net_in_keys = ["hidden"]
+        cfg.total_input_keys = ["observation"]
+        # logger
+        cfg.logger.backend = None
+        # device
+        cfg.device = "cpu"
+        # compile
+        cfg.compile.compile = False
+        # ipmd-specific
+        cfg.ipmd.utd_ratio = float(utd_ratio)
+        # q net cells expected by off-policy implementation
+        cfg.action_value_net.num_cells = [64, 64]
+        cfg.use_value_function = False
+        return cfg
+
+    return _make
 
 @pytest.fixture
 def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
