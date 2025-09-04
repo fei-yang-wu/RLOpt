@@ -6,13 +6,13 @@ from collections.abc import Callable
 import pytest
 import torch
 import torchrl.envs.libs.gym
-from torchrl.envs import DoubleToFloat, EnvCreator, ParallelEnv, TransformedEnv
+from torchrl.envs import EnvCreator, ParallelEnv, TransformedEnv
 from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
 
+from rlopt.agent.ipmd.ipmd import IPMDRLOptConfig
 from rlopt.agent.l2t.l2t import L2TRLOptConfig
 from rlopt.agent.ppo.ppo import PPORLOptConfig
 from rlopt.agent.sac.sac import SACRLOptConfig
-from rlopt.agent.ipmd.ipmd import IPMDRLOptConfig
 from rlopt.configs import (
     FeatureBlockSpec,
     LSTMBlockConfig,
@@ -307,6 +307,7 @@ def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
         return cfg
 
     return _make
+
 
 @pytest.fixture
 def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:

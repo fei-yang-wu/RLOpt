@@ -125,15 +125,21 @@ class L2TActorValueOperatorWrapper(SafeSequential):
         """Get the student operator of the actor-value operator."""
         return self.module[1]
 
-    def forward(
-        self,
-        **kwargs,
-    ):
-        sample = torch.rand((), generator=self._rng, device=self.device)
+    def forward(self, tensordict: TensorDict) -> TensorDict:  # type: ignore[override]
+        """Route the input to teacher or student operator.
+
+        TorchRL collectors call policies with a positional TensorDict. Accept
+        that here and forward to the selected operator.
+        """
+        # Draw once per call to choose teacher vs student
+        # Use underlying module device as source of truth
+        module_device = getattr(self.get_teacher_operator(), "device", None)
+        device = module_device if module_device is not None else torch.device("cpu")
+        sample = torch.rand((), generator=self._rng, device=device)
 
         if sample.item() < float(self.mixture_coeff):
-            return self.get_teacher_operator()(**kwargs)
-        return self.get_student_operator()(**kwargs)
+            return self.get_teacher_operator()(tensordict)
+        return self.get_student_operator()(tensordict)
 
 
 class L2T(BaseAlgorithm):
@@ -184,12 +190,12 @@ class L2T(BaseAlgorithm):
     def collector_policy(self) -> TensorDictModule:
         """By default, the collector_policy is self.policy or self.actor_critic.policy_operator()"""
         assert isinstance(self.config, L2TRLOptConfig)
-        assert isinstance(self.actor_critic, ActorValueOperator), (
-            "Actor critic is not an instance of ActorValueOperator"
-        )
-        assert isinstance(self.student_actor_critic, ActorValueOperator), (
-            "Student actor critic is not an instance of ActorValueOperator"
-        )
+        assert isinstance(
+            self.actor_critic, ActorValueOperator
+        ), "Actor critic is not an instance of ActorValueOperator"
+        assert isinstance(
+            self.student_actor_critic, ActorValueOperator
+        ), "Student actor critic is not an instance of ActorValueOperator"
 
         return L2TActorValueOperatorWrapper(
             teacher_operator=self.actor_critic,
@@ -596,7 +602,8 @@ class L2T(BaseAlgorithm):
                         else:
                             metrics_to_log.update(
                                 {
-                                    "Episode/" + key: (
+                                    "Episode/"
+                                    + key: (
                                         value.item()
                                         if isinstance(value, Tensor)
                                         else value
