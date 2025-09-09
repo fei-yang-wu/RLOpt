@@ -4,8 +4,6 @@ Only supports MuJoCo environments for now
 
 from __future__ import annotations
 
-import os
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +26,7 @@ from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
-from torchrl.envs.transforms import InitTracker, TensorDictPrimer
+from torchrl.envs.transforms import InitTracker
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
@@ -37,7 +35,7 @@ from torchrl.modules import (
     TanhNormal,
     ValueOperator,
 )
-from torchrl.objectives import ClipPPOLoss, KLPENPPOLoss, group_optimizers
+from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
@@ -153,7 +151,7 @@ class PPO(BaseAlgorithm):
             policy_mlp,
             AddStateIndependentNormalScale(
                 self.policy_output_shape,
-                scale_lb=1e-8,  # type: ignore
+                # scale_lb=1e-8,  # type: ignore
             ).to(self.device),
         )
 
@@ -169,7 +167,7 @@ class PPO(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.DETERMINISTIC,
+            default_interaction_type=ExplorationType.RANDOM,
         )
 
     def _construct_value_function(
@@ -256,7 +254,7 @@ class PPO(BaseAlgorithm):
             value_network=self.actor_critic.get_value_operator(),  # type: ignore
             average_gae=False,
             device=self.device,
-            vectorized=not self.config.compile.compile,
+            vectorized=False,
         )
 
     def _construct_data_buffer(self) -> ReplayBuffer:
@@ -408,6 +406,15 @@ class PPO(BaseAlgorithm):
             self.data_buffer.empty()
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
+
+                    # Check for NaNs in data_reshape tensordict
+                    for key in data.keys(include_nested=True):
+                        value = data.get(key)
+                        if isinstance(value, Tensor):
+                            if torch.isnan(value).any():
+                                print("Before GAE")
+                                print(f"[WARNING] NaNs detected in data at key: {key}")
+
                     # Compute GAE
                     with torch.no_grad(), timeit("adv"):
                         torch.compiler.cudagraph_mark_step_begin()
@@ -419,6 +426,16 @@ class PPO(BaseAlgorithm):
                         # Update the data buffer
                         data_reshape = data.reshape(-1)
                         self.data_buffer.extend(data_reshape)
+
+                    # Check for NaNs in data_reshape tensordict
+                    for key in data_reshape.keys(include_nested=True):
+                        value = data_reshape.get(key)
+                        if isinstance(value, Tensor):
+                            if torch.isnan(value).any():
+                                print("after GAE")
+                                print(
+                                    f"[WARNING] NaNs detected in data_reshape at key: {key}"
+                                )
 
                     for k, batch in enumerate(self.data_buffer):
                         with timeit("update"):
@@ -456,17 +473,22 @@ class PPO(BaseAlgorithm):
                         if "/" in key:
                             metrics_to_log.update(
                                 {
-                                    key: value.item()
-                                    if isinstance(value, Tensor)
-                                    else value
+                                    key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
                                 }
                             )
                         else:
                             metrics_to_log.update(
                                 {
-                                    "Episode/" + key: value.item()
-                                    if isinstance(value, Tensor)
-                                    else value
+                                    "Episode/"
+                                    + key: (
+                                        value.item()
+                                        if isinstance(value, Tensor)
+                                        else value
+                                    )
                                 }
                             )
 
@@ -637,7 +659,6 @@ class PPORecurrent(PPO):
         # With TorchRL's LSTMModule, states are automatically managed
         # This method is provided for compatibility but may not be needed
         # as the InitTracker transform and proper episode boundaries handle this
-        pass
 
     @classmethod
     def check_environment_compatibility(
