@@ -160,6 +160,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
         mixture_coeff: float = 0.0,
+        moe_aux_loss_coef: float = 1e-2,
         policy_kwargs: Optional[Dict[str, Any]] = None,
         student_policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
@@ -303,6 +304,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.student_policy = student_policy  # type: ignore
         self.mixture_coeff = mixture_coeff
+        self.moe_aux_loss_coef = moe_aux_loss_coef
 
         # self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
         self.student_policy_kwargs = (
@@ -771,7 +773,7 @@ class RecurrentStudent(OnPolicyAlgorithm):
             # If MoE is enabled on the student policy, add aux loss
             moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
             if moe_aux is not None:
-                student_loss = student_loss + moe_aux  # scaled in policy
+                student_loss = student_loss + self.moe_aux_loss_coef * moe_aux
 
             student_losses.append(student_loss.item())
 
@@ -844,10 +846,14 @@ class RecurrentStudent(OnPolicyAlgorithm):
         # Log MoE aux loss if present
         moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
         if moe_aux is not None and isinstance(moe_aux, th.Tensor):
-            try:
-                self.logger.record("train/moe_aux_loss", float(moe_aux.detach().cpu().item()))
-            except Exception:
-                pass
+            with th.no_grad():
+                try:
+                    self.logger.record(
+                        "train/moe_aux_loss",
+                        float((self.moe_aux_loss_coef * moe_aux).detach().cpu().item()),
+                    )
+                except Exception:
+                    pass
         # self.logger.record(
         #     "train/student_policy_loss", statistics.mean(student_policy_losses)
         # )

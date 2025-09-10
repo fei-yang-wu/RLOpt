@@ -159,6 +159,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         stats_window_size: int = 100,
         tensorboard_log: str | None = None,
         mixture_coeff: float = 0.0,
+        moe_aux_loss_coef: float = 1e-2,
         policy_kwargs: dict[str, Any] | None = None,
         student_policy_kwargs: dict[str, Any] | None = None,
         verbose: int = 0,
@@ -304,6 +305,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.student_policy = student_policy  # type: ignore
         self.mixture_coeff = mixture_coeff
+        self.moe_aux_loss_coef = moe_aux_loss_coef
 
         self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
         self.student_policy_kwargs = (
@@ -771,10 +773,10 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # + student_asym_loss
             )
 
-            # If student policy uses MoE, add router aux loss
+            # If student policy uses MoE, add router aux loss (scaled here)
             moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
             if moe_aux is not None:
-                student_loss = student_loss + moe_aux  # already scaled in policy
+                student_loss = student_loss + self.moe_aux_loss_coef * moe_aux
 
             student_losses.append(student_loss.item())
 
@@ -842,13 +844,17 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 clip_range_vf.item() if isinstance(clip_range_vf, th.Tensor) else clip_range_vf,  # type: ignore
             )
         self.logger.record("train/student_loss", np.mean(student_losses))
-        # Log MoE aux if present (use last seen value)
+        # Log (scaled) MoE aux if present (use last seen value)
         moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
         if moe_aux is not None and isinstance(moe_aux, th.Tensor):
-            try:
-                self.logger.record("train/moe_aux_loss", float(moe_aux.detach().cpu().item()))
-            except Exception:
-                pass
+            with th.no_grad():
+                try:
+                    self.logger.record(
+                        "train/moe_aux_loss",
+                        float((self.moe_aux_loss_coef * moe_aux).detach().cpu().item()),
+                    )
+                except Exception:
+                    pass
 
     def learn(
         self: SelfRecurrentL2T,

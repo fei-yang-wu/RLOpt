@@ -97,7 +97,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         moe_ffn_expand: float = 4.0,
         moe_dropout: float = 0.0,
         moe_router_jitter: float = 0.0,
-        moe_aux_loss_coef: float = 1e-2,
         moe_sparse_dispatch: bool = False,
         moe_capacity_factor: float = 1.0,
     ):
@@ -109,7 +108,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         self.moe_ffn_expand = moe_ffn_expand
         self.moe_dropout = moe_dropout
         self.moe_router_jitter = moe_router_jitter
-        self.moe_aux_loss_coef = moe_aux_loss_coef
         self.moe_sparse_dispatch = moe_sparse_dispatch
         self.moe_capacity_factor = moe_capacity_factor
         self.moe_aux_loss: th.Tensor | None = None
@@ -194,7 +192,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         if self.use_moe:
             # In SB3, latent_dim_pi is set by MlpExtractor.
             actor_in = self.lstm_output_dim
-            actor_out = getattr(self.mlp_extractor, "latent_dim_pi", self.lstm_output_dim)
+            actor_out = getattr(
+                self.mlp_extractor, "latent_dim_pi", self.lstm_output_dim
+            )
             # Use MoE that maps d_model -> d_model; if needed, add a linear to actor_out
             # To keep compatibility with action_net input, produce actor_out dim
             # by making d_model == actor_out when possible. If mismatch, add a linear.
@@ -224,14 +224,14 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         """Route actor latent through MLP or MoE depending on config, and store aux loss if any."""
         if self.use_moe and self._actor_moe is not None:
             # Ensure correct width for MoE/action head
-            latent_pi = self._actor_proj(latent_pi) if self._actor_proj is not None else latent_pi
-            latent_pi = self._actor_moe(latent_pi)
-            # record aux loss for training
-            self.moe_aux_loss = (
-                self._actor_moe.last_aux_loss * self.moe_aux_loss_coef
-                if self._actor_moe.last_aux_loss is not None
-                else None
+            latent_pi = (
+                self._actor_proj(latent_pi)
+                if self._actor_proj is not None
+                else latent_pi
             )
+            latent_pi = self._actor_moe(latent_pi)
+            # record aux loss for training (unscaled)
+            self.moe_aux_loss = self._actor_moe.last_aux_loss
             return latent_pi
         # default: standard MLP extractor
         self.moe_aux_loss = None

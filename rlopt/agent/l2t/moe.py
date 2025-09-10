@@ -60,7 +60,9 @@ class TopKRouter(nn.Module):
         self.router_jitter = router_jitter
         self.last_aux_loss: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # x: (N, d_model)
         logits = self.router(x)
         if self.training and self.router_jitter and self.router_jitter > 0:
@@ -125,9 +127,14 @@ class MoE(nn.Module):
         d_ff = max(1, int(d_model * ffn_expand))
 
         self.experts = nn.ModuleList(
-            [ExpertFFN(d_model, d_ff, activation=activation, dropout=dropout) for _ in range(num_experts)]
+            [
+                ExpertFFN(d_model, d_ff, activation=activation, dropout=dropout)
+                for _ in range(num_experts)
+            ]
         )
-        self.router = TopKRouter(d_model=d_model, num_experts=num_experts, k=k, router_jitter=router_jitter)
+        self.router = TopKRouter(
+            d_model=d_model, num_experts=num_experts, k=k, router_jitter=router_jitter
+        )
         self.sparse_dispatch = sparse_dispatch
         self.capacity_factor = capacity_factor
         self.last_aux_loss: Optional[torch.Tensor] = None
@@ -142,7 +149,9 @@ class MoE(nn.Module):
 
         if not self.sparse_dispatch:
             # Dense compute and mixing
-            expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)
+            expert_outputs = torch.stack(
+                [expert(x_flat) for expert in self.experts], dim=1
+            )
             y_flat = torch.sum(expert_outputs * mixing.unsqueeze(-1), dim=1)
         else:
             # Sparse dispatch with capacity and token dropping
@@ -154,13 +163,20 @@ class MoE(nn.Module):
 
             # Flatten assignments
             flat_e = topk_idx.reshape(-1)  # [A]
-            flat_w = topk_w.reshape(-1)    # [A]
-            tok = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(N, k).reshape(-1)  # [A]
+            flat_w = topk_w.reshape(-1)  # [A]
+            tok = (
+                torch.arange(N, device=x_flat.device)
+                .unsqueeze(1)
+                .expand(N, k)
+                .reshape(-1)
+            )  # [A]
 
             # Compute position within each expert using cumulative counts
             one_hot = F.one_hot(flat_e, num_classes=E).to(x_flat.dtype)  # [A, E]
             cumsum = torch.cumsum(one_hot, dim=0) - one_hot  # [A, E]
-            pos = cumsum[torch.arange(one_hot.size(0), device=x_flat.device), flat_e].long()  # [A]
+            pos = cumsum[
+                torch.arange(one_hot.size(0), device=x_flat.device), flat_e
+            ].long()  # [A]
 
             keep = pos < cap
             if keep.any():
