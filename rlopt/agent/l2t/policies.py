@@ -19,6 +19,8 @@ from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.utils import zip_strict
 from torch import nn
 
+from .moe import MoE
+
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
 
@@ -88,8 +90,30 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
         lstm_kwargs: Optional[Dict[str, Any]] = None,
+        # MoE config
+        use_moe: bool = False,
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
+        moe_ffn_expand: float = 4.0,
+        moe_dropout: float = 0.0,
+        moe_router_jitter: float = 0.0,
+        moe_aux_loss_coef: float = 1e-2,
+        moe_sparse_dispatch: bool = False,
+        moe_capacity_factor: float = 1.0,
     ):
         self.lstm_output_dim = lstm_hidden_size
+        # MoE params must be set before super().__init__ because _build_mlp_extractor is called inside
+        self.use_moe = use_moe
+        self.moe_num_experts = moe_num_experts
+        self.moe_top_k = moe_top_k
+        self.moe_ffn_expand = moe_ffn_expand
+        self.moe_dropout = moe_dropout
+        self.moe_router_jitter = moe_router_jitter
+        self.moe_aux_loss_coef = moe_aux_loss_coef
+        self.moe_sparse_dispatch = moe_sparse_dispatch
+        self.moe_capacity_factor = moe_capacity_factor
+        self.moe_aux_loss: th.Tensor | None = None
+
         super().__init__(
             observation_space,
             action_space,
@@ -166,6 +190,52 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             activation_fn=self.activation_fn,
             device=self.device,
         )
+        # If MoE is enabled, build an MoE block for the actor head.
+        if self.use_moe:
+            # In SB3, latent_dim_pi is set by MlpExtractor.
+            actor_in = self.lstm_output_dim
+            actor_out = getattr(self.mlp_extractor, "latent_dim_pi", self.lstm_output_dim)
+            # Use MoE that maps d_model -> d_model; if needed, add a linear to actor_out
+            # To keep compatibility with action_net input, produce actor_out dim
+            # by making d_model == actor_out when possible. If mismatch, add a linear.
+            d_model = actor_out
+            if actor_in != actor_out:
+                # project to actor_out before MoE, so MoE operates at the correct width
+                self._actor_proj = nn.Linear(actor_in, actor_out)
+            else:
+                self._actor_proj = nn.Identity()
+
+            self._actor_moe = MoE(
+                d_model=d_model,
+                num_experts=self.moe_num_experts,
+                k=self.moe_top_k,
+                ffn_expand=self.moe_ffn_expand,
+                activation=self.activation_fn,
+                dropout=self.moe_dropout,
+                router_jitter=self.moe_router_jitter,
+                sparse_dispatch=self.moe_sparse_dispatch,
+                capacity_factor=self.moe_capacity_factor,
+            )
+        else:
+            self._actor_proj = None
+            self._actor_moe = None
+
+    def _forward_actor_head(self, latent_pi: th.Tensor) -> th.Tensor:
+        """Route actor latent through MLP or MoE depending on config, and store aux loss if any."""
+        if self.use_moe and self._actor_moe is not None:
+            # Ensure correct width for MoE/action head
+            latent_pi = self._actor_proj(latent_pi) if self._actor_proj is not None else latent_pi
+            latent_pi = self._actor_moe(latent_pi)
+            # record aux loss for training
+            self.moe_aux_loss = (
+                self._actor_moe.last_aux_loss * self.moe_aux_loss_coef
+                if self._actor_moe.last_aux_loss is not None
+                else None
+            )
+            return latent_pi
+        # default: standard MLP extractor
+        self.moe_aux_loss = None
+        return self.mlp_extractor.forward_actor(latent_pi)
 
     @staticmethod
     def _process_sequence(
@@ -230,7 +300,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         lstm_states: RNNStates,
         episode_starts: th.Tensor,
         deterministic: bool = False,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, RNNStates]:
+    ) -> RNNStates:
         """
         Forward pass in all the networks (actor and critic)
 
@@ -264,7 +334,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             latent_vf = self.critic(vf_features)
             lstm_states_vf = lstm_states_pi
 
-        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_pi = self._forward_actor_head(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
         # Evaluate the values for the given observations
@@ -313,7 +383,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             latent_vf = self.critic(vf_features)
             lstm_states_vf = lstm_states_pi
 
-        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_pi = self._forward_actor_head(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
         return RNNStates(lstm_states_pi, lstm_states_vf)
@@ -341,7 +411,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             features, lstm_states, episode_starts, self.lstm_actor
         )
 
-        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_pi = self._forward_actor_head(latent_pi)
         return self._get_action_dist_from_latent(latent_pi), lstm_states
 
     def predict_values(
@@ -417,7 +487,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         else:
             latent_vf = self.critic(vf_features)
 
-        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_pi = self._forward_actor_head(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
         distribution = self._get_action_dist_from_latent(latent_pi)
@@ -459,7 +529,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         else:
             latent_vf = self.critic(features)
 
-        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_pi = self._forward_actor_head(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
         values = self.value_net(latent_vf)
@@ -686,7 +756,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         else:
             latent_vf = self.critic(features)
 
-        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_pi = self._forward_actor_head(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
         # value shape (n_steps, n_seq, 1)

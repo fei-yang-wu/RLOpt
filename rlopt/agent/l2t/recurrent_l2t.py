@@ -771,6 +771,11 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # + student_asym_loss
             )
 
+            # If student policy uses MoE, add router aux loss
+            moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
+            if moe_aux is not None:
+                student_loss = student_loss + moe_aux  # already scaled in policy
+
             student_losses.append(student_loss.item())
 
             # adaptive step size
@@ -837,6 +842,13 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 clip_range_vf.item() if isinstance(clip_range_vf, th.Tensor) else clip_range_vf,  # type: ignore
             )
         self.logger.record("train/student_loss", np.mean(student_losses))
+        # Log MoE aux if present (use last seen value)
+        moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
+        if moe_aux is not None and isinstance(moe_aux, th.Tensor):
+            try:
+                self.logger.record("train/moe_aux_loss", float(moe_aux.detach().cpu().item()))
+            except Exception:
+                pass
 
     def learn(
         self: SelfRecurrentL2T,

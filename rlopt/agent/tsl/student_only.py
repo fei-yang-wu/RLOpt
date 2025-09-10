@@ -768,6 +768,11 @@ class RecurrentStudent(OnPolicyAlgorithm):
                 # + student_asym_loss
             )
 
+            # If MoE is enabled on the student policy, add aux loss
+            moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
+            if moe_aux is not None:
+                student_loss = student_loss + moe_aux  # scaled in policy
+
             student_losses.append(student_loss.item())
 
             # Calculate approximate form of reverse KL Divergence for early stopping
@@ -836,6 +841,13 @@ class RecurrentStudent(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self.logger.record("train/student_loss", np.mean(student_losses))
+        # Log MoE aux loss if present
+        moe_aux = getattr(self.compiled_student_policy, "moe_aux_loss", None)
+        if moe_aux is not None and isinstance(moe_aux, th.Tensor):
+            try:
+                self.logger.record("train/moe_aux_loss", float(moe_aux.detach().cpu().item()))
+            except Exception:
+                pass
         # self.logger.record(
         #     "train/student_policy_loss", statistics.mean(student_policy_losses)
         # )
