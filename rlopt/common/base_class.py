@@ -67,6 +67,10 @@ class BaseAlgorithm(ABC):
 
         # Seed for reproducibility
         torch.manual_seed(config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.seed)
+        # Set both global NumPy seed and a dedicated Generator
+        np.random.seed(config.seed)
         self.np_rng = np.random.default_rng(config.seed)
         self.mp_context = "fork"
 
@@ -406,9 +410,9 @@ class BaseAlgorithm(ABC):
 
     def _load_offline_data(self) -> TensorDict:
         """Load from replay buffer or offline dataset."""
-        assert self.replay_buffer is not None, (
-            "ReplayBuffer must be provided for offline."
-        )
+        assert (
+            self.replay_buffer is not None
+        ), "ReplayBuffer must be provided for offline."
         return self.replay_buffer.sample(self.config.batch_size)
 
     def update_parameters(self, batch: TensorDict) -> dict[str, float]:

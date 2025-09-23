@@ -313,8 +313,17 @@ class PPO(BaseAlgorithm):
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         total_loss = critic_loss + actor_loss
+        loss_cap = getattr(self.config.loss, "max_loss", None)
+        if loss_cap is not None:
+            total_loss = total_loss.clamp(min=-loss_cap, max=loss_cap)
         # Backward pass
         total_loss.backward()
+
+        # clip gradients per optimizer group
+        for group in self.optim.param_groups:
+            torch.nn.utils.clip_grad_norm_(
+                group["params"], self.config.optim.max_grad_norm
+            )
 
         # Update the networks
         self.optim.step()
@@ -381,7 +390,8 @@ class PPO(BaseAlgorithm):
         total_iter = len(self.collector)
         for _i in range(total_iter):
             # timeit.printevery(1000, total_iter, erase=True)
-
+            self.actor_critic.eval()
+            self.adv_module.eval()
             with timeit("collecting"):
                 data = next(collector_iter)
 
@@ -404,9 +414,11 @@ class PPO(BaseAlgorithm):
                     }
                 )
             self.data_buffer.empty()
+
+            self.actor_critic.train()
+            self.adv_module.train()
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
-
                     # Check for NaNs in data_reshape tensordict
                     for key in data.keys(include_nested=True):
                         value = data.get(key)
@@ -418,6 +430,23 @@ class PPO(BaseAlgorithm):
                     # Compute GAE
                     with torch.no_grad(), timeit("adv"):
                         torch.compiler.cudagraph_mark_step_begin()
+
+                        # check if value network and gae module do not have NaNs
+                        if any(
+                            torch.isnan(param).any()
+                            for param in self.actor_critic.get_value_operator().parameters()
+                            if param.dtype.is_floating_point
+                        ):
+                            print("Before GAE")
+                            print("[WARNING] NaNs detected in value network")
+                        if any(
+                            torch.isnan(param).any()
+                            for param in self.adv_module.parameters()
+                            if param.dtype.is_floating_point
+                        ):
+                            print("Before GAE")
+                            print("[WARNING] NaNs detected in gae module")
+
                         data = self.adv_module(data)
                         if self.config.compile.compile_mode:
                             data = data.clone()
