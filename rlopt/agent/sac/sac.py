@@ -235,12 +235,12 @@ class SAC(BaseAlgorithm):
         return self._build_qvalue_module(q_net=q_net, layout=self.config.network)
 
     def _construct_actor_critic(self) -> TensorDictModule:
-        assert isinstance(
-            self.q_function, TensorDictModule
-        ), "Q-function must be a TensorDictModule"
-        assert isinstance(
-            self.policy, TensorDictModule
-        ), "Policy must be a TensorDictModule"
+        assert isinstance(self.q_function, TensorDictModule), (
+            "Q-function must be a TensorDictModule"
+        )
+        assert isinstance(self.policy, TensorDictModule), (
+            "Policy must be a TensorDictModule"
+        )
 
         return ActorValueOperator(
             common_operator=self.feature_extractor,

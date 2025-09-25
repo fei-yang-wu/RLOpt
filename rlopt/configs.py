@@ -98,22 +98,41 @@ class LoggerConfig:
 
 @dataclass
 class OptimizerConfig:
-    """Optimizer configuration for RLOpt  ."""
+    """Optimizer configuration for RLOpt."""
+
+    optimizer: str = "adamw"
+    """Name of the optimizer to use (e.g. ``"adamw"``, ``"adam"``, ``"sgd"``)."""
 
     lr: float = 3e-4
-    """Learning rate."""
+    """Base learning rate."""
 
-    weight_decay: float = 0.0
-    """Weight decay for optimizer."""
+    weight_decay: float = 0.01
+    """Weight decay applied to all parameter groups."""
 
-    anneal_lr: bool = True
-    """Whether to anneal learning rate."""
+    optimizer_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {"betas": (0.9, 0.999), "eps": 1e-8}
+    )
+    """Extra keyword arguments forwarded to the optimizer (defaults tailored for Adam-family optimizers)."""
+
+    scheduler: str | None = "steplr"
+    """Optional learning-rate scheduler name (e.g. ``"steplr"``, ``"cosineannealinglr"``)."""
+
+    scheduler_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {"step_size": 1_000, "gamma": 0.9}
+    )
+    """Keyword arguments passed to the scheduler constructor."""
+
+    scheduler_step: Literal["update", "epoch"] = "update"
+    """Whether to step the scheduler after each optimizer update or once per epoch."""
 
     device: str = "cuda:0"
-    """Device for optimizer."""
+    """Device for optimizer state when applicable."""
 
     target_update_polyak: float = 0.995
     """Polyak averaging coefficient for target network updates."""
+
+    max_grad_norm: float | None = 0.5
+    """Maximum gradient norm for clipping; set to ``None`` to disable clipping."""
 
 
 @dataclass
@@ -385,11 +404,11 @@ class RLOptConfig:
     save_interval: int = 500
     """Interval for saving the model."""
 
-    policy_in_keys: ClassVar[list[str]] = ["hidden"]
+    policy_in_keys: list[str] = field(default_factory=lambda: ["hidden"])
     """Keys to use for the policy."""
 
-    value_net_in_keys: ClassVar[list[str]] = ["hidden"]
+    value_net_in_keys: list[str] = field(default_factory=lambda: ["hidden"])
     """Keys to use for the value network."""
 
-    total_input_keys: ClassVar[list[str]] = ["policy"]
+    total_input_keys: list[str] = field(default_factory=lambda: ["policy"])
     """Keys to use for the total input."""

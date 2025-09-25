@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -14,6 +16,8 @@ from tensordict.nn import (
     TensorDictModule,
 )
 from torch import Tensor
+from torch.nn.utils import clip_grad_norm_
+from torch.optim import lr_scheduler
 from torchrl._utils import timeit
 
 # Import missing modules
@@ -204,26 +208,74 @@ class PPO(BaseAlgorithm):
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers"""
-        # Create optimizers
-        actor_optim = torch.optim.AdamW(
-            self.actor_critic.get_policy_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        critic_optim = torch.optim.AdamW(
-            self.actor_critic.get_value_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        if self.config.use_feature_extractor:
-            feature_optim = torch.optim.AdamW(
-                self.feature_extractor.parameters(),
-                lr=torch.tensor(self.config.optim.lr, device=self.device),
-                # eps=1e-5,
-            )
-            return group_optimizers(actor_optim, critic_optim, feature_optim)
+        cfg = self.config.optim
 
-        return group_optimizers(actor_optim, critic_optim)
+        optimizer_map: dict[str, type[torch.optim.Optimizer]] = {
+            "adam": torch.optim.Adam,
+            "adamw": torch.optim.AdamW,
+            "adamax": torch.optim.Adamax,
+            "sgd": torch.optim.SGD,
+            "rmsprop": torch.optim.RMSprop,
+        }
+
+        optimizer_name = cfg.optimizer.lower()
+        if optimizer_name not in optimizer_map:
+            available = ", ".join(sorted(optimizer_map))
+            msg = f"Unknown optimizer '{cfg.optimizer}'. Choose one of: {available}."
+            raise ValueError(msg)
+
+        optimizer_cls = optimizer_map[optimizer_name]
+
+        base_kwargs = {
+            "lr": cfg.lr,
+            "weight_decay": cfg.weight_decay,
+        }
+        optimizer_kwargs = {**base_kwargs, **cfg.optimizer_kwargs}
+
+        actor_optim = optimizer_cls(
+            self.actor_critic.get_policy_head().parameters(),
+            **optimizer_kwargs,
+        )
+        critic_optim = optimizer_cls(
+            self.actor_critic.get_value_head().parameters(),
+            **optimizer_kwargs,
+        )
+
+        optimizers: list[torch.optim.Optimizer] = [actor_optim, critic_optim]
+        if self.config.use_feature_extractor:
+            feature_optim = optimizer_cls(
+                self.feature_extractor.parameters(),
+                **optimizer_kwargs,
+            )
+            optimizers.append(feature_optim)
+
+        optim = group_optimizers(*optimizers)
+
+        scheduler_name = (cfg.scheduler or "").lower() or None
+        scheduler_map: dict[str, type[lr_scheduler.LRScheduler]] = {
+            "steplr": lr_scheduler.StepLR,
+            "multiplicativelr": lr_scheduler.MultiplicativeLR,
+            "exponentiallr": lr_scheduler.ExponentialLR,
+            "cosineannealinglr": lr_scheduler.CosineAnnealingLR,
+            "cosineannealingwarmrestarts": lr_scheduler.CosineAnnealingWarmRestarts,
+        }
+
+        self.lr_scheduler = None
+        if scheduler_name is not None:
+            if scheduler_name not in scheduler_map:
+                available = ", ".join(sorted(scheduler_map))
+                msg = (
+                    f"Unknown scheduler '{cfg.scheduler}'. Choose one of: {available}."
+                )
+                raise ValueError(msg)
+
+            scheduler_cls = scheduler_map[scheduler_name]
+            scheduler_kwargs = dict(cfg.scheduler_kwargs)
+            self.lr_scheduler = scheduler_cls(optim, **scheduler_kwargs)
+
+        self.lr_scheduler_step = getattr(cfg, "scheduler_step", "update").lower()
+
+        return optim
 
     # _get_activation_class and _initialize_weights now provided by BaseAlgorithm
 
@@ -277,31 +329,78 @@ class PPO(BaseAlgorithm):
         self, batch: TensorDict, num_network_updates: int
     ) -> tuple[TensorDict, int]:
         """Update function"""
+        stage_prefix = self._update_stage_context or "update"
+        # for debug
+        # self._validate_parameters(f"{stage_prefix}:pre_zero_grad")
         self.optim.zero_grad(set_to_none=True)
         assert isinstance(self.config, PPORLOptConfig)
-        # Linearly decrease the learning rate and clip epsilon
-        alpha = torch.ones((), device=self.device)
-        if self.config.optim.anneal_lr:
-            alpha = 1 - (num_network_updates / self.total_network_updates)
-            for group in self.optim.param_groups:
-                group["lr"] = self.config.optim.lr * alpha
-
-        if self.config.ppo.anneal_clip_epsilon:
-            self.loss_module.clip_epsilon.copy_(self.config.ppo.clip_epsilon * alpha)  # type: ignore
-
-        num_network_updates = num_network_updates + 1
 
         # Forward pass PPO loss
         loss = self.loss_module(batch)
+        loss = self._sanitize_loss_tensordict(loss, f"{stage_prefix}:raw_loss")
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         total_loss = critic_loss + actor_loss
+
         # Backward pass
-        total_loss.backward()
+        total_loss.backward()  # type: ignore
+        grads_finite = self._validate_gradients(
+            f"{stage_prefix}:post_backward", raise_error=False
+        )
+
+        if not grads_finite:
+            warnings.warn(
+                "Skipping optimizer step due to non-finite gradients; batch will be discarded.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.optim.zero_grad(set_to_none=True)
+            output_loss = loss.detach().set(
+                "alpha", torch.tensor(1.0, device=self.device)
+            )
+            current_lr = torch.tensor(
+                self.optim.param_groups[0]["lr"],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            output_loss.set("lr", current_lr)
+            output_loss.set("skipped_update", torch.tensor(True, device=self.device))
+            return output_loss, num_network_updates
+
+        grad_params = [
+            param for _, param in self._parameter_monitor if param.grad is not None
+        ]
+        grad_norm_tensor = None
+        max_grad_norm = getattr(self.config.optim, "max_grad_norm", None)
+        if grad_params and max_grad_norm is not None and max_grad_norm > 0:
+            grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
 
         # Update the networks
         self.optim.step()
-        return loss.detach().set("alpha", alpha), num_network_updates
+        if self.lr_scheduler and self.lr_scheduler_step == "update":
+            self.lr_scheduler.step()
+        # for debug
+        # self._validate_parameters(f"{stage_prefix}:post_step")
+        output_loss = loss.detach().set("alpha", torch.tensor(1.0, device=self.device))
+        if grad_norm_tensor is not None:
+            output_loss.set("grad_norm", grad_norm_tensor.detach())
+        current_lr = torch.tensor(
+            self.optim.param_groups[0]["lr"],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        output_loss.set("lr", current_lr)
+        output_loss.set("skipped_update", torch.tensor(False, device=self.device))
+        return output_loss, num_network_updates + 1
+
+    def _collector_iter(self) -> Iterator[TensorDict]:
+        """Yield data from the collector while enforcing NaN guards per batch."""
+
+        for step_idx, tensordict in enumerate(self.collector):
+            self._validate_tensordict(
+                tensordict, f"collector_iter:step{step_idx}", raise_error=False
+            )
+            yield tensordict
 
     def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
         """Predict action given observation"""
@@ -337,9 +436,6 @@ class PPO(BaseAlgorithm):
 
         # extract cfg variables
         cfg_loss_ppo_epochs: int = self.config.loss.epochs
-        cfg_optim_lr: torch.Tensor = torch.tensor(
-            self.config.optim.lr, device=self.device
-        )
         cfg_loss_anneal_clip_eps: bool = self.config.ppo.anneal_clip_epsilon
         cfg_loss_clip_epsilon: float = self.config.ppo.clip_epsilon
 
@@ -376,11 +472,15 @@ class PPO(BaseAlgorithm):
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
                     # Compute GAE
+                    self._validate_tensordict(data, f"epoch{j}:pre_gae_input")
+                    self._validate_parameters(f"epoch{j}:pre_gae")
                     with torch.no_grad(), timeit("adv"):
                         torch.compiler.cudagraph_mark_step_begin()
                         data = self.adv_module(data)
                         if self.config.compile.compile_mode:
                             data = data.clone()
+                    self._validate_parameters(f"epoch{j}:post_gae")
+                    self._validate_tensordict(data, f"epoch{j}:post_gae")
 
                     with timeit("rb - extend"):
                         # Update the data buffer
@@ -388,31 +488,68 @@ class PPO(BaseAlgorithm):
                         self.data_buffer.extend(data_reshape)
 
                     for k, batch in enumerate(self.data_buffer):
+                        if not self._validate_tensordict(
+                            batch,
+                            f"epoch{j}:mini_batch{k}:pre_update_batch",
+                            raise_error=False,
+                        ):
+                            warnings.warn(
+                                "Discarding mini-batch due to non-finite values",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                            continue
+                        self._update_stage_context = f"epoch{j}:mini_batch{k}"
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
                             loss, num_network_updates = self.update(  # type: ignore
                                 batch, num_network_updates=num_network_updates
                             )
                             loss = loss.clone()
+                        self._update_stage_context = ""
+                        self._validate_tensordict(
+                            batch, f"epoch{j}:mini_batch{k}:post_update_batch"
+                        )
                         num_network_updates = num_network_updates.clone()  # type: ignore
                         losses[j, k] = loss.select(
                             "loss_critic", "loss_entropy", "loss_objective"
                         )
 
+                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
+                        self.lr_scheduler.step()
+
             # Get training losses and times
             losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
             for key, value in losses_mean.items():  # type: ignore
-                metrics_to_log.update({f"train/{key}": value.item()})
-            metrics_to_log.update(
+                metrics_to_log.update({f"train/{key}": value.item()})  # type: ignore
+            current_lr_tensor = (
+                loss["lr"]
+                if "lr" in loss.keys()
+                else torch.tensor(
+                    self.optim.param_groups[0]["lr"],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            )
+            clip_attr = getattr(self.loss_module, "clip_epsilon", None)
+            if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
+                clip_epsilon_value = clip_attr.detach()
+            else:
+                clip_epsilon_value = torch.tensor(
+                    cfg_loss_clip_epsilon,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            metrics_to_log.update(  # type: ignore
                 {
-                    "train/lr": loss["alpha"] * cfg_optim_lr,
-                    "train/clip_epsilon": (
-                        loss["alpha"] * cfg_loss_clip_epsilon
-                        if cfg_loss_anneal_clip_eps
-                        else cfg_loss_clip_epsilon
-                    ),
+                    "train/lr": current_lr_tensor,
+                    "train/clip_epsilon": clip_epsilon_value,
                 }
             )
+            if "grad_norm" in loss.keys():
+                metrics_to_log["train/grad_norm"] = loss["grad_norm"]
+            if "skipped_update" in loss.keys():
+                metrics_to_log["train/skipped_update"] = loss["skipped_update"]
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):

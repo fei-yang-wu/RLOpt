@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections import deque
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn
 import torch.optim
+from tensordict import TensorDict
 from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torch import Tensor
 from torchrl.collectors import SyncDataCollector
@@ -72,6 +75,9 @@ class BaseAlgorithm(ABC):
         self.mp_context = "fork"
 
         # Construct or attach networks based on existence in config
+        self.lr_scheduler = None
+        self.lr_scheduler_step = "update"
+
         self.feature_extractor = self._construct_feature_extractor(
             feature_extractor_net
         )
@@ -134,6 +140,11 @@ class BaseAlgorithm(ABC):
 
         # episode rewards
         self.episode_rewards = deque(maxlen=100)
+
+        # Cache parameters for fast NaN checks during training
+        self._parameter_monitor: list[tuple[str, torch.nn.Parameter]] = []
+        self._refresh_parameter_monitor()
+        self._update_stage_context: str = ""
 
         # Print model overview once components are initialized
         try:  # noqa: SIM105
@@ -342,7 +353,7 @@ class BaseAlgorithm(ABC):
                 experiment_name=exp_name,
                 log_dir=cfg.logger.log_dir,
                 wandb_kwargs={
-                    "config": dict(cfg),
+                    "config": asdict(cfg),
                     "project": cfg.logger.project_name,
                     "group": cfg.logger.group_name,
                 },
@@ -742,3 +753,125 @@ class BaseAlgorithm(ABC):
             self.feature_extractor.load_state_dict(data["feature_extractor_state_dict"])  # type: ignore[arg-type]
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
             self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
+
+    def _refresh_parameter_monitor(self) -> None:
+        """Collect parameter references for NaN checks while avoiding duplicates."""
+        modules_to_check: list[tuple[str, torch.nn.Module | None]] = [
+            ("actor_critic", self.actor_critic),
+            ("loss_module", self.loss_module),
+        ]
+        if getattr(self.config, "use_feature_extractor", False):
+            modules_to_check.append(("feature_extractor", self.feature_extractor))
+
+        seen: set[int] = set()
+        monitored: list[tuple[str, torch.nn.Parameter]] = []
+        for module_label, module in modules_to_check:
+            if module is None:
+                continue
+            for name, param in module.named_parameters(recurse=True):
+                if param is None or not torch.is_floating_point(param):
+                    continue
+                param_id = id(param)
+                if param_id in seen:
+                    continue
+                seen.add(param_id)
+                monitored.append((f"{module_label}.{name}", param))
+
+        self._parameter_monitor = monitored
+
+    def _validate_parameters(self, stage: str) -> None:
+        """Ensure all monitored parameters remain finite."""
+        if not self._parameter_monitor:
+            self._refresh_parameter_monitor()
+
+        for name, param in self._parameter_monitor:
+            if not torch.isfinite(param).all():
+                nan_count = torch.isnan(param).sum().item()
+                inf_count = torch.isinf(param).sum().item()
+                msg = (
+                    "Detected non-finite parameter values "
+                    f"during '{stage}' in {name}: nan={nan_count}, inf={inf_count}"
+                )
+                raise FloatingPointError(msg)
+
+    def _validate_gradients(self, stage: str, raise_error: bool = False) -> bool:
+        """Ensure gradients for monitored parameters are finite."""
+        if not self._parameter_monitor:
+            self._refresh_parameter_monitor()
+
+        all_finite = True
+        for name, param in self._parameter_monitor:
+            grad = param.grad
+            if grad is None or not torch.is_floating_point(grad):
+                continue
+            if not torch.isfinite(grad).all():
+                nan_count = torch.isnan(grad).sum().item()
+                inf_count = torch.isinf(grad).sum().item()
+                msg = (
+                    "Detected non-finite gradients "
+                    f"during '{stage}' in {name}: nan={nan_count}, inf={inf_count}"
+                )
+                all_finite = False
+                if raise_error:
+                    raise FloatingPointError(msg)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        return all_finite
+
+    def _validate_tensordict(
+        self,
+        td: TensorDict,
+        stage: str,
+        prefix: tuple[str, ...] = (),
+        raise_error: bool = False,
+    ) -> bool:
+        """Recursively ensure TensorDict floating tensors are finite."""
+
+        all_finite = True
+        for key, value in td.items():  # type: ignore
+            key_str = str(key)
+            next_prefix = (*prefix, key_str)
+            if isinstance(value, TensorDict):
+                all_finite &= self._validate_tensordict(
+                    value, stage, next_prefix, raise_error
+                )
+            elif torch.is_tensor(value) and torch.is_floating_point(value):  # noqa: SIM102
+                if not torch.isfinite(value).all():
+                    nan_count = torch.isnan(value).sum().item()
+                    inf_count = torch.isinf(value).sum().item()
+                    joined_key = ".".join(next_prefix)
+                    msg = (
+                        "Detected non-finite tensor values "
+                        f"during '{stage}' at key '{joined_key}': "
+                        f"nan={nan_count}, inf={inf_count}"
+                    )
+                    all_finite = False
+                    if raise_error:
+                        raise FloatingPointError(msg)
+                    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+        return all_finite
+
+    def _sanitize_loss_tensordict(self, loss_td: TensorDict, stage: str) -> TensorDict:
+        """Replace non-finite loss terms with zeros and warn the user."""
+
+        for key, value in list(loss_td.items()):
+            if isinstance(value, TensorDict):
+                self._sanitize_loss_tensordict(value, stage)
+                continue
+
+            if torch.is_tensor(value) and torch.is_floating_point(value):
+                if torch.isfinite(value).all():
+                    continue
+
+                nan_count = torch.isnan(value).sum().item()
+                inf_count = torch.isinf(value).sum().item()
+                key_repr = key if isinstance(key, str) else str(key)
+                warnings.warn(
+                    "Non-finite PPO loss detected; replacing with zeros. "
+                    f"Stage='{stage}', key='{key_repr}', nan={nan_count}, inf={inf_count}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                loss_td.set(key, torch.zeros_like(value))  # type: ignore
+
+        return loss_td
