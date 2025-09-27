@@ -305,9 +305,8 @@ def log_info(log_info_dict: dict, metrics_to_log: dict):
         else:
             metrics_to_log.update(
                 {
-                    "Episode/" + key: (
-                        value.item() if isinstance(value, Tensor) else value
-                    )
+                    "Episode/"
+                    + key: (value.item() if isinstance(value, Tensor) else value)
                 }
             )
 

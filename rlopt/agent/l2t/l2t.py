@@ -37,6 +37,7 @@ from rlopt.configs import (
     NetworkLayout,
     RLOptConfig,
 )
+from rlopt.type_aliases import OptimizerClass
 
 
 @dataclass
@@ -333,49 +334,37 @@ class L2T(BaseAlgorithm):
             student_hidden_key=l2t_cfg.student_hidden_key,
         )
 
-    def _configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizers"""
-        # Teacher optimizers
-        actor_optim = torch.optim.AdamW(
-            self.actor_critic.get_policy_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        critic_optim = torch.optim.AdamW(
-            self.actor_critic.get_value_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        optimizers = [actor_optim, critic_optim]
-        if self.config.use_feature_extractor:
-            feature_optim = torch.optim.AdamW(
-                self.feature_extractor.parameters(),
-                lr=torch.tensor(self.config.optim.lr, device=self.device),
-            )
-            optimizers.append(feature_optim)
+    def _get_additional_optimizers(
+        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    ) -> list[torch.optim.Optimizer]:
+        """Get additional optimizers for L2T-specific components."""
+        additional_optimizers = []
 
-        # Student optimizers
-        student_actor_optim = torch.optim.AdamW(
-            self.student_actor_critic.get_policy_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-        )
-        student_critic_optim = torch.optim.AdamW(
-            self.student_actor_critic.get_value_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-        )
-        optimizers.extend([student_actor_optim, student_critic_optim])
-        # student feature extractor (if not identity)
-        if hasattr(self.student_feature_extractor, "parameters"):
+        # Student optimizers for L2T
+        if hasattr(self, "student_actor_critic"):
+            student_actor_optim = optimizer_cls(
+                self.student_actor_critic.get_policy_head().parameters(),
+                **optimizer_kwargs,
+            )
+            additional_optimizers.append(student_actor_optim)
+
+            student_critic_optim = optimizer_cls(
+                self.student_actor_critic.get_value_head().parameters(),
+                **optimizer_kwargs,
+            )
+            additional_optimizers.append(student_critic_optim)
+
+        # Student feature extractor optimizer (if not identity)
+        if hasattr(self, "student_feature_extractor"):
             student_fe_params = list(self.student_feature_extractor.parameters())
             if len(student_fe_params) > 0:
-                optimizers.append(
-                    torch.optim.AdamW(
-                        student_fe_params,
-                        lr=torch.tensor(self.config.optim.lr, device=self.device),
-                    )
+                student_feature_optim = optimizer_cls(
+                    student_fe_params,
+                    **optimizer_kwargs,
                 )
+                additional_optimizers.append(student_feature_optim)
 
-        return group_optimizers(*optimizers)
+        return additional_optimizers
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
@@ -427,6 +416,30 @@ class L2T(BaseAlgorithm):
         self, batch: TensorDict, num_network_updates: int
     ) -> tuple[TensorDict, int]:
         """Update function"""
+        stage_prefix = self._update_stage_context or "update"
+
+        # Validate input tensordict
+        if not self._validate_tensordict(
+            batch, f"{stage_prefix}:pre_update_batch", raise_error=False
+        ):
+            self.log.debug(
+                "Discarding batch due to non-finite values in input tensordict"
+            )
+            # Return dummy loss with zeros
+            dummy_loss = TensorDict(
+                {
+                    "loss_critic": torch.tensor(0.0, device=self.device),
+                    "loss_objective": torch.tensor(0.0, device=self.device),
+                    "loss_entropy": torch.tensor(0.0, device=self.device),
+                    "loss_imitation": torch.tensor(0.0, device=self.device),
+                },
+                batch_size=[],
+            )
+            alpha = torch.ones((), device=self.device)
+            if self.config.optim.anneal_lr:
+                alpha = 1 - (num_network_updates / self.total_network_updates)
+            return dummy_loss.set("alpha", alpha), num_network_updates
+
         self.optim.zero_grad(set_to_none=True)
 
         # Linearly decrease the learning rate and clip epsilon
@@ -445,12 +458,26 @@ class L2T(BaseAlgorithm):
 
         # Forward pass PPO loss
         loss = self.loss_module(batch)
+        loss = self._sanitize_loss_tensordict(loss, f"{stage_prefix}:raw_loss")
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         imitation_loss = loss.get("loss_imitation", torch.zeros_like(actor_loss))
         total_loss = critic_loss + actor_loss + imitation_loss
+
         # Backward pass
         total_loss.backward()
+
+        # Validate gradients
+        grads_finite = self._validate_gradients(
+            f"{stage_prefix}:post_backward", raise_error=False
+        )
+
+        if not grads_finite:
+            self.log.debug(
+                "Skipping optimizer step due to non-finite gradients; batch discarded"
+            )
+            self.optim.zero_grad(set_to_none=True)
+            return loss.detach().set("alpha", alpha), num_network_updates
 
         # Update the networks
         self.optim.step()
@@ -521,6 +548,9 @@ class L2T(BaseAlgorithm):
 
             with timeit("collecting"):
                 data = next(collector_iter)
+                self._validate_tensordict(
+                    data, f"collector_iter:step{_i}", raise_error=False
+                )
 
             metrics_to_log = {}
             frames_in_batch = data.numel()
@@ -544,11 +574,15 @@ class L2T(BaseAlgorithm):
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
                     # Compute GAE
+                    self._validate_tensordict(data, f"epoch{j}:pre_gae_input")
+                    self._validate_parameters(f"epoch{j}:pre_gae")
                     with torch.no_grad(), timeit("adv"):
                         torch.compiler.cudagraph_mark_step_begin()
                         data = self.adv_module(data)
                         if self.config.compile.compile_mode:
                             data = data.clone()
+                    self._validate_parameters(f"epoch{j}:post_gae")
+                    self._validate_tensordict(data, f"epoch{j}:post_gae")
 
                     with timeit("rb - extend"):
                         # Update the data buffer
@@ -556,12 +590,28 @@ class L2T(BaseAlgorithm):
                         self.data_buffer.extend(data_reshape)
 
                     for k, batch in enumerate(self.data_buffer):
+                        if not self._validate_tensordict(
+                            batch,
+                            f"epoch{j}:mini_batch{k}:pre_update_batch",
+                            raise_error=False,
+                        ):
+                            self.log.debug(
+                                "Discarding mini-batch %d in epoch %d due to non-finite values",
+                                k,
+                                j,
+                            )
+                            continue
+                        self._update_stage_context = f"epoch{j}:mini_batch{k}"
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
                             loss, num_network_updates = self.update(  # type: ignore
                                 batch, num_network_updates=num_network_updates
                             )
                             loss = loss.clone()
+                        self._update_stage_context = ""
+                        self._validate_tensordict(
+                            batch, f"epoch{j}:mini_batch{k}:post_update_batch"
+                        )
                         num_network_updates = num_network_updates.clone()  # type: ignore
                         losses[j, k] = loss.select(
                             "loss_critic", "loss_entropy", "loss_objective"

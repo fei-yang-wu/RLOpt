@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import tqdm
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
+from tensordict.nn import InteractionType, TensorDictModule
 from torch import Tensor, nn
 from torchrl._utils import timeit
 from torchrl.data import (
@@ -17,20 +17,21 @@ from torchrl.data import (
     ReplayBuffer,
     TensorDictReplayBuffer,
 )
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
-from torchrl.envs.utils import ExplorationType, set_exploration_type
+from torchrl.data.replay_buffers.samplers import RandomSampler
+from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
     ProbabilisticActor,
     TanhNormal,
 )
-from torchrl.objectives import SoftUpdate, group_optimizers
+from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import RLOptConfig
+from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import log_info
 
 
@@ -38,22 +39,22 @@ from rlopt.utils import log_info
 class SACConfig:
     """SAC-specific configuration."""
 
-    alpha_init: float = 1.0
+    alpha_init: float = 0.001
     """Initial alpha value."""
 
-    min_alpha: float | None = None
+    min_alpha: float | None = 0.001
     """Minimum alpha value."""
 
-    max_alpha: float | None = None
+    max_alpha: float | None = 0.001
     """Maximum alpha value."""
 
     num_qvalue_nets: int = 2
     """Number of Q-value networks."""
 
-    fixed_alpha: bool = False
+    fixed_alpha: bool = True
     """Whether to fix alpha."""
 
-    target_entropy: float | str = "auto"
+    target_entropy: float | str = 0.001
     """Target entropy."""
 
     delay_actor: bool = False
@@ -91,7 +92,7 @@ class SACRLOptConfig(RLOptConfig):
     sac: SACConfig = field(default_factory=SACConfig)
     """SAC configuration."""
 
-    def _post_init(self):
+    def __post_init__(self):
         self.use_value_function = False
 
 
@@ -217,7 +218,7 @@ class SAC(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.RANDOM,
+            default_interaction_type=InteractionType.RANDOM,
         )
 
     def _construct_value_function(
@@ -243,7 +244,7 @@ class SAC(BaseAlgorithm):
         return ActorValueOperator(
             common_operator=self.feature_extractor,
             policy_operator=self.policy,
-            value_operator=self.q_function,  # dummy / unused in SAC
+            value_operator=self.q_function,
         )
 
     def _construct_loss_module(self) -> nn.Module:
@@ -285,45 +286,34 @@ class SAC(BaseAlgorithm):
 
     # _get_activation_class and _initialize_weights now provided by BaseAlgorithm
 
-    def _configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizers"""
-        actor_optim = torch.optim.AdamW(
-            self.actor_critic.get_policy_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        critic_optim = torch.optim.AdamW(
-            self.actor_critic.get_value_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        alpha_optim = torch.optim.AdamW(
-            [self.loss_module.log_alpha],
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-        )
-        if self.config.use_feature_extractor:
-            feature_optim = torch.optim.AdamW(
-                self.feature_extractor.parameters(),
-                lr=torch.tensor(self.config.optim.lr, device=self.device),
-                # eps=1e-5,
-            )
-            return group_optimizers(
-                actor_optim, critic_optim, feature_optim, alpha_optim
-            )
+    def _get_additional_optimizers(
+        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    ) -> list[torch.optim.Optimizer]:
+        """Get additional optimizers for SAC-specific components."""
+        additional_optimizers = []
 
-        return group_optimizers(actor_optim, critic_optim, alpha_optim)
+        # Alpha optimizer for SAC
+        if hasattr(self, "loss_module") and hasattr(self.loss_module, "log_alpha"):
+            alpha_optim = optimizer_cls(
+                [self.loss_module.log_alpha],
+                **optimizer_kwargs,
+            )
+            additional_optimizers.append(alpha_optim)
+
+        return additional_optimizers
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer"""
         # Create data buffer
         cfg = self.config
-        sampler = SamplerWithoutReplacement()
-        scratch_dir = cfg.collector.scratch_dir
+        sampler = RandomSampler()
+        # Prefer replay buffer-specific settings when available
+        scratch_dir = cfg.replay_buffer.scratch_dir or cfg.collector.scratch_dir
         device = cfg.device
-        buffer_size = cfg.collector.frames_per_batch
+        buffer_size = cfg.replay_buffer.size
         batch_size = cfg.loss.mini_batch_size
         shared = cfg.collector.shared
-        prefetch = cfg.collector.prefetch
+        prefetch = cfg.replay_buffer.prefetch
         storage_cls = (
             functools.partial(LazyTensorStorage, device=device)
             if not scratch_dir
@@ -387,9 +377,9 @@ class SAC(BaseAlgorithm):
         loss_td = self.loss_module(sampled_tensordict)
         loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_loss")
 
-        actor_loss = loss_td["loss_actor"]
-        q_loss = loss_td["loss_qvalue"]
-        alpha_loss = loss_td["loss_alpha"]
+        actor_loss = cast(Tensor, loss_td["loss_actor"])  # type: ignore[arg-type]
+        q_loss = cast(Tensor, loss_td["loss_qvalue"])  # type: ignore[arg-type]
+        alpha_loss = cast(Tensor, loss_td["loss_alpha"])  # type: ignore[arg-type]
 
         total_loss = (actor_loss + q_loss + alpha_loss).sum()
 
@@ -406,28 +396,31 @@ class SAC(BaseAlgorithm):
                 "Skipping optimizer step due to non-finite gradients; batch discarded"
             )
             self.optim.zero_grad(set_to_none=True)
-            return loss_td.detach()
+            return loss_td.detach_()
 
         # Update networks
         self.optim.step()
-        self.optim.zero_grad(set_to_none=True)
 
         # Update qnet_target params
         self.target_net_updater.step()
-        return loss_td.detach()
+        return loss_td.detach_()
 
     def train(self) -> None:  # type: ignore[override]
         assert isinstance(self.config, SACRLOptConfig)
         cfg = self.config
         frames_per_batch = cfg.collector.frames_per_batch
+        num_envs = cfg.env.num_envs
         total_frames = cfg.collector.total_frames
         utd_ratio = float(cfg.sac.utd_ratio)
         init_random_frames = int(self.config.collector.init_random_frames)
-        num_updates = int(frames_per_batch * utd_ratio)
+        # Compute updates per collector iteration based on UTD ratio and batch sizes
+        num_updates = int(
+            (float(frames_per_batch) * utd_ratio / cfg.loss.mini_batch_size)
+            * cfg.loss.epochs
+        )
         collected_frames = 0
         collector_iter = iter(self.collector)
         pbar = tqdm.tqdm(total=total_frames)
-        # Prioritized replay buffer is currently not supported/dormant
 
         while collected_frames < total_frames:
             with timeit("collect"):
@@ -446,11 +439,13 @@ class SAC(BaseAlgorithm):
                 episode_length = data["next", "step_count"][data["next", "done"]]
                 self.episode_lengths.extend(episode_length.cpu().tolist())
                 self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
+
                 metrics_to_log.update(
                     {
                         "episode/length": np.mean(self.episode_lengths),
                         "episode/return": np.mean(self.episode_rewards),
-                        "train/reward": episode_rewards.mean().item(),
+                        "train/reward": episode_rewards_mean,
                     }
                 )
 
@@ -505,7 +500,11 @@ class SAC(BaseAlgorithm):
             if losses is not None:
                 losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
                 for key, value in losses_mean.items():  # type: ignore
-                    metrics_to_log.update({f"train/{key}": value.item()})
+                    try:
+                        scalar = float(value)  # type: ignore[arg-type]
+                    except Exception:
+                        scalar = value.detach().cpu().float().item()  # type: ignore[attr-defined]
+                    metrics_to_log.update({f"train/{key}": scalar})
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
@@ -524,7 +523,7 @@ class SAC(BaseAlgorithm):
             # Save model periodically
             if (
                 self.config.save_interval > 0
-                and collected_frames % self.config.save_interval == 0
+                and collected_frames % (self.config.save_interval * num_envs) == 0
             ):
                 self.save_model(
                     path=self.log_dir / self.config.logger.save_path,
@@ -538,7 +537,7 @@ class SAC(BaseAlgorithm):
         obs = torch.as_tensor([obs], device=self.device)
         policy_op = self.actor_critic.get_policy_operator()
         policy_op.eval()
-        with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
+        with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
             td = TensorDict(
                 dict.fromkeys(self.total_input_keys, obs),
                 batch_size=[1],

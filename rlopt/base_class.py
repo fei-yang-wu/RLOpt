@@ -1,4 +1,3 @@
-from tensordict.base import TensorDictBase
 from __future__ import annotations
 
 import logging
@@ -14,14 +13,18 @@ import torch
 import torch.nn
 import torch.optim
 from tensordict import TensorDict
+from tensordict.base import TensorDictBase
 from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
+from tensordict.nn.distributions import NormalParamExtractor
 from torch import Tensor
+from torch.optim import lr_scheduler
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
     ReplayBuffer,
 )
 from torchrl.envs import TransformedEnv
 from torchrl.modules import MLP, ValueOperator
+from torchrl.objectives import group_optimizers
 from torchrl.record.loggers.common import Logger
 
 from rlopt.configs import (
@@ -31,7 +34,10 @@ from rlopt.configs import (
     RLOptConfig,
 )
 from rlopt.logging_utils import ROOT_LOGGER_NAME, LoggingManager, MetricReporter
+from rlopt.type_aliases import OptimizerClass, SchedulerClass
 from rlopt.utils import log_agent_overview
+
+torch.set_float32_matmul_precision("high")
 
 
 class BaseAlgorithm(ABC):
@@ -346,10 +352,154 @@ class BaseAlgorithm(ABC):
             ...     self.compute_returns = self._compute_returns
         """
 
-    @abstractmethod
     def _configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizers for different components."""
-        # Basic example: one optimizer for each component
+        """Configure optimizers for different components.
+
+        This method provides a general implementation that can be overridden by
+        specific algorithms if they need custom optimizer configuration.
+        """
+        cfg = self.config.optim
+
+        optimizer_map: dict[str, OptimizerClass] = {
+            "adam": torch.optim.Adam,
+            "adamw": torch.optim.AdamW,
+            "adamax": torch.optim.Adamax,
+            "sgd": torch.optim.SGD,
+            "rmsprop": torch.optim.RMSprop,
+        }
+
+        optimizer_name = cfg.optimizer.lower()
+        if optimizer_name not in optimizer_map:
+            available = ", ".join(sorted(optimizer_map))
+            msg = f"Unknown optimizer '{cfg.optimizer}'. Choose one of: {available}."
+            raise ValueError(msg)
+
+        optimizer_cls = optimizer_map[optimizer_name]
+
+        base_kwargs = {
+            "lr": cfg.lr,
+            "weight_decay": cfg.weight_decay,
+        }
+        optimizer_kwargs = {**base_kwargs, **cfg.optimizer_kwargs}
+
+        # Create optimizers for different components
+        optimizers: list[torch.optim.Optimizer] = []
+
+        # Actor/policy optimizer
+        if hasattr(self, "actor_critic"):
+            policy_module = None
+            if hasattr(self.actor_critic, "get_policy_head"):
+                try:
+                    policy_module = self.actor_critic.get_policy_head()
+                except Exception:
+                    policy_module = None
+            if policy_module is None and hasattr(
+                self.actor_critic, "get_policy_operator"
+            ):
+                try:
+                    policy_module = self.actor_critic.get_policy_operator()
+                except Exception:
+                    policy_module = None
+            if policy_module is None and getattr(self, "policy", None) is not None:
+                policy_module = self.policy
+            if policy_module is not None:
+                actor_optim = optimizer_cls(
+                    policy_module.parameters(), **optimizer_kwargs
+                )
+                optimizers.append(actor_optim)
+
+        # Critic/value optimizer
+        if hasattr(self, "actor_critic"):
+            value_module = None
+            if hasattr(self.actor_critic, "get_value_head"):
+                try:
+                    value_module = self.actor_critic.get_value_head()
+                except Exception:
+                    value_module = None
+            if value_module is None and hasattr(
+                self.actor_critic, "get_value_operator"
+            ):
+                try:
+                    value_module = self.actor_critic.get_value_operator()
+                except Exception:
+                    value_module = None
+            if value_module is None:
+                # fall back to explicit networks when available
+                value_module = getattr(self, "value_function", None) or getattr(
+                    self, "q_function", None
+                )
+            if value_module is not None:
+                critic_optim = optimizer_cls(
+                    value_module.parameters(), **optimizer_kwargs
+                )
+                optimizers.append(critic_optim)
+
+        # Feature extractor optimizer
+        if self.config.use_feature_extractor and hasattr(self, "feature_extractor"):
+            feature_optim = optimizer_cls(
+                self.feature_extractor.parameters(),
+                **optimizer_kwargs,
+            )
+            optimizers.append(feature_optim)
+
+        # Additional optimizers for specific algorithms
+        additional_optimizers = self._get_additional_optimizers(
+            optimizer_cls, optimizer_kwargs
+        )
+        optimizers.extend(additional_optimizers)
+
+        if not optimizers:
+            raise ValueError(
+                "No optimizers could be created. Check that the algorithm has the required components."
+            )
+
+        optim = group_optimizers(*optimizers)
+
+        # Configure learning rate scheduler
+        scheduler_name = (cfg.scheduler or "").lower() or None
+        scheduler_map: dict[str, SchedulerClass] = {
+            "steplr": lr_scheduler.StepLR,
+            "multiplicativelr": lr_scheduler.MultiplicativeLR,
+            "exponentiallr": lr_scheduler.ExponentialLR,
+            "cosineannealinglr": lr_scheduler.CosineAnnealingLR,
+            "cosineannealingwarmrestarts": lr_scheduler.CosineAnnealingWarmRestarts,
+            "linearlr": lr_scheduler.LinearLR,
+            "polynomiallr": lr_scheduler.PolynomialLR,
+        }
+
+        self.lr_scheduler = None
+        if scheduler_name is not None:
+            if scheduler_name not in scheduler_map:
+                available = ", ".join(sorted(scheduler_map))
+                msg = (
+                    f"Unknown scheduler '{cfg.scheduler}'. Choose one of: {available}."
+                )
+                raise ValueError(msg)
+
+            scheduler_cls = scheduler_map[scheduler_name]
+            scheduler_kwargs = dict(cfg.scheduler_kwargs)
+            self.lr_scheduler = scheduler_cls(optim, **scheduler_kwargs)
+
+        self.lr_scheduler_step = getattr(cfg, "scheduler_step", "update").lower()
+
+        return optim
+
+    def _get_additional_optimizers(
+        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    ) -> list[torch.optim.Optimizer]:
+        """Get additional optimizers for algorithm-specific components.
+
+        Override this method in subclasses to add optimizers for components
+        like alpha parameters in SAC, reward estimators in IPMD, etc.
+
+        Args:
+            optimizer_cls: The optimizer class to use
+            optimizer_kwargs: The optimizer keyword arguments
+
+        Returns:
+            List of additional optimizers
+        """
+        return []
 
     def _configure_logger(self, logger_override: Logger | None = None) -> None:
         """Configure Python logging and the optional TorchRL metrics backend."""
@@ -587,7 +737,7 @@ class BaseAlgorithm(ABC):
         net = torch.nn.Sequential(
             net,
             AddStateIndependentNormalScale(
-                int(self.policy_output_shape), scale_lb=1e-8
+                int(self.policy_output_shape), scale_lb=1e-4
             ).to(self.device),
         )
         return TensorDictModule(module=net, in_keys=in_keys, out_keys=list(out_keys))

@@ -73,7 +73,7 @@ class PPORLOptConfig(RLOptConfig):
     ppo: PPOConfig = field(default_factory=PPOConfig)
     """PPO configuration."""
 
-    def _post_init(self):
+    def __post_init__(self):
         self.use_value_function = True
 
 
@@ -204,81 +204,6 @@ class PPO(BaseAlgorithm):
             normalize_advantage=ppo_config.normalize_advantage,
             clip_value=ppo_config.clip_value,
         )
-
-    def _configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizers"""
-        cfg = self.config.optim
-
-        optimizer_map: dict[str, OptimizerClass] = {
-            "adam": torch.optim.Adam,
-            "adamw": torch.optim.AdamW,
-            "adamax": torch.optim.Adamax,
-            "sgd": torch.optim.SGD,
-            "rmsprop": torch.optim.RMSprop,
-        }
-
-        optimizer_name = cfg.optimizer.lower()
-        if optimizer_name not in optimizer_map:
-            available = ", ".join(sorted(optimizer_map))
-            msg = f"Unknown optimizer '{cfg.optimizer}'. Choose one of: {available}."
-            raise ValueError(msg)
-
-        optimizer_cls = optimizer_map[optimizer_name]
-
-        base_kwargs = {
-            "lr": cfg.lr,
-            "weight_decay": cfg.weight_decay,
-        }
-        optimizer_kwargs = {**base_kwargs, **cfg.optimizer_kwargs}
-
-        actor_optim = optimizer_cls(
-            self.actor_critic.get_policy_head().parameters(),
-            **optimizer_kwargs,
-        )
-        critic_optim = optimizer_cls(
-            self.actor_critic.get_value_head().parameters(),
-            **optimizer_kwargs,
-        )
-
-        optimizers: list[torch.optim.Optimizer] = [actor_optim, critic_optim]
-        if self.config.use_feature_extractor:
-            feature_optim = optimizer_cls(
-                self.feature_extractor.parameters(),
-                **optimizer_kwargs,
-            )
-            optimizers.append(feature_optim)
-
-        optim = group_optimizers(*optimizers)
-
-        scheduler_name = (cfg.scheduler or "").lower() or None
-        scheduler_map: dict[str, SchedulerClass] = {
-            "steplr": lr_scheduler.StepLR,
-            "multiplicativelr": lr_scheduler.MultiplicativeLR,
-            "exponentiallr": lr_scheduler.ExponentialLR,
-            "cosineannealinglr": lr_scheduler.CosineAnnealingLR,
-            "cosineannealingwarmrestarts": lr_scheduler.CosineAnnealingWarmRestarts,
-            "linearlr": lr_scheduler.LinearLR,
-            "polynomiallr": lr_scheduler.PolynomialLR,
-        }
-
-        self.lr_scheduler = None
-        if scheduler_name is not None:
-            if scheduler_name not in scheduler_map:
-                available = ", ".join(sorted(scheduler_map))
-                msg = (
-                    f"Unknown scheduler '{cfg.scheduler}'. Choose one of: {available}."
-                )
-                raise ValueError(msg)
-
-            scheduler_cls = scheduler_map[scheduler_name]
-            scheduler_kwargs = dict(cfg.scheduler_kwargs)
-            self.lr_scheduler = scheduler_cls(optim, **scheduler_kwargs)
-
-        self.lr_scheduler_step = getattr(cfg, "scheduler_step", "update").lower()
-
-        return optim
-
-    # _get_activation_class and _initialize_weights now provided by BaseAlgorithm
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
@@ -695,22 +620,6 @@ class PPORecurrent(PPO):
             deactivate_vmap=True,  # to be compatible with lstm
             shifted=True,  # to be compatible with lstm
         )
-
-    # def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
-    #     """Predict action given observation with LSTM state management"""
-    #     obs = torch.as_tensor([obs], device=self.device)
-    #     self.policy.eval()
-
-    #     with torch.inference_mode():
-    #         td = TensorDict(
-    #             dict.fromkeys(list(self.config.policy_in_keys), obs),
-    #             batch_size=[1],
-    #             device=self.policy.device,  # type: ignore
-    #         )
-
-    #         # The LSTMModule automatically handles recurrent states through TensorDict
-    #         # No need for manual state management - TorchRL handles this
-    #         return self.policy(td).get("action")
 
     def reset_recurrent_states(self):
         """Reset LSTM recurrent states - called at episode boundaries"""

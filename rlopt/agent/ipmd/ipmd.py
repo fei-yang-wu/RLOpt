@@ -33,6 +33,7 @@ from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import RLOptConfig
+from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import log_info
 
 
@@ -125,7 +126,8 @@ class IPMDRLOptConfig(RLOptConfig):
     ipmd: IPMDConfig = field(default_factory=IPMDConfig)
     """IPMD configuration."""
 
-    def _post_init(self):
+    def __post_init__(self):
+        super().__post_init__()
         self.use_value_function = False
 
 
@@ -311,37 +313,29 @@ class IPMD(BaseAlgorithm):
 
     # _get_activation_class and _initialize_weights now provided by BaseAlgorithm
 
-    def _configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizers"""
-        actor_optim = torch.optim.AdamW(
-            self.actor_critic.get_policy_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        critic_optim = torch.optim.AdamW(
-            self.actor_critic.get_value_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        alpha_optim = torch.optim.AdamW(
-            [self.loss_module.log_alpha],
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-        )
-        reward_optim = torch.optim.AdamW(
-            self.reward_estimator.parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-        )
-        if self.config.use_feature_extractor:
-            feature_optim = torch.optim.AdamW(
-                self.feature_extractor.parameters(),
-                lr=torch.tensor(self.config.optim.lr, device=self.device),
-                # eps=1e-5,
-            )
-            return group_optimizers(
-                actor_optim, critic_optim, feature_optim, alpha_optim, reward_optim
-            )
+    def _get_additional_optimizers(
+        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    ) -> list[torch.optim.Optimizer]:
+        """Get additional optimizers for IPMD-specific components."""
+        additional_optimizers = []
 
-        return group_optimizers(actor_optim, critic_optim, alpha_optim, reward_optim)
+        # Alpha optimizer for SAC component
+        if hasattr(self, "loss_module") and hasattr(self.loss_module, "log_alpha"):
+            alpha_optim = optimizer_cls(
+                [self.loss_module.log_alpha],
+                **optimizer_kwargs,
+            )
+            additional_optimizers.append(alpha_optim)
+
+        # Reward estimator optimizer for IPMD
+        if hasattr(self, "reward_estimator"):
+            reward_optim = optimizer_cls(
+                self.reward_estimator.parameters(),
+                **optimizer_kwargs,
+            )
+            additional_optimizers.append(reward_optim)
+
+        return additional_optimizers
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer"""

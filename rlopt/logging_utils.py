@@ -348,6 +348,10 @@ class LoggingManager:
 
         root_logger = logging.getLogger(ROOT_LOGGER_NAME)
         root_logger.setLevel(level)
+        # Prevent logs from bubbling up to the Python root logger, which can
+        # cause duplicate console outputs when other libraries call basicConfig
+        # or attach their own root handlers.
+        root_logger.propagate = False
         _configure_console_handler(root_logger, config, level)
         _configure_file_handler(root_logger, config, level, self.run_dir)
         if not root_logger.handlers:

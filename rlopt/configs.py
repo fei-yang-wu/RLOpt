@@ -25,7 +25,7 @@ class CollectorConfig:
     num_collectors: int = 1
     """Number of data collectors."""
 
-    frames_per_batch: int = 4096 * 12
+    frames_per_batch: int = 12
     """Number of frames per batch."""
 
     total_frames: int = 100_000_000
@@ -202,15 +202,18 @@ class CompileConfig:
 class PolicyConfig:
     """Policy network configuration for RLOpt  ."""
 
-    num_cells: ClassVar[list[int]] = [512, 256, 128]
+    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
     """Number of cells in each layer."""
+
+    default_policy_scale: float = 0.1
+    """Default policy scale."""
 
 
 @dataclass
 class ValueNetConfig:
     """Value network configuration for RLOpt  ."""
 
-    num_cells: ClassVar[list[int]] = [512, 256, 128]
+    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
     """Number of cells in each layer."""
 
 
@@ -218,7 +221,7 @@ class ValueNetConfig:
 class ActionValueNetConfig:
     """Action-value (Q) network configuration for RLOpt."""
 
-    num_cells: ClassVar[list[int]] = [512, 256, 128]
+    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
     """Number of cells in each layer."""
 
 
@@ -226,7 +229,7 @@ class ActionValueNetConfig:
 class FeatureExtractorConfig:
     """Feature extractor configuration for RLOpt  ."""
 
-    num_cells: ClassVar[list[int]] = [512, 256, 128]
+    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
     """Number of cells in each layer."""
 
     output_dim: int = 128
@@ -242,7 +245,7 @@ class FeatureExtractorConfig:
 class MLPBlockConfig:
     """Config for an MLP block (torso or head)."""
 
-    num_cells: list[int]
+    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
     activation: Literal["relu", "elu", "tanh", "gelu"] = "elu"
     init: Literal["orthogonal", "xavier_uniform", "kaiming_uniform"] = "orthogonal"
     layer_norm: bool = False
@@ -253,7 +256,7 @@ class MLPBlockConfig:
 class LSTMBlockConfig:
     """Config for an LSTM block (torso)."""
 
-    hidden_size: int
+    hidden_size: int = 128
     num_layers: int = 1
     bidirectional: bool = False
     dropout: float = 0.0
