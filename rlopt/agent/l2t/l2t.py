@@ -37,7 +37,6 @@ from rlopt.configs import (
     NetworkLayout,
     RLOptConfig,
 )
-from rlopt.modules import TanhNormalStable
 
 
 @dataclass
@@ -961,7 +960,7 @@ class ClipL2TLoss(ClipPPOLoss):
 
             if self.imitation_type == "bc":
                 # Behavior cloning with TanhNormal log-likelihood
-                dist = TanhNormalStable(student_loc, student_scale, event_dims=1)
+                dist = TanhNormal(student_loc, student_scale, event_dims=1)
                 nll = -dist.log_prob(teacher_action)
                 imitation_loss = nll.mean()
             else:

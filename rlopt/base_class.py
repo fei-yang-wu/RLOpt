@@ -1,12 +1,13 @@
+from tensordict.base import TensorDictBase
 from __future__ import annotations
 
 import logging
 import time
-import warnings
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import asdict
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -21,7 +22,6 @@ from torchrl.data import (
 )
 from torchrl.envs import TransformedEnv
 from torchrl.modules import MLP, ValueOperator
-from torchrl.record.loggers import generate_exp_name, get_logger
 from torchrl.record.loggers.common import Logger
 
 from rlopt.configs import (
@@ -30,9 +30,8 @@ from rlopt.configs import (
     NetworkLayout,
     RLOptConfig,
 )
+from rlopt.logging_utils import ROOT_LOGGER_NAME, LoggingManager, MetricReporter
 from rlopt.utils import log_agent_overview
-
-logger = logging.getLogger(__name__)
 
 
 class BaseAlgorithm(ABC):
@@ -67,8 +66,25 @@ class BaseAlgorithm(ABC):
         super().__init__()
         self.env = env
         self.config = config
-        self.logger = logger
         self.kwargs = kwargs
+
+        # Keep Python logger and TorchRL logger state on the instance for reuse
+        self.log: logging.Logger = logging.getLogger(
+            f"{ROOT_LOGGER_NAME}.{self.__class__.__name__}"
+        )
+        self.logger: Logger | None = None
+        self.metrics: MetricReporter | None = None
+        self._logging_manager: LoggingManager | None = None
+        self.logger_video = False
+
+        self._configure_logger(logger_override=logger)
+        self.log_dir: Path = self._logging_manager.run_dir
+        self.log.debug(
+            "Initialized %s (metrics_backend=%s, level=%s)",
+            self.__class__.__name__,
+            self.config.logger.backend or "none",
+            logging.getLevelName(self.log.level),
+        )
 
         # Seed for reproducibility
         self.manual_seed(config.seed)
@@ -128,12 +144,6 @@ class BaseAlgorithm(ABC):
 
         # buffer
         self.data_buffer = self._construct_data_buffer()
-
-        # logger_video attribute must be defined before use
-        self.logger_video = False
-
-        # logger
-        self._configure_logger()
 
         # episode length
         self.episode_lengths = deque(maxlen=100)
@@ -341,27 +351,43 @@ class BaseAlgorithm(ABC):
         """Configure optimizers for different components."""
         # Basic example: one optimizer for each component
 
-    def _configure_logger(self) -> None:
-        # Create logger
-        self.logger = None
-        cfg = self.config
-        if cfg.logger.backend:
-            exp_name = generate_exp_name("PPO", f"{cfg.logger.exp_name}")
-            self.logger = get_logger(
-                cfg.logger.backend,
-                logger_name="ppo",
-                experiment_name=exp_name,
-                log_dir=cfg.logger.log_dir,
-                wandb_kwargs={
-                    "config": asdict(cfg),
-                    "project": cfg.logger.project_name,
-                    "group": cfg.logger.group_name,
-                },
-            )
-            self.logger_video = cfg.logger.video
+    def _configure_logger(self, logger_override: Logger | None = None) -> None:
+        """Configure Python logging and the optional TorchRL metrics backend."""
 
-        else:
-            self.logger_video = False
+        self._logging_manager = LoggingManager(
+            config=self.config,
+            component=self.__class__.__name__,
+            metrics_logger=logger_override,
+        )
+        self.log = self._logging_manager.logger
+        self.logger = self._logging_manager.metrics_logger
+        self.metrics = self._logging_manager.metric_reporter
+        self.logger_video = self._logging_manager.video_enabled
+
+    def log_metrics(
+        self,
+        metrics: Mapping[str, Any],
+        *,
+        step: Any,
+        log_python: bool | None = None,
+        python_level: int = logging.INFO,
+    ) -> None:
+        """Log scalar metrics via the configured metric backend and optional Python logs."""
+
+        if self.metrics is None:
+            return
+
+        should_log_python = (
+            bool(self.config.logger.log_to_console)
+            if log_python is None
+            else log_python
+        )
+        self.metrics.log_scalars(
+            metrics,
+            step=step,
+            log_python=should_log_python,
+            python_level=python_level,
+        )
 
     @abstractmethod
     def train(self) -> None:
@@ -397,7 +423,7 @@ class BaseAlgorithm(ABC):
         log_agent_overview(
             self,
             title=title,
-            logger=logger,
+            logger=self.log,
             extra=extra,
             max_depth=1,
             indent=0,
@@ -686,33 +712,24 @@ class BaseAlgorithm(ABC):
         self, path: str | Path | None = None, step: int | None = None
     ) -> None:
         """Save the model and related parameters to a file."""
-        # Handle case where no logger is provided (e.g., in testing)
-        if path is None and self.logger is None:
-            # Default to current directory if no logger and no path provided
-            prefix = "."
-        elif path is None:
-            prefix = f"{self.config.logger.log_dir}"
-        else:
-            prefix = path
+        default_dir = self.log_dir
+        target_base = Path(path).expanduser() if path is not None else default_dir
+        base_exists = target_base.exists()
+        base_is_file = base_exists and target_base.is_file()
+        has_suffix = bool(target_base.suffix)
 
-        # Include step in filename if provided
         if step is not None:
-            if Path(prefix).is_file():
-                # If prefix is a file, add step to the filename
-                path = str(prefix).rsplit(".", 1)[0] + f"_step_{step}.pt"
+            if base_is_file or (has_suffix and not target_base.is_dir()):
+                suffix = target_base.suffix
+                stemmed = target_base.with_suffix("")
+                target_path = stemmed.with_name(stemmed.name + f"_step_{step}{suffix}")
             else:
-                # If prefix is a directory, create filename with step
-                path = f"{prefix}/model_step_{step}.pt"
-        elif Path(prefix).is_file():
-            # If prefix is a file, use it directly
-            path = prefix
+                target_path = target_base / f"model_step_{step}.pt"
+        elif base_is_file or (has_suffix and not target_base.is_dir()):
+            target_path = target_base
         else:
-            # If prefix is a directory, create default filename
-            path = f"{prefix}/model.pt"
-
-        # Ensure directory exists only if we're creating a new path
-        if path != prefix or Path(prefix).is_dir():
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            target_path = target_base / "model.pt"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
 
         data_to_save: dict[str, torch.Tensor | dict] = {
             "policy_state_dict": (
@@ -736,7 +753,7 @@ class BaseAlgorithm(ABC):
         ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
 
-        torch.save(data_to_save, path)
+        torch.save(data_to_save, target_path)
 
     def load_model(self, path: str) -> None:
         """Load the model and related parameters from a file."""
@@ -814,12 +831,12 @@ class BaseAlgorithm(ABC):
                 all_finite = False
                 if raise_error:
                     raise FloatingPointError(msg)
-                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                self.log.debug("%s", msg)
         return all_finite
 
     def _validate_tensordict(
         self,
-        td: TensorDict,
+        td: TensorDictBase,
         stage: str,
         prefix: tuple[str, ...] = (),
         raise_error: bool = False,
@@ -834,7 +851,7 @@ class BaseAlgorithm(ABC):
                 all_finite &= self._validate_tensordict(
                     value, stage, next_prefix, raise_error
                 )
-            elif torch.is_tensor(value) and torch.is_floating_point(value):  # noqa: SIM102
+            elif torch.is_tensor(value) and torch.is_floating_point(value):
                 if not torch.isfinite(value).all():
                     nan_count = torch.isnan(value).sum().item()
                     inf_count = torch.isinf(value).sum().item()
@@ -847,7 +864,7 @@ class BaseAlgorithm(ABC):
                     all_finite = False
                     if raise_error:
                         raise FloatingPointError(msg)
-                    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                    self.log.debug("%s", msg)
 
         return all_finite
 
@@ -866,11 +883,12 @@ class BaseAlgorithm(ABC):
                 nan_count = torch.isnan(value).sum().item()
                 inf_count = torch.isinf(value).sum().item()
                 key_repr = key if isinstance(key, str) else str(key)
-                warnings.warn(
-                    "Non-finite PPO loss detected; replacing with zeros. "
-                    f"Stage='{stage}', key='{key_repr}', nan={nan_count}, inf={inf_count}",
-                    RuntimeWarning,
-                    stacklevel=2,
+                self.log.debug(
+                    "Non-finite loss detected; replacing with zeros | stage=%s key=%s nan=%d inf=%d",
+                    stage,
+                    key_repr,
+                    nan_count,
+                    inf_count,
                 )
                 loss_td.set(key, torch.zeros_like(value))  # type: ignore
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 import functools
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterator, Optional, cast
+from typing import Any, cast
+from collections.abc import Iterator
 
 import numpy as np
 import torch
@@ -104,6 +104,19 @@ class IPMDConfig:
     reward_detach_features: bool = True
     """Detach features when computing reward loss (avoid leaking grads)."""
 
+    use_estimated_rewards_for_sac: bool = True
+    """Whether to use estimated rewards instead of environment rewards for SAC loss."""
+
+    expert_batch_size: int | None = None
+    """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
+
+    detach_reward_when_used_for_sac: bool = True
+    """Detach the estimated reward tensor when injecting it into the SAC loss.
+
+    This prevents the SAC updates from backpropagating into the reward estimator.
+    The reward network is then trained solely via the IPMD objective.
+    """
+
 
 @dataclass
 class IPMDRLOptConfig(RLOptConfig):
@@ -157,8 +170,8 @@ class IPMD(BaseAlgorithm):
         )
 
         # Expert data sources (iterator and/or replay buffer)
-        self._expert_iterator: Optional[Iterator[TensorDict]] = None
-        self._expert_buffer: Optional[TensorDictReplayBuffer] = None
+        self._expert_iterator: Iterator[TensorDict] | None = None
+        self._expert_buffer: TensorDictReplayBuffer | None = None
         self._warned_no_expert = False
 
         # Compile if requested
@@ -194,46 +207,6 @@ class IPMD(BaseAlgorithm):
             "high": self.env.action_spec_unbatched.space.high.to(self.device),  # type: ignore
             "tanh_loc": False,
         }
-
-        # Define policy architecture
-        if policy_net is None:
-            # Use NetworkLayout if provided, otherwise fall back to legacy config
-            if self.config.network and self.config.network.policy:
-                policy_config = self.config.network.policy
-                if policy_config.head:
-                    num_cells = list(policy_config.head.num_cells)
-                    activation_class = self._get_activation_class(
-                        policy_config.head.activation
-                    )
-                else:
-                    # Fallback to legacy config
-                    num_cells = self.config.policy.num_cells
-                    activation_class = torch.nn.ELU
-            else:
-                # Fallback to legacy config
-                num_cells = self.config.policy.num_cells
-                activation_class = torch.nn.ELU
-
-            policy_mlp = MLP(
-                in_features=self.policy_input_shape,
-                activation_class=activation_class,
-                out_features=self.policy_output_shape,
-                num_cells=num_cells,
-                device=self.device,
-            )
-            # Initialize policy weights
-            if (
-                self.config.network
-                and self.config.network.policy
-                and self.config.network.policy.head
-            ):
-                self._initialize_weights(
-                    policy_mlp, self.config.network.policy.head.init
-                )
-            else:
-                self._initialize_weights(policy_mlp, "orthogonal")
-        else:
-            policy_mlp = policy_net
 
         # Build policy head via base helper and wrap
         policy_td = self._build_policy_head_module(
@@ -377,7 +350,7 @@ class IPMD(BaseAlgorithm):
         sampler = SamplerWithoutReplacement()
         scratch_dir = cfg.collector.scratch_dir
         device = cfg.device
-        buffer_size = cfg.collector.frames_per_batch
+        buffer_size = cfg.replay_buffer.size
         batch_size = cfg.loss.mini_batch_size
         shared = cfg.collector.shared
         prefetch = cfg.collector.prefetch
@@ -389,7 +362,7 @@ class IPMD(BaseAlgorithm):
             )
         )
         if cfg.replay_buffer.prb:
-            logging.getLogger(__name__).warning(
+            self.log.warning(
                 "Prioritized replay buffer (prb) is not supported; using uniform replay."
             )
         replay_buffer = TensorDictReplayBuffer(
@@ -403,18 +376,6 @@ class IPMD(BaseAlgorithm):
         if scratch_dir:
             replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
         return replay_buffer
-
-        # Removed True parameter to match ppo_mujoco.py
-        return TensorDictReplayBuffer(
-            storage=LazyTensorStorage(
-                cfg.collector.frames_per_batch,
-                compilable=cfg.compile.compile,  # type: ignore
-                device=self.device,
-            ),
-            sampler=sampler,
-            batch_size=cfg.loss.mini_batch_size,
-            compilable=cfg.compile.compile,
-        )
 
     def _construct_trainer(self):  # type: ignore[override]
         return None
@@ -441,18 +402,121 @@ class IPMD(BaseAlgorithm):
         """
         self._expert_buffer = buffer
 
-    def _next_expert_batch(self) -> Optional[TensorDict]:
+    def set_expert_source(self, source: Any) -> None:
+        """Attach an expert data source.
+
+        Accepts either:
+        - A TensorDict replay buffer object exposing ``sample()`` (e.g., TorchRL's
+          ``TensorDictReplayBuffer``), or
+        - An ImitationLearningTools replay manager exposing a ``buffer`` attribute
+          whose ``sample()`` method returns a TensorDict (see ILTools tests for usage).
+
+        Example with ILTools:
+            mgr = build_replay_from_zarr(...)
+            ipmd.set_expert_source(mgr)  # same as ipmd.set_expert_buffer(mgr.buffer)
+        """
+        # Direct replay buffer with sample()
+        if hasattr(source, "sample") and callable(getattr(source, "sample")):
+            self._expert_buffer = source  # type: ignore[assignment]
+            return
+        # Manager-like object exposing a `.buffer.sample()` API
+        buf = getattr(source, "buffer", None)
+        if (
+            buf is not None
+            and hasattr(buf, "sample")
+            and callable(getattr(buf, "sample"))
+        ):
+            self._expert_buffer = buf  # type: ignore[assignment]
+            return
+        msg = (
+            "Unsupported expert source: expected an object with 'sample()' or a 'buffer'"
+            " exposing 'sample()'."
+        )
+        raise TypeError(msg)
+
+    def create_expert_buffer(
+        self, expert_data: TensorDict, buffer_size: int | None = None
+    ) -> TensorDictReplayBuffer:
+        """Create an expert replay buffer from expert demonstration data.
+
+        Args:
+            expert_data: TensorDict containing expert demonstrations with keys:
+                - 'observation' (s_t)
+                - 'action' (a_t)
+                - ('next', 'observation') (s_{t+1})
+            buffer_size: Maximum buffer size. If None, uses the size of expert_data.
+
+        Returns:
+            TensorDictReplayBuffer containing expert data
+        """
+        if buffer_size is None:
+            buffer_size = expert_data.numel()
+
+        cfg = self.config
+        sampler = SamplerWithoutReplacement()
+        scratch_dir = cfg.collector.scratch_dir
+        device = cfg.device
+        batch_size = cfg.loss.mini_batch_size
+        shared = cfg.collector.shared
+        prefetch = cfg.collector.prefetch
+
+        storage_cls = (
+            functools.partial(LazyTensorStorage, device=device)
+            if not scratch_dir
+            else functools.partial(
+                LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir
+            )
+        )
+
+        expert_buffer = TensorDictReplayBuffer(
+            pin_memory=False,
+            prefetch=prefetch,
+            sampler=sampler,
+            storage=storage_cls(max_size=buffer_size, compilable=cfg.compile.compile),
+            batch_size=batch_size,
+            shared=shared,
+        )
+
+        # Add expert data to buffer
+        expert_buffer.extend(expert_data.reshape(-1))
+
+        if scratch_dir:
+            expert_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
+
+        return expert_buffer
+
+    def _next_expert_batch(self) -> TensorDict | None:
         # Priority: sample from expert buffer if available
         if self._expert_buffer is not None:
             try:
-                return self._expert_buffer.sample()
+                expert_batch = cast(TensorDict, self._expert_buffer.sample())
+                # Ensure expert batch has the right batch size if specified
+                assert isinstance(self.config, IPMDRLOptConfig)
+                if self.config.ipmd.expert_batch_size is not None:
+                    # If expert batch is larger than desired, take a subset
+                    if expert_batch.numel() > self.config.ipmd.expert_batch_size:
+                        expert_batch = cast(
+                            TensorDict,
+                            expert_batch[: self.config.ipmd.expert_batch_size],
+                        )
+                return expert_batch
             except Exception:
                 pass
 
         # Fall back to iterator
         if self._expert_iterator is not None:
             try:
-                return next(self._expert_iterator)
+                expert_batch = cast(TensorDict, next(self._expert_iterator))
+                # Ensure expert batch has the right batch size if specified
+                assert isinstance(self.config, IPMDRLOptConfig)
+                if self.config.ipmd.expert_batch_size is not None:
+                    # If expert batch is larger than desired, take a subset
+                    if expert_batch.numel() > self.config.ipmd.expert_batch_size:
+                        expert_batch = cast(
+                            TensorDict,
+                            expert_batch[: self.config.ipmd.expert_batch_size],
+                        )
+                return expert_batch
             except StopIteration:
                 return None
 
@@ -470,56 +534,135 @@ class IPMD(BaseAlgorithm):
 
     def _reward_from_batch(self, td: TensorDict) -> Tensor:
         obs_key = self.total_input_keys[0]
-        obs = td.get(obs_key)
-        act = td.get("action")
-        next_obs = td.get(("next", obs_key))
+        obs = cast(Tensor, td.get(obs_key))
+        act = cast(Tensor, td.get("action"))
+        next_obs = cast(Tensor, td.get(("next", obs_key)))
 
         phi_s = self._compute_features(obs)
         phi_next = self._compute_features(next_obs)
 
+        assert isinstance(self.config, IPMDRLOptConfig)
         if self.config.ipmd.reward_detach_features:
             phi_s = phi_s.detach()
             phi_next = phi_next.detach()
             act = act.detach()
 
         x = torch.cat([phi_s, act, phi_next], dim=-1)
-        r = self.reward_estimator(x).squeeze(-1)
-        return r
+        return self.reward_estimator(x).squeeze(-1)
 
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
+        # Validate input tensordict
+        if not self._validate_tensordict(
+            sampled_tensordict, "update:input", raise_error=False
+        ):
+            self.log.debug(
+                "Discarding batch due to non-finite values in input tensordict"
+            )
+            # Return dummy loss with zeros
+            return TensorDict(
+                {
+                    "loss_actor": torch.tensor(0.0, device=self.device),
+                    "loss_qvalue": torch.tensor(0.0, device=self.device),
+                    "loss_alpha": torch.tensor(0.0, device=self.device),
+                    "loss_reward_diff": torch.tensor(0.0, device=self.device),
+                    "loss_reward_l2": torch.tensor(0.0, device=self.device),
+                    "estimated_reward_mean": torch.tensor(0.0, device=self.device),
+                    "estimated_reward_std": torch.tensor(0.0, device=self.device),
+                    "expert_reward_mean": torch.tensor(0.0, device=self.device),
+                    "expert_reward_std": torch.tensor(0.0, device=self.device),
+                },
+                batch_size=[],
+            )
+
         # Zero all grads
         self.optim.zero_grad(set_to_none=True)
 
-        # 1) SAC objective (actor/critic/alpha)
-        loss_td = self.loss_module(sampled_tensordict)
-        sac_total = (
-            loss_td["loss_actor"] + loss_td["loss_qvalue"] + loss_td["loss_alpha"]
-        ).sum()
-        sac_total.backward()
+        # 1) Compute estimated rewards for current policy data
+        estimated_rewards = self._reward_from_batch(sampled_tensordict)
 
-        # 2) Reward estimator objective
+        # Use estimated rewards for SAC loss if configured to do so
+        assert isinstance(self.config, IPMDRLOptConfig)
+        if self.config.ipmd.use_estimated_rewards_for_sac:
+            sampled_tensordict_for_sac = sampled_tensordict.clone()
+            # Prevent SAC from backpropagating into the reward estimator unless explicitly allowed
+            reward_for_sac = (
+                estimated_rewards.detach()
+                if self.config.ipmd.detach_reward_when_used_for_sac
+                else estimated_rewards
+            )
+            sampled_tensordict_for_sac["reward"] = reward_for_sac
+        else:
+            sampled_tensordict_for_sac = sampled_tensordict
+
+        # 2) SAC objective using estimated rewards (actor/critic/alpha)
+        loss_td = cast(TensorDict, self.loss_module(sampled_tensordict_for_sac))
+        loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_sac_loss")
+
+        actor_loss = cast(Tensor, loss_td["loss_actor"])  # ensure Tensor type
+        q_loss = cast(Tensor, loss_td["loss_qvalue"])  # ensure Tensor type
+        alpha_loss = cast(Tensor, loss_td["loss_alpha"])  # ensure Tensor type
+        total_sac_loss = (actor_loss + q_loss + alpha_loss).sum()
+        total_sac_loss.backward()
+
+        # 3) Reward estimator objective: IPMD Loss
         reward_diff = torch.zeros((), device=self.device)
         reward_l2 = torch.zeros((), device=self.device)
         expert_td = self._next_expert_batch()
+        expert_rewards_cached: Tensor | None = None
         if expert_td is not None:
-            r_pi = self._reward_from_batch(sampled_tensordict)
-            r_exp = self._reward_from_batch(expert_td.to(self.device))
-            # Use sum as MC surrogate per spec
-            diff = r_pi.sum() - r_exp.sum()
-            l2 = sum((p.pow(2).sum() for p in self.reward_estimator.parameters()))
-            total_reward_loss = (
-                float(self.config.ipmd.reward_loss_coeff) * diff
-                + float(self.config.ipmd.reward_l2_coeff) * l2
-            )
-            total_reward_loss.backward()
-            reward_diff = diff.detach()
-            reward_l2 = l2.detach()
-        else:
-            if not self._warned_no_expert:
+            # Validate expert batch
+            if not self._validate_tensordict(
+                expert_td, "update:expert_batch", raise_error=False
+            ):
                 logging.getLogger(__name__).warning(
-                    "Expert iterator not set; skipping reward estimator updates."
+                    "Expert batch contains non-finite values, skipping reward update"
                 )
-                self._warned_no_expert = True
+            else:
+                # Compute estimated rewards for current policy data
+                r_pi = estimated_rewards
+
+                # Compute estimated rewards for expert data
+                r_exp = self._reward_from_batch(expert_td.to(self.device))
+                expert_rewards_cached = r_exp
+
+                # IPMD Loss: difference between estimated returns
+                # Current policy estimated return - Expert policy estimated return
+                diff = r_pi.sum() - r_exp.sum()
+
+                # L2 regularization for reward estimator
+                l2 = torch.zeros((), device=self.device)
+                for p in self.reward_estimator.parameters():
+                    l2 = l2 + p.pow(2).sum()
+
+                assert isinstance(self.config, IPMDRLOptConfig)
+                total_reward_loss = (
+                    float(self.config.ipmd.reward_loss_coeff) * diff
+                    + float(self.config.ipmd.reward_l2_coeff) * l2
+                )
+                total_reward_loss.backward()
+                reward_diff = diff.detach()
+                reward_l2 = l2.detach()
+        elif not self._warned_no_expert:
+            logging.getLogger(__name__).warning(
+                "Expert iterator not set; skipping reward estimator updates."
+            )
+            self._warned_no_expert = True
+
+        # Validate gradients before optimizer step
+        grads_finite = self._validate_gradients(
+            "update:post_backward", raise_error=False
+        )
+
+        if not grads_finite:
+            logging.getLogger(__name__).debug(
+                "Skipping optimizer step due to non-finite gradients; batch discarded"
+            )
+            self.optim.zero_grad(set_to_none=True)
+            # Return sanitized loss
+            out = cast(TensorDict, loss_td.clone())
+            out["loss_reward_diff"] = reward_diff
+            out["loss_reward_l2"] = reward_l2
+            return out
 
         # Step all parameter groups
         self.optim.step()
@@ -529,9 +672,25 @@ class IPMD(BaseAlgorithm):
         self.target_net_updater.step()
 
         # Attach diagnostics
-        out = loss_td.detach()
-        out.set("loss_reward_diff", reward_diff)
-        out.set("loss_reward_l2", reward_l2)
+        out = cast(TensorDict, loss_td.clone())
+        out["loss_reward_diff"] = reward_diff
+        out["loss_reward_l2"] = reward_l2
+
+        # Add additional diagnostics for IPMD
+        out["estimated_reward_mean"] = estimated_rewards.mean().detach()
+        out["estimated_reward_std"] = estimated_rewards.std().detach()
+        if expert_td is not None:
+            rewards_for_diag = (
+                expert_rewards_cached
+                if expert_rewards_cached is not None
+                else self._reward_from_batch(expert_td.to(self.device))
+            )
+            out["expert_reward_mean"] = rewards_for_diag.mean().detach()
+            out["expert_reward_std"] = rewards_for_diag.std().detach()
+        else:
+            out["expert_reward_mean"] = torch.tensor(0.0, device=self.device)
+            out["expert_reward_std"] = torch.tensor(0.0, device=self.device)
+
         return out
 
     def train(self) -> None:  # type: ignore[override]
@@ -566,9 +725,9 @@ class IPMD(BaseAlgorithm):
                 self.episode_rewards.extend(episode_rewards.cpu().tolist())
                 metrics_to_log.update(
                     {
-                        "episode/length": np.mean(self.episode_lengths),
-                        "episode/return": np.mean(self.episode_rewards),
-                        "train/reward": episode_rewards.mean().item(),
+                        "episode/length": float(np.mean(self.episode_lengths)),
+                        "episode/return": float(np.mean(self.episode_rewards)),
+                        "train/reward": float(episode_rewards.float().mean().item()),
                     }
                 )
 
@@ -587,6 +746,56 @@ class IPMD(BaseAlgorithm):
                             # Sample from replay buffer
                             sampled_tensordict = self.data_buffer.sample()
 
+                        # Validate sampled batch before update
+                        if not self._validate_tensordict(
+                            sampled_tensordict,
+                            f"train:mini_batch{i}:pre_update",
+                            raise_error=False,
+                        ):
+                            logging.getLogger(__name__).debug(
+                                "Discarding mini-batch %d due to non-finite values", i
+                            )
+                            # Create dummy loss entry
+                            losses[i] = TensorDict(
+                                {
+                                    "loss_actor": torch.tensor(0.0, device=self.device),
+                                    "loss_qvalue": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                    "loss_alpha": torch.tensor(0.0, device=self.device),
+                                    "loss_reward_diff": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                    "loss_reward_l2": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                    "estimated_reward_mean": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                    "estimated_reward_std": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                    "expert_reward_mean": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                    "expert_reward_std": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                },
+                                batch_size=[],
+                            ).select(
+                                "loss_actor",
+                                "loss_qvalue",
+                                "loss_alpha",
+                                "loss_reward_diff",
+                                "loss_reward_l2",
+                                "estimated_reward_mean",
+                                "estimated_reward_std",
+                                "expert_reward_mean",
+                                "expert_reward_std",
+                            )
+                            continue
+
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
                             # Compute loss
@@ -597,6 +806,10 @@ class IPMD(BaseAlgorithm):
                             "loss_alpha",
                             "loss_reward_diff",
                             "loss_reward_l2",
+                            "estimated_reward_mean",
+                            "estimated_reward_std",
+                            "expert_reward_mean",
+                            "expert_reward_std",
                         )
 
                     # PRB updates disabled
@@ -604,15 +817,17 @@ class IPMD(BaseAlgorithm):
             # Get training losses and times
             if losses is not None:
                 losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
-                for key, value in losses_mean.items():  # type: ignore
-                    metrics_to_log.update({f"train/{key}": value.item()})
+                for key, value in list(losses_mean.items()):  # type: ignore
+                    if isinstance(value, Tensor):
+                        metrics_to_log[f"train/{key}"] = float(value.item())
 
-            if self.logger is not None and metrics_to_log:
-                for k, v in metrics_to_log.items():
-                    if isinstance(v, Tensor):
-                        self.logger.log_scalar(k, float(v.item()), collected_frames)
-                    else:
-                        self.logger.log_scalar(k, v, collected_frames)
+            # Merge timing metrics and emit via shared logger interface
+            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
+            rate = pbar.format_dict.get("rate")
+            if rate is not None:
+                metrics_to_log["time/speed"] = rate
+            if metrics_to_log:
+                self.log_metrics(metrics_to_log, step=collected_frames)
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
@@ -625,13 +840,56 @@ class IPMD(BaseAlgorithm):
                 and collected_frames % self.config.save_interval == 0
             ):
                 self.save_model(
-                    path=Path(self.config.logger.log_dir)
-                    / self.config.logger.save_path,
+                    path=self.log_dir / self.config.logger.save_path,
                     step=collected_frames,
                 )
 
         pbar.close()
         self.collector.shutdown()
+
+    def validate_ipmd_loss(
+        self, test_batch: TensorDict, expert_batch: TensorDict
+    ) -> dict[str, float]:
+        """Validate the IPMD loss computation with test data.
+
+        Args:
+            test_batch: Current policy batch for testing
+            expert_batch: Expert demonstration batch for testing
+
+        Returns:
+            Dictionary containing loss components and diagnostics
+        """
+        # switch to eval mode for deterministic diagnostics
+        for m in (self.actor_critic, self.reward_estimator):
+            if hasattr(m, "eval"):
+                m.eval()
+        with torch.no_grad():
+            # Compute estimated rewards
+            estimated_rewards = self._reward_from_batch(test_batch)
+            expert_rewards = self._reward_from_batch(expert_batch)
+
+            # Compute IPMD loss components
+            reward_diff = estimated_rewards.sum() - expert_rewards.sum()
+            l2_reg = torch.zeros((), device=self.device)
+            for p in self.reward_estimator.parameters():
+                l2_reg = l2_reg + p.pow(2).sum()
+
+            # Compute SAC loss with estimated rewards
+            test_batch_with_estimated_rewards = test_batch.clone()
+            test_batch_with_estimated_rewards.set("reward", estimated_rewards)
+            sac_loss_td = self.loss_module(test_batch_with_estimated_rewards)
+
+            return {
+                "reward_diff": reward_diff.item(),
+                "reward_l2": l2_reg.item(),
+                "estimated_reward_mean": estimated_rewards.mean().item(),
+                "estimated_reward_std": estimated_rewards.std().item(),
+                "expert_reward_mean": expert_rewards.mean().item(),
+                "expert_reward_std": expert_rewards.std().item(),
+                "sac_loss_actor": sac_loss_td["loss_actor"].item(),
+                "sac_loss_qvalue": sac_loss_td["loss_qvalue"].item(),
+                "sac_loss_alpha": sac_loss_td["loss_alpha"].item(),
+            }
 
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
         obs = torch.as_tensor([obs], device=self.device)

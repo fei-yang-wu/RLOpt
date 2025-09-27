@@ -90,10 +90,37 @@ class LoggerConfig:
     """Whether to record videos."""
 
     log_dir: str = "logs"
-    """Directory to save logs."""
+    """Base directory under which run folders are created."""
 
     save_path: str = "models"
     """Path to save the model."""
+
+    python_level: str | None = None
+    """Overrides :attr:`RLOptConfig.log_level` for standard Python logging when provided."""
+
+    log_to_console: bool = True
+    """Whether to emit Python logs to the console."""
+
+    console_use_rich: bool = True
+    """Attempt to use ``rich``'s console handler when available for better readability."""
+
+    console_format: str = "%(message)s"
+    """Logging format string for console output (ignored when ``rich`` handler is used)."""
+
+    log_to_file: bool = True
+    """Whether to persist Python logs to a file."""
+
+    file_name: str = "rlopt.log"
+    """Filename (relative to ``log_dir``) for file logging."""
+
+    file_format: str = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    """Logging format string for the file handler."""
+
+    file_rotation_bytes: int = 10_000_000
+    """Rotate the log file once it reaches this many bytes (<=0 disables rotation)."""
+
+    file_backup_count: int = 5
+    """Number of rotated log files to keep when rotation is enabled."""
 
 
 @dataclass
@@ -401,7 +428,10 @@ class RLOptConfig:
     seed: int = 0
     """Random seed."""
 
-    save_interval: int = 500
+    log_level: str = "warning"
+    """Verbosity for internal debug logging (e.g. ``"debug"``, ``"info"``)."""
+
+    save_interval: int = 10
     """Interval for saving the model."""
 
     policy_in_keys: list[str] = field(default_factory=lambda: ["hidden"])

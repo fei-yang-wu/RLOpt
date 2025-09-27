@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -38,6 +36,7 @@ from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import RLOptConfig
+from rlopt.type_aliases import OptimizerClass, SchedulerClass
 from rlopt.utils import log_info
 
 
@@ -210,7 +209,7 @@ class PPO(BaseAlgorithm):
         """Configure optimizers"""
         cfg = self.config.optim
 
-        optimizer_map: dict[str, type[torch.optim.Optimizer]] = {
+        optimizer_map: dict[str, OptimizerClass] = {
             "adam": torch.optim.Adam,
             "adamw": torch.optim.AdamW,
             "adamax": torch.optim.Adamax,
@@ -252,12 +251,14 @@ class PPO(BaseAlgorithm):
         optim = group_optimizers(*optimizers)
 
         scheduler_name = (cfg.scheduler or "").lower() or None
-        scheduler_map: dict[str, type[lr_scheduler.LRScheduler]] = {
+        scheduler_map: dict[str, SchedulerClass] = {
             "steplr": lr_scheduler.StepLR,
             "multiplicativelr": lr_scheduler.MultiplicativeLR,
             "exponentiallr": lr_scheduler.ExponentialLR,
             "cosineannealinglr": lr_scheduler.CosineAnnealingLR,
             "cosineannealingwarmrestarts": lr_scheduler.CosineAnnealingWarmRestarts,
+            "linearlr": lr_scheduler.LinearLR,
+            "polynomiallr": lr_scheduler.PolynomialLR,
         }
 
         self.lr_scheduler = None
@@ -336,7 +337,7 @@ class PPO(BaseAlgorithm):
         assert isinstance(self.config, PPORLOptConfig)
 
         # Forward pass PPO loss
-        loss = self.loss_module(batch)
+        loss: TensorDict = self.loss_module(batch)
         loss = self._sanitize_loss_tensordict(loss, f"{stage_prefix}:raw_loss")
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
@@ -348,16 +349,15 @@ class PPO(BaseAlgorithm):
             f"{stage_prefix}:post_backward", raise_error=False
         )
 
+        # clone the loss
+        output_loss = loss.clone().detach_()
+
         if not grads_finite:
-            warnings.warn(
-                "Skipping optimizer step due to non-finite gradients; batch will be discarded.",
-                RuntimeWarning,
-                stacklevel=2,
+            self.log.debug(
+                "Skipping optimizer step due to non-finite gradients; batch discarded"
             )
             self.optim.zero_grad(set_to_none=True)
-            output_loss = loss.detach().set(
-                "alpha", torch.tensor(1.0, device=self.device)
-            )
+            output_loss.set("alpha", torch.tensor(1.0, device=self.device))
             current_lr = torch.tensor(
                 self.optim.param_groups[0]["lr"],
                 device=self.device,
@@ -381,7 +381,7 @@ class PPO(BaseAlgorithm):
             self.lr_scheduler.step()
         # for debug
         # self._validate_parameters(f"{stage_prefix}:post_step")
-        output_loss = loss.detach().set("alpha", torch.tensor(1.0, device=self.device))
+        output_loss.set("alpha", torch.tensor(1.0, device=self.device))
         if grad_norm_tensor is not None:
             output_loss.set("grad_norm", grad_norm_tensor.detach())
         current_lr = torch.tensor(
@@ -401,18 +401,6 @@ class PPO(BaseAlgorithm):
                 tensordict, f"collector_iter:step{step_idx}", raise_error=False
             )
             yield tensordict
-
-    def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Predict action given observation"""
-        obs = torch.as_tensor([obs], device=self.device)
-        self.policy.eval()
-        with torch.inference_mode():
-            td = TensorDict(
-                dict.fromkeys(list(self.config.policy_in_keys), obs),
-                batch_size=[1],
-                device=self.policy.device,  # type: ignore
-            )
-            return self.policy(td).get("action")
 
     def train(self) -> None:  # type: ignore
         """Train the agent"""
@@ -450,7 +438,7 @@ class PPO(BaseAlgorithm):
             with timeit("collecting"):
                 data = next(collector_iter)
 
-            metrics_to_log = {}
+            metrics_to_log: dict[str, Any] = {}
             frames_in_batch = data.numel()
             collected_frames += frames_in_batch
             pbar.update(frames_in_batch)
@@ -461,11 +449,12 @@ class PPO(BaseAlgorithm):
                 episode_length = data["next", "step_count"][data["next", "done"]]
                 self.episode_lengths.extend(episode_length.cpu().tolist())
                 self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
                 metrics_to_log.update(
                     {
                         "episode/length": np.mean(self.episode_lengths),
                         "episode/return": np.mean(self.episode_rewards),
-                        "train/reward": episode_rewards.mean().item(),
+                        "train/reward": episode_rewards_mean,
                     }
                 )
             self.data_buffer.empty()
@@ -493,10 +482,10 @@ class PPO(BaseAlgorithm):
                             f"epoch{j}:mini_batch{k}:pre_update_batch",
                             raise_error=False,
                         ):
-                            warnings.warn(
-                                "Discarding mini-batch due to non-finite values",
-                                RuntimeWarning,
-                                stacklevel=2,
+                            self.log.debug(
+                                "Discarding mini-batch %d in epoch %d due to non-finite values",
+                                k,
+                                j,
                             )
                             continue
                         self._update_stage_context = f"epoch{j}:mini_batch{k}"
@@ -524,7 +513,7 @@ class PPO(BaseAlgorithm):
                 metrics_to_log.update({f"train/{key}": value.item()})  # type: ignore
             current_lr_tensor = (
                 loss["lr"]
-                if "lr" in loss.keys()
+                if "lr" in loss
                 else torch.tensor(
                     self.optim.param_groups[0]["lr"],
                     device=self.device,
@@ -546,9 +535,9 @@ class PPO(BaseAlgorithm):
                     "train/clip_epsilon": clip_epsilon_value,
                 }
             )
-            if "grad_norm" in loss.keys():
+            if "grad_norm" in loss:
                 metrics_to_log["train/grad_norm"] = loss["grad_norm"]
-            if "skipped_update" in loss.keys():
+            if "skipped_update" in loss:
                 metrics_to_log["train/skipped_update"] = loss["skipped_update"]
 
             # for IsaacLab, we need to log the metrics from the environment
@@ -556,28 +545,23 @@ class PPO(BaseAlgorithm):
                 log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
                 log_info(log_info_dict, metrics_to_log)
 
-            # Log metrics
-            if self.logger:
-                metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-                metrics_to_log["time/speed"] = pbar.format_dict["rate"]
-                for key, value in metrics_to_log.items():
-                    if isinstance(value, Tensor):
-                        self.logger.log_scalar(
-                            key, float(value.item()), collected_frames
-                        )
-                    else:
-                        self.logger.log_scalar(key, value, collected_frames)
+            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
+            rate = pbar.format_dict.get("rate")
+            if rate is not None:
+                metrics_to_log["time/speed"] = rate
+
+            # Stream metrics to both TorchRL backends and python logs via the base helper
+            self.log_metrics(metrics_to_log, step=collected_frames)
 
             self.collector.update_policy_weights_()
 
             # Save model periodically
             if (
                 self.config.save_interval > 0
-                and collected_frames % self.config.save_interval == 0
+                and num_network_updates % self.config.save_interval == 0
             ):
                 self.save_model(
-                    path=Path(self.config.logger.log_dir)
-                    / self.config.logger.save_path,
+                    path=self.log_dir / self.config.logger.save_path,
                     step=collected_frames,
                 )
 
@@ -649,7 +633,7 @@ class PPORecurrent(PPO):
                 if isinstance(self.env.transform, Compose):
                     self.env.transform.append(primer)
                 else:
-                    self.env.transform = Compose(self.env.transform, primer)
+                    self.env.transform = Compose([self.env.transform, primer])
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
@@ -712,21 +696,21 @@ class PPORecurrent(PPO):
             shifted=True,  # to be compatible with lstm
         )
 
-    def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Predict action given observation with LSTM state management"""
-        obs = torch.as_tensor([obs], device=self.device)
-        self.policy.eval()
+    # def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
+    #     """Predict action given observation with LSTM state management"""
+    #     obs = torch.as_tensor([obs], device=self.device)
+    #     self.policy.eval()
 
-        with torch.inference_mode():
-            td = TensorDict(
-                dict.fromkeys(list(self.config.policy_in_keys), obs),
-                batch_size=[1],
-                device=self.policy.device,  # type: ignore
-            )
+    #     with torch.inference_mode():
+    #         td = TensorDict(
+    #             dict.fromkeys(list(self.config.policy_in_keys), obs),
+    #             batch_size=[1],
+    #             device=self.policy.device,  # type: ignore
+    #         )
 
-            # The LSTMModule automatically handles recurrent states through TensorDict
-            # No need for manual state management - TorchRL handles this
-            return self.policy(td).get("action")
+    #         # The LSTMModule automatically handles recurrent states through TensorDict
+    #         # No need for manual state management - TorchRL handles this
+    #         return self.policy(td).get("action")
 
     def reset_recurrent_states(self):
         """Reset LSTM recurrent states - called at episode boundaries"""
@@ -796,8 +780,8 @@ class PPORecurrent(PPO):
                         for transform in new_transforms:
                             env.transform.append(transform)
                     else:
-                        env.transform = Compose(env.transform, *new_transforms)
+                        env.transform = Compose([env.transform, *new_transforms])
                 else:
-                    env.transform = Compose(*new_transforms)
+                    env.transform = Compose([*new_transforms])
 
         return env

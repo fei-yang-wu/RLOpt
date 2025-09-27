@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import functools
-import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -235,12 +233,12 @@ class SAC(BaseAlgorithm):
         return self._build_qvalue_module(q_net=q_net, layout=self.config.network)
 
     def _construct_actor_critic(self) -> TensorDictModule:
-        assert isinstance(self.q_function, TensorDictModule), (
-            "Q-function must be a TensorDictModule"
-        )
-        assert isinstance(self.policy, TensorDictModule), (
-            "Policy must be a TensorDictModule"
-        )
+        assert isinstance(
+            self.q_function, TensorDictModule
+        ), "Q-function must be a TensorDictModule"
+        assert isinstance(
+            self.policy, TensorDictModule
+        ), "Policy must be a TensorDictModule"
 
         return ActorValueOperator(
             common_operator=self.feature_extractor,
@@ -334,7 +332,7 @@ class SAC(BaseAlgorithm):
             )
         )
         if cfg.replay_buffer.prb:
-            logging.getLogger(__name__).warning(
+            self.log.warning(
                 "Prioritized replay buffer (prb) is not supported; using uniform replay."
             )
         replay_buffer = TensorDictReplayBuffer(
@@ -365,14 +363,52 @@ class SAC(BaseAlgorithm):
         return None
 
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
+        # Validate input tensordict
+        if not self._validate_tensordict(
+            sampled_tensordict, "update:input", raise_error=False
+        ):
+            self.log.debug(
+                "Discarding batch due to non-finite values in input tensordict"
+            )
+            # Return dummy loss with zeros
+            return TensorDict(
+                {
+                    "loss_actor": torch.tensor(0.0, device=self.device),
+                    "loss_qvalue": torch.tensor(0.0, device=self.device),
+                    "loss_alpha": torch.tensor(0.0, device=self.device),
+                },
+                batch_size=[],
+            )
+
+        # Zero gradients
+        self.optim.zero_grad(set_to_none=True)
+
         # Compute loss
         loss_td = self.loss_module(sampled_tensordict)
+        loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_loss")
 
         actor_loss = loss_td["loss_actor"]
         q_loss = loss_td["loss_qvalue"]
         alpha_loss = loss_td["loss_alpha"]
 
-        (actor_loss + q_loss + alpha_loss).sum().backward()
+        total_loss = (actor_loss + q_loss + alpha_loss).sum()
+
+        # Backward pass
+        total_loss.backward()
+
+        # Validate gradients
+        grads_finite = self._validate_gradients(
+            "update:post_backward", raise_error=False
+        )
+
+        if not grads_finite:
+            self.log.debug(
+                "Skipping optimizer step due to non-finite gradients; batch discarded"
+            )
+            self.optim.zero_grad(set_to_none=True)
+            return loss_td.detach()
+
+        # Update networks
         self.optim.step()
         self.optim.zero_grad(set_to_none=True)
 
@@ -433,6 +469,28 @@ class SAC(BaseAlgorithm):
                             # Sample from replay buffer
                             sampled_tensordict = self.data_buffer.sample()
 
+                        # Validate sampled batch before update
+                        if not self._validate_tensordict(
+                            sampled_tensordict,
+                            f"train:mini_batch{i}:pre_update",
+                            raise_error=False,
+                        ):
+                            self.log.debug(
+                                "Discarding mini-batch %d due to non-finite values", i
+                            )
+                            # Create dummy loss entry
+                            losses[i] = TensorDict(
+                                {
+                                    "loss_actor": torch.tensor(0.0, device=self.device),
+                                    "loss_qvalue": torch.tensor(
+                                        0.0, device=self.device
+                                    ),
+                                    "loss_alpha": torch.tensor(0.0, device=self.device),
+                                },
+                                batch_size=[],
+                            ).select("loss_actor", "loss_qvalue", "loss_alpha")
+                            continue
+
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
                             # Compute loss
@@ -449,17 +507,19 @@ class SAC(BaseAlgorithm):
                 for key, value in losses_mean.items():  # type: ignore
                     metrics_to_log.update({f"train/{key}": value.item()})
 
-            if self.logger is not None and metrics_to_log:
-                for k, v in metrics_to_log.items():
-                    if isinstance(v, Tensor):
-                        self.logger.log_scalar(k, float(v.item()), collected_frames)
-                    else:
-                        self.logger.log_scalar(k, v, collected_frames)
-
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
                 log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
                 log_info(log_info_dict, metrics_to_log)
+
+            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
+            rate = pbar.format_dict.get("rate")
+            if rate is not None:
+                metrics_to_log["time/speed"] = rate
+
+            if metrics_to_log:
+                # Use the shared base-class helper for consistent metrics emission
+                self.log_metrics(metrics_to_log, step=collected_frames)
 
             # Save model periodically
             if (
@@ -467,8 +527,7 @@ class SAC(BaseAlgorithm):
                 and collected_frames % self.config.save_interval == 0
             ):
                 self.save_model(
-                    path=Path(self.config.logger.log_dir)
-                    / self.config.logger.save_path,
+                    path=self.log_dir / self.config.logger.save_path,
                     step=collected_frames,
                 )
 

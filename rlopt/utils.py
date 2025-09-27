@@ -1,38 +1,25 @@
 from __future__ import annotations
 
-import os
-import warnings
 import logging
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
 import torch as th
 from stable_baselines3.common.callbacks import (
-    BaseCallback,
     CheckpointCallback,
-    EventCallback,
 )
 from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
+from stable_baselines3.common.preprocessing import get_flattened_obs_dim
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import TensorDict
-from stable_baselines3.common.utils import get_device
-from stable_baselines3.common.vec_env import (
-    DummyVecEnv,
-    SubprocVecEnv,
-    VecEnv,
-    VecEnvWrapper,
-    VecMonitor,
-    is_vecenv_wrapped,
-    sync_envs_normalization,
-)
-from torch import nn
+from torch import Tensor, nn
 
 
 def obs_as_tensor(
-    obs: Union[th.Tensor, np.ndarray, Dict[str, np.ndarray], Any], device: th.device
-) -> Union[th.Tensor, TensorDict]:
+    obs: th.Tensor | np.ndarray | dict[str, np.ndarray] | Any, device: th.device
+) -> th.Tensor | TensorDict:
     """
     Moves the observation to the given device.
 
@@ -42,16 +29,15 @@ def obs_as_tensor(
     """
     if isinstance(obs, np.ndarray) or isinstance(obs, th.Tensor):
         return th.as_tensor(obs, device=device)
-    elif isinstance(obs, dict):
+    if isinstance(obs, dict):
         return {key: th.as_tensor(_obs, device=device) for (key, _obs) in obs.items()}
-    else:
-        raise Exception(f"Unrecognized type of observation {type(obs)}")
+    raise Exception(f"Unrecognized type of observation {type(obs)}")
 
 
 # From stable baselines
 def explained_variance(
-    y_pred: Union[np.ndarray, th.Tensor], y_true: Union[np.ndarray, th.Tensor]
-) -> Union[float, np.ndarray, th.Tensor]:
+    y_pred: np.ndarray | th.Tensor, y_true: np.ndarray | th.Tensor
+) -> float | np.ndarray | th.Tensor:
     """
     Computes fraction of variance that ypred explains about y.
     Returns 1 - Var[y-ypred] / Var[y]
@@ -69,13 +55,12 @@ def explained_variance(
     if isinstance(y_pred, np.ndarray):
         var_y = np.var(y_true)
         return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y  # type: ignore
-    elif isinstance(y_pred, th.Tensor) and isinstance(y_true, th.Tensor):
+    if isinstance(y_pred, th.Tensor) and isinstance(y_true, th.Tensor):
         var_y = th.var(y_true).item()
         return np.nan if var_y == 0 else 1 - th.var(y_true - y_pred).item() / var_y
-    else:
-        raise ValueError(
-            "y_pred and y_true must be of the same type (np.ndarray or th.Tensor)"
-        )
+    raise ValueError(
+        "y_pred and y_true must be of the same type (np.ndarray or th.Tensor)"
+    )
 
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
@@ -194,7 +179,7 @@ class OnnxableOnPolicy(th.nn.Module):
         super().__init__()
         self.policy = policy
 
-    def forward(self, observation: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def forward(self, observation: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         # NOTE: Preprocessing is included, but postprocessing
         # (clipping/inscaling actions) is not,
         # If needed, you also need to transpose the images so that they are channel first
@@ -215,9 +200,9 @@ class OnnxableOffPolicy(th.nn.Module):
 
 
 def export_to_onnx(
-    model: Union[BasePolicy, th.nn.Module],
+    model: BasePolicy | th.nn.Module,
     onnx_filename: str,
-    input_shape: Optional[Tuple[int, ...]] = None,
+    input_shape: tuple[int, ...] | None = None,
     export_params: bool = True,
     verbose: int = 0,
 ) -> None:
@@ -309,30 +294,24 @@ class OnnxCheckpointCallback(CheckpointCallback):
 
         return True
 
+
 def log_info(log_info_dict: dict, metrics_to_log: dict):
     # log all the keys
     for key, value in log_info_dict.items():
         if "/" in key:
             metrics_to_log.update(
-                {
-                    key: (
-                        value.item()
-                        if isinstance(value, Tensor)
-                        else value
-                    )
-                }
+                {key: (value.item() if isinstance(value, Tensor) else value)}
             )
         else:
             metrics_to_log.update(
                 {
-                    "Episode/"
-                    + key: (
-                        value.item()
-                        if isinstance(value, Tensor)
-                        else value
+                    "Episode/" + key: (
+                        value.item() if isinstance(value, Tensor) else value
                     )
                 }
             )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -341,8 +320,8 @@ logger = logging.getLogger(__name__)
 # -------------------------------
 try:
     import torch
-    import torch.optim as optim
     from tensordict.nn import TensorDictModule
+    from torch import optim
 except Exception:  # pragma: no cover
     torch = None  # type: ignore[assignment]
     optim = None  # type: ignore[assignment]
@@ -377,7 +356,7 @@ def _describe_object(obj: Any) -> str:
     if torch is not None and isinstance(obj, nn.Module):
         total = 0
         trainable = 0
-        device: Optional[str] = None
+        device: str | None = None
         try:
             for p in obj.parameters():
                 n = int(p.numel())
@@ -395,13 +374,17 @@ def _describe_object(obj: Any) -> str:
             extras.append(f"trainable={trainable:,}")
         if device:
             extras.append(f"device={device}")
-        return f"{type(obj).__name__}" + (" (" + ", ".join(extras) + ")" if extras else "")
+        return f"{type(obj).__name__}" + (
+            " (" + ", ".join(extras) + ")" if extras else ""
+        )
 
     # Optimizer
     if optim is not None and isinstance(obj, optim.Optimizer):
         try:
             lrs = {pg.get("lr") for pg in obj.param_groups if "lr" in pg}
-            return f"{type(obj).__name__} groups={len(obj.param_groups)} lrs={sorted(lrs)}"
+            return (
+                f"{type(obj).__name__} groups={len(obj.param_groups)} lrs={sorted(lrs)}"
+            )
         except Exception:
             return type(obj).__name__
 
@@ -422,9 +405,9 @@ def _describe_object(obj: Any) -> str:
 
 
 def log_model_overview(
-    components: Union[Mapping[str, Any], Sequence[Tuple[str, Any]]],
-    title: Optional[str] = None,
-    logger: Optional[logging.Logger] = None,
+    components: Mapping[str, Any] | Sequence[tuple[str, Any]],
+    title: str | None = None,
+    logger: logging.Logger | None = None,
     *,
     max_depth: int = 0,
     indent: int = 0,
@@ -438,11 +421,11 @@ def log_model_overview(
     - indent: initial left padding in spaces
     """
     if isinstance(components, Mapping):
-        items: Sequence[Tuple[str, Any]] = list(components.items())
+        items: Sequence[tuple[str, Any]] = list(components.items())
     else:
         items = list(components)
 
-    emit = (logger.info if logger is not None else print)
+    emit = logger.info if logger is not None else print
     pad = " " * indent
 
     if title:
@@ -450,15 +433,15 @@ def log_model_overview(
         emit(f"{pad}{title}")
         emit(f"{pad}{bar}")
 
-    def _as_items(obj: Any) -> Optional[Sequence[Tuple[str, Any]]]:
+    def _as_items(obj: Any) -> Sequence[tuple[str, Any]] | None:
         if isinstance(obj, Mapping):
             return list(obj.items())
         return None
 
-    def _print(items: Sequence[Tuple[str, Any]], depth: int, base_prefix: str) -> None:
+    def _print(items: Sequence[tuple[str, Any]], depth: int, base_prefix: str) -> None:
         n = len(items)
         for i, (name, obj) in enumerate(items):
-            last = (i == n - 1)
+            last = i == n - 1
             branch = "└─" if last else "├─"
             cont = "  " if last else "│ "
             prefix = base_prefix + branch + " "
@@ -473,11 +456,11 @@ def log_model_overview(
 
 def log_agent_overview(
     agent: Any,
-    title: Optional[str] = None,
-    logger: Optional[logging.Logger] = None,
+    title: str | None = None,
+    logger: logging.Logger | None = None,
     *,
-    include: Optional[Iterable[str]] = None,
-    extra: Optional[Mapping[str, Any]] = None,
+    include: Iterable[str] | None = None,
+    extra: Mapping[str, Any] | None = None,
     max_depth: int = 0,
     indent: int = 0,
 ) -> None:
@@ -487,7 +470,7 @@ def log_agent_overview(
     actor-critics, and L2T student components. Additional attributes can
     be included via `include` or `extra`.
     """
-    components: Dict[str, Any] = {}
+    components: dict[str, Any] = {}
 
     # Detect teacher-student pattern and group if present
     has_student = any(
@@ -502,8 +485,8 @@ def log_agent_overview(
     )
 
     if has_student:
-        teacher_map: Dict[str, Any] = {}
-        student_map: Dict[str, Any] = {}
+        teacher_map: dict[str, Any] = {}
+        student_map: dict[str, Any] = {}
 
         # Teacher components (BaseAlgorithm standard names)
         for name, label in (
@@ -534,9 +517,9 @@ def log_agent_overview(
 
         # Explicit teacher/student attributes if present
         if hasattr(agent, "teacher"):
-            teacher_map.setdefault("Teacher", getattr(agent, "teacher"))
+            teacher_map.setdefault("Teacher", agent.teacher)
         if hasattr(agent, "student"):
-            student_map.setdefault("Student", getattr(agent, "student"))
+            student_map.setdefault("Student", agent.student)
 
         components["Teacher"] = teacher_map
         components["Student"] = student_map

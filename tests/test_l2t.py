@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
+from torchrl.modules import TanhNormal
 
 from rlopt.agent.l2t.l2t import L2T, L2TR
-from rlopt.modules import TanhNormalStable
 
 
 def _action_bounds(env):
@@ -48,7 +48,7 @@ def test_l2t_instantiation_and_shapes(l2t_cfg_factory, make_env):  # type: ignor
     assert student_scale.shape[-1] == int(env.action_spec_unbatched.shape[-1])
 
     # Behavior cloning distribution sampling check
-    dist = TanhNormalStable(student_loc, student_scale, event_dims=1)
+    dist = TanhNormal(student_loc, student_scale, event_dims=1)
     sample = dist.rsample()
     assert torch.all(sample >= low.to(sample) - 1e-6)
     assert torch.all(sample <= high.to(sample) + 1e-6)
