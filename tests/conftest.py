@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import multiprocessing as mp
 from collections.abc import Callable
+from typing import Literal
 
 import gymnasium as gym
 import pytest
 import torch
 import torchrl.envs.libs.gym
 from torchrl.envs import EnvCreator, ParallelEnv, TransformedEnv
-from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
+from torchrl.envs.libs.gym import GymEnv, GymWrapper
 
 from rlopt.agent.ipmd.ipmd import IPMDRLOptConfig
 from rlopt.agent.l2t.l2t import L2TRLOptConfig
@@ -25,10 +26,7 @@ from rlopt.configs import (
 
 def is_env_available(env_name: str) -> bool:
     try:
-        # Lazy import to avoid unnecessary backend loads
-        from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
-
-        _ = TorchRLGymEnv(env_name, device="cpu")
+        _ = GymEnv(env_name, device="cpu")
         return True
     except Exception:
         return False
@@ -48,6 +46,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "gpu: requires CUDA; auto-skips if torch.cuda.is_available() is False",
     )
     config.addinivalue_line("markers", "compile: tests that enable torch.compile")
+    config.addinivalue_line(
+        "markers",
+        "full_halfcheetah: long SAC HalfCheetah-v5 training with wandb; skipped unless --run-full-halfcheetah is set",
+    )
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -72,6 +74,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Enable CUDA graphs in compile tests",
+    )
+    # Long-run / optional benchmarks
+    opt_group = parser.getgroup("long")
+    opt_group.addoption(
+        "--run-full-halfcheetah",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the long SAC HalfCheetah-v5 training test with wandb logging (default: skip)."
+        ),
     )
 
 
@@ -129,6 +141,15 @@ def pytest_collection_modifyitems(
         if item.get_closest_marker("gpu") is not None and not torch.cuda.is_available():
             item.add_marker(pytest.mark.skip(reason="CUDA not available"))
 
+        # Skip full HalfCheetah test unless explicitly enabled
+        if item.get_closest_marker("full_halfcheetah") is not None:
+            if not config.getoption("--run-full-halfcheetah"):
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="Skipped by default. Enable with --run-full-halfcheetah"
+                    )
+                )
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _set_fork_start_method() -> None:
@@ -172,6 +193,8 @@ def ppo_cfg_factory() -> Callable[..., PPORLOptConfig]:
         lr: float = 3e-4,
         mini_batch_size: int = 256,
         epochs: int = 2,
+        save_interval: int = 10000,
+        num_collectors: int = 1,
     ) -> PPORLOptConfig:
         cfg = PPORLOptConfig()
         # env
@@ -179,6 +202,7 @@ def ppo_cfg_factory() -> Callable[..., PPORLOptConfig]:
         cfg.env.device = "cpu"
         cfg.env.num_envs = num_envs
         # collector
+        cfg.collector.num_collectors = num_collectors
         cfg.collector.frames_per_batch = frames_per_batch
         cfg.collector.total_frames = total_frames
         cfg.collector.set_truncated = False
@@ -195,12 +219,13 @@ def ppo_cfg_factory() -> Callable[..., PPORLOptConfig]:
         cfg.policy_in_keys = ["hidden"]
         cfg.value_net_in_keys = ["hidden"]
         cfg.total_input_keys = ["observation"]
-        # logger
-        cfg.logger.backend = None
+        # logger (empty backend disables metric logging)
+        cfg.logger.backend = ""
         # device
         cfg.device = "cpu"
         # compile
         cfg.compile.compile = False
+        cfg.save_interval = save_interval
         return cfg
 
     return _make
@@ -219,6 +244,7 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         mini_batch_size: int = 256,
         utd_ratio: float = 0.25,
         init_random_frames: int = 256,
+        save_interval: int = 10000,
     ) -> SACRLOptConfig:
         cfg = SACRLOptConfig()
         # env
@@ -226,6 +252,7 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         cfg.env.device = "cpu"
         cfg.env.num_envs = num_envs
         # collector
+        cfg.collector.num_collectors = num_envs
         cfg.collector.frames_per_batch = frames_per_batch
         cfg.collector.total_frames = total_frames
         cfg.collector.set_truncated = False
@@ -242,8 +269,8 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         cfg.policy_in_keys = ["hidden"]
         cfg.value_net_in_keys = ["hidden"]
         cfg.total_input_keys = ["observation"]
-        # logger
-        cfg.logger.backend = None
+        # logger (empty backend disables metric logging)
+        cfg.logger.backend = ""
         # device
         cfg.device = "cpu"
         # compile
@@ -251,8 +278,10 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         # sac-specific
         cfg.sac.utd_ratio = utd_ratio
         # q net cells expected by SAC implementation
-        cfg.action_value_net.num_cells = [64, 64]
+        cfg.action_value_net.num_cells = [256, 256] if feature_dim >= 128 else [64, 64]
         cfg.use_value_function = False
+        cfg.save_interval = save_interval
+        
         return cfg
 
     return _make
@@ -271,6 +300,7 @@ def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
         mini_batch_size: int = 256,
         utd_ratio: float = 0.25,
         init_random_frames: int = 256,
+        save_interval: int = 10000,
     ) -> IPMDRLOptConfig:
         cfg = IPMDRLOptConfig()
         # env
@@ -278,6 +308,7 @@ def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
         cfg.env.device = "cpu"
         cfg.env.num_envs = num_envs
         # collector
+        cfg.collector.num_collectors = num_envs
         cfg.collector.frames_per_batch = frames_per_batch
         cfg.collector.total_frames = total_frames
         cfg.collector.set_truncated = False
@@ -294,8 +325,8 @@ def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
         cfg.policy_in_keys = ["hidden"]
         cfg.value_net_in_keys = ["hidden"]
         cfg.total_input_keys = ["observation"]
-        # logger
-        cfg.logger.backend = None
+        # logger (empty backend disables metric logging)
+        cfg.logger.backend = ""
         # device
         cfg.device = "cpu"
         # compile
@@ -305,6 +336,7 @@ def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
         # q net cells expected by off-policy implementation
         cfg.action_value_net.num_cells = [64, 64]
         cfg.use_value_function = False
+        cfg.save_interval = save_interval
         return cfg
 
     return _make
@@ -323,8 +355,9 @@ def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
         mini_batch_size: int = 64,
         epochs: int = 1,
         student_recurrent: bool = False,
-        imitation: str = "l2",
+        imitation: Literal["asymmetric", "bc", "l2"] = "l2",
         mixture_coeff: float = 0.2,
+        save_interval: int = 10000,
     ) -> L2TRLOptConfig:
         cfg = L2TRLOptConfig()
         # env
@@ -332,6 +365,7 @@ def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
         cfg.env.device = "cpu"
         cfg.env.num_envs = num_envs
         # collector
+        cfg.collector.num_collectors = num_envs
         cfg.collector.frames_per_batch = frames_per_batch
         cfg.collector.total_frames = total_frames
         cfg.collector.set_truncated = False
@@ -348,8 +382,8 @@ def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
         cfg.policy_in_keys = ["hidden"]
         cfg.value_net_in_keys = ["hidden"]
         cfg.total_input_keys = ["observation"]
-        # logger
-        cfg.logger.backend = None
+        # logger (empty backend disables metric logging)
+        cfg.logger.backend = ""
         cfg.device = "cpu"
         cfg.compile.compile = False
 
@@ -399,7 +433,7 @@ def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
         cfg.l2t.clip_epsilon = 0.2
         cfg.l2t.critic_coeff = 1.0
         cfg.l2t.entropy_coeff = 0.0
-
+        cfg.save_interval = save_interval
         return cfg
 
     return _make
@@ -413,7 +447,7 @@ def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
 @pytest.fixture
 def make_env() -> Callable[[str, str], TransformedEnv]:
     def _make(env_name: str, device: str = "cpu") -> TransformedEnv:
-        base = TorchRLGymEnv(env_name, device=device)
+        base = GymWrapper(gym.make(env_name), device=device)
         env = TransformedEnv(base)
         from torchrl.envs import ClipTransform, RewardSum, StepCounter
 
@@ -438,8 +472,7 @@ def make_env() -> Callable[[str, str], TransformedEnv]:
 def make_env_parallel() -> Callable[[str, int, str], TransformedEnv]:
     def _make(env_name: str, num_workers: int, device: str = "cpu") -> TransformedEnv:
         def maker():
-            env = gym.make(env_name)
-            return TorchRLGymEnv(env, device=device)
+            return GymWrapper(gym.make(env_name), device=device)
 
         base = ParallelEnv(
             num_workers,

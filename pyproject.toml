@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "rlopt"
-version = "2025.3.0"
+version = "2025.4.0"
 description = "Reinforcement Learning Optimization"
 readme = "README.md"
 authors = [{ name = "Feiyang Wu", email = "feiyangwu@gatech.edu" }]

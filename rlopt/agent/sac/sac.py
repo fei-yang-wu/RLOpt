@@ -21,7 +21,7 @@ from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
     MLP,
-    ActorValueOperator,
+    ActorCriticOperator,
     ProbabilisticActor,
     TanhNormal,
 )
@@ -39,22 +39,22 @@ from rlopt.utils import log_info
 class SACConfig:
     """SAC-specific configuration."""
 
-    alpha_init: float = 0.001
+    alpha_init: float = 0.2
     """Initial alpha value."""
 
-    min_alpha: float | None = 0.001
+    min_alpha: float | None = 1e-4
     """Minimum alpha value."""
 
-    max_alpha: float | None = 0.001
+    max_alpha: float | None = 10.0
     """Maximum alpha value."""
 
     num_qvalue_nets: int = 2
     """Number of Q-value networks."""
 
-    fixed_alpha: bool = True
+    fixed_alpha: bool = False
     """Whether to fix alpha."""
 
-    target_entropy: float | str = 0.001
+    target_entropy: float | str = "auto"
     """Target entropy."""
 
     delay_actor: bool = False
@@ -114,6 +114,12 @@ class SAC(BaseAlgorithm):
         feature_extractor_net: nn.Module | None = None,
         **kwargs,
     ):
+        # Adjust key configuration when no feature extractor is used
+        if not config.use_feature_extractor:
+            # When no feature extractor, policy and Q-function should use the same keys as input
+            config.policy_in_keys = config.total_input_keys.copy()
+            config.value_net_in_keys = config.total_input_keys.copy()
+        
         super().__init__(
             env=env,
             config=config,
@@ -241,7 +247,7 @@ class SAC(BaseAlgorithm):
             self.policy, TensorDictModule
         ), "Policy must be a TensorDictModule"
 
-        return ActorValueOperator(
+        return ActorCriticOperator(
             common_operator=self.feature_extractor,
             policy_operator=self.policy,
             value_operator=self.q_function,
@@ -256,7 +262,7 @@ class SAC(BaseAlgorithm):
 
         loss_module = SACLoss(
             actor_network=self.actor_critic.get_policy_operator(),
-            qvalue_network=self.actor_critic.get_value_operator(),
+            qvalue_network=self.actor_critic.get_critic_operator(),
             num_qvalue_nets=sac_cfg.num_qvalue_nets,
             alpha_init=sac_cfg.alpha_init,
             loss_function=self.config.loss.loss_critic_type,

@@ -133,7 +133,7 @@ class OptimizerConfig:
     lr: float = 3e-4
     """Base learning rate."""
 
-    weight_decay: float = 0.01
+    weight_decay: float = 0.0
     """Weight decay applied to all parameter groups."""
 
     optimizer_kwargs: dict[str, Any] = field(
@@ -152,7 +152,7 @@ class OptimizerConfig:
     scheduler_step: Literal["update", "epoch"] = "update"
     """Whether to step the scheduler after each optimizer update or once per epoch."""
 
-    device: str = "cuda:0"
+    device: str = "cpu"
     """Device for optimizer state when applicable."""
 
     target_update_polyak: float = 0.995

@@ -449,8 +449,9 @@ class BaseAlgorithm(ABC):
         optimizers.extend(additional_optimizers)
 
         if not optimizers:
+            msg = "No optimizers could be created. Check that the algorithm has the required components."
             raise ValueError(
-                "No optimizers could be created. Check that the algorithm has the required components."
+                msg
             )
 
         optim = group_optimizers(*optimizers)
