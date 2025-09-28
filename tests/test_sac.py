@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 
+import gymnasium as gym
 import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
 from torchrl.envs import TransformedEnv
-from torchrl.envs.libs.gym import GymEnv as TorchRLGymEnv
+from torchrl.envs.libs.gym import GymEnv, GymWrapper
 
 from rlopt.agent.sac import SAC
 
@@ -15,7 +16,7 @@ from rlopt.agent.sac import SAC
 def evaluate_policy_average_return(
     agent: SAC, env_name: str, num_episodes: int = 3, max_steps: int = 200
 ) -> float:
-    base = TorchRLGymEnv(env_name, device="cpu")
+    base = GymWrapper(gym.make(env_name), device="cpu")
     eval_env = TransformedEnv(base)
     from torchrl.envs import ClipTransform, RewardSum, StepCounter
 
@@ -84,7 +85,8 @@ def test_sac_halfcheetah_v5_smoke(sac_cfg_factory, make_env_parallel):  # type: 
     """Lightweight SAC smoke run on HalfCheetah-v5 to validate integration."""
     # Skip if MuJoCo/Gymnasium env is unavailable in the environment
     try:
-        _ = TorchRLGymEnv("HalfCheetah-v5", device="cpu")
+        env = gym.make("HalfCheetah-v5")
+        _ = GymWrapper(env, device="cpu")
     except Exception as e:  # pragma: no cover - env availability varies
         pytest.skip(f"HalfCheetah-v5 unavailable: {e}")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing as mp
 from collections.abc import Callable
 
+import gymnasium as gym
 import pytest
 import torch
 import torchrl.envs.libs.gym
@@ -437,7 +438,8 @@ def make_env() -> Callable[[str, str], TransformedEnv]:
 def make_env_parallel() -> Callable[[str, int, str], TransformedEnv]:
     def _make(env_name: str, num_workers: int, device: str = "cpu") -> TransformedEnv:
         def maker():
-            return TorchRLGymEnv(env_name, device=device)
+            env = gym.make(env_name)
+            return TorchRLGymEnv(env, device=device)
 
         base = ParallelEnv(
             num_workers,
