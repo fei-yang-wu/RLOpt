@@ -334,7 +334,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         self._init_student_policy(self.student_policy, self.student_policy_kwargs)
         # Initialize schedules for policy/value clipping
-        self.clip_range = get_schedule_fn(self.clip_range)
+        self.clip_range = utils.FloatSchedule(self.clip_range)
         if self.clip_range_vf is not None:
             if isinstance(self.clip_range_vf, float | int):
                 assert self.clip_range_vf > 0, (
@@ -342,7 +342,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     "pass `None` to deactivate vf clipping"
                 )
 
-            self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
+            self.clip_range_vf = utils.FloatSchedule(self.clip_range_vf)
 
         self.compiled_policy = th.compile(self.policy)  # type: ignore
 
