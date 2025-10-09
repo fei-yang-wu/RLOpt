@@ -1,11 +1,14 @@
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from __future__ import annotations
+
+from typing import Any, Iterable, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
+from sb3_contrib.common.recurrent.type_aliases import RNNStates
 from stable_baselines3.common.distributions import (
-    Distribution,
     DiagGaussianDistribution,
+    Distribution,
 )
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import (
@@ -21,7 +24,52 @@ from torch import nn
 
 from .moe import MoE
 
-from sb3_contrib.common.recurrent.type_aliases import RNNStates
+
+class DictKeyFlattenExtractor(BaseFeaturesExtractor):
+    """Flatten observations from a dict using a specific key."""
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        key: str,
+        fallback_keys: Optional[Iterable[str]] = None,
+    ) -> None:
+        if not isinstance(observation_space, spaces.Dict):
+            msg = "DictKeyFlattenExtractor requires a gymnasium.spaces.Dict observation space."
+            raise ValueError(msg)
+        resolved_key = self._resolve_key(observation_space, key, fallback_keys)
+        self.key = resolved_key
+        subspace = observation_space.spaces[self.key]
+        if not isinstance(subspace, spaces.Box):
+            msg = f"Extractor only supports Box subspaces; received {type(subspace)} for key '{self.key}'."
+            raise ValueError(msg)
+        self.subspace = subspace
+        features_dim = int(np.prod(subspace.shape))
+        super().__init__(observation_space, features_dim=features_dim)
+
+    @staticmethod
+    def _resolve_key(
+        observation_space: spaces.Dict,
+        primary_key: str,
+        fallback_keys: Optional[Iterable[str]],
+    ) -> str:
+        if primary_key in observation_space.spaces:
+            return primary_key
+        if fallback_keys:
+            for candidate in fallback_keys:
+                if candidate in observation_space.spaces:
+                    return candidate
+        available_keys = ", ".join(observation_space.spaces.keys())
+        msg = f"Key '{primary_key}' not present. Available keys: {available_keys}"
+        raise KeyError(msg)
+
+    def forward(self, observations: dict[str, th.Tensor]) -> th.Tensor:
+        tensor = observations[self.key]
+        if tensor.dim() == len(self.subspace.shape):
+            tensor = tensor.view(tensor.shape[0], -1)
+        else:
+            tensor = tensor.reshape(tensor.shape[0], -1)
+        return tensor
 
 
 class RecurrentActorCriticPolicy(ActorCriticPolicy):
@@ -71,25 +119,25 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
-        activation_fn: Type[nn.Module] = nn.Tanh,
+        net_arch: list[int] | dict[str, list[int]] | None = None,
+        activation_fn: type[nn.Module] = nn.Tanh,
         ortho_init: bool = True,
         use_sde: bool = False,
         log_std_init: float = 0.0,
         full_std: bool = True,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        features_extractor_class: type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor_kwargs: dict[str, Any] | None = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.AdamW,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        optimizer_class: type[th.optim.Optimizer] = th.optim.AdamW,
+        optimizer_kwargs: dict[str, Any] | None = None,
         lstm_hidden_size: int = 256,
         n_lstm_layers: int = 1,
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
-        lstm_kwargs: Optional[Dict[str, Any]] = None,
+        lstm_kwargs: dict[str, Any] | None = None,
         # MoE config
         use_moe: bool = False,
         moe_num_experts: int = 4,
@@ -240,10 +288,10 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     @staticmethod
     def _process_sequence(
         features: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        lstm_states: tuple[th.Tensor, th.Tensor],
         episode_starts: th.Tensor,
         lstm: nn.LSTM,
-    ) -> Tuple[th.Tensor, th.Tensor]:
+    ) -> tuple[th.Tensor, th.Tensor]:
         """
         Do a forward pass in the LSTM network.
 
@@ -277,7 +325,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         lstm_output = []
         # Iterate over the sequence
-        for features, episode_start in zip_strict(features_sequence, episode_starts):
+        for features, episode_start in zip_strict(features_sequence, episode_starts):  # noqa: PLR1704
             hidden, lstm_states = lstm(
                 features.unsqueeze(dim=0),
                 (
@@ -300,7 +348,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         lstm_states: RNNStates,
         episode_starts: th.Tensor,
         deterministic: bool = False,
-    ) -> RNNStates:
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor, RNNStates]:
         """
         Forward pass in all the networks (actor and critic)
 
@@ -349,7 +397,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         obs: th.Tensor,
         lstm_states: RNNStates,
         episode_starts: th.Tensor,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, RNNStates]:
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor, RNNStates]:
         """
         Forward pass in all the networks (actor and critic)
 
@@ -391,9 +439,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     def get_distribution(
         self,
         obs: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        lstm_states: tuple[th.Tensor, th.Tensor],
         episode_starts: th.Tensor,
-    ) -> Tuple[Distribution, Tuple[th.Tensor, ...]]:
+    ) -> tuple[Distribution, tuple[th.Tensor, ...]]:
         """
         Get the current policy distribution given the observations.
 
@@ -417,7 +465,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     def predict_values(
         self,
         obs: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        lstm_states: tuple[th.Tensor, th.Tensor],
         episode_starts: th.Tensor,
     ) -> th.Tensor:
         """
@@ -435,7 +483,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         )
 
         if self.lstm_critic is not None:
-            latent_vf, lstm_states_vf = self._process_sequence(
+            latent_vf, lstm_states_vf = self._process_sequence(  # noqa: RUF059
                 features, lstm_states, episode_starts, self.lstm_critic
             )
         elif self.shared_lstm:
@@ -456,7 +504,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         actions: th.Tensor,
         lstm_states: RNNStates,
         episode_starts: th.Tensor,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions according to the current policy,
         given the observations.
@@ -499,7 +547,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         self,
         obs: th.Tensor,
         actions: th.Tensor,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions of batches of whole sequences according to the current policy,
         given the observations.
@@ -546,10 +594,10 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     def _predict(
         self,
         observation: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
+        lstm_states: tuple[th.Tensor, th.Tensor],
         episode_starts: th.Tensor,
         deterministic: bool = False,
-    ) -> Tuple[th.Tensor, Tuple[th.Tensor, ...]]:
+    ) -> tuple[th.Tensor, tuple[th.Tensor, ...]]:
         """
         Get the action according to the policy for a given observation.
 
@@ -567,11 +615,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
     def predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: np.ndarray | dict[str, np.ndarray],
+        state: tuple[np.ndarray, ...] | None = None,
+        episode_start: np.ndarray | None = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -643,11 +691,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
     def predict_and_return_tensor(
         self,
-        observation: Union[th.Tensor, Dict[str, th.Tensor]],
-        state: Optional[Tuple[th.Tensor, ...]] = None,
-        episode_start: Optional[th.Tensor] = None,
+        observation: th.Tensor | dict[str, th.Tensor],
+        state: tuple[th.Tensor, ...] | None = None,
+        episode_start: th.Tensor | None = None,
         deterministic: bool = False,
-    ) -> Tuple[th.Tensor, Optional[Tuple[th.Tensor, ...]]]:
+    ) -> tuple[th.Tensor, tuple[th.Tensor, ...] | None]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
@@ -722,7 +770,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
     def predict_whole_sequence(
         self, obs: th.Tensor, deterministic: bool = False, lstm_states: RNNStates = None
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Predict actions of batches of whole sequences according to the current policy,
         given the observations.
@@ -735,7 +783,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         self.set_training_mode(True)
 
         if lstm_states is None:
-            raise ValueError("lstm_states must be provided for recurrent policies")
+            msg = "lstm_states must be provided for recurrent policies"
+            raise ValueError(msg)
 
         # Preprocess the observation if needed
 
@@ -762,9 +811,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # value shape (n_steps, n_seq, 1)
         values = self.value_net(latent_vf)
 
-        # need to reshape actions to (n_steps * n_seq, n_actions)
-        n_steps, n_seq, _ = latent_pi.shape
-        # latent_pi = latent_pi.reshape((n_steps * n_seq, latent_pi.shape[-1]))
         distribution = self._get_action_dist_from_latent(latent_pi)
         distribution: DiagGaussianDistribution
 
@@ -824,25 +870,25 @@ class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
-        activation_fn: Type[nn.Module] = nn.Tanh,
+        net_arch: list[int] | dict[str, list[int]] | None = None,
+        activation_fn: type[nn.Module] = nn.Tanh,
         ortho_init: bool = True,
         use_sde: bool = False,
         log_std_init: float = 0.0,
         full_std: bool = True,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = NatureCNN,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        features_extractor_class: type[BaseFeaturesExtractor] = NatureCNN,
+        features_extractor_kwargs: dict[str, Any] | None = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: dict[str, Any] | None = None,
         lstm_hidden_size: int = 256,
         n_lstm_layers: int = 1,
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
-        lstm_kwargs: Optional[Dict[str, Any]] = None,
+        lstm_kwargs: dict[str, Any] | None = None,
     ):
         super().__init__(
             observation_space,
@@ -914,25 +960,25 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
-        activation_fn: Type[nn.Module] = nn.Tanh,
+        net_arch: list[int] | dict[str, list[int]] | None = None,
+        activation_fn: type[nn.Module] = nn.Tanh,
         ortho_init: bool = True,
         use_sde: bool = False,
         log_std_init: float = 0.0,
         full_std: bool = True,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = CombinedExtractor,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        features_extractor_class: type[BaseFeaturesExtractor] = CombinedExtractor,
+        features_extractor_kwargs: dict[str, Any] | None = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: dict[str, Any] | None = None,
         lstm_hidden_size: int = 256,
         n_lstm_layers: int = 1,
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
-        lstm_kwargs: Optional[Dict[str, Any]] = None,
+        lstm_kwargs: dict[str, Any] | None = None,
     ):
         super().__init__(
             observation_space,
@@ -960,6 +1006,197 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         )
 
 
+class AsymmetricStudentTeacherPolicy(RecurrentActorCriticPolicy):
+    """Policy with LSTM actor on student observations and MLP critic on privileged/teacher observations."""
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        *,
+        student_key: str = "student",
+        critic_key: str = "teacher",
+        student_fallback_keys: Optional[Iterable[str]] = ("student", "state"),
+        critic_fallback_keys: Optional[Iterable[str]] = (
+            "teacher",
+            "critic",
+            "privileged_state",
+        ),
+        critic_net_arch: Optional[List[int]] = None,
+        **kwargs,
+    ) -> None:
+        extractor_kwargs = kwargs.pop("features_extractor_kwargs", {}) or {}
+        extractor_kwargs.update(
+            {
+                "key": student_key,
+                "fallback_keys": student_fallback_keys,
+            }
+        )
+        kwargs.setdefault("features_extractor_class", DictKeyFlattenExtractor)
+        kwargs["features_extractor_kwargs"] = extractor_kwargs
+        kwargs.setdefault("shared_lstm", False)
+        kwargs.setdefault("enable_critic_lstm", False)
+        self.student_key = student_key
+        self.critic_key = critic_key
+        self.student_fallback_keys = student_fallback_keys
+        self.critic_fallback_keys = critic_fallback_keys
+        self.critic_net_arch = critic_net_arch or []
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            share_features_extractor=True,
+            **kwargs,
+        )
+        self.teacher_extractor = DictKeyFlattenExtractor(
+            observation_space,
+            key=critic_key,
+            fallback_keys=critic_fallback_keys,
+        )
+        critic_layers: List[nn.Module] = []
+        last_dim = self.teacher_extractor.features_dim
+        for hidden_dim in self.critic_net_arch:
+            critic_layers.append(nn.Linear(last_dim, hidden_dim))
+            critic_layers.append(self.activation_fn())
+            last_dim = hidden_dim
+        critic_layers.append(nn.Linear(last_dim, self.lstm_output_dim))
+        self.teacher_value_net = nn.Sequential(*critic_layers)
+
+    def _actor_features(self, obs: dict[str, th.Tensor]) -> th.Tensor:
+        return super().extract_features(obs)
+
+    def _critic_features(self, obs: dict[str, th.Tensor]) -> th.Tensor:
+        return self.teacher_extractor(obs)
+
+    def _value_latent(self, critic_features: th.Tensor) -> th.Tensor:
+        return self.teacher_value_net(critic_features)
+
+    def forward(
+        self,
+        obs: dict[str, th.Tensor],
+        lstm_states: RNNStates,
+        episode_starts: th.Tensor,
+        deterministic: bool = False,
+    ) -> RNNStates:
+        actor_features = self._actor_features(obs)
+        critic_features = self._critic_features(obs)
+        latent_pi, lstm_states_pi = self._process_sequence(
+            actor_features, lstm_states.pi, episode_starts, self.lstm_actor
+        )
+        latent_pi = self._forward_actor_head(latent_pi)
+        latent_vf = self._value_latent(critic_features)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        return actions, values, log_prob, RNNStates(lstm_states_pi, lstm_states_pi)
+
+    def evaluate_actions(
+        self,
+        obs: dict[str, th.Tensor],
+        actions: th.Tensor,
+        lstm_states: RNNStates,
+        episode_starts: th.Tensor,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        actor_features = self._actor_features(obs)
+        critic_features = self._critic_features(obs)
+        latent_pi, _ = self._process_sequence(
+            actor_features, lstm_states.pi, episode_starts, self.lstm_actor
+        )
+        latent_pi = self._forward_actor_head(latent_pi)
+        latent_vf = self._value_latent(critic_features)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions)
+        entropy = distribution.entropy()
+        values = self.value_net(latent_vf)
+        return values, log_prob, entropy
+
+    def evaluate_actions_whole_sequence(
+        self,
+        obs: dict[str, th.Tensor],
+        actions: th.Tensor,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        student_obs = obs[self.student_key]
+        critic_obs = obs.get(self.critic_key)
+        if critic_obs is None and self.critic_fallback_keys:
+            for key in self.critic_fallback_keys:
+                critic_obs = obs.get(key)
+                if critic_obs is not None:
+                    break
+        if critic_obs is None:
+            raise KeyError(
+                "Unable to locate critic observations for asymmetric policy."
+            )
+        n_steps, n_seq = student_obs.shape[:2]
+        actor_sequence = student_obs.reshape(n_steps, n_seq, -1).swapaxes(0, 1)
+        lstm_states = (
+            th.zeros(
+                (self.lstm_actor.num_layers, n_seq, self.lstm_actor.hidden_size),
+                device=student_obs.device,
+            ),
+            th.zeros(
+                (self.lstm_actor.num_layers, n_seq, self.lstm_actor.hidden_size),
+                device=student_obs.device,
+            ),
+        )
+        lstm_output, _ = self.lstm_actor(actor_sequence, lstm_states)
+        latent_pi = self._forward_actor_head(
+            th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
+        )
+        critic_flat = critic_obs.reshape(n_steps * n_seq, -1)
+        latent_vf = self._value_latent(critic_flat)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.distribution.log_prob(actions).sum(-1, keepdim=True)
+        entropy = distribution.distribution.entropy().sum(-1)
+        return values, log_prob, entropy
+
+    def predict_values(
+        self,
+        obs: dict[str, th.Tensor],
+        lstm_states: Tuple[th.Tensor, th.Tensor],
+        episode_starts: th.Tensor,
+    ) -> th.Tensor:
+        critic_features = self._critic_features(obs)
+        latent_vf = self._value_latent(critic_features)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+        return self.value_net(latent_vf)
+
+    def get_distribution(
+        self,
+        obs: dict[str, th.Tensor],
+        lstm_states: Tuple[th.Tensor, th.Tensor],
+        episode_starts: th.Tensor,
+    ) -> Tuple[Distribution, Tuple[th.Tensor, th.Tensor]]:
+        actor_features = self._actor_features(obs)
+        latent_pi, lstm_states = self._process_sequence(
+            actor_features, lstm_states, episode_starts, self.lstm_actor
+        )
+        latent_pi = self._forward_actor_head(latent_pi)
+        return self._get_action_dist_from_latent(latent_pi), lstm_states
+
+
+class RecurrentActorCriticMoEPolicy(RecurrentActorCriticPolicy):
+    """Convenience wrapper enabling MoE routing by default."""
+
+    def __init__(self, *args, use_moe: bool = True, **kwargs) -> None:
+        super().__init__(*args, use_moe=use_moe, **kwargs)
+
+
+class RecurrentMultiInputActorCriticMoEPolicy(RecurrentMultiInputActorCriticPolicy):
+    """Multi-input variant with MoE actor head enabled by default."""
+
+    def __init__(self, *args, use_moe: bool = True, **kwargs) -> None:
+        super().__init__(*args, use_moe=use_moe, **kwargs)
+
+
 MlpLstmPolicy = RecurrentActorCriticPolicy
 CnnLstmPolicy = RecurrentActorCriticCnnPolicy
 MultiInputLstmPolicy = RecurrentMultiInputActorCriticPolicy
+MoeLstmPolicy = RecurrentActorCriticMoEPolicy
+MoeMultiInputLstmPolicy = RecurrentMultiInputActorCriticMoEPolicy
+AsymmetricLstmPolicy = AsymmetricStudentTeacherPolicy
