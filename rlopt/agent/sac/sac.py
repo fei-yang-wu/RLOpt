@@ -28,6 +28,7 @@ from torchrl.modules import (
 from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
+from tqdm.std import tqdm as Tqdm
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import RLOptConfig
@@ -39,7 +40,7 @@ from rlopt.utils import log_info
 class SACConfig:
     """SAC-specific configuration."""
 
-    alpha_init: float = 0.2
+    alpha_init: float = 1.0  # Match TorchRL default
     """Initial alpha value."""
 
     min_alpha: float | None = 1e-4
@@ -94,6 +95,11 @@ class SACRLOptConfig(RLOptConfig):
 
     def __post_init__(self):
         self.use_value_function = False
+        # Match TorchRL stable architecture defaults
+        self.use_feature_extractor = False  # Direct input like TorchRL
+        self.policy_in_keys = ["observation"]  # Direct observation input
+        self.value_net_in_keys = ["observation"]  # Direct observation input
+        self.total_input_keys = ["observation"]  # Direct observation input
 
 
 class SAC(BaseAlgorithm):
@@ -119,7 +125,7 @@ class SAC(BaseAlgorithm):
             # When no feature extractor, policy and Q-function should use the same keys as input
             config.policy_in_keys = config.total_input_keys.copy()
             config.value_net_in_keys = config.total_input_keys.copy()
-        
+
         super().__init__(
             env=env,
             config=config,
@@ -261,8 +267,8 @@ class SAC(BaseAlgorithm):
             sac_cfg.num_qvalue_nets = self.config.network.critic.num_nets
 
         loss_module = SACLoss(
-            actor_network=self.actor_critic.get_policy_operator(),
-            qvalue_network=self.actor_critic.get_critic_operator(),
+            actor_network=self.policy,  # type: ignore[arg-type]
+            qvalue_network=self.q_function,  # type: ignore[arg-type]
             num_qvalue_nets=sac_cfg.num_qvalue_nets,
             alpha_init=sac_cfg.alpha_init,
             loss_function=self.config.loss.loss_critic_type,
@@ -343,39 +349,10 @@ class SAC(BaseAlgorithm):
             replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
         return replay_buffer
 
-        # Removed True parameter to match ppo_mujoco.py
-        return TensorDictReplayBuffer(
-            storage=LazyTensorStorage(
-                cfg.collector.frames_per_batch,
-                compilable=cfg.compile.compile,  # type: ignore
-                device=self.device,
-            ),
-            sampler=sampler,
-            batch_size=cfg.loss.mini_batch_size,
-            compilable=cfg.compile.compile,
-        )
-
     def _construct_trainer(self):  # type: ignore[override]
         return None
 
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
-        # Validate input tensordict
-        if not self._validate_tensordict(
-            sampled_tensordict, "update:input", raise_error=False
-        ):
-            self.log.debug(
-                "Discarding batch due to non-finite values in input tensordict"
-            )
-            # Return dummy loss with zeros
-            return TensorDict(
-                {
-                    "loss_actor": torch.tensor(0.0, device=self.device),
-                    "loss_qvalue": torch.tensor(0.0, device=self.device),
-                    "loss_alpha": torch.tensor(0.0, device=self.device),
-                },
-                batch_size=[],
-            )
-
         # Zero gradients
         self.optim.zero_grad(set_to_none=True)
 
@@ -392,23 +369,12 @@ class SAC(BaseAlgorithm):
         # Backward pass
         total_loss.backward()
 
-        # Validate gradients
-        grads_finite = self._validate_gradients(
-            "update:post_backward", raise_error=False
-        )
-
-        if not grads_finite:
-            self.log.debug(
-                "Skipping optimizer step due to non-finite gradients; batch discarded"
-            )
-            self.optim.zero_grad(set_to_none=True)
-            return loss_td.detach_()
-
         # Update networks
         self.optim.step()
 
         # Update qnet_target params
         self.target_net_updater.step()
+
         return loss_td.detach_()
 
     def train(self) -> None:  # type: ignore[override]
@@ -420,15 +386,14 @@ class SAC(BaseAlgorithm):
         utd_ratio = float(cfg.sac.utd_ratio)
         init_random_frames = int(self.config.collector.init_random_frames)
         # Compute updates per collector iteration based on UTD ratio and batch sizes
-        num_updates = int(
-            (float(frames_per_batch) * utd_ratio / cfg.loss.mini_batch_size)
-            * cfg.loss.epochs
-        )
+        num_updates = int(frames_per_batch * utd_ratio)
         collected_frames = 0
         collector_iter = iter(self.collector)
-        pbar = tqdm.tqdm(total=total_frames)
+        pbar: Tqdm = Tqdm(total=total_frames)  # type: ignore[assignment]
 
         while collected_frames < total_frames:
+            timeit.printevery(num_prints=1000, total_count=total_frames, erase=True)
+
             with timeit("collect"):
                 data = next(collector_iter)
 
@@ -469,28 +434,6 @@ class SAC(BaseAlgorithm):
                         with timeit("rb - sample"):
                             # Sample from replay buffer
                             sampled_tensordict = self.data_buffer.sample()
-
-                        # Validate sampled batch before update
-                        if not self._validate_tensordict(
-                            sampled_tensordict,
-                            f"train:mini_batch{i}:pre_update",
-                            raise_error=False,
-                        ):
-                            self.log.debug(
-                                "Discarding mini-batch %d due to non-finite values", i
-                            )
-                            # Create dummy loss entry
-                            losses[i] = TensorDict(
-                                {
-                                    "loss_actor": torch.tensor(0.0, device=self.device),
-                                    "loss_qvalue": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                    "loss_alpha": torch.tensor(0.0, device=self.device),
-                                },
-                                batch_size=[],
-                            ).select("loss_actor", "loss_qvalue", "loss_alpha")
-                            continue
 
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
@@ -544,7 +487,7 @@ class SAC(BaseAlgorithm):
         policy_op = self.actor_critic.get_policy_operator()
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
-            td = TensorDict(
+            td = TensorDict(  # type: ignore[arg-type]
                 dict.fromkeys(self.total_input_keys, obs),
                 batch_size=[1],
                 device=self.device,

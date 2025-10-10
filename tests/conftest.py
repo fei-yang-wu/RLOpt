@@ -26,7 +26,6 @@ from rlopt.configs import (
 
 def is_env_available(env_name: str) -> bool:
     try:
-        _ = GymEnv(env_name, device="cpu")
         return True
     except Exception:
         return False
@@ -261,16 +260,6 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         cfg.optim.lr = lr
         # loss
         cfg.loss.mini_batch_size = mini_batch_size
-        # feature extractor + io keys
-        cfg.use_feature_extractor = True
-        cfg.feature_extractor.output_dim = feature_dim
-        cfg.policy.num_cells = [64, 64]
-        cfg.value_net.num_cells = [64, 64]
-        cfg.policy_in_keys = ["hidden"]
-        cfg.value_net_in_keys = ["hidden"]
-        cfg.total_input_keys = ["observation"]
-        # logger (empty backend disables metric logging)
-        cfg.logger.backend = ""
         # device
         cfg.device = "cpu"
         # compile
@@ -281,7 +270,7 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         cfg.action_value_net.num_cells = [256, 256] if feature_dim >= 128 else [64, 64]
         cfg.use_value_function = False
         cfg.save_interval = save_interval
-        
+
         return cfg
 
     return _make

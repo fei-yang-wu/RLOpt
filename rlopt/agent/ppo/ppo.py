@@ -11,6 +11,7 @@ import torch.optim
 import tqdm
 from tensordict import TensorDict
 from tensordict.nn import (
+    InteractionType,
     TensorDictModule,
 )
 from torch import Tensor
@@ -24,6 +25,7 @@ from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
 from torchrl.envs.transforms import InitTracker
+from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
     ActorValueOperator,
     LSTMModule,
@@ -491,6 +493,20 @@ class PPO(BaseAlgorithm):
                 )
 
         self.collector.shutdown()
+
+    def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
+        """Predict action given observation."""
+        obs = torch.as_tensor([obs], device=self.device)
+        policy_op = self.actor_critic.get_policy_operator()
+        policy_op.eval()
+        with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
+            td = TensorDict(
+                {key: obs for key in self.total_input_keys},
+                batch_size=[1],
+                device=self.device,
+            )
+            td = policy_op(td)
+            return td.get("action")
 
 
 class PPORecurrent(PPO):

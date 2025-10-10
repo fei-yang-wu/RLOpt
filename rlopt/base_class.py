@@ -450,9 +450,7 @@ class BaseAlgorithm(ABC):
 
         if not optimizers:
             msg = "No optimizers could be created. Check that the algorithm has the required components."
-            raise ValueError(
-                msg
-            )
+            raise ValueError(msg)
 
         optim = group_optimizers(*optimizers)
 
@@ -727,7 +725,7 @@ class BaseAlgorithm(ABC):
             net = MLP(
                 in_features=in_dim,
                 activation_class=activation_class,
-                out_features=int(self.policy_output_shape),
+                out_features=int(self.policy_output_shape) * 2,
                 num_cells=list(num_cells),
                 device=self.device,
             )
@@ -735,12 +733,16 @@ class BaseAlgorithm(ABC):
         else:
             net = policy_net
 
-        net = torch.nn.Sequential(
-            net,
-            AddStateIndependentNormalScale(
-                int(self.policy_output_shape), scale_lb=1e-4
-            ).to(self.device),
-        )
+        # net = torch.nn.Sequential(
+        #     net,
+        #     AddStateIndependentNormalScale(
+        #         int(self.policy_output_shape), scale_lb=1e-4
+        #     ).to(self.device),
+        # )
+        extractor = NormalParamExtractor(
+            scale_mapping="biased_softplus_0.1", scale_lb=0.1  # type: ignore
+        ).to(self.device)
+        net = torch.nn.Sequential(net, extractor)
         return TensorDictModule(module=net, in_keys=in_keys, out_keys=list(out_keys))
 
     def _build_value_module(

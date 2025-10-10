@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 
 @dataclass
 class EnvConfig:
     """Environment configuration for RLOpt  ."""
 
-    env_name: Any = "Pendulum-v1"
+    env_name: Any = "HalfCheetah-v4"
     """Name of the environment."""
 
     num_envs: int = 1
@@ -16,6 +16,9 @@ class EnvConfig:
 
     device: str = "cpu"
     """Device to run the environment on."""
+
+    library: str = "gymnasium"
+    """Library to use for the environment."""
 
 
 @dataclass
@@ -202,10 +205,12 @@ class CompileConfig:
 class PolicyConfig:
     """Policy network configuration for RLOpt  ."""
 
-    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
+    num_cells: list[int] = field(
+        default_factory=lambda: [256, 256]
+    )  # Match TorchRL stable architecture
     """Number of cells in each layer."""
 
-    default_policy_scale: float = 0.1
+    default_policy_scale: float = 1.0  # Match TorchRL default
     """Default policy scale."""
 
 
@@ -213,7 +218,9 @@ class PolicyConfig:
 class ValueNetConfig:
     """Value network configuration for RLOpt  ."""
 
-    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
+    num_cells: list[int] = field(
+        default_factory=lambda: [256, 256]
+    )  # Match TorchRL stable architecture
     """Number of cells in each layer."""
 
 
@@ -221,7 +228,9 @@ class ValueNetConfig:
 class ActionValueNetConfig:
     """Action-value (Q) network configuration for RLOpt."""
 
-    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
+    num_cells: list[int] = field(
+        default_factory=lambda: [256, 256]
+    )  # Match TorchRL stable architecture
     """Number of cells in each layer."""
 
 
@@ -229,10 +238,12 @@ class ActionValueNetConfig:
 class FeatureExtractorConfig:
     """Feature extractor configuration for RLOpt  ."""
 
-    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
+    num_cells: list[int] = field(
+        default_factory=lambda: [256, 256]
+    )  # Match TorchRL stable architecture
     """Number of cells in each layer."""
 
-    output_dim: int = 128
+    output_dim: int = 256  # Match TorchRL stable architecture
     """Output dimension of the feature extractor."""
 
 
@@ -245,8 +256,10 @@ class FeatureExtractorConfig:
 class MLPBlockConfig:
     """Config for an MLP block (torso or head)."""
 
-    num_cells: list[int] = field(default_factory=lambda: [512, 256, 128])
-    activation: Literal["relu", "elu", "tanh", "gelu"] = "elu"
+    num_cells: list[int] = field(
+        default_factory=lambda: [256, 256]
+    )  # Match TorchRL stable architecture
+    activation: Literal["relu", "elu", "tanh", "gelu"] = "relu"  # Match TorchRL default
     init: Literal["orthogonal", "xavier_uniform", "kaiming_uniform"] = "orthogonal"
     layer_norm: bool = False
     dropout: float = 0.0
@@ -284,7 +297,7 @@ class FeatureBlockSpec:
     mlp: MLPBlockConfig | None = None
     lstm: LSTMBlockConfig | None = None
     cnn: CNNBlockConfig | None = None
-    output_dim: int = 128
+    output_dim: int = 256  # Match TorchRL stable architecture
 
 
 @dataclass

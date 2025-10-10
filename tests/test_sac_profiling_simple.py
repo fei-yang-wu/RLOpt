@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+Simple SAC profiling test for RLOpt implementation.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -5,7 +10,6 @@ from datetime import datetime
 from pathlib import Path
 
 import gymnasium as gym
-import pytest
 from torchrl.envs import TransformedEnv
 from torchrl.envs.libs.gym import GymWrapper
 from torchrl.envs.transforms import (
@@ -15,51 +19,56 @@ from torchrl.envs.transforms import (
     RewardSum,
     StepCounter,
 )
-from torchrl.record.loggers import generate_exp_name, get_logger
 
 from rlopt.agent.sac.sac import SAC, SACRLOptConfig
 from rlopt.configs import (
     EnvConfig,
     RLOptConfig,
     NetworkLayout,
-    ModuleNetConfig,
     MLPBlockConfig,
+    ModuleNetConfig,
     CriticConfig,
-    SharedFeatures,
 )
 from rlopt.env_utils import make_parallel_env
 
 
-@pytest.mark.full_halfcheetah
-@pytest.mark.mujoco("HalfCheetah-v4")
-@pytest.mark.filterwarnings("ignore::Warning")
-def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
-    """Optional long-run SAC training on HalfCheetah-v5 with wandb logging.
+def test_sac_profiling():
+    """Simple SAC profiling test."""
+    print("Starting RLOpt SAC profiling test...")
 
-    Skipped by default; enable with --run-full-halfcheetah.
-    """
-    # Configure a longer training run with SOTA SAC hyperparameters
-    cfg: SACRLOptConfig = sac_cfg_factory(  # type: ignore
-        env_name="HalfCheetah-v4",
-        num_envs=8,
-        frames_per_batch=1000,
-        total_frames=1_000_000,
-        feature_dim=256,  # Increased for better representation
-        lr=3e-4,
-        mini_batch_size=256,
-        utd_ratio=1.0,
-        init_random_frames=25000,  # Increased for better exploration
-        save_interval=100000,
-    )
+    # Configure a shorter training run for profiling
+    cfg = SACRLOptConfig()
 
-    cfg.compile.compile = True
-    cfg.compile.compile_mode = "default"
-    cfg.compile.cudagraphs = True
-    cfg.compile.warmup = 1
+    # Environment configuration
+    cfg.env.env_name = "HalfCheetah-v4"
+    cfg.env.device = "cuda:0"
+    cfg.env.num_envs = 8
+
+    # Collector configuration
+    cfg.collector.num_collectors = 8
+    cfg.collector.frames_per_batch = 1000
+    cfg.collector.total_frames = 10000  # Reduced for quick profiling
+    cfg.collector.set_truncated = False
+    cfg.collector.init_random_frames = 1000  # Reduced for quick start
+
+    # Optimization configuration
+    cfg.optim.lr = 3e-4
+    cfg.optim.target_update_polyak = 0.995
+    cfg.optim.weight_decay = 0.0
+
+    # Loss configuration
+    cfg.loss.mini_batch_size = 256
+
+    # Create NetworkLayout to match TorchRL architecture exactly
+    # No shared features, direct input to networks, ReLU activation
+    from rlopt.configs import SharedFeatures
+
+    # Empty shared features (no feature extractor)
+    shared_features = SharedFeatures(features={})
 
     network_layout = NetworkLayout(
         # No shared features - direct input like TorchRL
-        shared=SharedFeatures(features={}),
+        shared=shared_features,
         # Policy module - direct input, ReLU activation
         policy=ModuleNetConfig(
             feature_ref=None,  # No feature extractor
@@ -95,6 +104,32 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
         ),
     )
 
+    # Apply the network layout
+    cfg.network = network_layout
+
+    # Feature extractor configuration - DISABLE to match TorchRL
+    cfg.use_feature_extractor = False
+    cfg.feature_extractor.output_dim = 256
+    cfg.feature_extractor.num_cells = [64, 64]
+
+    # Network architecture - match TorchRL exactly
+    cfg.policy.num_cells = [256, 256]
+    cfg.action_value_net.num_cells = [256, 256]
+
+    # Input/output keys - direct input like TorchRL
+    cfg.policy_in_keys = ["observation"]
+    cfg.value_net_in_keys = ["observation"]
+    cfg.total_input_keys = ["observation"]
+
+    # Logger configuration (disable for profiling)
+    cfg.logger.backend = ""
+
+    # Device configuration
+    cfg.device = "cuda:0"
+
+    # Compile configuration
+    cfg.compile.compile = False
+
     # SAC-specific configuration - match TorchRL exactly
     cfg.sac.utd_ratio = 1.0
     cfg.sac.alpha_init = 1.0
@@ -103,35 +138,13 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
     cfg.sac.min_alpha = None
     cfg.sac.max_alpha = None
 
-    # Build a wandb logger with the requested entity
-    run_dir = (
-        Path("logs")
-        / "sac"
-        / "halfcheetah-v4"
-        / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    )
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    exp_name = generate_exp_name("SAC", "HalfCheetah-v4")
-    wandb_logger = get_logger(
-        "wandb",
-        logger_name=str(run_dir),
-        experiment_name=exp_name,
-        wandb_kwargs={
-            "project": cfg.logger.project_name,
-            "group": "HalfCheetah-v4",
-            "entity": "fywu",
-            "config": asdict(cfg),
-        },
-    )
-
     # Replay buffer settings
     cfg.replay_buffer.size = 100000  # Reduced for profiling
 
     # Save interval (disable for profiling)
     cfg.save_interval = 0
 
-    # Parallel env and agent
+    # Create environment
     env = make_parallel_env(cfg)
     env = TransformedEnv(
         env,
@@ -144,7 +157,15 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
             ]
         ),
     )
-    agent = SAC(env=env, config=cfg, logger=wandb_logger)
 
-    # Full training run (no strict assertions; ensures it executes without error)
+    # Create agent without logger for profiling
+    agent = SAC(env=env, config=cfg, logger=None)
+
+    # Run training with profiling
+    print("Starting training with profiling...")
     agent.train()
+    print("RLOpt SAC profiling test completed!")
+
+
+if __name__ == "__main__":
+    test_sac_profiling()
