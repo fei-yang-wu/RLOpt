@@ -248,7 +248,7 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         cfg = SACRLOptConfig()
         # env
         cfg.env.env_name = env_name
-        cfg.env.device = "cpu"
+        cfg.env.device = "cuda:0"
         cfg.env.num_envs = num_envs
         # collector
         cfg.collector.num_collectors = num_envs
@@ -261,7 +261,7 @@ def sac_cfg_factory() -> Callable[..., SACRLOptConfig]:
         # loss
         cfg.loss.mini_batch_size = mini_batch_size
         # device
-        cfg.device = "cpu"
+        cfg.device = "cuda:0"
         # compile
         cfg.compile.compile = False
         # sac-specific
@@ -294,7 +294,7 @@ def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
         cfg = IPMDRLOptConfig()
         # env
         cfg.env.env_name = env_name
-        cfg.env.device = "cpu"
+        cfg.env.device = "cuda:0"
         cfg.env.num_envs = num_envs
         # collector
         cfg.collector.num_collectors = num_envs
@@ -317,7 +317,7 @@ def ipmd_cfg_factory() -> Callable[..., IPMDRLOptConfig]:
         # logger (empty backend disables metric logging)
         cfg.logger.backend = ""
         # device
-        cfg.device = "cpu"
+        cfg.device = "cuda:0"
         # compile
         cfg.compile.compile = False
         # ipmd-specific
@@ -351,7 +351,7 @@ def l2t_cfg_factory() -> Callable[..., L2TRLOptConfig]:
         cfg = L2TRLOptConfig()
         # env
         cfg.env.env_name = env_name
-        cfg.env.device = "cpu"
+        cfg.env.device = "cuda:0"
         cfg.env.num_envs = num_envs
         # collector
         cfg.collector.num_collectors = num_envs

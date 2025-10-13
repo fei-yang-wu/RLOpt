@@ -19,15 +19,18 @@ from torchrl.record.loggers import generate_exp_name, get_logger
 
 from rlopt.agent.sac.sac import SAC, SACRLOptConfig
 from rlopt.configs import (
-    EnvConfig,
-    RLOptConfig,
-    NetworkLayout,
-    ModuleNetConfig,
-    MLPBlockConfig,
     CriticConfig,
+    EnvConfig,
+    MLPBlockConfig,
+    ModuleNetConfig,
+    NetworkLayout,
+    RLOptConfig,
     SharedFeatures,
 )
 from rlopt.env_utils import make_parallel_env
+
+import torch
+import numpy as np
 
 
 @pytest.mark.full_halfcheetah
@@ -52,9 +55,9 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
         save_interval=100000,
     )
 
-    cfg.compile.compile = True
+    cfg.compile.compile = False
     cfg.compile.compile_mode = "default"
-    cfg.compile.cudagraphs = True
+    cfg.compile.cudagraphs = False
     cfg.compile.warmup = 1
 
     network_layout = NetworkLayout(
@@ -66,9 +69,6 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
             head=MLPBlockConfig(
                 num_cells=[256, 256],  # Match TorchRL hidden sizes
                 activation="relu",  # Match TorchRL activation
-                init="orthogonal",
-                layer_norm=False,
-                dropout=0.0,
             ),
             in_keys=["observation"],  # Direct input
             out_key="hidden",
@@ -79,10 +79,7 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
                 feature_ref=None,  # No feature extractor
                 head=MLPBlockConfig(
                     num_cells=[256, 256],  # Match TorchRL hidden sizes
-                    activation="relu",  # Match TorchRL activation
-                    init="orthogonal",
-                    layer_norm=False,
-                    dropout=0.0,
+                    activation="relu",  # Match TorchRL activatio
                 ),
                 in_keys=["observation", "action"],  # Direct input
                 out_key="hidden",
@@ -95,6 +92,10 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
         ),
     )
 
+    cfg.network = network_layout
+
+    cfg.use_feature_extractor = False
+
     # SAC-specific configuration - match TorchRL exactly
     cfg.sac.utd_ratio = 1.0
     cfg.sac.alpha_init = 1.0
@@ -102,6 +103,10 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
     cfg.sac.target_entropy = "auto"
     cfg.sac.min_alpha = None
     cfg.sac.max_alpha = None
+
+    cfg.policy_in_keys = ["observation"]
+    cfg.value_net_in_keys = ["observation"]
+    cfg.total_input_keys = ["observation"]
 
     # Build a wandb logger with the requested entity
     run_dir = (
@@ -126,10 +131,12 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
     )
 
     # Replay buffer settings
-    cfg.replay_buffer.size = 100000  # Reduced for profiling
+    cfg.replay_buffer.size = 1000000  # Reduced for profiling
 
     # Save interval (disable for profiling)
     cfg.save_interval = 0
+
+    cfg.seed = 42
 
     # Parallel env and agent
     env = make_parallel_env(cfg)
@@ -138,12 +145,13 @@ def test_sac_halfcheetah_v5_full_wandb(sac_cfg_factory) -> None:  # type: ignore
         Compose(
             [
                 InitTracker(),
-                StepCounter(),
+                StepCounter(1000),
                 DoubleToFloat(),
                 RewardSum(),
             ]
         ),
     )
+
     agent = SAC(env=env, config=cfg, logger=wandb_logger)
 
     # Full training run (no strict assertions; ensures it executes without error)

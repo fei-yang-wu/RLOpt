@@ -130,7 +130,7 @@ class LoggerConfig:
 class OptimizerConfig:
     """Optimizer configuration for RLOpt."""
 
-    optimizer: str = "adamw"
+    optimizer: str = "adam"
     """Name of the optimizer to use (e.g. ``"adamw"``, ``"adam"``, ``"sgd"``)."""
 
     lr: float = 3e-4
@@ -262,7 +262,7 @@ class MLPBlockConfig:
     activation: Literal["relu", "elu", "tanh", "gelu"] = "relu"  # Match TorchRL default
     init: Literal["orthogonal", "xavier_uniform", "kaiming_uniform"] = "orthogonal"
     layer_norm: bool = False
-    dropout: float = 0.0
+    dropout: float | None = None
 
 
 @dataclass
@@ -441,7 +441,7 @@ class RLOptConfig:
     device: str = "cuda:0"
     """Device for training."""
 
-    seed: int = 0
+    seed: int = 42
     """Random seed."""
 
     log_level: str = "warning"

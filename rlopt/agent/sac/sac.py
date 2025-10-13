@@ -6,7 +6,6 @@ from typing import Any, cast
 
 import numpy as np
 import torch
-import tqdm
 from tensordict import TensorDict
 from tensordict.nn import InteractionType, TensorDictModule
 from torch import Tensor, nn
@@ -18,14 +17,14 @@ from torchrl.data import (
     TensorDictReplayBuffer,
 )
 from torchrl.data.replay_buffers.samplers import RandomSampler
-from torchrl.envs.utils import set_exploration_type
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import (
     MLP,
     ActorCriticOperator,
     ProbabilisticActor,
     TanhNormal,
 )
-from torchrl.objectives import SoftUpdate
+from torchrl.objectives import SoftUpdate, group_optimizers
 from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 from tqdm.std import tqdm as Tqdm
@@ -166,16 +165,6 @@ class SAC(BaseAlgorithm):
         self, policy_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
         """Construct policy"""
-        # for SAC, we use a probabilistic actor
-
-        # Define policy output distribution class
-        distribution_class = TanhNormal
-        distribution_kwargs = {
-            "low": self.env.action_spec_unbatched.space.low.to(self.device),  # type: ignore
-            "high": self.env.action_spec_unbatched.space.high.to(self.device),  # type: ignore
-            "tanh_loc": False,
-        }
-
         # Define policy architecture
         if policy_net is None:
             # Use NetworkLayout if provided, otherwise fall back to legacy config
@@ -198,40 +187,45 @@ class SAC(BaseAlgorithm):
             policy_mlp = MLP(
                 in_features=self.policy_input_shape,
                 activation_class=activation_class,
-                out_features=self.policy_output_shape,
-                num_cells=num_cells,
+                out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+                # 2 outputs for loc and scale
+                num_cells=list(num_cells),
                 device=self.device,
             )
-            # Initialize policy weights
-            if (
-                self.config.network
-                and self.config.network.policy
-                and self.config.network.policy.head
-            ):
-                self._initialize_weights(
-                    policy_mlp, self.config.network.policy.head.init
-                )
-            else:
-                self._initialize_weights(policy_mlp, "orthogonal")
+
         else:
             policy_mlp = policy_net
 
         # Build policy head via base helper and wrap
         policy_td = self._build_policy_head_module(
-            policy_net=policy_net,
+            policy_net=policy_mlp,
             in_keys=list(self.config.policy_in_keys),
             out_keys=["loc", "scale"],
             layout=self.config.network,
         )
+
+        # Define policy output distribution class
+        distribution_class = TanhNormal
+        distribution_kwargs = {
+            "low": self.env.action_spec_unbatched.space.low,  # type: ignore
+            "high": self.env.action_spec_unbatched.space.high,  # type: ignore
+            "tanh_loc": False,
+        }
+
         return ProbabilisticActor(
             policy_td,
             in_keys=["loc", "scale"],
             spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
-            return_log_prob=True,
-            default_interaction_type=InteractionType.RANDOM,
+            return_log_prob=False,
+            default_interaction_type=ExplorationType.RANDOM,
         )
+
+    @property
+    def collector_policy(self) -> TensorDictModule:
+        """By default, the collector_policy is self.policy or self.actor_critic.policy_operator()"""
+        return self.policy  # type: ignore[override]
 
     def _construct_value_function(
         self, value_net: nn.Module | None = None
@@ -274,7 +268,6 @@ class SAC(BaseAlgorithm):
             loss_function=self.config.loss.loss_critic_type,
             min_alpha=sac_cfg.min_alpha,
             max_alpha=sac_cfg.max_alpha,
-            action_spec=None,
             fixed_alpha=sac_cfg.fixed_alpha,
             target_entropy=sac_cfg.target_entropy,
             delay_actor=sac_cfg.delay_actor,
@@ -289,14 +282,40 @@ class SAC(BaseAlgorithm):
 
         return loss_module
 
+    def _configure_optimizers(self):
+        critic_params = list(
+            self.loss_module.qvalue_network_params.flatten_keys().values()  # type: ignore[attr-defined]
+        )
+
+        actor_params = list(
+            self.loss_module.actor_network_params.flatten_keys().values()  # type: ignore[attr-defined]
+        )
+
+        optimizer_actor = torch.optim.Adam(
+            actor_params,
+            lr=self.config.optim.lr,
+            weight_decay=self.config.optim.weight_decay,
+            eps=1.0e-8,
+        )
+        optimizer_critic = torch.optim.Adam(
+            critic_params,
+            lr=self.config.optim.lr,
+            weight_decay=self.config.optim.weight_decay,
+            eps=1.0e-8,
+        )
+        optimizer_alpha = torch.optim.Adam(
+            [self.loss_module.log_alpha],
+            lr=3.0e-4,
+        )
+
+        return group_optimizers(optimizer_actor, optimizer_critic, optimizer_alpha)
+
     def _construct_target_net_updater(self) -> SoftUpdate:
         # Prefer polyak parameter from network layout critic if present
         eps = self.config.optim.target_update_polyak
         if self.config.network and self.config.network.critic:
             eps = self.config.network.critic.polyak_eps
         return SoftUpdate(self.loss_module, eps=eps)
-
-    # _get_activation_class and _initialize_weights now provided by BaseAlgorithm
 
     def _get_additional_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
@@ -345,6 +364,7 @@ class SAC(BaseAlgorithm):
             batch_size=batch_size,
             shared=shared,
         )
+
         if scratch_dir:
             replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
         return replay_buffer
@@ -353,24 +373,25 @@ class SAC(BaseAlgorithm):
         return None
 
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
-        # Zero gradients
-        self.optim.zero_grad(set_to_none=True)
 
         # Compute loss
         loss_td = self.loss_module(sampled_tensordict)
         loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_loss")
 
-        actor_loss = cast(Tensor, loss_td["loss_actor"])  # type: ignore[arg-type]
-        q_loss = cast(Tensor, loss_td["loss_qvalue"])  # type: ignore[arg-type]
-        alpha_loss = cast(Tensor, loss_td["loss_alpha"])  # type: ignore[arg-type]
+        actor_loss = loss_td["loss_actor"]
+        q_loss = loss_td["loss_qvalue"]
+        alpha_loss = loss_td["loss_alpha"]
 
         total_loss = (actor_loss + q_loss + alpha_loss).sum()
 
         # Backward pass
-        total_loss.backward()
+        total_loss.backward()  # type: ignore[operator]
 
         # Update networks
         self.optim.step()
+
+        # Zero gradients
+        self.optim.zero_grad(set_to_none=True)
 
         # Update qnet_target params
         self.target_net_updater.step()
@@ -424,9 +445,7 @@ class SAC(BaseAlgorithm):
             with timeit("replay_extend"):
                 self.data_buffer.extend(data.reshape(-1))  # type: ignore[arg-type]
 
-            # Initialize losses variable
-            losses = TensorDict(batch_size=[num_updates])
-
+            losses = None
             with timeit("train"):
                 if collected_frames >= init_random_frames:
                     losses = TensorDict(batch_size=[num_updates])

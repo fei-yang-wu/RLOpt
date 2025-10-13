@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -84,7 +85,7 @@ class BaseAlgorithm(ABC):
         self.logger_video = False
 
         self._configure_logger(logger_override=logger)
-        self.log_dir: Path = self._logging_manager.run_dir
+        self.log_dir: Path = self._logging_manager.run_dir  # type: ignore[union-attr]
         self.log.debug(
             "Initialized %s (metrics_backend=%s, level=%s)",
             self.__class__.__name__,
@@ -206,7 +207,6 @@ class BaseAlgorithm(ABC):
                 [
                     self.env.observation_spec[key].shape[-1]
                     for key in self.config.policy_in_keys
-                    + self.config.value_net_in_keys
                 ]
             )
             .sum()
@@ -280,9 +280,10 @@ class BaseAlgorithm(ABC):
     ) -> SyncDataCollector:
         # We can't use nested child processes with mp_start_method="fork"
 
-        return SyncDataCollector(
+        collector = SyncDataCollector(
             create_env_fn=env,
             policy=policy,
+            init_random_frames=self.config.collector.init_random_frames,
             frames_per_batch=self.config.collector.frames_per_batch,
             total_frames=self.config.collector.total_frames,
             # this is the default behavior: the collector runs in ``"random"`` (or explorative) mode
@@ -299,9 +300,11 @@ class BaseAlgorithm(ABC):
             # heterogeneous devices
             device=self.device,
             storing_device=self.device,
-            reset_at_each_iter=False,
-            set_truncated=self.config.collector.set_truncated,
+            # reset_at_each_iter=False,
+            # set_truncated=self.config.collector.set_truncated,
         )
+        collector.set_seed(self.config.seed)
+        return collector
 
     @abstractmethod
     def _construct_policy(
@@ -491,10 +494,6 @@ class BaseAlgorithm(ABC):
         Override this method in subclasses to add optimizers for components
         like alpha parameters in SAC, reward estimators in IPMD, etc.
 
-        Args:
-            optimizer_cls: The optimizer class to use
-            optimizer_kwargs: The optimizer keyword arguments
-
         Returns:
             List of additional optimizers
         """
@@ -584,11 +583,8 @@ class BaseAlgorithm(ABC):
     def _sum_input_dim(self, keys: list[str]) -> int:
         dims = []
         for k in keys:
-            try:
+            with contextlib.suppress(Exception):
                 dims.append(int(self.env.observation_spec[k].shape[-1]))  # type: ignore[index]
-            except Exception:
-                # Unknown key (e.g., hidden); caller should override in_dim
-                pass
         if dims:
             return int(torch.tensor(dims).sum().item())
         # Fallback to total_input_shape if nothing matched
@@ -641,7 +637,7 @@ class BaseAlgorithm(ABC):
         in_keys = list(in_keys) if in_keys is not None else list(self.total_input_keys)
         if feature_extractor_net is not None:
             return TensorDictModule(
-                module=feature_extractor_net, in_keys=in_keys, out_keys=[out_key]
+                module=feature_extractor_net, in_keys=in_keys, out_keys=[out_key]  # type: ignore[call-arg]
             )
 
         if use_feature_extractor is None:
@@ -664,7 +660,7 @@ class BaseAlgorithm(ABC):
                     )
                     self._initialize_weights(fe, spec.mlp.init)
                     return TensorDictModule(
-                        module=fe, in_keys=in_keys, out_keys=[out_key]
+                        module=fe, in_keys=in_keys, out_keys=[out_key]  # type: ignore[call-arg]
                     )
                 msg = f"Feature type {spec.type} not supported (expected mlp)"
                 raise NotImplementedError(msg)
@@ -679,11 +675,11 @@ class BaseAlgorithm(ABC):
                 device=self.device,
             )
             self._initialize_weights(fe, "orthogonal")
-            return TensorDictModule(module=fe, in_keys=in_keys, out_keys=[out_key])
+            return TensorDictModule(module=fe, in_keys=in_keys, out_keys=[out_key])  # type: ignore[call-arg]
 
         # No feature extractor: identity mapping
         return TensorDictModule(
-            module=torch.nn.Identity(), in_keys=in_keys, out_keys=in_keys
+            module=torch.nn.Identity(), in_keys=in_keys, out_keys=in_keys  # type: ignore[call-arg]
         )
 
     def _build_policy_head_module(
@@ -725,11 +721,11 @@ class BaseAlgorithm(ABC):
             net = MLP(
                 in_features=in_dim,
                 activation_class=activation_class,
-                out_features=int(self.policy_output_shape) * 2,
+                out_features=int(self.policy_output_shape),
                 num_cells=list(num_cells),
                 device=self.device,
             )
-            self._initialize_weights(net, init)
+            # self._initialize_weights(net, init)
         else:
             net = policy_net
 
@@ -740,10 +736,10 @@ class BaseAlgorithm(ABC):
         #     ).to(self.device),
         # )
         extractor = NormalParamExtractor(
-            scale_mapping="biased_softplus_0.1", scale_lb=0.1  # type: ignore
+            scale_mapping="biased_softplus_1.0", scale_lb=0.1  # type: ignore
         ).to(self.device)
         net = torch.nn.Sequential(net, extractor)
-        return TensorDictModule(module=net, in_keys=in_keys, out_keys=list(out_keys))
+        return TensorDictModule(module=net, in_keys=in_keys, out_keys=list(out_keys))  # type: ignore[call-arg]
 
     def _build_value_module(
         self,
@@ -1004,20 +1000,23 @@ class BaseAlgorithm(ABC):
                 all_finite &= self._validate_tensordict(
                     value, stage, next_prefix, raise_error
                 )
-            elif torch.is_tensor(value) and torch.is_floating_point(value):
-                if not torch.isfinite(value).all():
-                    nan_count = torch.isnan(value).sum().item()
-                    inf_count = torch.isinf(value).sum().item()
-                    joined_key = ".".join(next_prefix)
-                    msg = (
-                        "Detected non-finite tensor values "
-                        f"during '{stage}' at key '{joined_key}': "
-                        f"nan={nan_count}, inf={inf_count}"
-                    )
-                    all_finite = False
-                    if raise_error:
-                        raise FloatingPointError(msg)
-                    self.log.debug("%s", msg)
+            elif (
+                torch.is_tensor(value)
+                and torch.is_floating_point(value)  # type: ignore[call-arg]
+                and not torch.isfinite(value).all()  # type: ignore
+            ):
+                nan_count = torch.isnan(value).sum().item()  # type: ignore[call-arg]
+                inf_count = torch.isinf(value).sum().item()  # type: ignore[call-arg]
+                joined_key = ".".join(next_prefix)
+                msg = (
+                    "Detected non-finite tensor values "
+                    f"during '{stage}' at key '{joined_key}': "
+                    f"nan={nan_count}, inf={inf_count}"
+                )
+                all_finite = False
+                if raise_error:
+                    raise FloatingPointError(msg)
+                self.log.debug("%s", msg)
 
         return all_finite
 
@@ -1029,12 +1028,12 @@ class BaseAlgorithm(ABC):
                 self._sanitize_loss_tensordict(value, stage)
                 continue
 
-            if torch.is_tensor(value) and torch.is_floating_point(value):
-                if torch.isfinite(value).all():
+            if torch.is_tensor(value) and torch.is_floating_point(value):  # type: ignore[call-arg]
+                if torch.isfinite(value).all():  # type: ignore[call-arg]
                     continue
 
-                nan_count = torch.isnan(value).sum().item()
-                inf_count = torch.isinf(value).sum().item()
+                nan_count = torch.isnan(value).sum().item()  # type: ignore[call-arg]
+                inf_count = torch.isinf(value).sum().item()  # type: ignore[call-arg]
                 key_repr = key if isinstance(key, str) else str(key)
                 self.log.debug(
                     "Non-finite loss detected; replacing with zeros | stage=%s key=%s nan=%d inf=%d",
