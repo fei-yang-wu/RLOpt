@@ -23,10 +23,11 @@ logger:
 
 # Optim
 optim:
-  lr: 3e-4
+  lr: 1e-4
   weight_decay: 0.0
   anneal_lr: True
   device:
+  max_grad_norm: 0.5
 
 # loss
 loss:

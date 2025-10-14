@@ -12,6 +12,7 @@ from torchrl.envs import (
     RewardSum,
     StepCounter,
     TransformedEnv,
+    VecNormV2
 )
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.transforms import (
