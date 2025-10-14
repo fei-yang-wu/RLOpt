@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torchrl.envs.libs.gym
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from tensordict import TensorDict
 from torchrl.envs import EnvCreator, ParallelEnv, TransformedEnv
@@ -288,3 +288,4 @@ def test_training_improves_return_pporecurrent():
 
     assert duration < 120.0
     assert after > before + 0.01
+    
