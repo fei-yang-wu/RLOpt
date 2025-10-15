@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from tensordict.nn import InteractionType, TensorDictModule
+from tensordict.nn.distributions import NormalParamExtractor
 from torch import Tensor, nn
 from torchrl._utils import timeit
 from torchrl.data import (
@@ -23,8 +24,9 @@ from torchrl.modules import (
     ActorCriticOperator,
     ProbabilisticActor,
     TanhNormal,
+    ValueOperator,
 )
-from torchrl.objectives import SoftUpdate, group_optimizers
+from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 from tqdm.std import tqdm as Tqdm
@@ -32,7 +34,7 @@ from tqdm.std import tqdm as Tqdm
 from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import RLOptConfig
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import log_info
+from rlopt.utils import get_activation_class, log_info
 
 
 @dataclass
@@ -93,12 +95,8 @@ class SACRLOptConfig(RLOptConfig):
     """SAC configuration."""
 
     def __post_init__(self):
-        self.use_value_function = False
-        # Match TorchRL stable architecture defaults
-        self.use_feature_extractor = False  # Direct input like TorchRL
-        self.policy_in_keys = ["observation"]  # Direct observation input
-        self.value_net_in_keys = ["observation"]  # Direct observation input
-        self.total_input_keys = ["observation"]  # Direct observation input
+        # Assert Q-function config exists
+        assert self.q_function, "SAC requires a Q-function configuration."
 
 
 class SAC(BaseAlgorithm):
@@ -112,28 +110,14 @@ class SAC(BaseAlgorithm):
         self,
         env,
         config: SACRLOptConfig,
-        policy_net: nn.Module | None = None,
-        q_net: nn.Module | None = None,  # optional external Q-value module
-        replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
-        feature_extractor_net: nn.Module | None = None,
         **kwargs,
     ):
-        # Adjust key configuration when no feature extractor is used
-        if not config.use_feature_extractor:
-            # When no feature extractor, policy and Q-function should use the same keys as input
-            config.policy_in_keys = config.total_input_keys.copy()
-            config.value_net_in_keys = config.total_input_keys.copy()
 
         super().__init__(
             env=env,
             config=config,
-            policy_net=policy_net,
-            value_net=None,
-            q_net=q_net,
-            replay_buffer=replay_buffer,
             logger=logger,
-            feature_extractor_net=feature_extractor_net,
             **kwargs,
         )
 
@@ -150,68 +134,30 @@ class SAC(BaseAlgorithm):
         # construct the target net updater
         self.target_net_updater = self._construct_target_net_updater()
 
-    def _construct_feature_extractor(
-        self, feature_extractor_net: torch.nn.Module | None = None
-    ) -> TensorDictModule:
-        """Build shared feature extractor via base helper."""
-        return self._build_feature_extractor_module(
-            feature_extractor_net=feature_extractor_net,
-            in_keys=list(self.total_input_keys),
-            out_key="hidden",
-            layout=self.config.network,
+    def _construct_policy(self) -> TensorDictModule:
+        """Construct policy network."""
+        policy_mlp = MLP(
+            in_features=self.config.policy.input_dim,
+            activation_class=get_activation_class(self.config.policy.activation_fn),
+            out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+            num_cells=list(self.config.policy.num_cells),
+            device=self.device,
         )
-
-    def _construct_policy(
-        self, policy_net: torch.nn.Module | None = None
-    ) -> TensorDictModule:
-        """Construct policy"""
-        # Define policy architecture
-        if policy_net is None:
-            # Use NetworkLayout if provided, otherwise fall back to legacy config
-            if self.config.network and self.config.network.policy:
-                policy_config = self.config.network.policy
-                if policy_config.head:
-                    num_cells = list(policy_config.head.num_cells)
-                    activation_class = self._get_activation_class(
-                        policy_config.head.activation
-                    )
-                else:
-                    # Fallback to legacy config
-                    num_cells = self.config.policy.num_cells
-                    activation_class = torch.nn.ELU
-            else:
-                # Fallback to legacy config
-                num_cells = self.config.policy.num_cells
-                activation_class = torch.nn.ELU
-
-            policy_mlp = MLP(
-                in_features=self.policy_input_shape,
-                activation_class=activation_class,
-                out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
-                # 2 outputs for loc and scale
-                num_cells=list(num_cells),
-                device=self.device,
-            )
-
-        else:
-            policy_mlp = policy_net
-
-        # Build policy head via base helper and wrap
-        policy_td = self._build_policy_head_module(
-            policy_net=policy_mlp,
-            in_keys=list(self.config.policy_in_keys),
-            out_keys=["loc", "scale"],
-            layout=self.config.network,
+        extractor = NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0", scale_lb=0.1  # type: ignore
+        ).to(self.device)
+        net = torch.nn.Sequential(policy_mlp, extractor)
+        policy_td = TensorDictModule(
+            module=net,
+            in_keys=list(self.config.policy.input_keys),
+            out_keys=list(self.config.policy.output_keys),
         )
-
-        # Define policy output distribution class
         distribution_class = TanhNormal
         distribution_kwargs = {
             "low": self.env.action_spec_unbatched.space.low,  # type: ignore
             "high": self.env.action_spec_unbatched.space.high,  # type: ignore
             "tanh_loc": False,
         }
-
         return ProbabilisticActor(
             policy_td,
             in_keys=["loc", "scale"],
@@ -225,44 +171,67 @@ class SAC(BaseAlgorithm):
     @property
     def collector_policy(self) -> TensorDictModule:
         """By default, the collector_policy is self.policy or self.actor_critic.policy_operator()"""
-        return self.policy  # type: ignore[override]
+        return self.actor_critic.get_policy_operator()  # type: ignore[override]
 
-    def _construct_value_function(
-        self, value_net: nn.Module | None = None
-    ) -> TensorDictModule:  # type: ignore[override]
-        """SAC does not use a state-value function explicitly.
-        We return a minimal dummy ValueOperator (not used in loss) to satisfy
-        ActorValueOperator structure.
-        """
+    def _construct_q_function(self) -> TensorDictModule:
+        if self.config.q_function is None:
+            msg = "SAC requires a Q-function configuration."
+            raise ValueError(msg)
 
-    def _construct_q_function(self, q_net: nn.Module | None = None) -> TensorDictModule:
-        # Delegate to base helper
-        return self._build_qvalue_module(q_net=q_net, layout=self.config.network)
+        q_function = MLP(
+            activation_class=get_activation_class(self.config.q_function.activation_fn),
+            num_cells=list(self.config.q_function.num_cells),
+            out_features=1,
+            device=self.device,
+        )
+
+        return ValueOperator(
+            module=q_function,
+            in_keys=list(self.config.q_function.input_keys),
+        )
 
     def _construct_actor_critic(self) -> TensorDictModule:
-        assert isinstance(
-            self.q_function, TensorDictModule
-        ), "Q-function must be a TensorDictModule"
-        assert isinstance(
-            self.policy, TensorDictModule
-        ), "Policy must be a TensorDictModule"
+        # Pass a dummy common_operator as required by ActorCriticOperator
 
+        if self.q_function is None or self.policy is None:
+            msg = "SAC requires a Q-function and policy configuration."
+            raise ValueError(msg)
+
+        # use the feature extractor if available
+        if self.feature_extractor:
+            return ActorCriticOperator(
+                common_operator=self.feature_extractor,
+                policy_operator=self.policy,
+                value_operator=self.q_function,
+            )
+
+        class IdentityModule(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        dummy = TensorDictModule(
+            module=IdentityModule(),
+            in_keys=["observation"],
+            out_keys=["observation"],
+        )
         return ActorCriticOperator(
-            common_operator=self.feature_extractor,
+            common_operator=dummy,
             policy_operator=self.policy,
             value_operator=self.q_function,
         )
 
     def _construct_loss_module(self) -> nn.Module:
-        assert isinstance(self.config, SACRLOptConfig)
-        sac_cfg = self.config.sac
-        # Read num critics from network layout if provided
-        if self.config.network and self.config.network.critic:
-            sac_cfg.num_qvalue_nets = self.config.network.critic.num_nets
+        sac_cfg = getattr(self.config, "sac", None)
+        if sac_cfg is None:
+            msg = "SAC config missing 'sac' attribute"
+            raise AttributeError(msg)
+        assert isinstance(
+            self.actor_critic, ActorCriticOperator
+        ), "actor_critic must be an ActorCriticOperator"
 
         loss_module = SACLoss(
-            actor_network=self.policy,  # type: ignore[arg-type]
-            qvalue_network=self.q_function,  # type: ignore[arg-type]
+            actor_network=self.actor_critic.get_policy_operator(),  # type: ignore[arg-type]
+            qvalue_network=self.actor_critic.get_critic_operator(),  # type: ignore[arg-type]
             num_qvalue_nets=sac_cfg.num_qvalue_nets,
             alpha_init=sac_cfg.alpha_init,
             loss_function=self.config.loss.loss_critic_type,
@@ -279,42 +248,32 @@ class SAC(BaseAlgorithm):
             deactivate_vmap=sac_cfg.deactivate_vmap,
         )
         loss_module.make_value_estimator(gamma=self.config.loss.gamma)
-
         return loss_module
 
-    def _configure_optimizers(self):
+    def _set_optimizers(
+        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    ) -> list[torch.optim.Optimizer]:
+        """Create optimizers for actor, critic, and alpha parameters."""
         critic_params = list(
             self.loss_module.qvalue_network_params.flatten_keys().values()  # type: ignore[attr-defined]
         )
-
         actor_params = list(
             self.loss_module.actor_network_params.flatten_keys().values()  # type: ignore[attr-defined]
         )
-
-        optimizer_actor = torch.optim.Adam(
-            actor_params,
-            lr=self.config.optim.lr,
-            weight_decay=self.config.optim.weight_decay,
-            eps=1.0e-8,
-        )
-        optimizer_critic = torch.optim.Adam(
-            critic_params,
-            lr=self.config.optim.lr,
-            weight_decay=self.config.optim.weight_decay,
-            eps=1.0e-8,
-        )
-        optimizer_alpha = torch.optim.Adam(
-            [self.loss_module.log_alpha],
-            lr=3.0e-4,
-        )
-
-        return group_optimizers(optimizer_actor, optimizer_critic, optimizer_alpha)
+        optimizers = [
+            optimizer_cls(actor_params, **optimizer_kwargs),
+            optimizer_cls(critic_params, **optimizer_kwargs),
+        ]
+        # Alpha optimizer for entropy temperature
+        if hasattr(self.loss_module, "log_alpha"):
+            param = self.loss_module.log_alpha
+            if isinstance(param, torch.nn.Parameter):
+                optimizers.append(torch.optim.Adam([param], lr=3.0e-4))
+        return optimizers
 
     def _construct_target_net_updater(self) -> SoftUpdate:
         # Prefer polyak parameter from network layout critic if present
         eps = self.config.optim.target_update_polyak
-        if self.config.network and self.config.network.critic:
-            eps = self.config.network.critic.polyak_eps
         return SoftUpdate(self.loss_module, eps=eps)
 
     def _get_additional_optimizers(
@@ -334,11 +293,8 @@ class SAC(BaseAlgorithm):
         return additional_optimizers
 
     def _construct_data_buffer(self) -> ReplayBuffer:
-        """Construct data buffer"""
-        # Create data buffer
         cfg = self.config
         sampler = RandomSampler()
-        # Prefer replay buffer-specific settings when available
         scratch_dir = cfg.replay_buffer.scratch_dir or cfg.collector.scratch_dir
         device = cfg.device
         buffer_size = cfg.replay_buffer.size
@@ -352,7 +308,7 @@ class SAC(BaseAlgorithm):
                 LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir
             )
         )
-        if cfg.replay_buffer.prb:
+        if getattr(cfg.replay_buffer, "prb", False):
             self.log.warning(
                 "Prioritized replay buffer (prb) is not supported; using uniform replay."
             )
@@ -364,7 +320,6 @@ class SAC(BaseAlgorithm):
             batch_size=batch_size,
             shared=shared,
         )
-
         if scratch_dir:
             replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
         return replay_buffer
@@ -382,7 +337,7 @@ class SAC(BaseAlgorithm):
         q_loss = loss_td["loss_qvalue"]
         alpha_loss = loss_td["loss_alpha"]
 
-        total_loss = (actor_loss + q_loss + alpha_loss).sum()
+        total_loss = (actor_loss + q_loss + alpha_loss).sum()  # type: ignore[operator]
 
         # Backward pass
         total_loss.backward()  # type: ignore[operator]
@@ -501,15 +456,9 @@ class SAC(BaseAlgorithm):
         pbar.close()
         self.collector.shutdown()
 
-    def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
-        obs = torch.as_tensor([obs], device=self.device)
+    def predict(self, td: TensorDict) -> Tensor:  # type: ignore[override]
         policy_op = self.actor_critic.get_policy_operator()
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
-            td = TensorDict(  # type: ignore[arg-type]
-                dict.fromkeys(self.total_input_keys, obs),
-                batch_size=[1],
-                device=self.device,
-            )
             td = policy_op(td)
             return td.get("action")

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import torch
+
 
 @dataclass
 class EnvConfig:
@@ -247,6 +249,53 @@ class FeatureExtractorConfig:
     """Output dimension of the feature extractor."""
 
 
+@dataclass
+class NetworkConfig:
+    """Network configuration for RLOpt  ."""
+
+    num_cells: list[int] = field(
+        default_factory=lambda: [256, 256]
+    )  # Match TorchRL stable architecture
+    """Number of cells in each layer."""
+
+    input_dim: int | None = None
+    """Input dimension of the network. Defaults to lazy initialization if None."""
+
+    output_dim: int = 256
+    """Output dimension of the feature extractor."""
+
+    input_keys: list[str] = field(default_factory=lambda: ["observation"])
+    """Input keys for the network."""
+
+    output_keys: list[str] = field(default_factory=list)
+    """Output keys for the network."""
+
+    activation_fn: str = "relu"
+    """Activation function."""
+
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    """Additional keyword arguments for the network."""
+
+
+@dataclass
+class FeatureExtractorNetworkConfig(NetworkConfig):
+    """Feature network config with type-discriminated config.
+
+    One of mlp, lstm, or cnn may be set depending on `type`.
+    """
+
+    type: Literal["mlp", "lstm", "cnn"] = "mlp"
+    # Feature extractor configuration for RLOpt.
+
+    mlp: NetworkConfig | None = None
+
+    lstm: NetworkConfig | None = None
+
+    cnn: NetworkConfig | None = None
+
+    output_dim: int = 256  # Match TorchRL stable architecture
+
+
 # ------------------------------
 # Advanced network configuration
 # ------------------------------
@@ -410,33 +459,27 @@ class RLOptConfig:
     compile: CompileConfig = field(default_factory=CompileConfig)
     """Compilation configuration."""
 
-    policy: PolicyConfig = field(default_factory=PolicyConfig)
+    policy: NetworkConfig = field(default_factory=NetworkConfig)
     """Policy network configuration."""
 
-    value_net: ValueNetConfig = field(default_factory=ValueNetConfig)
+    value_function: NetworkConfig | None = None
     """Value network configuration."""
 
-    action_value_net: ActionValueNetConfig = field(default_factory=ActionValueNetConfig)
+    q_function: NetworkConfig | None = None
     """Action-value network configuration (used by off-policy agents such as SAC)."""
 
-    feature_extractor: FeatureExtractorConfig = field(
-        default_factory=FeatureExtractorConfig
-    )
+    feature_extractor: FeatureExtractorNetworkConfig | None = None
     """Feature extractor configuration."""
 
-    # Optional advanced network layout. If provided, agents may use this
-    # to build shared/private feature extractors and heads.
-    network: NetworkLayout | None = None
-
-    trainer: TrainerConfig = field(default_factory=TrainerConfig)
+    trainer: TrainerConfig | None = None
     """Trainer configuration."""
 
-    use_feature_extractor: bool = True
-    """Whether to use a feature extractor."""
+    # use_value_function: bool = True
+    # """Whether to use a value function.
+    # If use action_value function, then q network is used."""
 
-    use_value_function: bool = True
-    """Whether to use a value function. 
-    If use action_value function, then q network is used."""
+    # use_action_value_function: bool = False
+    # """Whether to use an action-value function."""
 
     device: str = "cuda:0"
     """Device for training."""
@@ -449,12 +492,3 @@ class RLOptConfig:
 
     save_interval: int = 10
     """Interval for saving the model."""
-
-    policy_in_keys: list[str] = field(default_factory=lambda: ["hidden"])
-    """Keys to use for the policy."""
-
-    value_net_in_keys: list[str] = field(default_factory=lambda: ["hidden"])
-    """Keys to use for the value network."""
-
-    total_input_keys: list[str] = field(default_factory=lambda: ["policy"])
-    """Keys to use for the total input."""

@@ -561,3 +561,14 @@ def log_agent_overview(
         max_depth=max_depth,
         indent=indent,
     )
+
+
+def get_activation_class(activation_name: str) -> type[th.nn.Module]:
+    """Get activation class from activation name across agents."""
+    activation_map = {
+        "relu": th.nn.ReLU,
+        "elu": th.nn.ELU,
+        "tanh": th.nn.Tanh,
+        "gelu": th.nn.GELU,
+    }
+    return activation_map.get(activation_name, th.nn.ELU)
