@@ -9,6 +9,7 @@ from collections import deque
 from typing import (
     Any,
     ClassVar,
+    Optional,
     TypeVar,
 )
 
@@ -121,6 +122,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
         "MlpPolicy": ActorCriticPolicy,
         "CnnPolicy": ActorCriticCnnPolicy,
         "MultiInputPolicy": MultiInputActorCriticPolicy,
+        "MlpLstmPolicy": MlpLstmPolicy,
+        "CnnLstmPolicy": CnnLstmPolicy,
+        "MultiInputLstmPolicy": MultiInputLstmPolicy,
     }
     student_policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "MlpLstmPolicy": MlpLstmPolicy,
@@ -330,6 +334,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         )
         self.policy = self.policy.to(self.device)
 
+        self._init_teacher_lstm_states()
+
         self._init_student_policy(self.student_policy, self.student_policy_kwargs)
         # Initialize schedules for policy/value clipping
         self.clip_range = get_schedule_fn(self.clip_range)
@@ -345,6 +351,172 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.compiled_policy = th.compile(self.policy)  # type: ignore
 
         self.compiled_student_policy = th.compile(self.student_policy)  # type: ignore
+
+    def _init_teacher_lstm_states(self) -> None:
+        """
+        Initialize teacher LSTM states if the teacher policy is recurrent.
+        """
+        # Check if teacher policy is recurrent
+        if hasattr(self.policy, 'lstm_actor'):
+            lstm = self.policy.lstm_actor
+            single_hidden_state_shape = (lstm.num_layers, self.n_envs, lstm.hidden_size)
+            # hidden and cell states for actor and critic
+            self._last_teacher_lstm_states = RNNStates(
+                (
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                ),
+                (
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                    th.zeros(single_hidden_state_shape, device=self.device),
+                ),
+            )
+            if self.verbose >= 1:
+                print(f"Initialized teacher LSTM states: {single_hidden_state_shape}")
+        else:
+            self._last_teacher_lstm_states = None
+            if self.verbose >= 1:
+                print("Teacher policy is not recurrent, LSTM states not initialized")
+
+    def _handle_teacher_lstm_states(
+        self, 
+        teacher_hidden_batch: Optional[RNNStates], 
+        batch_size: int
+    ) -> RNNStates:
+        """
+        Handle teacher LSTM states for training.
+        """
+        try:
+            if teacher_hidden_batch is None:
+                # Fallback: use zero states if no stored states available
+                if self.verbose >= 2:
+                    print(f"Teacher LSTM states not available, using zero states for batch size {batch_size}")
+                return RNNStates(
+                    (
+                        th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                        th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                    ),
+                    (
+                        th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                        th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                    ),
+                )
+            
+            stored_batch_size = teacher_hidden_batch.pi[0].shape[1]
+            
+            if stored_batch_size == batch_size:
+                # Perfect match, use as is
+                if self.verbose >= 2:
+                    print(f"Teacher LSTM states batch size match: {batch_size}")
+                return teacher_hidden_batch
+            elif stored_batch_size < batch_size:
+                # Need to expand the stored states to match current batch size
+                if self.verbose >= 2:
+                    print(f"Expanding teacher LSTM states: {stored_batch_size} -> {batch_size}")
+                return self._expand_teacher_lstm_states(teacher_hidden_batch, batch_size, stored_batch_size)
+            else:
+                # Current batch is smaller, take the first part
+                if self.verbose >= 2:
+                    print(f"Truncating teacher LSTM states: {stored_batch_size} -> {batch_size}")
+                return RNNStates(
+                    (
+                        teacher_hidden_batch.pi[0][:, :batch_size, :],
+                        teacher_hidden_batch.pi[1][:, :batch_size, :],
+                    ),
+                    (
+                        teacher_hidden_batch.vf[0][:, :batch_size, :],
+                        teacher_hidden_batch.vf[1][:, :batch_size, :],
+                    ),
+                )
+        except Exception as e:
+            if self.verbose >= 1:
+                print(f"Error handling teacher LSTM states: {e}")
+            # Fallback to zero states
+            return RNNStates(
+                (
+                    th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                    th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                ),
+                (
+                    th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                    th.zeros((1, batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                ),
+            )
+
+    def _expand_teacher_lstm_states(
+        self, 
+        teacher_hidden_batch: RNNStates, 
+        target_batch_size: int, 
+        stored_batch_size: int
+    ) -> RNNStates:
+        """
+        Expand stored teacher LSTM states to match target batch size.
+        """
+        try:
+            if target_batch_size == stored_batch_size:
+                return teacher_hidden_batch
+            
+            repeat_factor = target_batch_size // stored_batch_size
+            remainder = target_batch_size % stored_batch_size
+            
+            # Expansion using repeat and slice
+            if remainder == 0:
+                # Simple repeat
+                return RNNStates(
+                    (
+                        teacher_hidden_batch.pi[0].repeat(1, repeat_factor, 1),
+                        teacher_hidden_batch.pi[1].repeat(1, repeat_factor, 1),
+                    ),
+                    (
+                        teacher_hidden_batch.vf[0].repeat(1, repeat_factor, 1),
+                        teacher_hidden_batch.vf[1].repeat(1, repeat_factor, 1),
+                    ),
+                )
+            else:
+                # Repeat the full batches
+                expanded_pi_hidden = teacher_hidden_batch.pi[0].repeat(1, repeat_factor, 1)
+                expanded_pi_cell = teacher_hidden_batch.pi[1].repeat(1, repeat_factor, 1)
+                expanded_vf_hidden = teacher_hidden_batch.vf[0].repeat(1, repeat_factor, 1)
+                expanded_vf_cell = teacher_hidden_batch.vf[1].repeat(1, repeat_factor, 1)
+                
+                # Add remainder using slice
+                if remainder > 0:
+                    expanded_pi_hidden = th.cat([
+                        expanded_pi_hidden, 
+                        teacher_hidden_batch.pi[0][:, :remainder, :]
+                    ], dim=1)
+                    expanded_pi_cell = th.cat([
+                        expanded_pi_cell, 
+                        teacher_hidden_batch.pi[1][:, :remainder, :]
+                    ], dim=1)
+                    expanded_vf_hidden = th.cat([
+                        expanded_vf_hidden, 
+                        teacher_hidden_batch.vf[0][:, :remainder, :]
+                    ], dim=1)
+                    expanded_vf_cell = th.cat([
+                        expanded_vf_cell, 
+                        teacher_hidden_batch.vf[1][:, :remainder, :]
+                    ], dim=1)
+                
+                return RNNStates(
+                    (expanded_pi_hidden, expanded_pi_cell),
+                    (expanded_vf_hidden, expanded_vf_cell),
+                )
+            
+        except Exception as e:
+            # Fallback to zero states if expansion fails
+            if self.verbose >= 1:
+                print(f"Warning: Failed to expand teacher LSTM states: {e}")
+            return RNNStates(
+                (
+                    th.zeros((1, target_batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                    th.zeros((1, target_batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                ),
+                (
+                    th.zeros((1, target_batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                    th.zeros((1, target_batch_size, self.policy.lstm_actor.hidden_size), device=self.device),
+                ),
+            )
 
     def _init_student_policy(
         self,
@@ -482,9 +654,21 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     )
                     student_predicted = True
                 else:
-                    actions, values, log_probs = self.compiled_policy(
-                        obs_tensor["teacher"]
-                    )
+                    # Check if teacher policy is recurrent
+                    if self._last_teacher_lstm_states is not None:
+                        # Directly use the stored LSTM states
+                        actions, values, log_probs, teacher_lstm_states = (
+                            self.compiled_policy.forward(
+                                obs_tensor["teacher"],
+                                self._last_teacher_lstm_states,
+                                episode_starts,
+                            )
+                        )
+                    else:
+                        actions, values, log_probs = self.compiled_policy(
+                            obs_tensor["teacher"]
+                        )
+                        teacher_lstm_states = None
 
                 # get the hidden state of the current student state
                 if not student_predicted:
@@ -556,10 +740,36 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 log_probs,
                 lstm_states=self._last_lstm_states,  # type: ignore[arg-type]
                 dones=dones,  # type: ignore[arg-type]
+                teacher_lstm_states=self._last_teacher_lstm_states,  # type: ignore[arg-type]
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones  # type: ignore[arg-type]
             self._last_lstm_states = lstm_states  # type: ignore
+            
+            # Update teacher LSTM states if teacher is recurrent
+            if self._last_teacher_lstm_states is not None and teacher_lstm_states is not None:
+                # Reset LSTM states for episodes that ended
+                if dones.any():
+                    # More efficient: use in-place operations where possible
+                    episode_ends = dones.unsqueeze(0).unsqueeze(-1)  # (1, n_envs, 1)
+                    reset_mask = (1.0 - episode_ends)
+                    
+                    # Create new states with reset logic
+                    self._last_teacher_lstm_states = RNNStates(
+                        (
+                            reset_mask * teacher_lstm_states.pi[0],
+                            reset_mask * teacher_lstm_states.pi[1],
+                        ),
+                        (
+                            reset_mask * teacher_lstm_states.vf[0],
+                            reset_mask * teacher_lstm_states.vf[1],
+                        ),
+                    )
+                    if self.verbose >= 2:
+                        print(f"Reset teacher LSTM states for {dones.sum().item()} ended episodes")
+                else:
+                    # No episodes ended, just update states
+                    self._last_teacher_lstm_states = teacher_lstm_states
 
             # record reward and episode length
             self.rewbuffer.extend(
@@ -573,9 +783,23 @@ class RecurrentL2T(OnPolicyAlgorithm):
 
         with th.inference_mode():
             # Compute value for the last timestep
-            values = self.compiled_policy.predict_values(
-                obs_as_tensor(new_obs["teacher"], self.device)  # type: ignore[arg-type]
-            )
+            if self._last_teacher_lstm_states is not None:
+                # For recurrent teacher, we need to provide LSTM states
+                # Convert RNNStates to tuple format expected by predict_values
+                teacher_lstm_tuple = (
+                    self._last_teacher_lstm_states.vf[0],  # hidden state
+                    self._last_teacher_lstm_states.vf[1]   # cell state
+                )
+                values = self.compiled_policy.predict_values(
+                    obs_as_tensor(new_obs["teacher"], self.device),  # type: ignore[arg-type]
+                    teacher_lstm_tuple,
+                    th.zeros((self.n_envs,), dtype=th.bool, device=self.device)
+                )
+            else:
+                # Standard MLP teacher
+                values = self.compiled_policy.predict_values(
+                    obs_as_tensor(new_obs["teacher"], self.device)  # type: ignore[arg-type]
+                )
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)  # type: ignore[arg-type]
 
         callback.update_locals(locals())
@@ -654,6 +878,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
             old_actions_log_prob_batch,
             masks_batch,
             hidden_batch,
+            teacher_hidden_batch,
         ) in generator:
             # Do a complete pass on the rollout buffer
 
@@ -673,11 +898,24 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 actions = actions["teacher"]  # type: ignore[arg-type]
                 observations = obs_batch["teacher"]
 
-            # teacher is mlp so no funny business
-            values, log_prob, entropy = self.compiled_policy.evaluate_actions(
-                observations,  # type: ignore[arg-type]
-                actions,  # type: ignore
-            )
+            if self._last_teacher_lstm_states is not None:
+                # For recurrent teacher, use intelligent LSTM state handling
+                batch_size = observations.shape[0]
+                teacher_lstm_states = self._handle_teacher_lstm_states(teacher_hidden_batch, batch_size)
+                
+                episode_starts = th.zeros((batch_size,), dtype=th.bool, device=self.device)
+                values, log_prob, entropy = self.compiled_policy.evaluate_actions(
+                    observations,  # type: ignore[arg-type]
+                    actions,  # type: ignore
+                    teacher_lstm_states,
+                    episode_starts,
+                )
+            else:
+                # Standard MLP teacher
+                values, log_prob, entropy = self.compiled_policy.evaluate_actions(
+                    observations,  # type: ignore[arg-type]
+                    actions,  # type: ignore
+                )
             values = values.flatten()
 
             # Normalize advantage

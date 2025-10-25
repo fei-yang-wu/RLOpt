@@ -1850,6 +1850,20 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         self.cell_states_vf = th.zeros(
             self.hidden_state_shape, dtype=th.float32, device=self.device
         )
+        
+        # Teacher LSTM states
+        self.teacher_hidden_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.teacher_cell_states_pi = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.teacher_hidden_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
+        self.teacher_cell_states_vf = th.zeros(
+            self.hidden_state_shape, dtype=th.float32, device=self.device
+        )
 
         self.reset()
 
@@ -1937,14 +1951,24 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         log_prob: th.Tensor,
         lstm_states: RNNStates,
         dones: th.Tensor,
+        teacher_lstm_states: Optional[RNNStates] = None,
     ) -> None:
         """
         :param hidden_states: LSTM cell and hidden state
+        :param teacher_lstm_states: Teacher LSTM states
         """
+        # Store student LSTM states
         self.hidden_states_pi[self.pos] = lstm_states.pi[0].detach()
         self.cell_states_pi[self.pos] = lstm_states.pi[1].detach()
         self.hidden_states_vf[self.pos] = lstm_states.vf[0].detach()
         self.cell_states_vf[self.pos] = lstm_states.vf[1].detach()
+        
+        # Store teacher LSTM states
+        if teacher_lstm_states is not None:
+            self.teacher_hidden_states_pi[self.pos] = teacher_lstm_states.pi[0].detach()
+            self.teacher_cell_states_pi[self.pos] = teacher_lstm_states.pi[1].detach()
+            self.teacher_hidden_states_vf[self.pos] = teacher_lstm_states.vf[0].detach()
+            self.teacher_cell_states_vf[self.pos] = teacher_lstm_states.vf[1].detach()
 
         if len(log_prob.shape) == 0:
             # Reshape 0-d tensor to avoid error
@@ -2086,6 +2110,44 @@ class RLOptDictRecurrentReplayBuffer(ABC):
                     ),
                 )
 
-                yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, masks_batch, hid_batch
+                # Process teacher LSTM states
+                teacher_hid_batch = None
+                if hasattr(self, 'teacher_hidden_states_pi') and self.teacher_hidden_states_pi.sum() != 0:
+                    teacher_hid_batch_hidden_state_pi = [
+                        saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][
+                            first_traj:last_traj
+                        ]
+                        .transpose(1, 0)
+                        .contiguous()
+                        for saved_hidden_states in [
+                            self.teacher_hidden_states_pi,
+                            self.teacher_cell_states_pi,
+                        ]
+                    ]
+
+                    teacher_hid_batch_hidden_state_vf = [
+                        saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][
+                            first_traj:last_traj
+                        ]
+                        .transpose(1, 0)
+                        .contiguous()
+                        for saved_hidden_states in [
+                            self.teacher_hidden_states_vf,
+                            self.teacher_cell_states_vf,
+                        ]
+                    ]
+
+                    teacher_hid_batch = RNNStates(
+                        pi=(
+                            teacher_hid_batch_hidden_state_pi[0],
+                            teacher_hid_batch_hidden_state_pi[1],
+                        ),
+                        vf=(
+                            teacher_hid_batch_hidden_state_vf[0],
+                            teacher_hid_batch_hidden_state_vf[1],
+                        ),
+                    )
+
+                yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, masks_batch, hid_batch, teacher_hid_batch
 
                 first_traj = last_traj
