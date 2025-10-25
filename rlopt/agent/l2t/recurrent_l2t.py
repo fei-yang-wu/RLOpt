@@ -140,6 +140,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
             str | type[RecurrentActorCriticPolicy]
         ) = RecurrentActorCriticPolicy,
         learning_rate: float | Schedule = 3e-4,
+        lr_min: float = 1e-6,
+        lr_max: float = 1e-2,
         n_steps: int = 2048,
         batch_size: int = 64,
         whole_sequences: bool = True,
@@ -188,6 +190,8 @@ class RecurrentL2T(OnPolicyAlgorithm):
         self.action_noise: ActionNoise | None = None
         self.start_time = 0.0
         self.learning_rate = learning_rate
+        self.lr_min = lr_min
+        self.lr_max = lr_max
         self.tensorboard_log = tensorboard_log
         self._last_obs = None  # type: ignore
         self._last_episode_starts = None  # type: ignore
@@ -821,24 +825,23 @@ class RecurrentL2T(OnPolicyAlgorithm):
             An optimizer or a list of optimizers.
         """
 
+        # Get the learning rate and apply bounds
+        if lr is not None:
+            current_lr = lr
+        else:
+            current_lr = self.lr_schedule(self._current_progress_remaining)
+        
+        # Apply learning rate bounds
+        current_lr = max(self.lr_min, min(self.lr_max, current_lr))
+
         # Log the current learning rate
-        self.logger.record(
-            "train/learning_rate",
-            lr
-            if lr is not None
-            else self.lr_schedule(self._current_progress_remaining),
-        )
+        self.logger.record("train/learning_rate", current_lr)
 
         if not isinstance(optimizers, list):
             optimizers = [optimizers]
-        if lr is not None:
-            for optimizer in optimizers:
-                update_learning_rate(optimizer, lr)
-        else:
-            for optimizer in optimizers:
-                update_learning_rate(
-                    optimizer, self.lr_schedule(self._current_progress_remaining)
-                )
+        
+        for optimizer in optimizers:
+            update_learning_rate(optimizer, current_lr)
 
     def train(self) -> None:
         """
@@ -1021,9 +1024,9 @@ class RecurrentL2T(OnPolicyAlgorithm):
                 # Adjust learning rate based on KL divergence
                 if self.target_kl is not None:
                     if approx_kl_div > 2.0 * self.target_kl:
-                        self.current_lr = self.current_lr * 0.5
+                        self.current_lr = max(self.lr_min, self.current_lr * 0.5)
                     elif approx_kl_div < 0.5 * self.target_kl:
-                        self.current_lr = self.current_lr * 2
+                        self.current_lr = min(self.lr_max, self.current_lr * 2)
 
                 # Log KL divergence
                 self.logger.record("train/approx_kl", float(approx_kl_div))
@@ -1033,6 +1036,7 @@ class RecurrentL2T(OnPolicyAlgorithm):
                     self.compiled_policy.optimizer,
                     self.compiled_student_policy.optimizer,
                 ],
+                lr=self.current_lr,
             )
 
             # Optimization step
