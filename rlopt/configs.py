@@ -79,6 +79,9 @@ class LoggerConfig:
     project_name: str = "RLOpt"
     """Project name for logging."""
 
+    entity: str | None = None
+    """W&B entity (username or team name) for logging."""
+
     group_name: str | None = None
     """Group name for logging."""
 
@@ -95,10 +98,13 @@ class LoggerConfig:
     """Whether to record videos."""
 
     log_dir: str = "logs"
-    """Base directory under which run folders are created."""
+    """Base directory for logging. Structure: {log_dir}/{algorithm}/{env_name}/{timestamp}/
+    
+    Default creates: ./logs/SAC/Pendulum-v1/2025-10-27_19-49-59/
+    """
 
     save_path: str = "models"
-    """Path to save the model."""
+    """Path to save model checkpoints (relative to run directory)."""
 
     python_level: str | None = None
     """Overrides :attr:`RLOptConfig.log_level` for standard Python logging when provided."""
@@ -296,115 +302,6 @@ class FeatureExtractorNetworkConfig(NetworkConfig):
     output_dim: int = 256  # Match TorchRL stable architecture
 
 
-# ------------------------------
-# Advanced network configuration
-# ------------------------------
-
-
-@dataclass
-class MLPBlockConfig:
-    """Config for an MLP block (torso or head)."""
-
-    num_cells: list[int] = field(
-        default_factory=lambda: [256, 256]
-    )  # Match TorchRL stable architecture
-    activation: Literal["relu", "elu", "tanh", "gelu"] = "relu"  # Match TorchRL default
-    init: Literal["orthogonal", "xavier_uniform", "kaiming_uniform"] = "orthogonal"
-    layer_norm: bool = False
-    dropout: float | None = None
-
-
-@dataclass
-class LSTMBlockConfig:
-    """Config for an LSTM block (torso)."""
-
-    hidden_size: int = 128
-    num_layers: int = 1
-    bidirectional: bool = False
-    dropout: float = 0.0
-
-
-@dataclass
-class CNNBlockConfig:
-    """Config for a CNN block (torso for pixel inputs)."""
-
-    channels: list[int]
-    kernels: list[int]
-    strides: list[int]
-    paddings: list[int]
-    activation: Literal["relu", "elu", "tanh", "gelu"] = "relu"
-
-
-@dataclass
-class FeatureBlockSpec:
-    """Feature block spec with type-discriminated config.
-
-    One of mlp, lstm, or cnn may be set depending on `type`.
-    """
-
-    type: Literal["mlp", "lstm", "cnn"] = "mlp"
-    mlp: MLPBlockConfig | None = None
-    lstm: LSTMBlockConfig | None = None
-    cnn: CNNBlockConfig | None = None
-    output_dim: int = 256  # Match TorchRL stable architecture
-
-
-@dataclass
-class ModuleNetConfig:
-    """Full module network config with optional feature sharing.
-
-    If `feature_ref` is provided, it references a named feature in `SharedFeatures.features`.
-    If `feature_ref` is None and `feature` is provided, a private feature is built.
-    The `head` typically refers to an MLP used after features (policy/value/Q head).
-    """
-
-    feature_ref: str | None = None
-    feature: FeatureBlockSpec | None = None
-    head: MLPBlockConfig | None = None
-    in_keys: list[str] = field(default_factory=lambda: ["hidden"])  # after FE
-    out_key: str = "hidden"
-
-
-@dataclass
-class SharedFeatures:
-    """Registry of shared feature extractors that modules can reference by name."""
-
-    features: dict[str, FeatureBlockSpec] = field(default_factory=dict)
-
-
-@dataclass
-class CriticConfig:
-    """Generic critic configuration (state-value or action-value).
-
-    - Supports multiple critics (e.g., twin Q for SAC) via `num_nets`.
-    - Supports shared or private torso across critics.
-    - Supports optional target networks and update strategies.
-    """
-
-    template: ModuleNetConfig = field(default_factory=ModuleNetConfig)
-    num_nets: int = 1
-    shared_feature_ref: str | None = None
-    # Target network options
-    use_target: bool = True
-    target_update: Literal["polyak", "hard"] = "polyak"
-    polyak_eps: float = 0.995
-    hard_update_interval: int = 1_000
-
-
-@dataclass
-class NetworkLayout:
-    """High-level network layout for an agent.
-
-    - PPO typically uses `policy` + `value` modules.
-    - SAC uses `policy` + `q_ensemble` modules.
-    """
-
-    shared: SharedFeatures = field(default_factory=SharedFeatures)
-    policy: ModuleNetConfig = field(default_factory=ModuleNetConfig)
-    value: ModuleNetConfig | None = None
-    critic: CriticConfig | None = None
-
-
 @dataclass
 class TrainerConfig:
     """Trainer configuration for RLOpt  ."""
@@ -473,13 +370,6 @@ class RLOptConfig:
 
     trainer: TrainerConfig | None = None
     """Trainer configuration."""
-
-    # use_value_function: bool = True
-    # """Whether to use a value function.
-    # If use action_value function, then q network is used."""
-
-    # use_action_value_function: bool = False
-    # """Whether to use an action-value function."""
 
     device: str = "cuda:0"
     """Device for training."""

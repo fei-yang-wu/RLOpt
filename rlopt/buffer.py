@@ -558,7 +558,6 @@ class RolloutBuffer(BaseBuffer):
     def get(
         self, batch_size: int | None = None
     ) -> Generator[RolloutBufferSamples, None, None]:
-
         assert self.full, ""
         indices = th.randperm(self.buffer_size * self.n_envs)
         # Prepare the data
@@ -592,7 +591,6 @@ class RolloutBuffer(BaseBuffer):
         batch_inds: th.Tensor,
         env: VecNormalize | None = None,
     ) -> RolloutBufferSamples:
-
         data = (
             self.observations[batch_inds],
             self.actions[batch_inds],
@@ -640,18 +638,18 @@ class DictReplayBuffer(ReplayBuffer):
             buffer_size, observation_space, action_space, device, n_envs=n_envs
         )
 
-        assert isinstance(
-            self.obs_shape, dict
-        ), "DictReplayBuffer must be used with Dict obs space only"
+        assert isinstance(self.obs_shape, dict), (
+            "DictReplayBuffer must be used with Dict obs space only"
+        )
         self.buffer_size = max(buffer_size // n_envs, 1)
 
         # Check that the replay buffer can fit into the memory
         if psutil is not None:
             mem_available = psutil.virtual_memory().available
 
-        assert (
-            not optimize_memory_usage
-        ), "DictReplayBuffer does not support optimize_memory_usage"
+        assert not optimize_memory_usage, (
+            "DictReplayBuffer does not support optimize_memory_usage"
+        )
         # disabling as this adds quite a bit of complexity
         # https://github.com/DLR-RM/stable-baselines3/pull/243#discussion_r531535702
         self.optimize_memory_usage = optimize_memory_usage
@@ -878,9 +876,9 @@ class DictRolloutBuffer(RolloutBuffer):
             buffer_size, observation_space, action_space, device, n_envs=n_envs
         )
 
-        assert isinstance(
-            self.obs_shape, dict
-        ), "DictRolloutBuffer must be used with Dict obs space only"
+        assert isinstance(self.obs_shape, dict), (
+            "DictRolloutBuffer must be used with Dict obs space only"
+        )
 
         self.gae_lambda = gae_lambda
         self.gamma = gamma
@@ -1774,9 +1772,9 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         self.full = False
         self.device = get_device(device)  # type: ignore[assignment]
         self.n_envs = n_envs
-        assert isinstance(
-            self.obs_shape, dict
-        ), "DictRolloutBuffer must be used with Dict obs space only"
+        assert isinstance(self.obs_shape, dict), (
+            "DictRolloutBuffer must be used with Dict obs space only"
+        )
 
         self.gae_lambda = gae_lambda
         self.gamma = gamma
@@ -1919,7 +1917,6 @@ class RLOptDictRecurrentReplayBuffer(ABC):
         self.returns = self.advantages + self.values
 
     def reset(self):
-
         self.generator_ready = False
         self.pos = 0
         self.full = False
@@ -2083,6 +2080,15 @@ class RLOptDictRecurrentReplayBuffer(ABC):
                     ),
                 )
 
-                yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, masks_batch, hid_batch
+                yield (
+                    obs_batch,
+                    actions_batch,
+                    values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    masks_batch,
+                    hid_batch,
+                )
 
                 first_traj = last_traj

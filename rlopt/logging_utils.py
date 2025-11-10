@@ -317,7 +317,17 @@ class MetricReporter:
 
 
 class LoggingManager:
-    """Centralised control for Python logging and TorchRL metric loggers."""
+    """Centralised control for Python logging and TorchRL metric loggers.
+
+    Creates structured logging directories:
+        {log_dir}/{algorithm_name}/{env_or_task_name}/{date_time}/
+
+    Example:
+        ./logs/SAC/Pendulum-v1/2025-10-27_19-49-59/
+        ./logs/IPMD/UnitreeG1/2025-10-27_20-15-30/
+
+    All logs, metrics, and model checkpoints are saved in the run directory.
+    """
 
     def __init__(
         self,
@@ -334,10 +344,12 @@ class LoggingManager:
             default=logging.WARNING,
         )
 
+        # Resolve base directory
         base_dir = Path(config.logger.log_dir).expanduser()
         if not base_dir.is_absolute():
             base_dir = Path.cwd() / base_dir
 
+        # Create hierarchical structure: {base}/{algorithm}/{task}/{timestamp}
         algo_slug = _slugify(component, "algorithm")
         task_name = getattr(config.env, "env_name", None)
         task_slug = _slugify(task_name, "task")
@@ -381,6 +393,7 @@ class LoggingManager:
 
         wandb_kwargs = {
             "project": self._config.logger.project_name,
+            "entity": self._config.logger.entity,
             "group": self._config.logger.group_name,
         }
 

@@ -31,8 +31,6 @@ from rlopt.configs import (
 from rlopt.logging_utils import ROOT_LOGGER_NAME, LoggingManager, MetricReporter
 from rlopt.type_aliases import OptimizerClass, SchedulerClass
 
-torch.set_float32_matmul_precision("high")
-
 
 class BaseAlgorithm(ABC):
     """Abstract base class for reinforcement learning algorithms.
@@ -329,6 +327,11 @@ class BaseAlgorithm(ABC):
                     "warmup": int(getattr(self.config.compile, "warmup", 1)),
                 }
                 if self.config.compile.compile
+                else False
+            ),
+            cudagraph_policy=(
+                {"warmup": 10}
+                if self.config.compile.cudagraphs and self.device.type == "cuda"
                 else False
             ),
             # heterogeneous devices

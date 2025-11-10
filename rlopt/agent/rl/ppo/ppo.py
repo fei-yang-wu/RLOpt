@@ -29,17 +29,20 @@ from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
     ActorValueOperator,
     LSTMModule,
+    MLP,
     ProbabilisticActor,
     TanhNormal,
+    ValueOperator,
 )
+from tensordict.nn.distributions import NormalParamExtractor
 from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
-from rlopt.configs import RLOptConfig
+from rlopt.configs import NetworkConfig, RLOptConfig
+from rlopt.utils import get_activation_class, log_info
 from rlopt.type_aliases import OptimizerClass, SchedulerClass
-from rlopt.utils import log_info
 
 
 @dataclass
@@ -77,6 +80,14 @@ class PPORLOptConfig(RLOptConfig):
 
     def __post_init__(self):
         self.use_value_function = True
+        # Initialize value_function config if not set
+        if self.value_function is None:
+            self.value_function = NetworkConfig(
+                num_cells=[256, 256],
+                activation_fn="relu",
+                output_dim=1,
+                input_keys=["observation"],
+            )
 
 
 class PPO(BaseAlgorithm):
@@ -120,13 +131,9 @@ class PPO(BaseAlgorithm):
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        """Build feature extractor via base reusable helper."""
-        return self._build_feature_extractor_module(
-            feature_extractor_net=feature_extractor_net,
-            in_keys=list(self.total_input_keys),
-            out_key="hidden",
-            layout=self.config.network,
-        )
+        """Build feature extractor (optional for PPO)."""
+        msg = "PPO does not require a feature extractor by default."
+        raise NotImplementedError(msg)
 
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None
@@ -142,16 +149,35 @@ class PPO(BaseAlgorithm):
             "tanh_loc": False,
         }
 
-        # Build policy head via base helper (produces loc/scale)
-        policy_mlp = self._build_policy_head_module(
-            policy_net=policy_net,
-            in_keys=list(self.config.policy_in_keys),
+        # Build policy network
+        if policy_net is None:
+            policy_mlp = MLP(
+                in_features=self.config.policy.input_dim,
+                activation_class=get_activation_class(self.config.policy.activation_fn),
+                out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+                num_cells=list(self.config.policy.num_cells),
+                device=self.device,
+            )
+        else:
+            policy_mlp = policy_net
+
+        # Add parameter extractor
+        extractor = NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,  # type: ignore
+        ).to(self.device)
+        net = torch.nn.Sequential(policy_mlp, extractor)
+
+        # Wrap in TensorDictModule
+        policy_td = TensorDictModule(
+            module=net,
+            in_keys=list(self.config.policy.input_keys),
             out_keys=["loc", "scale"],
-            layout=self.config.network,
         )
+
         # Add probabilistic sampling of the actions
         return ProbabilisticActor(
-            policy_mlp,
+            policy_td,
             in_keys=["loc", "scale"],
             spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
@@ -164,11 +190,27 @@ class PPO(BaseAlgorithm):
         self, value_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
         """Construct value function"""
-        # Build value via base helper
-        return self._build_value_module(
-            value_net=value_net,
-            in_keys=list(self.config.value_net_in_keys),
-            layout=self.config.network,
+        if self.config.value_function is None:
+            msg = "PPO requires a value function configuration."
+            raise ValueError(msg)
+
+        # Build value network
+        if value_net is None:
+            value_mlp = MLP(
+                in_features=self.config.value_function.input_dim,
+                activation_class=get_activation_class(
+                    self.config.value_function.activation_fn
+                ),
+                out_features=1,
+                num_cells=list(self.config.value_function.num_cells),
+                device=self.device,
+            )
+        else:
+            value_mlp = value_net
+
+        return ValueOperator(
+            module=value_mlp,
+            in_keys=list(self.config.value_function.input_keys),
         )
 
     def _construct_q_function(self) -> TensorDictModule:  # type: ignore[override]
@@ -185,8 +227,24 @@ class PPO(BaseAlgorithm):
         """Construct actor-critic network"""
         assert isinstance(self.value_function, TensorDictModule)
         assert isinstance(self.policy, TensorDictModule)
+
+        # Use feature extractor if available, otherwise use identity
+        if self.feature_extractor:
+            common_operator = self.feature_extractor
+        else:
+            # Create a dummy identity module when no feature extractor
+            class IdentityModule(torch.nn.Module):
+                def forward(self, x):
+                    return x
+
+            common_operator = TensorDictModule(
+                module=IdentityModule(),
+                in_keys=["observation"],
+                out_keys=["observation"],
+            )
+
         return ActorValueOperator(
-            common_operator=self.feature_extractor,
+            common_operator=common_operator,
             policy_operator=self.policy,
             value_operator=self.value_function,
         )
@@ -196,6 +254,12 @@ class PPO(BaseAlgorithm):
         assert isinstance(self.config, PPORLOptConfig)
         loss_config = self.config.loss
         ppo_config = self.config.ppo
+
+        # Initialize lazy layers by performing a forward pass with dummy data
+        fake_tensordict = self.env.fake_tensordict()
+        with torch.no_grad():
+            _ = self.actor_critic(fake_tensordict)
+
         return ClipPPOLoss(
             actor_network=self.actor_critic.get_policy_operator(),
             critic_network=self.actor_critic.get_value_operator(),
@@ -219,6 +283,13 @@ class PPO(BaseAlgorithm):
             device=self.device,
             vectorized=not self.config.compile.compile,
         )
+
+    def _set_optimizers(
+        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    ) -> list[torch.optim.Optimizer]:
+        """Create optimizer for actor-critic parameters."""
+        # For PPO, we use a single optimizer for both policy and value
+        return [optimizer_cls(self.actor_critic.parameters(), **optimizer_kwargs)]
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer"""
@@ -370,20 +441,21 @@ class PPO(BaseAlgorithm):
             collected_frames += frames_in_batch
             pbar.update(frames_in_batch)
 
-            # Get training rewards and episode lengths
-            episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-            if len(episode_rewards) > 0:
-                episode_length = data["next", "step_count"][data["next", "done"]]
-                self.episode_lengths.extend(episode_length.cpu().tolist())
-                self.episode_rewards.extend(episode_rewards.cpu().tolist())
-                episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
-                metrics_to_log.update(
-                    {
-                        "episode/length": np.mean(self.episode_lengths),
-                        "episode/return": np.mean(self.episode_rewards),
-                        "train/reward": episode_rewards_mean,
-                    }
-                )
+            # Get training rewards and episode lengths (if available)
+            if ("next", "episode_reward") in data.keys(True):
+                episode_rewards = data["next", "episode_reward"][data["next", "done"]]
+                if len(episode_rewards) > 0:
+                    episode_length = data["next", "step_count"][data["next", "done"]]
+                    self.episode_lengths.extend(episode_length.cpu().tolist())
+                    self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                    episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
+                    metrics_to_log.update(
+                        {
+                            "episode/length": np.mean(self.episode_lengths),
+                            "episode/return": np.mean(self.episode_rewards),
+                            "train/reward": episode_rewards_mean,
+                        }
+                    )
             self.data_buffer.empty()
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import functools
+import logging
+import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 import numpy as np
 import torch
 from tensordict import TensorDict
-from tensordict.nn import InteractionType, TensorDictModule
+from tensordict.nn import CudaGraphModule, InteractionType, TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import Tensor, nn
-from torchrl._utils import timeit
+from torchrl._utils import compile_with_warmup, timeit
 from torchrl.data import (
     LazyMemmapStorage,
     LazyTensorStorage,
@@ -94,10 +97,6 @@ class SACRLOptConfig(RLOptConfig):
     sac: SACConfig = field(default_factory=SACConfig)
     """SAC configuration."""
 
-    def __post_init__(self):
-        # Assert Q-function config exists
-        assert self.q_function, "SAC requires a Q-function configuration."
-
 
 class SAC(BaseAlgorithm):
     """Soft Actor-Critic algorithm.
@@ -113,7 +112,6 @@ class SAC(BaseAlgorithm):
         logger: Logger | None = None,
         **kwargs,
     ):
-
         super().__init__(
             env=env,
             config=config,
@@ -124,6 +122,8 @@ class SAC(BaseAlgorithm):
         # Narrow the type for static checkers
         self.config = cast(SACRLOptConfig, self.config)
         self.config: SACRLOptConfig
+
+        assert self.q_function, "SAC requires a Q-function configuration."
 
         # Compile if requested
         self._compile_components()
@@ -144,13 +144,15 @@ class SAC(BaseAlgorithm):
             device=self.device,
         )
         extractor = NormalParamExtractor(
-            scale_mapping="biased_softplus_1.0", scale_lb=0.1  # type: ignore
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,  # type: ignore
         ).to(self.device)
         net = torch.nn.Sequential(policy_mlp, extractor)
+        # SAC policy outputs loc and scale for the Normal distribution
         policy_td = TensorDictModule(
             module=net,
             in_keys=list(self.config.policy.input_keys),
-            out_keys=list(self.config.policy.output_keys),
+            out_keys=["loc", "scale"],
         )
         distribution_class = TanhNormal
         distribution_kwargs = {
@@ -185,9 +187,15 @@ class SAC(BaseAlgorithm):
             device=self.device,
         )
 
+        # SAC Q-function takes both observation and action as inputs
+        in_keys = list(self.config.q_function.input_keys)
+        if "action" not in in_keys:
+            in_keys.append("action")
+
         return ValueOperator(
             module=q_function,
-            in_keys=list(self.config.q_function.input_keys),
+            in_keys=in_keys,
+            out_keys=["state_action_value"],
         )
 
     def _construct_actor_critic(self) -> TensorDictModule:
@@ -225,9 +233,14 @@ class SAC(BaseAlgorithm):
         if sac_cfg is None:
             msg = "SAC config missing 'sac' attribute"
             raise AttributeError(msg)
-        assert isinstance(
-            self.actor_critic, ActorCriticOperator
-        ), "actor_critic must be an ActorCriticOperator"
+        assert isinstance(self.actor_critic, ActorCriticOperator), (
+            "actor_critic must be an ActorCriticOperator"
+        )
+
+        # Initialize lazy layers by performing a forward pass with dummy data
+        fake_tensordict = self.env.fake_tensordict()
+        with torch.no_grad():
+            _ = self.actor_critic(fake_tensordict)
 
         loss_module = SACLoss(
             actor_network=self.actor_critic.get_policy_operator(),  # type: ignore[arg-type]
@@ -324,11 +337,15 @@ class SAC(BaseAlgorithm):
             replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
         return replay_buffer
 
+    def _construct_feature_extractor(self) -> TensorDictModule:
+        """Construct feature extractor (optional for SAC)."""
+        msg = "SAC does not require a feature extractor by default."
+        raise NotImplementedError(msg)
+
     def _construct_trainer(self):  # type: ignore[override]
         return None
 
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
-
         # Compute loss
         loss_td = self.loss_module(sampled_tensordict)
         loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_loss")
@@ -363,6 +380,36 @@ class SAC(BaseAlgorithm):
         init_random_frames = int(self.config.collector.init_random_frames)
         # Compute updates per collector iteration based on UTD ratio and batch sizes
         num_updates = int(frames_per_batch * utd_ratio)
+
+        # Compile the update function if requested
+        compile_mode = None
+        if cfg.compile.compile:
+            compile_mode = cfg.compile.compile_mode
+            if compile_mode in ("", None):
+                if cfg.compile.cudagraphs:
+                    compile_mode = "default"
+                else:
+                    compile_mode = "reduce-overhead"
+
+            self.log.info(f"Compiling update function with mode: {compile_mode}")
+            self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)  # type: ignore[method-assign]
+
+        # Only use CUDAGraphs on CUDA devices
+        if cfg.compile.cudagraphs:
+            if self.device.type == "cuda":
+                warnings.warn(
+                    "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
+                    category=UserWarning,
+                )
+                self.log.warning("Wrapping update with CudaGraphModule (experimental)")
+                self.update = CudaGraphModule(
+                    self.update, in_keys=[], out_keys=[], warmup=5
+                )  # type: ignore[method-assign]
+            else:
+                self.log.warning(
+                    f"CUDAGraphs requested but device is {self.device.type}, not CUDA. Skipping CUDAGraphs."
+                )
+
         collected_frames = 0
         collector_iter = iter(self.collector)
         pbar: Tqdm = Tqdm(total=total_frames)  # type: ignore[assignment]
@@ -380,21 +427,31 @@ class SAC(BaseAlgorithm):
 
             self.collector.update_policy_weights_()
 
-            # Get training rewards and episode lengths
-            episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-            if len(episode_rewards) > 0:
-                episode_length = data["next", "step_count"][data["next", "done"]]
-                self.episode_lengths.extend(episode_length.cpu().tolist())
-                self.episode_rewards.extend(episode_rewards.cpu().tolist())
-                episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
+            # Log step rewards (always available)
+            if ("next", "reward") in data.keys(True):
+                step_rewards = data["next", "reward"]
+                metrics_to_log["train/step_reward_mean"] = step_rewards.mean().item()
+                metrics_to_log["train/step_reward_std"] = step_rewards.std().item()
+                metrics_to_log["train/step_reward_max"] = step_rewards.max().item()
+                metrics_to_log["train/step_reward_min"] = step_rewards.min().item()
 
-                metrics_to_log.update(
-                    {
-                        "episode/length": np.mean(self.episode_lengths),
-                        "episode/return": np.mean(self.episode_rewards),
-                        "train/reward": episode_rewards_mean,
-                    }
-                )
+            # Get training rewards and episode lengths (if available)
+            if ("next", "episode_reward") in data.keys(True):
+                episode_rewards = data["next", "episode_reward"][data["next", "done"]]
+                if len(episode_rewards) > 0:
+                    episode_length = data["next", "step_count"][data["next", "done"]]
+                    self.episode_lengths.extend(episode_length.cpu().tolist())
+                    self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                    episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
+
+                    metrics_to_log.update(
+                        {
+                            "episode/length": np.mean(self.episode_lengths),
+                            "episode/return": np.mean(self.episode_rewards),
+                            "episode/return_latest": episode_rewards_mean,
+                            "episode/num_completed": len(self.episode_rewards),
+                        }
+                    )
 
             # Don't empty the buffer in off-policy setting
             with timeit("replay_extend"):
@@ -403,8 +460,8 @@ class SAC(BaseAlgorithm):
             losses = None
             with timeit("train"):
                 if collected_frames >= init_random_frames:
-                    losses = TensorDict(batch_size=[num_updates])
-                    for i in range(num_updates):
+                    losses_list = []
+                    for _i in range(num_updates):
                         with timeit("rb - sample"):
                             # Sample from replay buffer
                             sampled_tensordict = self.data_buffer.sample()
@@ -413,9 +470,20 @@ class SAC(BaseAlgorithm):
                             torch.compiler.cudagraph_mark_step_begin()
                             # Compute loss
                             loss = self.update(sampled_tensordict).clone()
-                        losses[i] = loss.select(
-                            "loss_actor", "loss_qvalue", "loss_alpha"
+                        losses_list.append(
+                            loss.select("loss_actor", "loss_qvalue", "loss_alpha")
                         )
+
+                    # Stack collected losses into a TensorDict
+                    if len(losses_list) > 0:
+                        # gather keys and stack per-key tensors along new batch dim
+                        keys = list(losses_list[0].keys())
+                        stacked = {}
+                        for key in keys:
+                            stacked[key] = torch.stack(
+                                [ld.get(key) for ld in losses_list]
+                            )
+                        losses = TensorDict(stacked, batch_size=[num_updates])
 
                     # PRB updates disabled
 
@@ -428,6 +496,11 @@ class SAC(BaseAlgorithm):
                     except Exception:
                         scalar = value.detach().cpu().float().item()  # type: ignore[attr-defined]
                     metrics_to_log.update({f"train/{key}": scalar})
+
+                # Log SAC-specific metrics
+                if hasattr(self.loss_module, "log_alpha"):
+                    alpha = self.loss_module.log_alpha.exp().detach().cpu().item()
+                    metrics_to_log["train/alpha"] = alpha
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
@@ -442,6 +515,22 @@ class SAC(BaseAlgorithm):
             if metrics_to_log:
                 # Use the shared base-class helper for consistent metrics emission
                 self.log_metrics(metrics_to_log, step=collected_frames)
+
+                # Update progress bar with latest metrics
+                postfix = {}
+                if "train/step_reward_mean" in metrics_to_log:
+                    postfix["r_step"] = (
+                        f"{metrics_to_log['train/step_reward_mean']:.2f}"
+                    )
+                if "episode/return" in metrics_to_log:
+                    postfix["r_ep"] = f"{metrics_to_log['episode/return']:.1f}"
+                    postfix["n_ep"] = metrics_to_log["episode/num_completed"]
+                if "train/loss_actor" in metrics_to_log:
+                    postfix["π_loss"] = f"{metrics_to_log['train/loss_actor']:.3f}"
+                if "train/alpha" in metrics_to_log:
+                    postfix["α"] = f"{metrics_to_log['train/alpha']:.3f}"
+                if postfix:
+                    pbar.set_postfix(postfix)
 
             # Save model periodically
             if (

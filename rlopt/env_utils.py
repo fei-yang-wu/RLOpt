@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import functools
 
+import torch
 from torchrl.envs import (
+    Compose,
+    DoubleToFloat,
     EnvCreator,
     ParallelEnv,
+    RewardSum,
+    StepCounter,
 )
 from torchrl.envs.libs.gym import GymEnv, set_gym_backend
 
@@ -15,14 +20,28 @@ def env_maker(cfg: RLOptConfig, device="cpu", from_pixels=False):
     lib = cfg.env.library
     if lib in ("gym", "gymnasium"):
         with set_gym_backend(lib):
-            return GymEnv(
+            env = GymEnv(
                 cfg.env.env_name,
                 device=device,
                 from_pixels=from_pixels,
                 pixels_only=False,
             )
+            # Add dtype conversion transform (float64 -> float32) only if needed
+            # Check if observations are float64
+            obs_spec = env.observation_spec["observation"]
+            if hasattr(obs_spec, "dtype") and obs_spec.dtype == torch.float64:
+                env = env.append_transform(DoubleToFloat(in_keys=["observation"]))
+
+            # Add transforms to track episode rewards and lengths
+            # RewardSum accumulates rewards and adds "episode_reward" when done
+            # StepCounter tracks steps and adds "step_count"
+            env = env.append_transform(StepCounter(max_steps=1000))
+            env = env.append_transform(RewardSum())
+
+            return env
     else:
-        raise NotImplementedError(f"Unknown lib {lib}.")
+        msg = f"Unknown lib {lib}."
+        raise NotImplementedError(msg)
 
 
 def make_parallel_env(cfg: RLOptConfig):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -24,11 +24,14 @@ from torchrl.envs.transforms import InitTracker
 from torchrl.modules import (
     ActorValueOperator,
     LSTMModule,
+    MLP,
+    NormalParamExtractor,
     ProbabilisticActor,
     TanhNormal,
+    ValueOperator,
 )
 from torchrl.modules.tensordict_module.sequence import SafeSequential
-from torchrl.objectives import ClipPPOLoss, group_optimizers
+from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
@@ -38,6 +41,7 @@ from rlopt.configs import (
     RLOptConfig,
 )
 from rlopt.type_aliases import OptimizerClass
+from rlopt.utils import get_activation_class
 
 
 @dataclass
@@ -190,12 +194,12 @@ class L2T(BaseAlgorithm):
     def collector_policy(self) -> TensorDictModule:
         """By default, the collector_policy is self.policy or self.actor_critic.policy_operator()"""
         assert isinstance(self.config, L2TRLOptConfig)
-        assert isinstance(
-            self.actor_critic, ActorValueOperator
-        ), "Actor critic is not an instance of ActorValueOperator"
-        assert isinstance(
-            self.student_actor_critic, ActorValueOperator
-        ), "Student actor critic is not an instance of ActorValueOperator"
+        assert isinstance(self.actor_critic, ActorValueOperator), (
+            "Actor critic is not an instance of ActorValueOperator"
+        )
+        assert isinstance(self.student_actor_critic, ActorValueOperator), (
+            "Student actor critic is not an instance of ActorValueOperator"
+        )
 
         return L2TActorValueOperatorWrapper(
             teacher_operator=self.actor_critic,
@@ -207,12 +211,69 @@ class L2T(BaseAlgorithm):
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        """Teacher feature extractor using base helper with teacher layout."""
-        return self._build_feature_extractor_module(
-            feature_extractor_net=feature_extractor_net,
+        """Teacher feature extractor (MLP by default)."""
+        if feature_extractor_net is not None:
+            return TensorDictModule(
+                module=feature_extractor_net,
+                in_keys=list(self.total_input_keys),
+                out_keys=["hidden"],
+            )
+
+        if not self.config.use_feature_extractor:
+            # Identity mapping if no feature extractor
+            return TensorDictModule(
+                module=torch.nn.Identity(),
+                in_keys=list(self.total_input_keys),
+                out_keys=["hidden"],
+            )
+
+        # Build MLP feature extractor for teacher
+        # Use config.network layout if specified
+        hidden_size = 256  # default
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        if (
+            self.config.network
+            and self.config.network.shared
+            and self.config.network.shared.features
+        ):
+            # Get the first feature block or one referenced by policy/value
+            feature_name = None
+            if self.config.network.policy and self.config.network.policy.feature_ref:
+                feature_name = self.config.network.policy.feature_ref
+            elif self.config.network.value and self.config.network.value.feature_ref:
+                feature_name = self.config.network.value.feature_ref
+            else:
+                # Use first available feature
+                feature_name = next(
+                    iter(self.config.network.shared.features.keys()), None
+                )
+
+            if feature_name and feature_name in self.config.network.shared.features:
+                feature_spec = self.config.network.shared.features[feature_name]
+                hidden_size = feature_spec.output_dim
+                if feature_spec.mlp:
+                    num_cells = (
+                        list(feature_spec.mlp.num_cells)
+                        if feature_spec.mlp.num_cells
+                        else [256, 256]
+                    )
+                    activation = feature_spec.mlp.activation or "relu"
+
+        # Build MLP
+        feature_mlp = MLP(
+            in_features=self.total_input_shape,
+            out_features=hidden_size,
+            num_cells=num_cells,
+            activation_class=get_activation_class(activation),
+            device=self.device,
+        )
+
+        return TensorDictModule(
+            module=feature_mlp,
             in_keys=list(self.total_input_keys),
-            out_key="hidden",
-            layout=self.config.network,
+            out_keys=["hidden"],
         )
 
     def _construct_policy(
@@ -226,12 +287,77 @@ class L2T(BaseAlgorithm):
             "tanh_loc": False,
         }
 
-        policy_td = self._build_policy_head_module(
-            policy_net=policy_net,
+        # Determine input dimension
+        if self.config.use_feature_extractor:
+            input_dim = 256  # default from feature extractor
+            if (
+                self.config.network
+                and self.config.network.shared
+                and self.config.network.shared.features
+            ):
+                feature_name = None
+                if (
+                    self.config.network.policy
+                    and self.config.network.policy.feature_ref
+                ):
+                    feature_name = self.config.network.policy.feature_ref
+                elif (
+                    self.config.network.value and self.config.network.value.feature_ref
+                ):
+                    feature_name = self.config.network.value.feature_ref
+                else:
+                    feature_name = next(
+                        iter(self.config.network.shared.features.keys()), None
+                    )
+
+                if feature_name and feature_name in self.config.network.shared.features:
+                    input_dim = self.config.network.shared.features[
+                        feature_name
+                    ].output_dim
+        else:
+            input_dim = self.total_input_shape
+
+        # Determine policy head configuration
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        if (
+            self.config.network
+            and self.config.network.policy
+            and self.config.network.policy.head
+        ):
+            head_cfg = self.config.network.policy.head
+            if head_cfg.num_cells:
+                num_cells = list(head_cfg.num_cells)
+            if head_cfg.activation:
+                activation = head_cfg.activation
+
+        # Build policy network
+        if policy_net is None:
+            policy_mlp = MLP(
+                in_features=input_dim,
+                out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+                num_cells=num_cells,
+                activation_class=get_activation_class(activation),
+                device=self.device,
+            )
+        else:
+            policy_mlp = policy_net
+
+        # Add parameter extractor
+        extractor = NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,  # type: ignore
+        ).to(self.device)
+        net = torch.nn.Sequential(policy_mlp, extractor)
+
+        # Wrap in TensorDictModule
+        policy_td = TensorDictModule(
+            module=net,
             in_keys=list(self.config.policy_in_keys),
             out_keys=["loc", "scale"],
-            layout=self.config.network,
         )
+
         return ProbabilisticActor(
             policy_td,
             in_keys=["loc", "scale"],
@@ -246,10 +372,64 @@ class L2T(BaseAlgorithm):
         self, value_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
         """Teacher value function (PPO-style), honoring advanced layout if provided."""
-        return self._build_value_module(
-            value_net=value_net,
+        # Determine input dimension
+        if self.config.use_feature_extractor:
+            input_dim = 256  # default from feature extractor
+            if (
+                self.config.network
+                and self.config.network.shared
+                and self.config.network.shared.features
+            ):
+                feature_name = None
+                if self.config.network.value and self.config.network.value.feature_ref:
+                    feature_name = self.config.network.value.feature_ref
+                elif (
+                    self.config.network.policy
+                    and self.config.network.policy.feature_ref
+                ):
+                    feature_name = self.config.network.policy.feature_ref
+                else:
+                    feature_name = next(
+                        iter(self.config.network.shared.features.keys()), None
+                    )
+
+                if feature_name and feature_name in self.config.network.shared.features:
+                    input_dim = self.config.network.shared.features[
+                        feature_name
+                    ].output_dim
+        else:
+            input_dim = self.total_input_shape
+
+        # Determine value head configuration
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        if (
+            self.config.network
+            and self.config.network.value
+            and self.config.network.value.head
+        ):
+            head_cfg = self.config.network.value.head
+            if head_cfg.num_cells:
+                num_cells = list(head_cfg.num_cells)
+            if head_cfg.activation:
+                activation = head_cfg.activation
+
+        # Build value network
+        if value_net is None:
+            value_mlp = MLP(
+                in_features=input_dim,
+                out_features=1,
+                num_cells=num_cells,
+                activation_class=get_activation_class(activation),
+                device=self.device,
+            )
+        else:
+            value_mlp = value_net
+
+        return ValueOperator(
+            module=value_mlp,
             in_keys=list(self.config.value_net_in_keys),
-            layout=self.config.network,
         )
 
     def _construct_actor_critic(self) -> TensorDictModule:
@@ -272,29 +452,189 @@ class L2T(BaseAlgorithm):
     # Student builders (MLP variant)
     # ------------------------------
     def _construct_student_feature_extractor(self) -> TensorDictModule:
+        """Build student feature extractor network (MLP by default)."""
         assert isinstance(self.config, L2TRLOptConfig)
-        return self._build_feature_extractor_module(
+
+        # For L2T base class, student uses MLP feature extractor
+        # Check if we should use a feature extractor
+        if not self.config.use_feature_extractor:
+            # Identity mapping if no feature extractor
+            return TensorDictModule(
+                module=torch.nn.Identity(),
+                in_keys=list(self.total_input_keys),
+                out_keys=[self.config.l2t.student_hidden_key],
+            )
+
+        # Build MLP feature extractor for student
+        # Use student layout if specified, otherwise use default from config
+        student_layout = self.config.l2t.student
+
+        # Determine configuration for student feature extractor
+        # Try to get from student's shared features first
+        hidden_size = 256  # default
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        if student_layout and student_layout.shared and student_layout.shared.features:
+            # Get the first feature block or one referenced by policy/value
+            feature_name = None
+            if student_layout.policy and student_layout.policy.feature_ref:
+                feature_name = student_layout.policy.feature_ref
+            elif student_layout.value and student_layout.value.feature_ref:
+                feature_name = student_layout.value.feature_ref
+            else:
+                # Use first available feature
+                feature_name = next(iter(student_layout.shared.features.keys()), None)
+
+            if feature_name and feature_name in student_layout.shared.features:
+                feature_spec = student_layout.shared.features[feature_name]
+                hidden_size = feature_spec.output_dim
+                if feature_spec.mlp:
+                    num_cells = (
+                        list(feature_spec.mlp.num_cells)
+                        if feature_spec.mlp.num_cells
+                        else [256, 256]
+                    )
+                    activation = feature_spec.mlp.activation or "relu"
+
+        # Build MLP
+        feature_mlp = MLP(
+            in_features=self.total_input_shape,
+            out_features=hidden_size,
+            num_cells=num_cells,
+            activation_class=get_activation_class(activation),
+            device=self.device,
+        )
+
+        return TensorDictModule(
+            module=feature_mlp,
             in_keys=list(self.total_input_keys),
-            out_key=self.config.l2t.student_hidden_key,
-            layout=self.config.l2t.student,
+            out_keys=[self.config.l2t.student_hidden_key],
         )
 
     def _construct_student_policy(self) -> TensorDictModule:
+        """Build student policy head (outputs loc and scale for TanhNormal distribution)."""
         assert isinstance(self.config, L2TRLOptConfig)
-        return self._build_policy_head_module(
+
+        # Determine input dimension (from feature extractor or observation)
+        if self.config.use_feature_extractor:
+            # Get from student feature extractor output
+            student_layout = self.config.l2t.student
+            input_dim = 256  # default
+
+            if (
+                student_layout
+                and student_layout.shared
+                and student_layout.shared.features
+            ):
+                feature_name = None
+                if student_layout.policy and student_layout.policy.feature_ref:
+                    feature_name = student_layout.policy.feature_ref
+                elif student_layout.value and student_layout.value.feature_ref:
+                    feature_name = student_layout.value.feature_ref
+                else:
+                    feature_name = next(
+                        iter(student_layout.shared.features.keys()), None
+                    )
+
+                if feature_name and feature_name in student_layout.shared.features:
+                    input_dim = student_layout.shared.features[feature_name].output_dim
+        else:
+            input_dim = self.total_input_shape
+
+        # Determine policy head configuration
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        student_layout = self.config.l2t.student
+        if student_layout and student_layout.policy and student_layout.policy.head:
+            head_cfg = student_layout.policy.head
+            if head_cfg.num_cells:
+                num_cells = list(head_cfg.num_cells)
+            if head_cfg.activation:
+                activation = head_cfg.activation
+
+        # Build policy MLP
+        policy_mlp = MLP(
+            in_features=input_dim,
+            out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+            num_cells=num_cells,
+            activation_class=get_activation_class(activation),
+            device=self.device,
+        )
+
+        # Add parameter extractor for normal distribution
+        extractor = NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,  # type: ignore
+        ).to(self.device)
+
+        net = torch.nn.Sequential(policy_mlp, extractor)
+
+        # Wrap in TensorDictModule (NOT ProbabilisticActor, just the parameter generation)
+        return TensorDictModule(
+            module=net,
             in_keys=[self.config.l2t.student_hidden_key],
             out_keys=[
                 self.config.l2t.student_loc_key,
                 self.config.l2t.student_scale_key,
             ],
-            layout=self.config.l2t.student,
         )
 
     def _construct_student_value_function(self) -> TensorDictModule:
+        """Build student value function head (outputs state value estimate)."""
         assert isinstance(self.config, L2TRLOptConfig)
-        return self._build_value_module(
+
+        # Determine input dimension (same logic as policy)
+        if self.config.use_feature_extractor:
+            student_layout = self.config.l2t.student
+            input_dim = 256  # default
+
+            if (
+                student_layout
+                and student_layout.shared
+                and student_layout.shared.features
+            ):
+                feature_name = None
+                if student_layout.value and student_layout.value.feature_ref:
+                    feature_name = student_layout.value.feature_ref
+                elif student_layout.policy and student_layout.policy.feature_ref:
+                    feature_name = student_layout.policy.feature_ref
+                else:
+                    feature_name = next(
+                        iter(student_layout.shared.features.keys()), None
+                    )
+
+                if feature_name and feature_name in student_layout.shared.features:
+                    input_dim = student_layout.shared.features[feature_name].output_dim
+        else:
+            input_dim = self.total_input_shape
+
+        # Determine value head configuration
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        student_layout = self.config.l2t.student
+        if student_layout and student_layout.value and student_layout.value.head:
+            head_cfg = student_layout.value.head
+            if head_cfg.num_cells:
+                num_cells = list(head_cfg.num_cells)
+            if head_cfg.activation:
+                activation = head_cfg.activation
+
+        # Build value MLP
+        value_mlp = MLP(
+            in_features=input_dim,
+            out_features=1,
+            num_cells=num_cells,
+            activation_class=get_activation_class(activation),
+            device=self.device,
+        )
+
+        # Wrap in ValueOperator
+        return ValueOperator(
+            module=value_mlp,
             in_keys=[self.config.l2t.student_hidden_key],
-            layout=self.config.l2t.student,
         )
 
     def _construct_q_function(
@@ -316,11 +656,17 @@ class L2T(BaseAlgorithm):
         """Construct loss module with teacher PPO and student imitation."""
         assert isinstance(self.config, L2TRLOptConfig)
         l2t_cfg = self.config.l2t
+
+        # Initialize lazy layers by performing a forward pass with dummy data
+        fake_tensordict = self.env.fake_tensordict()
+        with torch.no_grad():
+            _ = self.actor_critic(fake_tensordict)
+            _ = self.student_actor_critic(fake_tensordict)
+
         return ClipL2TLoss(
             actor_network=self.actor_critic.get_policy_operator(),
             critic_network=self.actor_critic.get_value_operator(),
-            student_actor_network=self.student_actor_critic.get_policy_operator(),
-            student_critic_network=self.student_actor_critic.get_value_operator(),
+            student_actor_critic=self.student_actor_critic,  # Pass full actor-critic
             clip_epsilon=l2t_cfg.clip_epsilon,
             loss_critic_type=self.config.loss.loss_critic_type,
             entropy_coeff=l2t_cfg.entropy_coeff,
@@ -334,37 +680,34 @@ class L2T(BaseAlgorithm):
             student_hidden_key=l2t_cfg.student_hidden_key,
         )
 
-    def _get_additional_optimizers(
+    def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
-        """Get additional optimizers for L2T-specific components."""
-        additional_optimizers = []
+        """Create optimizers for L2T teacher and student networks.
 
-        # Student optimizers for L2T
+        Creates separate optimizers for:
+        1. Teacher actor-critic (policy + value)
+        2. Student actor-critic (policy + value + feature extractor)
+        """
+        optimizers = []
+
+        # Teacher optimizer (for PPO)
+        teacher_optim = optimizer_cls(
+            self.actor_critic.parameters(),
+            **optimizer_kwargs,
+        )
+        optimizers.append(teacher_optim)
+
+        # Student optimizer (all student components together)
+        # This includes feature extractor + policy + value
         if hasattr(self, "student_actor_critic"):
-            student_actor_optim = optimizer_cls(
-                self.student_actor_critic.get_policy_head().parameters(),
+            student_optim = optimizer_cls(
+                self.student_actor_critic.parameters(),
                 **optimizer_kwargs,
             )
-            additional_optimizers.append(student_actor_optim)
+            optimizers.append(student_optim)
 
-            student_critic_optim = optimizer_cls(
-                self.student_actor_critic.get_value_head().parameters(),
-                **optimizer_kwargs,
-            )
-            additional_optimizers.append(student_critic_optim)
-
-        # Student feature extractor optimizer (if not identity)
-        if hasattr(self, "student_feature_extractor"):
-            student_fe_params = list(self.student_feature_extractor.parameters())
-            if len(student_fe_params) > 0:
-                student_feature_optim = optimizer_cls(
-                    student_fe_params,
-                    **optimizer_kwargs,
-                )
-                additional_optimizers.append(student_feature_optim)
-
-        return additional_optimizers
+        return optimizers
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
@@ -651,8 +994,7 @@ class L2T(BaseAlgorithm):
                         else:
                             metrics_to_log.update(
                                 {
-                                    "Episode/"
-                                    + key: (
+                                    "Episode/" + key: (
                                         value.item()
                                         if isinstance(value, Tensor)
                                         else value
@@ -822,15 +1164,49 @@ class L2TR(L2T):
         )
 
     def _construct_student_policy(self) -> TensorDictModule:
-        """Student policy head producing loc/scale under student keys."""
+        """Student policy head producing loc/scale under student keys (for L2TR with LSTM)."""
         assert isinstance(self.config, L2TRLOptConfig)
-        return self._build_policy_head_module(
+
+        # Get input dimension from LSTM output
+        input_dim = self._student_policy_input_dim()
+
+        # Determine policy head configuration
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        student_layout = self.config.l2t.student
+        if student_layout and student_layout.policy and student_layout.policy.head:
+            head_cfg = student_layout.policy.head
+            if head_cfg.num_cells:
+                num_cells = list(head_cfg.num_cells)
+            if head_cfg.activation:
+                activation = head_cfg.activation
+
+        # Build policy MLP
+        policy_mlp = MLP(
+            in_features=input_dim,
+            out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+            num_cells=num_cells,
+            activation_class=get_activation_class(activation),
+            device=self.device,
+        )
+
+        # Add parameter extractor for normal distribution
+        extractor = NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,  # type: ignore
+        ).to(self.device)
+
+        net = torch.nn.Sequential(policy_mlp, extractor)
+
+        # Wrap in TensorDictModule
+        return TensorDictModule(
+            module=net,
             in_keys=[self.config.l2t.student_hidden_key],
             out_keys=[
                 self.config.l2t.student_loc_key,
                 self.config.l2t.student_scale_key,
             ],
-            layout=self.config.l2t.student,
         )
 
     def _student_value_input_dim(self) -> int:
@@ -838,11 +1214,37 @@ class L2TR(L2T):
         return self._student_policy_input_dim()
 
     def _construct_student_value_function(self) -> TensorDictModule:
-        """Student value function using student layout if provided."""
+        """Student value function using student layout if provided (for L2TR with LSTM)."""
         assert isinstance(self.config, L2TRLOptConfig)
-        return self._build_value_module(
+
+        # Get input dimension from LSTM output
+        input_dim = self._student_value_input_dim()
+
+        # Determine value head configuration
+        num_cells = [256, 256]  # default
+        activation = "relu"  # default
+
+        student_layout = self.config.l2t.student
+        if student_layout and student_layout.value and student_layout.value.head:
+            head_cfg = student_layout.value.head
+            if head_cfg.num_cells:
+                num_cells = list(head_cfg.num_cells)
+            if head_cfg.activation:
+                activation = head_cfg.activation
+
+        # Build value MLP
+        value_mlp = MLP(
+            in_features=input_dim,
+            out_features=1,
+            num_cells=num_cells,
+            activation_class=get_activation_class(activation),
+            device=self.device,
+        )
+
+        # Wrap in ValueOperator
+        return ValueOperator(
+            module=value_mlp,
             in_keys=[self.config.l2t.student_hidden_key],
-            layout=self.config.l2t.student,
         )
 
     def _construct_adv_module(self) -> torch.nn.Module:
@@ -963,8 +1365,7 @@ class ClipL2TLoss(ClipPPOLoss):
         *,
         actor_network: TensorDictModule,
         critic_network: TensorDictModule,
-        student_actor_network: TensorDictModule,
-        student_critic_network: TensorDictModule,
+        student_actor_critic: ActorValueOperator,
         clip_epsilon: float,
         loss_critic_type: str = "l2",
         entropy_coeff: float = 0.0,
@@ -987,8 +1388,7 @@ class ClipL2TLoss(ClipPPOLoss):
             normalize_advantage=normalize_advantage,
             clip_value=clip_value,
         )
-        self.student_actor_network = student_actor_network
-        self.student_critic_network = student_critic_network
+        self.student_actor_critic = student_actor_critic
         self.imitation_type = imitation_type
         self.imitation_coeff = imitation_coeff
         self.student_loc_key = student_loc_key
@@ -996,11 +1396,18 @@ class ClipL2TLoss(ClipPPOLoss):
         self.student_hidden_key = student_hidden_key
 
     def forward(self, tensordict: TensorDict) -> TensorDict:  # type: ignore[override]
-        loss_td = super().forward(tensordict)  # type: ignore[assignment]
+        # Compute teacher PPO losses
+        loss_td = super().forward(tensordict)
 
-        # Compute student outputs via full operator (features + head)
+        # Compute student outputs via full actor-critic (feature extractor + policy head)
+        # Clone tensordict to avoid modifying the original
         td = tensordict.clone(False)
-        td = self.student_actor_network(td)
+
+        # Pass through student actor-critic to get student_loc and student_scale
+        # The student actor-critic should:
+        # 1. Extract features from observations (via common_operator)
+        # 2. Generate policy parameters (loc, scale) via policy_operator
+        td = self.student_actor_critic(td)
 
         imitation_loss = td.new_zeros(())
         if self.imitation_coeff > 0.0:
@@ -1026,8 +1433,8 @@ class ClipL2TLoss(ClipPPOLoss):
 
             imitation_loss = self.imitation_coeff * imitation_loss
 
-        loss_td: TensorDict
-        loss_td.set("loss_imitation", imitation_loss)  # type: ignore[assignment]
+        # Add imitation loss to the loss tensordict
+        loss_td.set("loss_imitation", imitation_loss)
         return loss_td
 
     # Annotations to avoid TorchRL functionalization warnings
@@ -1038,6 +1445,5 @@ class ClipL2TLoss(ClipPPOLoss):
     target_actor_network_params: TensorDictParams
     target_critic_network_params: TensorDictParams
 
-    # Student networks (not converted to functional by base class)
-    student_actor_network: TensorDictModule
-    student_critic_network: TensorDictModule
+    # Student actor-critic (not converted to functional by base class)
+    student_actor_critic: ActorValueOperator
