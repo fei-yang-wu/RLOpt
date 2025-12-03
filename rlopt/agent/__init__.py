@@ -1,17 +1,14 @@
 """Agent algorithms module with backward compatibility."""
 
 # New organized imports
-from rlopt.agent.imitation import IPMD, IPMDConfig, IPMDRLOptConfig
-from rlopt.agent.rl import PPO, PPORLOptConfig, SAC, SACRLOptConfig
+from __future__ import annotations
+
+from rlopt.agent.ppo import PPO, PPORLOptConfig
+from rlopt.agent.sac import SAC, SACRLOptConfig
 
 __all__ = [
-    # RL algorithms
     "PPO",
-    "PPORLOptConfig",
     "SAC",
+    "PPORLOptConfig",
     "SACRLOptConfig",
-    # Imitation learning algorithms
-    "IPMD",
-    "IPMDConfig",
-    "IPMDRLOptConfig",
 ]

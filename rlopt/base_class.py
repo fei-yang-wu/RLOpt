@@ -25,7 +25,7 @@ from torchrl.envs import TransformedEnv
 from torchrl.objectives import group_optimizers
 from torchrl.record.loggers.common import Logger
 
-from rlopt.configs import (
+from rlopt.config_base import (
     RLOptConfig,
 )
 from rlopt.logging_utils import ROOT_LOGGER_NAME, LoggingManager, MetricReporter

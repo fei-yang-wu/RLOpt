@@ -13,7 +13,7 @@ from torchrl.envs import (
 )
 from torchrl.envs.libs.gym import GymEnv, set_gym_backend
 
-from rlopt.configs import RLOptConfig
+from rlopt.config_base import RLOptConfig
 
 
 def env_maker(cfg: RLOptConfig, device="cpu", from_pixels=False):

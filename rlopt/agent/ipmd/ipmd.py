@@ -44,8 +44,7 @@ from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
-from rlopt.configs import NetworkConfig, RLOptConfig
-from rlopt.imitation import ExpertReplayBuffer
+from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
@@ -192,7 +191,7 @@ class IPMD(BaseAlgorithm):
 
         # Expert data sources (iterator and/or replay buffer)
         self._expert_iterator: Iterator[TensorDict] | None = None
-        self._expert_buffer: ExpertReplayBuffer | None = None
+        self._expert_buffer: ReplayBuffer | None = None
         self._warned_no_expert = False
 
         # Compile if requested
@@ -488,7 +487,7 @@ class IPMD(BaseAlgorithm):
         self._expert_iterator = iterator
 
     def set_expert_buffer(
-        self, buffer: TensorDictReplayBuffer | ExpertReplayBuffer
+        self, buffer: TensorDictReplayBuffer | ReplayBuffer
     ) -> None:
         """Attach an expert replay buffer.
 

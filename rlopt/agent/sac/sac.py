@@ -35,7 +35,7 @@ from torchrl.record.loggers import Logger
 from tqdm.std import tqdm as Tqdm
 
 from rlopt.base_class import BaseAlgorithm
-from rlopt.configs import RLOptConfig
+from rlopt.config_base import RLOptConfig
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
@@ -289,21 +289,21 @@ class SAC(BaseAlgorithm):
         eps = self.config.optim.target_update_polyak
         return SoftUpdate(self.loss_module, eps=eps)
 
-    def _get_additional_optimizers(
-        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
-    ) -> list[torch.optim.Optimizer]:
-        """Get additional optimizers for SAC-specific components."""
-        additional_optimizers = []
+    # def _get_additional_optimizers(
+    #     self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    # ) -> list[torch.optim.Optimizer]:
+    #     """Get additional optimizers for SAC-specific components."""
+    #     additional_optimizers = []
 
-        # Alpha optimizer for SAC
-        if hasattr(self, "loss_module") and hasattr(self.loss_module, "log_alpha"):
-            alpha_optim = optimizer_cls(
-                [self.loss_module.log_alpha],
-                **optimizer_kwargs,
-            )
-            additional_optimizers.append(alpha_optim)
+    #     # Alpha optimizer for SAC
+    #     if hasattr(self, "loss_module") and hasattr(self.loss_module, "log_alpha"):
+    #         alpha_optim = optimizer_cls(
+    #             [self.loss_module.log_alpha],
+    #             **optimizer_kwargs,
+    #         )
+    #         additional_optimizers.append(alpha_optim)
 
-        return additional_optimizers
+    #     return additional_optimizers
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         cfg = self.config

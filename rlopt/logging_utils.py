@@ -15,7 +15,7 @@ import torch
 from torchrl.record.loggers import generate_exp_name, get_logger
 from torchrl.record.loggers.common import Logger
 
-from rlopt.configs import RLOptConfig
+from rlopt.config_base import RLOptConfig
 
 try:  # pragma: no cover - optional dependency
     from rich.logging import RichHandler

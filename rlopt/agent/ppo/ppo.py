@@ -14,6 +14,7 @@ from tensordict.nn import (
     InteractionType,
     TensorDictModule,
 )
+from tensordict.nn.distributions import NormalParamExtractor
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import lr_scheduler
@@ -27,22 +28,21 @@ from torchrl.envs import Compose, ExplorationType, TransformedEnv
 from torchrl.envs.transforms import InitTracker
 from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
+    MLP,
     ActorValueOperator,
     LSTMModule,
-    MLP,
     ProbabilisticActor,
     TanhNormal,
     ValueOperator,
 )
-from tensordict.nn.distributions import NormalParamExtractor
 from torchrl.objectives import ClipPPOLoss, group_optimizers
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
-from rlopt.configs import NetworkConfig, RLOptConfig
-from rlopt.utils import get_activation_class, log_info
+from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.type_aliases import OptimizerClass, SchedulerClass
+from rlopt.utils import get_activation_class, log_info
 
 
 @dataclass
