@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import functools
 import logging
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, cast
-from collections.abc import Iterator
 
 import numpy as np
 import torch
 import tqdm
+
+# Suppress torch.compile CUDA graph diagnostic messages
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+
+# Suppress CUDA graph skip messages
+import os
+
+os.environ.setdefault("TORCH_LOGS", "-all")
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
+from tensordict.nn import CudaGraphModule, TensorDictModule
+from tensordict.nn.distributions import NormalParamExtractor
 from torch import Tensor, nn
-from torchrl._utils import timeit
+from torchrl._utils import compile_with_warmup, timeit
 from torchrl.data import (
     LazyMemmapStorage,
     LazyTensorStorage,
@@ -22,22 +33,21 @@ from torchrl.data import (
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import (
-    ActorCriticOperator,
     MLP,
+    ActorCriticOperator,
     ProbabilisticActor,
     TanhNormal,
     ValueOperator,
 )
-from tensordict.nn.distributions import NormalParamExtractor
 from torchrl.objectives import SoftUpdate, group_optimizers
 from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.configs import NetworkConfig, RLOptConfig
+from rlopt.imitation import ExpertReplayBuffer
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
-from rlopt.expert_buffer import ExpertReplayBuffer
 
 
 @dataclass
@@ -696,8 +706,9 @@ class IPMD(BaseAlgorithm):
                     "Expert batch contains non-finite values, skipping reward update"
                 )
             else:
-                # Compute estimated rewards for current policy data
-                r_pi = estimated_rewards
+                # Recompute estimated rewards for current policy data
+                # (need fresh computation graph after SAC backward)
+                r_pi = self._reward_from_batch(sampled_tensordict)
 
                 # Compute estimated rewards for expert data
                 r_exp = self._reward_from_batch(expert_td.to(self.device))
@@ -755,8 +766,12 @@ class IPMD(BaseAlgorithm):
         out["loss_reward_l2"] = reward_l2
 
         # Add additional diagnostics for IPMD
-        out["estimated_reward_mean"] = estimated_rewards.mean().detach()
-        out["estimated_reward_std"] = estimated_rewards.std().detach()
+        # Recompute for diagnostics (no grad needed, just for logging)
+        with torch.no_grad():
+            diag_rewards = self._reward_from_batch(sampled_tensordict)
+            out["estimated_reward_mean"] = diag_rewards.mean()
+            out["estimated_reward_std"] = diag_rewards.std()
+
         if expert_td is not None:
             rewards_for_diag = (
                 expert_rewards_cached
@@ -779,6 +794,36 @@ class IPMD(BaseAlgorithm):
         utd_ratio = float(cfg.ipmd.utd_ratio)
         init_random_frames = int(self.config.collector.init_random_frames)
         num_updates = int(frames_per_batch * utd_ratio)
+
+        # Compile the update function if requested
+        compile_mode = None
+        if cfg.compile.compile:
+            compile_mode = cfg.compile.compile_mode
+            if compile_mode in ("", None):
+                if cfg.compile.cudagraphs:
+                    compile_mode = "default"
+                else:
+                    compile_mode = "reduce-overhead"
+
+            self.log.info(f"Compiling update function with mode: {compile_mode}")
+            self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)  # type: ignore[method-assign]
+
+        # Only use CUDAGraphs on CUDA devices
+        if cfg.compile.cudagraphs:
+            if self.device.type == "cuda":
+                warnings.warn(
+                    "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
+                    category=UserWarning,
+                )
+                self.log.warning("Wrapping update with CudaGraphModule (experimental)")
+                self.update = CudaGraphModule(
+                    self.update, in_keys=[], out_keys=[], warmup=5
+                )  # type: ignore[method-assign]
+            else:
+                self.log.warning(
+                    f"CUDAGraphs requested but device is {self.device.type}, not CUDA. Skipping CUDAGraphs."
+                )
+
         collected_frames = 0
         collector_iter = iter(self.collector)
         pbar = tqdm.tqdm(total=total_frames)
