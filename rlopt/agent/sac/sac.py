@@ -243,8 +243,8 @@ class SAC(BaseAlgorithm):
             _ = self.actor_critic(fake_tensordict)
 
         loss_module = SACLoss(
-            actor_network=self.actor_critic.get_policy_operator(),  # type: ignore[arg-type]
-            qvalue_network=self.actor_critic.get_critic_operator(),  # type: ignore[arg-type]
+            actor_network=self.actor_critic.get_policy_head(),  # type: ignore[arg-type]
+            qvalue_network=self.actor_critic.get_value_head(),  # type: ignore[arg-type]
             num_qvalue_nets=sac_cfg.num_qvalue_nets,
             alpha_init=sac_cfg.alpha_init,
             loss_function=self.config.loss.loss_critic_type,

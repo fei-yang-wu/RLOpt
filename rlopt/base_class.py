@@ -313,7 +313,7 @@ class BaseAlgorithm(ABC):
         # We can't use nested child processes with mp_start_method="fork"
 
         collector = SyncDataCollector(
-            create_env_fn=env,
+            env,
             policy=policy,
             init_random_frames=self.config.collector.init_random_frames,
             frames_per_batch=self.config.collector.frames_per_batch,
@@ -336,7 +336,7 @@ class BaseAlgorithm(ABC):
             ),
             # heterogeneous devices
             device=self.device,
-            storing_device=self.device,
+            # storing_device=self.device,
             # reset_at_each_iter=False,
             # set_truncated=self.config.collector.set_truncated,
         )
