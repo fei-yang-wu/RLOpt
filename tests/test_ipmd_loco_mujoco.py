@@ -4,19 +4,18 @@ from __future__ import annotations
 
 import pytest
 import torch
+from rlopt.agent.imitation import IPMD, IPMDRLOptConfig
+from rlopt.configs import NetworkConfig
 from tensordict import TensorDict
 from torchrl.envs import GymEnv, set_gym_backend
 from torchrl.envs.transforms import DoubleToFloat, StepCounter
 
-from rlopt.agent.imitation import IPMD, IPMDRLOptConfig
-from rlopt.configs import NetworkConfig
 from rlopt.imitation import ExpertReplayBuffer
-
 
 # Check if loco-mujoco is available
 try:
-    import loco_mujoco  # noqa: F401
     import gymnasium as gym
+    import loco_mujoco  # noqa: F401
 
     LOCO_MUJOCO_AVAILABLE = True
 except ImportError:
@@ -173,8 +172,8 @@ def test_ipmd_with_g1_smoke():
 @pytest.mark.skipif(not LOCO_MUJOCO_AVAILABLE, reason="loco-mujoco not installed")
 def test_ipmd_with_g1_and_iltools():
     """Test IPMD with G1 environment and ImitationLearningTools replay manager."""
-    pytest.importorskip("iltools_datasets")
-    from iltools_datasets.replay_manager import (
+    pytest.importorskip("iltools.datasets")
+    from iltools.datasets.replay_manager import (
         EnvAssignment,
         ExpertReplayManager,
         ExpertReplaySpec,

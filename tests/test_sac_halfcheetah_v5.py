@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from rlopt.agent.rl import SAC, SACRLOptConfig
+from rlopt.agent import SAC, SACRLOptConfig
+from rlopt.config_base import NetworkConfig
 from rlopt.env_utils import make_parallel_env
-from rlopt.configs import NetworkConfig
 
 
 def test_sac_train_halfcheetah_v5_smoke():

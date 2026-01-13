@@ -3,22 +3,12 @@ from __future__ import annotations
 import functools
 import logging
 import warnings
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 import numpy as np
 import torch
 import tqdm
-
-# Suppress torch.compile CUDA graph diagnostic messages
-logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
-logging.getLogger("torch._inductor").setLevel(logging.ERROR)
-
-# Suppress CUDA graph skip messages
-import os
-
-os.environ.setdefault("TORCH_LOGS", "-all")
 from tensordict import TensorDict
 from tensordict.nn import CudaGraphModule, TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
@@ -30,7 +20,7 @@ from torchrl.data import (
     ReplayBuffer,
     TensorDictReplayBuffer,
 )
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import (
     MLP,
@@ -39,7 +29,7 @@ from torchrl.modules import (
     TanhNormal,
     ValueOperator,
 )
-from torchrl.objectives import SoftUpdate, group_optimizers
+from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
 from torchrl.record.loggers import Logger
 
@@ -47,6 +37,10 @@ from rlopt.base_class import BaseAlgorithm
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
+
+# Suppress torch.compile CUDA graph diagnostic messages
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 
 
 @dataclass
@@ -189,9 +183,8 @@ class IPMD(BaseAlgorithm):
             **kwargs,
         )
 
-        # Expert data sources (iterator and/or replay buffer)
-        self._expert_iterator: Iterator[TensorDict] | None = None
-        self._expert_buffer: ReplayBuffer | None = None
+        # Expert data source (TensorDictReplayBuffer)
+        self._expert_buffer: TensorDictReplayBuffer | None = None
         self._warned_no_expert = False
 
         # Compile if requested
@@ -440,13 +433,13 @@ class IPMD(BaseAlgorithm):
         """Construct data buffer"""
         # Create data buffer
         cfg = self.config
-        sampler = SamplerWithoutReplacement()
-        scratch_dir = cfg.collector.scratch_dir
+        sampler = RandomSampler()
+        scratch_dir = cfg.replay_buffer.scratch_dir or cfg.collector.scratch_dir
         device = cfg.device
         buffer_size = cfg.replay_buffer.size
         batch_size = cfg.loss.mini_batch_size
         shared = cfg.collector.shared
-        prefetch = cfg.collector.prefetch
+        prefetch = cfg.replay_buffer.prefetch
         storage_cls = (
             functools.partial(LazyTensorStorage, device=device)
             if not scratch_dir
@@ -476,58 +469,24 @@ class IPMD(BaseAlgorithm):
     # -------------------------
     # Expert data API
     # -------------------------
-    def set_expert_iterator(self, iterator: Iterator[TensorDict]) -> None:
-        """Attach an expert data iterator.
+    def set_expert_buffer(self, buffer: TensorDictReplayBuffer) -> None:
+        """Attach an expert replay buffer.
 
-        The iterator must yield TensorDict batches with keys:
+        The buffer is expected to contain the keys:
         - 'observation' (s_t)
         - 'action' (a_t)
         - ('next', 'observation') (s_{t+1})
+
+        Shapes should follow:
+        - observation: [batch, obs_dim]
+        - action: [batch, action_dim]
+        - ('next', 'observation'): [batch, obs_dim]
         """
-        self._expert_iterator = iterator
-
-    def set_expert_buffer(
-        self, buffer: TensorDictReplayBuffer | ReplayBuffer
-    ) -> None:
-        """Attach an expert replay buffer.
-
-        This can be used to avoid Python-level iteration overhead and to
-        leverage TorchRL's device-aware sampling. The buffer is expected to
-        contain the keys: 'observation', 'action', ('next', 'observation').
-
-        Args:
-            buffer: Either a TensorDictReplayBuffer or ExpertReplayBuffer instance
-        """
-        if isinstance(buffer, ExpertReplayBuffer):
-            self._expert_buffer = buffer
-        else:
-            # Wrap TensorDictReplayBuffer in ExpertReplayBuffer for consistency
-            self._expert_buffer = ExpertReplayBuffer(buffer)
-
-    def set_expert_source(self, source: Any) -> None:
-        """Attach an expert data source.
-
-        Accepts:
-        - ImitationLearningTools ExpertReplayManager (primary)
-        - TorchRL TensorDictReplayBuffer
-        - Any object with a .sample() method
-
-        The source will be wrapped in ExpertReplayBuffer for consistent interface.
-
-        Example with ILTools:
-            >>> from iltools_datasets.replay_manager import ExpertReplayManager
-            >>> mgr = ExpertReplayManager(spec)
-            >>> ipmd.set_expert_source(mgr)
-
-        Example with TorchRL buffer:
-            >>> buffer = TensorDictReplayBuffer(...)
-            >>> ipmd.set_expert_source(buffer)
-        """
-        self._expert_buffer = ExpertReplayBuffer(source)
+        self._expert_buffer = buffer
 
     def create_expert_buffer(
         self, expert_data: TensorDict, buffer_size: int | None = None
-    ) -> ExpertReplayBuffer:
+    ) -> TensorDictReplayBuffer:
         """Create an expert replay buffer from expert demonstration data.
 
         Args:
@@ -538,13 +497,13 @@ class IPMD(BaseAlgorithm):
             buffer_size: Maximum buffer size. If None, uses the size of expert_data.
 
         Returns:
-            ExpertReplayBuffer wrapping a TensorDictReplayBuffer with expert data
+            TensorDictReplayBuffer with expert data
         """
         if buffer_size is None:
             buffer_size = expert_data.numel()
 
         cfg = self.config
-        sampler = SamplerWithoutReplacement()
+        sampler = RandomSampler()
         scratch_dir = cfg.collector.scratch_dir
         device = cfg.device
         batch_size = cfg.loss.mini_batch_size
@@ -574,18 +533,25 @@ class IPMD(BaseAlgorithm):
         if scratch_dir:
             expert_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
 
-        # Wrap in ExpertReplayBuffer for consistent interface
-        return ExpertReplayBuffer(expert_buffer)
+        return expert_buffer
+
+    def _check_expert_batch_keys(self, expert_batch: TensorDict) -> bool:
+        """Validate expert batch keys for the IPMD reward update."""
+        required_keys = ["observation", "action", ("next", "observation")]
+        available_keys = expert_batch.keys(True)
+        missing = [key for key in required_keys if key not in available_keys]
+        if missing:
+            self.log.warning("Expert batch missing required keys: %s", missing)
+            return False
+        return True
 
     def _next_expert_batch(self) -> TensorDict | None:
-        # Priority: sample from expert buffer if available
         if self._expert_buffer is not None:
             try:
                 expert_batch = cast(TensorDict, self._expert_buffer.sample())
                 # Ensure expert batch has the right batch size if specified
                 assert isinstance(self.config, IPMDRLOptConfig)
                 if self.config.ipmd.expert_batch_size is not None:
-                    # If expert batch is larger than desired, take a subset
                     if expert_batch.numel() > self.config.ipmd.expert_batch_size:
                         expert_batch = cast(
                             TensorDict,
@@ -594,23 +560,6 @@ class IPMD(BaseAlgorithm):
                 return expert_batch
             except Exception:
                 pass
-
-        # Fall back to iterator
-        if self._expert_iterator is not None:
-            try:
-                expert_batch = cast(TensorDict, next(self._expert_iterator))
-                # Ensure expert batch has the right batch size if specified
-                assert isinstance(self.config, IPMDRLOptConfig)
-                if self.config.ipmd.expert_batch_size is not None:
-                    # If expert batch is larger than desired, take a subset
-                    if expert_batch.numel() > self.config.ipmd.expert_batch_size:
-                        expert_batch = cast(
-                            TensorDict,
-                            expert_batch[: self.config.ipmd.expert_batch_size],
-                        )
-                return expert_batch
-            except StopIteration:
-                return None
 
         return None
 
@@ -637,6 +586,23 @@ class IPMD(BaseAlgorithm):
         x = torch.cat([phi_s, act, phi_next], dim=-1)
         return self.reward_estimator(x).squeeze(-1)
 
+    def _dummy_loss_tensordict(self) -> TensorDict:
+        """Return a dummy loss TensorDict for skipped updates."""
+        return TensorDict(
+            {
+                "loss_actor": torch.tensor(0.0, device=self.device),
+                "loss_qvalue": torch.tensor(0.0, device=self.device),
+                "loss_alpha": torch.tensor(0.0, device=self.device),
+                "loss_reward_diff": torch.tensor(0.0, device=self.device),
+                "loss_reward_l2": torch.tensor(0.0, device=self.device),
+                "estimated_reward_mean": torch.tensor(0.0, device=self.device),
+                "estimated_reward_std": torch.tensor(0.0, device=self.device),
+                "expert_reward_mean": torch.tensor(0.0, device=self.device),
+                "expert_reward_std": torch.tensor(0.0, device=self.device),
+            },
+            batch_size=[],
+        )
+
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
         # Validate input tensordict
         if not self._validate_tensordict(
@@ -645,21 +611,7 @@ class IPMD(BaseAlgorithm):
             self.log.debug(
                 "Discarding batch due to non-finite values in input tensordict"
             )
-            # Return dummy loss with zeros
-            return TensorDict(
-                {
-                    "loss_actor": torch.tensor(0.0, device=self.device),
-                    "loss_qvalue": torch.tensor(0.0, device=self.device),
-                    "loss_alpha": torch.tensor(0.0, device=self.device),
-                    "loss_reward_diff": torch.tensor(0.0, device=self.device),
-                    "loss_reward_l2": torch.tensor(0.0, device=self.device),
-                    "estimated_reward_mean": torch.tensor(0.0, device=self.device),
-                    "estimated_reward_std": torch.tensor(0.0, device=self.device),
-                    "expert_reward_mean": torch.tensor(0.0, device=self.device),
-                    "expert_reward_std": torch.tensor(0.0, device=self.device),
-                },
-                batch_size=[],
-            )
+            return self._dummy_loss_tensordict()
 
         # Zero all grads
         self.optim.zero_grad(set_to_none=True)
@@ -704,6 +656,8 @@ class IPMD(BaseAlgorithm):
                 logging.getLogger(__name__).warning(
                     "Expert batch contains non-finite values, skipping reward update"
                 )
+            elif not self._check_expert_batch_keys(expert_td):
+                pass
             else:
                 # Recompute estimated rewards for current policy data
                 # (need fresh computation graph after SAC backward)
@@ -732,7 +686,7 @@ class IPMD(BaseAlgorithm):
                 reward_l2 = l2.detach()
         elif not self._warned_no_expert:
             logging.getLogger(__name__).warning(
-                "Expert iterator not set; skipping reward estimator updates."
+                "Expert buffer not set; skipping reward estimator updates."
             )
             self._warned_no_expert = True
 
@@ -746,10 +700,13 @@ class IPMD(BaseAlgorithm):
                 "Skipping optimizer step due to non-finite gradients; batch discarded"
             )
             self.optim.zero_grad(set_to_none=True)
-            # Return sanitized loss
-            out = cast(TensorDict, loss_td.clone())
+            out = cast(TensorDict, loss_td.detach().clone())
             out["loss_reward_diff"] = reward_diff
             out["loss_reward_l2"] = reward_l2
+            out["estimated_reward_mean"] = torch.tensor(0.0, device=self.device)
+            out["estimated_reward_std"] = torch.tensor(0.0, device=self.device)
+            out["expert_reward_mean"] = torch.tensor(0.0, device=self.device)
+            out["expert_reward_std"] = torch.tensor(0.0, device=self.device)
             return out
 
         # Step all parameter groups
@@ -760,7 +717,7 @@ class IPMD(BaseAlgorithm):
         self.target_net_updater.step()
 
         # Attach diagnostics
-        out = cast(TensorDict, loss_td.clone())
+        out = cast(TensorDict, loss_td.detach().clone())
         out["loss_reward_diff"] = reward_diff
         out["loss_reward_l2"] = reward_l2
 
@@ -804,7 +761,7 @@ class IPMD(BaseAlgorithm):
                 else:
                     compile_mode = "reduce-overhead"
 
-            self.log.info(f"Compiling update function with mode: {compile_mode}")
+            self.log.info("Compiling update function with mode: %s", compile_mode)
             self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)  # type: ignore[method-assign]
 
         # Only use CUDAGraphs on CUDA devices
@@ -812,6 +769,7 @@ class IPMD(BaseAlgorithm):
             if self.device.type == "cuda":
                 warnings.warn(
                     "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
+                    stacklevel=2,
                     category=UserWarning,
                 )
                 self.log.warning("Wrapping update with CudaGraphModule (experimental)")
@@ -820,7 +778,8 @@ class IPMD(BaseAlgorithm):
                 )  # type: ignore[method-assign]
             else:
                 self.log.warning(
-                    f"CUDAGraphs requested but device is {self.device.type}, not CUDA. Skipping CUDAGraphs."
+                    "CUDAGraphs requested but device is %s, not CUDA. Skipping CUDAGraphs.",
+                    self.device.type,
                 )
 
         collected_frames = 0
@@ -829,6 +788,7 @@ class IPMD(BaseAlgorithm):
         # Prioritized replay buffer is currently not supported/dormant
 
         while collected_frames < total_frames:
+            timeit.printevery(num_prints=1000, total_count=total_frames, erase=True)
             with timeit("collect"):
                 data = next(collector_iter)
 
@@ -838,6 +798,14 @@ class IPMD(BaseAlgorithm):
             pbar.update(frames_in_batch)
 
             self.collector.update_policy_weights_()
+
+            # Log step rewards (always available)
+            if ("next", "reward") in data.keys(True):
+                step_rewards = data["next", "reward"]
+                metrics_to_log["train/step_reward_mean"] = step_rewards.mean().item()
+                metrics_to_log["train/step_reward_std"] = step_rewards.std().item()
+                metrics_to_log["train/step_reward_max"] = step_rewards.max().item()
+                metrics_to_log["train/step_reward_min"] = step_rewards.min().item()
 
             # Get training rewards and episode lengths (if available)
             if ("next", "episode_reward") in data.keys(True):
@@ -860,12 +828,10 @@ class IPMD(BaseAlgorithm):
             with timeit("replay_extend"):
                 self.data_buffer.extend(data.reshape(-1))  # type: ignore[arg-type]
 
-            # Initialize losses variable
-            losses = TensorDict(batch_size=[num_updates])
-
             with timeit("train"):
+                losses = None
                 if collected_frames >= init_random_frames:
-                    losses = TensorDict(batch_size=[num_updates])
+                    losses_list: list[TensorDict] = []
                     for i in range(num_updates):
                         with timeit("rb - sample"):
                             # Sample from replay buffer
@@ -880,35 +846,27 @@ class IPMD(BaseAlgorithm):
                             logging.getLogger(__name__).debug(
                                 "Discarding mini-batch %d due to non-finite values", i
                             )
-                            # Create dummy loss entry
-                            losses[i] = TensorDict(
-                                {
-                                    "loss_actor": torch.tensor(0.0, device=self.device),
-                                    "loss_qvalue": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                    "loss_alpha": torch.tensor(0.0, device=self.device),
-                                    "loss_reward_diff": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                    "loss_reward_l2": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                    "estimated_reward_mean": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                    "estimated_reward_std": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                    "expert_reward_mean": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                    "expert_reward_std": torch.tensor(
-                                        0.0, device=self.device
-                                    ),
-                                },
-                                batch_size=[],
-                            ).select(
+                            losses_list.append(
+                                self._dummy_loss_tensordict().select(
+                                    "loss_actor",
+                                    "loss_qvalue",
+                                    "loss_alpha",
+                                    "loss_reward_diff",
+                                    "loss_reward_l2",
+                                    "estimated_reward_mean",
+                                    "estimated_reward_std",
+                                    "expert_reward_mean",
+                                    "expert_reward_std",
+                                )
+                            )
+                            continue
+
+                        with timeit("update"):
+                            torch.compiler.cudagraph_mark_step_begin()
+                            # Compute loss
+                            loss = self.update(sampled_tensordict).clone()
+                        losses_list.append(
+                            loss.select(
                                 "loss_actor",
                                 "loss_qvalue",
                                 "loss_alpha",
@@ -919,25 +877,17 @@ class IPMD(BaseAlgorithm):
                                 "expert_reward_mean",
                                 "expert_reward_std",
                             )
-                            continue
-
-                        with timeit("update"):
-                            torch.compiler.cudagraph_mark_step_begin()
-                            # Compute loss
-                            loss = self.update(sampled_tensordict).clone()
-                        losses[i] = loss.select(
-                            "loss_actor",
-                            "loss_qvalue",
-                            "loss_alpha",
-                            "loss_reward_diff",
-                            "loss_reward_l2",
-                            "estimated_reward_mean",
-                            "estimated_reward_std",
-                            "expert_reward_mean",
-                            "expert_reward_std",
                         )
 
                     # PRB updates disabled
+                    if len(losses_list) > 0:
+                        keys = list(losses_list[0].keys())
+                        stacked = {}
+                        for key in keys:
+                            stacked[key] = torch.stack(
+                                [ld.get(key) for ld in losses_list]
+                            )
+                        losses = TensorDict(stacked, batch_size=[len(losses_list)])
 
             # Get training losses and times
             if losses is not None:
@@ -945,6 +895,10 @@ class IPMD(BaseAlgorithm):
                 for key, value in list(losses_mean.items()):  # type: ignore
                     if isinstance(value, Tensor):
                         metrics_to_log[f"train/{key}"] = float(value.item())
+
+                if hasattr(self.loss_module, "log_alpha"):
+                    alpha = self.loss_module.log_alpha.exp().detach().cpu().item()
+                    metrics_to_log["train/alpha"] = alpha
 
             # Merge timing metrics and emit via shared logger interface
             metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
@@ -959,10 +913,27 @@ class IPMD(BaseAlgorithm):
                 log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
                 log_info(log_info_dict, metrics_to_log)
 
+            if metrics_to_log:
+                postfix = {}
+                if "train/step_reward_mean" in metrics_to_log:
+                    postfix["r_step"] = (
+                        f"{metrics_to_log['train/step_reward_mean']:.2f}"
+                    )
+                if "episode/return" in metrics_to_log:
+                    postfix["r_ep"] = f"{metrics_to_log['episode/return']:.1f}"
+                if "train/loss_actor" in metrics_to_log:
+                    postfix["pi_loss"] = f"{metrics_to_log['train/loss_actor']:.3f}"
+                if "train/alpha" in metrics_to_log:
+                    postfix["alpha"] = f"{metrics_to_log['train/alpha']:.3f}"
+                if postfix:
+                    pbar.set_postfix(postfix)
+
             # Save model periodically
             if (
                 self.config.save_interval > 0
-                and collected_frames % self.config.save_interval == 0
+                and collected_frames
+                % (self.config.save_interval * self.config.env.num_envs)
+                == 0
             ):
                 self.save_model(
                     path=self.log_dir / self.config.logger.save_path,
@@ -1022,7 +993,7 @@ class IPMD(BaseAlgorithm):
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
             td = TensorDict(
-                dict.fromkeys(self.total_input_keys, obs),
+                dict.fromkeys(self.config.policy.input_keys, obs),
                 batch_size=[1],
                 device=self.device,
             )
