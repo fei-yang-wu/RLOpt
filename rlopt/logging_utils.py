@@ -395,6 +395,7 @@ class LoggingManager:
             "project": self._config.logger.project_name,
             "entity": self._config.logger.entity,
             "group": self._config.logger.group_name,
+            "dir": str(self.run_dir),
         }
 
         try:  # noqa: SIM105

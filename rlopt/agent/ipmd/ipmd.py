@@ -50,10 +50,10 @@ class IPMDConfig:
     alpha_init: float = 1.0
     """Initial alpha value."""
 
-    min_alpha: float | None = None
+    min_alpha: float | None = 1e-4
     """Minimum alpha value."""
 
-    max_alpha: float | None = None
+    max_alpha: float | None = 10.0
     """Maximum alpha value."""
 
     num_qvalue_nets: int = 2
@@ -111,8 +111,12 @@ class IPMDConfig:
     reward_detach_features: bool = True
     """Detach features when computing reward loss (avoid leaking grads)."""
 
-    use_estimated_rewards_for_sac: bool = True
-    """Whether to use estimated rewards instead of environment rewards for SAC loss."""
+    use_estimated_rewards_for_sac: bool = False
+    """Whether to use estimated rewards instead of environment rewards for SAC loss.
+
+    Default is False to keep IPMD aligned with SAC during debugging/comparison.
+    Set to True to train SAC updates on estimated rewards.
+    """
 
     expert_batch_size: int | None = None
     """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
@@ -362,8 +366,8 @@ class IPMD(BaseAlgorithm):
             _ = self.actor_critic(fake_tensordict)
 
         loss_module = SACLoss(
-            actor_network=self.actor_critic.get_policy_operator(),  # type: ignore[arg-type]
-            qvalue_network=self.actor_critic.get_critic_operator(),  # type: ignore[arg-type]
+            actor_network=self.actor_critic.get_policy_head(),  # type: ignore[arg-type]
+            qvalue_network=self.actor_critic.get_value_head(),  # type: ignore[arg-type]
             num_qvalue_nets=sac_cfg.num_qvalue_nets,
             alpha_init=sac_cfg.alpha_init,
             loss_function=self.config.loss.loss_critic_type,
@@ -385,14 +389,7 @@ class IPMD(BaseAlgorithm):
         return loss_module
 
     def _construct_target_net_updater(self) -> SoftUpdate:
-        # Prefer polyak parameter from network layout critic if present
         eps = self.config.optim.target_update_polyak
-        if (
-            hasattr(self.config, "network")
-            and self.config.network
-            and hasattr(self.config.network, "critic")
-        ):
-            eps = self.config.network.critic.polyak_eps
         return SoftUpdate(self.loss_module, eps=eps)
 
     # _get_activation_class and _initialize_weights now provided by BaseAlgorithm

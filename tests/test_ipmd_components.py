@@ -5,11 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 from tensordict import TensorDict
+from torchrl.data import TensorDictReplayBuffer
 
-from rlopt.agent.imitation import IPMD, IPMDRLOptConfig
-from rlopt.configs import NetworkConfig
+from rlopt.agent import IPMD, IPMDRLOptConfig
+from rlopt.config_base import NetworkConfig
 from rlopt.env_utils import make_parallel_env
-from rlopt.imitation import ExpertReplayBuffer
 
 
 def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
@@ -17,7 +17,7 @@ def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
     obs_dim = env.observation_spec["observation"].shape[-1]
     act_dim = env.action_spec.shape[-1]
 
-    data = TensorDict(
+    return TensorDict(
         {
             "observation": torch.randn(num_transitions, obs_dim),
             "action": torch.randn(num_transitions, act_dim),
@@ -29,7 +29,6 @@ def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
         },
         batch_size=[num_transitions],
     )
-    return data
 
 
 def test_ipmd_initialization():
@@ -120,7 +119,7 @@ def test_ipmd_expert_buffer_integration():
 
     # Create expert buffer using agent's helper method
     expert_buffer = agent.create_expert_buffer(expert_data, buffer_size=50)
-    assert isinstance(expert_buffer, ExpertReplayBuffer)
+    assert isinstance(expert_buffer, TensorDictReplayBuffer)
 
     # Set expert buffer on agent
     agent.set_expert_buffer(expert_buffer)
@@ -176,13 +175,13 @@ def test_ipmd_update_with_expert_data():
     loss_td = agent.update(policy_batch)
 
     # Check loss outputs
-    assert "loss_actor" in loss_td.keys()
-    assert "loss_qvalue" in loss_td.keys()
-    assert "loss_alpha" in loss_td.keys()
-    assert "loss_reward_diff" in loss_td.keys()
-    assert "loss_reward_l2" in loss_td.keys()
-    assert "estimated_reward_mean" in loss_td.keys()
-    assert "expert_reward_mean" in loss_td.keys()
+    assert "loss_actor" in loss_td
+    assert "loss_qvalue" in loss_td
+    assert "loss_alpha" in loss_td
+    assert "loss_reward_diff" in loss_td
+    assert "loss_reward_l2" in loss_td
+    assert "estimated_reward_mean" in loss_td
+    assert "expert_reward_mean" in loss_td
 
     # Check that losses are finite
     for key in loss_td.keys():
@@ -204,20 +203,11 @@ def test_ipmd_set_expert_source_compatibility():
     env = make_parallel_env(cfg)
     agent = IPMD(env, cfg, logger=None)
 
-    # Test 1: Set source with TensorDictReplayBuffer directly
+    # Test: Set source with TensorDictReplayBuffer directly
     expert_data = create_synthetic_expert_data(env, num_transitions=20)
     buffer = agent.create_expert_buffer(expert_data, buffer_size=20)
-    agent.set_expert_source(buffer)
+    agent.set_expert_buffer(buffer)
     assert agent._expert_buffer is not None
-
-    # Test 2: Set source with ExpertReplayBuffer
-    expert_buffer = ExpertReplayBuffer(buffer)
-    agent.set_expert_source(expert_buffer)
-    assert agent._expert_buffer is not None
-
-    # Sample to verify it works
-    sample = agent._next_expert_batch()
-    assert sample is not None
 
 
 if __name__ == "__main__":

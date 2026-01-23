@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-from rlopt.agent.imitation import IPMD, IPMDRLOptConfig
-from rlopt.configs import NetworkConfig
 from tensordict import TensorDict
 from torchrl.envs import GymEnv, set_gym_backend
 from torchrl.envs.transforms import DoubleToFloat, StepCounter
 
-from rlopt.imitation import ExpertReplayBuffer
+from rlopt.agent import IPMD, IPMDRLOptConfig
+from rlopt.config_base import NetworkConfig
 
 # Check if loco-mujoco is available
 try:
@@ -36,7 +35,7 @@ def test_create_g1_environment():
 
         # Test reset
         td = env.reset()
-        assert "observation" in td.keys()
+        assert "observation" in td
 
         # Test step
         action = env.action_spec.rand()
@@ -92,8 +91,8 @@ def test_collect_g1_expert_data():
         expert_data = torch.stack(transitions, dim=0)
 
         assert expert_data.batch_size[0] == num_transitions
-        assert "observation" in expert_data.keys()
-        assert "action" in expert_data.keys()
+        assert "observation" in expert_data
+        assert "action" in expert_data
         assert ("next", "observation") in expert_data.keys(True)
 
         env.close()
@@ -253,8 +252,8 @@ def test_ipmd_with_g1_and_iltools():
             sample = expert_buffer.sample()
             assert isinstance(sample, TensorDict)
             assert sample.batch_size[0] == len(assignment)
-            assert "observation" in sample.keys()
-            assert "action" in sample.keys()
+            assert "observation" in sample
+            assert "action" in sample
 
             # Create IPMD agent and set expert source
             cfg.policy.input_dim = obs_dim

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
-import torch as nn
+from torch import nn
 import torch.nn.functional as F
 from diffusers import DDPMScheduler
 from diffusers.models.embeddings import get_timestep_embedding
