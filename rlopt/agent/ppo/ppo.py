@@ -17,7 +17,6 @@ from tensordict.nn import (
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
-from torch.optim import lr_scheduler
 from torchrl._utils import timeit
 
 # Import missing modules
@@ -35,13 +34,13 @@ from torchrl.modules import (
     TanhNormal,
     ValueOperator,
 )
-from torchrl.objectives import ClipPPOLoss, group_optimizers
+from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.config_base import NetworkConfig, RLOptConfig
-from rlopt.type_aliases import OptimizerClass, SchedulerClass
+from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
 
@@ -239,8 +238,8 @@ class PPO(BaseAlgorithm):
 
             common_operator = TensorDictModule(
                 module=IdentityModule(),
-                in_keys=["observation"],
-                out_keys=["observation"],
+                in_keys=list(self.config.policy.input_keys),
+                out_keys=list(self.config.policy.input_keys),
             )
 
         return ActorValueOperator(
@@ -463,7 +462,7 @@ class PPO(BaseAlgorithm):
                     self._validate_tensordict(data, f"epoch{j}:pre_gae_input")
                     self._validate_parameters(f"epoch{j}:pre_gae")
                     with torch.no_grad(), timeit("adv"):
-                        torch.compiler.cudagraph_mark_step_begin()
+                        # torch.compiler.cudagraph_mark_step_begin()
                         data = self.adv_module(data)
                         if self.config.compile.compile_mode:
                             data = data.clone()
@@ -489,7 +488,7 @@ class PPO(BaseAlgorithm):
                             continue
                         self._update_stage_context = f"epoch{j}:mini_batch{k}"
                         with timeit("update"):
-                            torch.compiler.cudagraph_mark_step_begin()
+                            # torch.compiler.cudagraph_mark_step_begin()
                             loss, num_network_updates = self.update(  # type: ignore
                                 batch, num_network_updates=num_network_updates
                             )
@@ -510,15 +509,15 @@ class PPO(BaseAlgorithm):
             losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
             for key, value in losses_mean.items():  # type: ignore
                 metrics_to_log.update({f"train/{key}": value.item()})  # type: ignore
-            current_lr_tensor = (
-                loss["lr"]
-                if "lr" in loss
-                else torch.tensor(
-                    self.optim.param_groups[0]["lr"],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            )
+            # current_lr_tensor = (
+            #     loss["lr"]
+            #     if "lr" in loss
+            #     else torch.tensor(
+            #         self.optim.param_groups[0]["lr"],
+            #         device=self.device,
+            #         dtype=torch.float32,
+            #     )
+            # )
             clip_attr = getattr(self.loss_module, "clip_epsilon", None)
             if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
                 clip_epsilon_value = clip_attr.detach()
@@ -530,14 +529,14 @@ class PPO(BaseAlgorithm):
                 )
             metrics_to_log.update(  # type: ignore
                 {
-                    "train/lr": current_lr_tensor,
+                    # "train/lr": current_lr_tensor,
                     "train/clip_epsilon": clip_epsilon_value,
                 }
             )
-            if "grad_norm" in loss:
-                metrics_to_log["train/grad_norm"] = loss["grad_norm"]
-            if "skipped_update" in loss:
-                metrics_to_log["train/skipped_update"] = loss["skipped_update"]
+            # if "grad_norm" in loss:
+            #     metrics_to_log["train/grad_norm"] = loss["grad_norm"]
+            # if "skipped_update" in loss:
+            #     metrics_to_log["train/skipped_update"] = loss["skipped_update"]
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
@@ -573,7 +572,7 @@ class PPO(BaseAlgorithm):
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
             td = TensorDict(
-                {key: obs for key in self.total_input_keys},
+                dict.fromkeys(self.total_input_keys, obs),
                 batch_size=[1],
                 device=self.device,
             )

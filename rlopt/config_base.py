@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import torch
-
 
 @dataclass
 class EnvConfig:
@@ -16,7 +14,7 @@ class EnvConfig:
     num_envs: int = 1
     """Number of environments to simulate."""
 
-    device: str = "cpu"
+    device: str = "auto"
     """Device to run the environment on."""
 
     library: str = "gymnasium"
@@ -99,7 +97,7 @@ class LoggerConfig:
 
     log_dir: str = "logs"
     """Base directory for logging. Structure: {log_dir}/{algorithm}/{env_name}/{timestamp}/
-    
+
     Default creates: ./logs/SAC/Pendulum-v1/2025-10-27_19-49-59/
     """
 
@@ -163,7 +161,7 @@ class OptimizerConfig:
     scheduler_step: Literal["update", "epoch"] = "update"
     """Whether to step the scheduler after each optimizer update or once per epoch."""
 
-    device: str = "cpu"
+    device: str = "auto"
     """Device for optimizer state when applicable."""
 
     target_update_polyak: float = 0.995

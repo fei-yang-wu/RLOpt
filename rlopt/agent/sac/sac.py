@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import functools
-import logging
-import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -35,7 +33,7 @@ from torchrl.record.loggers import Logger
 from tqdm.std import tqdm as Tqdm
 
 from rlopt.base_class import BaseAlgorithm
-from rlopt.config_base import RLOptConfig
+from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
@@ -83,7 +81,7 @@ class SACConfig:
     skip_done_states: bool = False
     """Whether to skip done states."""
 
-    deactivate_vmap: bool = False
+    deactivate_vmap: bool = True
     """Whether to deactivate vmap."""
 
     utd_ratio: float = 1.0
@@ -96,6 +94,17 @@ class SACRLOptConfig(RLOptConfig):
 
     sac: SACConfig = field(default_factory=SACConfig)
     """SAC configuration."""
+
+    def __post_init__(self):
+        """Post-initialization setup."""
+        assert self.value_function is None, "SAC does not use a value function."
+
+        self.q_function = NetworkConfig(
+            num_cells=[256, 256],
+            activation_fn="relu",
+            output_dim=1,
+            input_keys=["observation"],
+        )
 
 
 class SAC(BaseAlgorithm):
@@ -219,8 +228,8 @@ class SAC(BaseAlgorithm):
 
         dummy = TensorDictModule(
             module=IdentityModule(),
-            in_keys=["observation"],
-            out_keys=["observation"],
+            in_keys=list(self.config.policy.input_keys),
+            out_keys=list(self.config.policy.input_keys),
         )
         return ActorCriticOperator(
             common_operator=dummy,
@@ -267,12 +276,18 @@ class SAC(BaseAlgorithm):
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
         """Create optimizers for actor, critic, and alpha parameters."""
-        critic_params = list(
-            self.loss_module.qvalue_network_params.flatten_keys().values()  # type: ignore[attr-defined]
-        )
-        actor_params = list(
-            self.loss_module.actor_network_params.flatten_keys().values()  # type: ignore[attr-defined]
-        )
+        if hasattr(self.loss_module, "qvalue_network_params"):
+            critic_params = list(
+                self.loss_module.qvalue_network_params.flatten_keys().values()  # type: ignore[attr-defined]
+            )
+        else:
+            critic_params = list(self.loss_module.qvalue_networks.parameters())  # type: ignore[attr-defined]
+        if hasattr(self.loss_module, "actor_network_params"):
+            actor_params = list(
+                self.loss_module.actor_network_params.flatten_keys().values()  # type: ignore[attr-defined]
+            )
+        else:
+            actor_params = list(self.loss_module.actor_network.parameters())  # type: ignore[attr-defined]
         optimizers = [
             optimizer_cls(actor_params, **optimizer_kwargs),
             optimizer_cls(critic_params, **optimizer_kwargs),
@@ -348,14 +363,18 @@ class SAC(BaseAlgorithm):
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
         # Compute loss
         loss_td = self.loss_module(sampled_tensordict)
-        loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_loss")
+        # loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_loss")
 
         actor_loss = loss_td["loss_actor"]
         q_loss = loss_td["loss_qvalue"]
         alpha_loss = loss_td["loss_alpha"]
 
         total_loss = (actor_loss + q_loss + alpha_loss).sum()  # type: ignore[operator]
-
+        # # debug: print out some losses
+        # print(
+        #     f"Actor loss: {actor_loss.mean().item():.6f}, Q loss: {q_loss.mean().item():.6f}, Alpha loss: {alpha_loss.mean().item():.6f}"
+        # )
+        # print(f"Total loss: {total_loss.item():.6f}")
         # Backward pass
         total_loss.backward()  # type: ignore[operator]
 
@@ -379,7 +398,7 @@ class SAC(BaseAlgorithm):
         utd_ratio = float(cfg.sac.utd_ratio)
         init_random_frames = int(self.config.collector.init_random_frames)
         # Compute updates per collector iteration based on UTD ratio and batch sizes
-        num_updates = int(frames_per_batch * utd_ratio)
+        num_updates = max(int(frames_per_batch * utd_ratio), 3)
 
         # Compile the update function if requested
         compile_mode = None
