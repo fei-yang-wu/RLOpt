@@ -14,9 +14,10 @@ import torch.nn
 import torch.optim
 from tensordict import TensorDict
 from tensordict.base import TensorDictBase
-from tensordict.nn import TensorDictModule
+from tensordict.nn import CudaGraphModule, TensorDictModule
 from torch import Tensor
 from torch.optim import lr_scheduler
+from torchrl._utils import compile_with_warmup
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
     ReplayBuffer,
@@ -192,6 +193,8 @@ class BaseAlgorithm(ABC):
         except Exception:
             # Avoid hard failures if summary printing hits an edge case
             pass
+
+        self._compile_components()
 
     def seed(self, seed: int) -> None:
         """Set random seeds for reproducibility across all random number generators.
@@ -474,6 +477,16 @@ class BaseAlgorithm(ABC):
             ...     self.compute_action = self._compute_action
             ...     self.compute_returns = self._compute_returns
         """
+        compile_mode = None
+
+        if self.config.compile.compile:
+            compile_mode = self.config.compile.compile_mode
+            if compile_mode in ("", None):
+                if self.config.compile.cudagraphs:
+                    compile_mode = "default"
+                else:
+                    compile_mode = "reduce-overhead"
+        self.compile_mode = compile_mode
 
     def _configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure optimizers and learning rate schedulers for training.
@@ -540,7 +553,7 @@ class BaseAlgorithm(ABC):
         }
 
         self.lr_scheduler = None
-        if scheduler_name:
+        if scheduler_name and scheduler_name != "adaptive":
             if scheduler_name not in scheduler_map:
                 available = ", ".join(sorted(scheduler_map))
                 msg = (
@@ -1003,3 +1016,65 @@ class BaseAlgorithm(ABC):
                 loss_td.set(key, torch.zeros_like(value))  # type: ignore
 
         return loss_td
+
+    @staticmethod
+    def _reduce_log_prob(log_prob: Tensor, action: Tensor) -> Tensor:
+        if log_prob.ndim == action.ndim:
+            return log_prob.sum(dim=-1)
+        return log_prob
+
+    def _prepare_kl_context(
+        self, sampled_tensordict: TensorDict, policy_op: TensorDictModule
+    ) -> dict[str, Tensor]:
+        obs_td = sampled_tensordict.select(*policy_op.in_keys).detach()
+        with torch.no_grad():
+            dist = policy_op.get_dist(obs_td)
+            action = dist.sample()
+            logp_before = dist.log_prob(action)
+            logp_before = self._reduce_log_prob(logp_before, action)
+        return {
+            "obs_td": obs_td,
+            "action": action,
+            "logp_before": logp_before,
+        }
+
+    def _compute_kl_after_update(
+        self, kl_context: dict[str, Tensor], policy_op: TensorDictModule
+    ) -> Tensor | None:
+        with torch.no_grad():
+            dist = policy_op.get_dist(kl_context["obs_td"])
+            logp_after = dist.log_prob(kl_context["action"])
+            logp_after = self._reduce_log_prob(logp_after, kl_context["action"])
+            kl_approx = (kl_context["logp_before"] - logp_after).mean()
+        if not torch.isfinite(kl_approx):
+            return None
+        return kl_approx
+
+    def _maybe_adjust_lr(self, kl_approx: Tensor, schedule_cfg: Any) -> None:
+        schedule = (getattr(schedule_cfg, "scheduler", "") or "").lower()
+        if schedule != "adaptive":
+            return
+        kl_value = float(kl_approx.detach().mean().cpu().item())
+        if not np.isfinite(kl_value) or kl_value <= 0.0:
+            return
+
+        desired_kl = float(getattr(schedule_cfg, "desired_kl", 0.01))
+        factor = float(getattr(schedule_cfg, "lr_adaptation_factor", 1.5))
+        min_lr = getattr(schedule_cfg, "min_lr", None)
+        max_lr = getattr(schedule_cfg, "max_lr", None)
+
+        lr = float(self.optim.param_groups[0]["lr"])
+        if kl_value > desired_kl * 2.0:
+            lr /= factor
+        elif kl_value < desired_kl / 2.0:
+            lr *= factor
+        else:
+            return
+
+        if min_lr is not None:
+            lr = max(lr, float(min_lr))
+        if max_lr is not None:
+            lr = min(lr, float(max_lr))
+
+        for group in self.optim.param_groups:
+            group["lr"] = lr

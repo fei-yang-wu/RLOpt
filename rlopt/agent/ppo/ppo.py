@@ -14,14 +14,18 @@ from tensordict.nn import (
     InteractionType,
     TensorDictModule,
 )
-from tensordict.nn.distributions import NormalParamExtractor
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
 
 # Import missing modules
 from torchrl.collectors import SyncDataCollector
-from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
+from torchrl.data import (
+    Bounded,
+    LazyTensorStorage,
+    ReplayBuffer,
+    TensorDictReplayBuffer,
+)
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
 from torchrl.envs.transforms import InitTracker
@@ -29,6 +33,7 @@ from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
+    IndependentNormal,
     LSTMModule,
     ProbabilisticActor,
     TanhNormal,
@@ -40,6 +45,7 @@ from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.config_base import NetworkConfig, RLOptConfig
+from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
@@ -63,11 +69,23 @@ class PPOConfig:
     critic_coeff: float = 1.0
     """Critic coefficient."""
 
-    entropy_coeff: float = 0.005
+    entropy_coeff: float = 0.008
     """Entropy coefficient."""
 
-    normalize_advantage: bool = False
+    normalize_advantage: bool = True
     """Whether to normalize the advantage estimates."""
+
+    log_std_init: float = 0.0
+    """Initial value for the policy log standard deviation (log std)."""
+
+    clip_log_std: bool = True
+    """Whether to clip the learned log standard deviation."""
+
+    log_std_min: float = -20.0
+    """Minimum log standard deviation (when clipping is enabled)."""
+
+    log_std_max: float = 2.0
+    """Maximum log standard deviation (when clipping is enabled)."""
 
 
 @dataclass
@@ -140,32 +158,40 @@ class PPO(BaseAlgorithm):
         """Construct policy"""
         # for PPO, we use a probabilistic actor
 
-        # Define policy output distribution class
-        distribution_class = TanhNormal
-        distribution_kwargs = {
-            "low": self.env.action_spec_unbatched.space.low.to(self.device),  # type: ignore
-            "high": self.env.action_spec_unbatched.space.high.to(self.device),  # type: ignore
-            "tanh_loc": False,
-        }
+        action_spec = self.env.action_spec_unbatched  # type: ignore
+        action_dim = int(action_spec.shape[-1])
+        if isinstance(action_spec, Bounded):
+            distribution_class = TanhNormal
+            distribution_kwargs = {
+                "low": action_spec.space.low,  # type: ignore[union-attr]
+                "high": action_spec.space.high,  # type: ignore[union-attr]
+                "tanh_loc": False,
+            }
+        else:
+            distribution_class = IndependentNormal
+            distribution_kwargs = {}
 
         # Build policy network
         if policy_net is None:
             policy_mlp = MLP(
                 in_features=self.config.policy.input_dim,
                 activation_class=get_activation_class(self.config.policy.activation_fn),
-                out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+                out_features=action_dim,
                 num_cells=list(self.config.policy.num_cells),
                 device=self.device,
             )
         else:
             policy_mlp = policy_net
 
-        # Add parameter extractor
-        extractor = NormalParamExtractor(
-            scale_mapping="biased_softplus_1.0",
-            scale_lb=0.1,  # type: ignore
-        ).to(self.device)
-        net = torch.nn.Sequential(policy_mlp, extractor)
+        net = GaussianPolicyHead(
+            base=policy_mlp,
+            action_dim=action_dim,
+            log_std_init=self.config.ppo.log_std_init,
+            log_std_min=self.config.ppo.log_std_min,
+            log_std_max=self.config.ppo.log_std_max,
+            clip_log_std=self.config.ppo.clip_log_std,
+            device=self.device,
+        )
 
         # Wrap in TensorDictModule
         policy_td = TensorDictModule(
@@ -328,8 +354,6 @@ class PPO(BaseAlgorithm):
     ) -> tuple[TensorDict, int]:
         """Update function"""
         stage_prefix = self._update_stage_context or "update"
-        # for debug
-        # self._validate_parameters(f"{stage_prefix}:pre_zero_grad")
         self.optim.zero_grad(set_to_none=True)
         assert isinstance(self.config, PPORLOptConfig)
 
@@ -342,27 +366,9 @@ class PPO(BaseAlgorithm):
 
         # Backward pass
         total_loss.backward()  # type: ignore
-        grads_finite = self._validate_gradients(
-            f"{stage_prefix}:post_backward", raise_error=False
-        )
 
         # clone the loss
         output_loss = loss.clone().detach_()
-
-        if not grads_finite:
-            self.log.debug(
-                "Skipping optimizer step due to non-finite gradients; batch discarded"
-            )
-            self.optim.zero_grad(set_to_none=True)
-            output_loss.set("alpha", torch.tensor(1.0, device=self.device))
-            current_lr = torch.tensor(
-                self.optim.param_groups[0]["lr"],
-                device=self.device,
-                dtype=torch.float32,
-            )
-            output_loss.set("lr", current_lr)
-            output_loss.set("skipped_update", torch.tensor(True, device=self.device))
-            return output_loss, num_network_updates
 
         grad_params = [
             param for _, param in self._parameter_monitor if param.grad is not None
@@ -376,8 +382,6 @@ class PPO(BaseAlgorithm):
         self.optim.step()
         if self.lr_scheduler and self.lr_scheduler_step == "update":
             self.lr_scheduler.step()
-        # for debug
-        # self._validate_parameters(f"{stage_prefix}:post_step")
         output_loss.set("alpha", torch.tensor(1.0, device=self.device))
         if grad_norm_tensor is not None:
             output_loss.set("grad_norm", grad_norm_tensor.detach())
@@ -394,9 +398,6 @@ class PPO(BaseAlgorithm):
         """Yield data from the collector while enforcing NaN guards per batch."""
 
         for step_idx, tensordict in enumerate(self.collector):
-            self._validate_tensordict(
-                tensordict, f"collector_iter:step{step_idx}", raise_error=False
-            )
             yield tensordict
 
     def train(self) -> None:  # type: ignore
@@ -429,6 +430,7 @@ class PPO(BaseAlgorithm):
         self.collector: SyncDataCollector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
+        policy_op = self.actor_critic.get_policy_operator()
         for _i in range(total_iter):
             # timeit.printevery(1000, total_iter, erase=True)
 
@@ -441,6 +443,16 @@ class PPO(BaseAlgorithm):
             pbar.update(frames_in_batch)
 
             # Get training rewards and episode lengths (if available)
+            if ("next", "reward") in data.keys(True):
+                step_rewards = data["next", "reward"]
+                metrics_to_log.update(
+                    {
+                        "train/step_reward_mean": step_rewards.mean().item(),
+                        "train/step_reward_std": step_rewards.std().item(),
+                        "train/step_reward_max": step_rewards.max().item(),
+                        "train/step_reward_min": step_rewards.min().item(),
+                    }
+                )
             if ("next", "episode_reward") in data.keys(True):
                 episode_rewards = data["next", "episode_reward"][data["next", "done"]]
                 if len(episode_rewards) > 0:
@@ -459,15 +471,11 @@ class PPO(BaseAlgorithm):
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
                     # Compute GAE
-                    self._validate_tensordict(data, f"epoch{j}:pre_gae_input")
-                    self._validate_parameters(f"epoch{j}:pre_gae")
                     with torch.no_grad(), timeit("adv"):
                         # torch.compiler.cudagraph_mark_step_begin()
                         data = self.adv_module(data)
                         if self.config.compile.compile_mode:
                             data = data.clone()
-                    self._validate_parameters(f"epoch{j}:post_gae")
-                    self._validate_tensordict(data, f"epoch{j}:post_gae")
 
                     with timeit("rb - extend"):
                         # Update the data buffer
@@ -475,32 +483,37 @@ class PPO(BaseAlgorithm):
                         self.data_buffer.extend(data_reshape)
 
                     for k, batch in enumerate(self.data_buffer):
-                        if not self._validate_tensordict(
-                            batch,
-                            f"epoch{j}:mini_batch{k}:pre_update_batch",
-                            raise_error=False,
-                        ):
-                            self.log.debug(
-                                "Discarding mini-batch %d in epoch %d due to non-finite values",
-                                k,
-                                j,
-                            )
-                            continue
-                        self._update_stage_context = f"epoch{j}:mini_batch{k}"
+                        kl_context = None
+                        if (self.config.optim.scheduler or "").lower() == "adaptive":
+                            kl_context = self._prepare_kl_context(batch, policy_op)
                         with timeit("update"):
                             # torch.compiler.cudagraph_mark_step_begin()
                             loss, num_network_updates = self.update(  # type: ignore
                                 batch, num_network_updates=num_network_updates
                             )
                             loss = loss.clone()
-                        self._update_stage_context = ""
-                        self._validate_tensordict(
-                            batch, f"epoch{j}:mini_batch{k}:post_update_batch"
-                        )
+                        if kl_context is not None:
+                            kl_approx = self._compute_kl_after_update(
+                                kl_context, policy_op
+                            )
+                            if kl_approx is not None:
+                                loss.set("kl_approx", kl_approx.detach())
+                                self._maybe_adjust_lr(kl_approx, self.config.optim)
                         num_network_updates = num_network_updates.clone()  # type: ignore
-                        losses[j, k] = loss.select(
-                            "loss_critic", "loss_entropy", "loss_objective"
-                        )
+                        loss_keys = ["loss_critic", "loss_entropy", "loss_objective"]
+                        optional_keys = [
+                            "entropy",
+                            "explained_variance",
+                            "clip_fraction",
+                            "value_clip_fraction",
+                            "ESS",
+                            "kl_approx",
+                            "grad_norm",
+                        ]
+                        for key in optional_keys:
+                            if key in loss.keys():
+                                loss_keys.append(key)
+                        losses[j, k] = loss.select(*loss_keys)
 
                     if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
@@ -509,15 +522,7 @@ class PPO(BaseAlgorithm):
             losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
             for key, value in losses_mean.items():  # type: ignore
                 metrics_to_log.update({f"train/{key}": value.item()})  # type: ignore
-            # current_lr_tensor = (
-            #     loss["lr"]
-            #     if "lr" in loss
-            #     else torch.tensor(
-            #         self.optim.param_groups[0]["lr"],
-            #         device=self.device,
-            #         dtype=torch.float32,
-            #     )
-            # )
+            metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
             clip_attr = getattr(self.loss_module, "clip_epsilon", None)
             if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
                 clip_epsilon_value = clip_attr.detach()
@@ -533,10 +538,6 @@ class PPO(BaseAlgorithm):
                     "train/clip_epsilon": clip_epsilon_value,
                 }
             )
-            # if "grad_norm" in loss:
-            #     metrics_to_log["train/grad_norm"] = loss["grad_norm"]
-            # if "skipped_update" in loss:
-            #     metrics_to_log["train/skipped_update"] = loss["skipped_update"]
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):

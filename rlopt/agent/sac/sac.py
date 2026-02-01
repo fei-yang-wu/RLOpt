@@ -1,39 +1,46 @@
 from __future__ import annotations
 
 import functools
-import warnings
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 import numpy as np
 import torch
 from tensordict import TensorDict
-from tensordict.nn import CudaGraphModule, InteractionType, TensorDictModule
-from tensordict.nn.distributions import NormalParamExtractor
+from tensordict.nn import (
+    CudaGraphModule,
+    InteractionType,
+    TensorDictModule,
+)
 from torch import Tensor, nn
 from torchrl._utils import compile_with_warmup, timeit
 from torchrl.data import (
+    Bounded,
     LazyMemmapStorage,
     LazyTensorStorage,
     ReplayBuffer,
+    TensorDictPrioritizedReplayBuffer,
     TensorDictReplayBuffer,
 )
 from torchrl.data.replay_buffers.samplers import RandomSampler
-from torchrl.envs.utils import ExplorationType, set_exploration_type
+from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
     MLP,
     ActorCriticOperator,
+    IndependentNormal,
     ProbabilisticActor,
     TanhNormal,
     ValueOperator,
 )
 from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss
+from torchrl.objectives.utils import ValueEstimators
 from torchrl.record.loggers import Logger
 from tqdm.std import tqdm as Tqdm
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.config_base import NetworkConfig, RLOptConfig
+from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
@@ -42,13 +49,13 @@ from rlopt.utils import get_activation_class, log_info
 class SACConfig:
     """SAC-specific configuration."""
 
-    alpha_init: float = 1.0  # Match TorchRL default
+    alpha_init: float = 1.0
     """Initial alpha value."""
 
     min_alpha: float | None = 1e-4
     """Minimum alpha value."""
 
-    max_alpha: float | None = 10.0
+    max_alpha: float | None = 10
     """Maximum alpha value."""
 
     num_qvalue_nets: int = 2
@@ -72,8 +79,8 @@ class SACConfig:
     priority_key: str = "td_error"
     """Priority key."""
 
-    separate_losses: bool = False
-    """Whether to separate losses."""
+    separate_losses: bool = True
+    """Whether to separate losses. Must be True for sequential updates."""
 
     reduction: str = "mean"
     """Reduction."""
@@ -81,11 +88,24 @@ class SACConfig:
     skip_done_states: bool = False
     """Whether to skip done states."""
 
-    deactivate_vmap: bool = True
+    deactivate_vmap: bool = False
     """Whether to deactivate vmap."""
 
     utd_ratio: float = 1.0
     """Number of updates per batch."""
+
+    # Policy log_std parameters (same as PPO for consistency)
+    log_std_init: float = 0.0
+    """Initial value for the policy log standard deviation (log std)."""
+
+    clip_log_std: bool = False
+    """Whether to clip the learned log standard deviation."""
+
+    log_std_min: float = -20.0
+    """Minimum log standard deviation (when clipping is enabled)."""
+
+    log_std_max: float = 2.0
+    """Maximum log standard deviation (when clipping is enabled)."""
 
 
 @dataclass
@@ -100,8 +120,8 @@ class SACRLOptConfig(RLOptConfig):
         assert self.value_function is None, "SAC does not use a value function."
 
         self.q_function = NetworkConfig(
-            num_cells=[256, 256],
-            activation_fn="relu",
+            num_cells=[256, 128, 128],
+            activation_fn="elu",
             output_dim=1,
             input_keys=["observation"],
         )
@@ -143,32 +163,65 @@ class SAC(BaseAlgorithm):
         # construct the target net updater
         self.target_net_updater = self._construct_target_net_updater()
 
+        if self.compile_mode:
+            self.update = compile_with_warmup(
+                self.update, mode=self.compile_mode, warmup=1
+            )
+
+        if self.config.compile.cudagraphs:
+            # self.logger.warn(
+            #     "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
+            #     category=UserWarning,
+            # )
+            self.update = CudaGraphModule(
+                self.update, in_keys=[], out_keys=[], warmup=5
+            )
+
     def _construct_policy(self) -> TensorDictModule:
-        """Construct policy network."""
+        """Construct policy network with learned log-std (same as PPO)."""
+        action_spec = self.env.action_spec_unbatched  # type: ignore
+        action_dim = int(action_spec.shape[-1])
+
+        # Build the base MLP that outputs action means
         policy_mlp = MLP(
             in_features=self.config.policy.input_dim,
             activation_class=get_activation_class(self.config.policy.activation_fn),
-            out_features=2 * self.env.action_spec_unbatched.shape[-1],  # type: ignore
+            out_features=action_dim,
             num_cells=list(self.config.policy.num_cells),
             device=self.device,
         )
-        extractor = NormalParamExtractor(
-            scale_mapping="biased_softplus_1.0",
-            scale_lb=0.1,  # type: ignore
-        ).to(self.device)
-        net = torch.nn.Sequential(policy_mlp, extractor)
-        # SAC policy outputs loc and scale for the Normal distribution
+
+        # Wrap with GaussianPolicyHead for learned log-std (consistent with PPO)
+        sac_cfg = self.config.sac
+        net = GaussianPolicyHead(
+            base=policy_mlp,
+            action_dim=action_dim,
+            log_std_init=sac_cfg.log_std_init,
+            log_std_min=sac_cfg.log_std_min,
+            log_std_max=sac_cfg.log_std_max,
+            clip_log_std=sac_cfg.clip_log_std,
+            device=self.device,
+        )
+
+        # Wrap in TensorDictModule
         policy_td = TensorDictModule(
             module=net,
             in_keys=list(self.config.policy.input_keys),
             out_keys=["loc", "scale"],
         )
-        distribution_class = TanhNormal
-        distribution_kwargs = {
-            "low": self.env.action_spec_unbatched.space.low,  # type: ignore
-            "high": self.env.action_spec_unbatched.space.high,  # type: ignore
-            "tanh_loc": False,
-        }
+
+        # Configure distribution based on action space bounds
+        if isinstance(action_spec, Bounded):
+            distribution_class = TanhNormal
+            distribution_kwargs = {
+                "low": action_spec.space.low,  # type: ignore[union-attr]
+                "high": action_spec.space.high,  # type: ignore[union-attr]
+                "tanh_loc": False,
+            }
+        else:
+            distribution_class = IndependentNormal
+            distribution_kwargs = {}
+
         return ProbabilisticActor(
             policy_td,
             in_keys=["loc", "scale"],
@@ -176,7 +229,7 @@ class SAC(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=False,
-            default_interaction_type=ExplorationType.RANDOM,
+            default_interaction_type=InteractionType.RANDOM,
         )
 
     @property
@@ -190,6 +243,7 @@ class SAC(BaseAlgorithm):
             raise ValueError(msg)
 
         q_function = MLP(
+            in_features=self.config.q_function.input_dim,
             activation_class=get_activation_class(self.config.q_function.activation_fn),
             num_cells=list(self.config.q_function.num_cells),
             out_features=1,
@@ -269,7 +323,12 @@ class SAC(BaseAlgorithm):
             skip_done_states=sac_cfg.skip_done_states,
             deactivate_vmap=sac_cfg.deactivate_vmap,
         )
-        loss_module.make_value_estimator(gamma=self.config.loss.gamma)
+        loss_module.make_value_estimator(
+            value_type=ValueEstimators.TD1,
+            gamma=self.config.loss.gamma,
+            # lmbda=0.95,
+            average_rewards=False,
+        )
         return loss_module
 
     def _set_optimizers(
@@ -296,29 +355,13 @@ class SAC(BaseAlgorithm):
         if hasattr(self.loss_module, "log_alpha"):
             param = self.loss_module.log_alpha
             if isinstance(param, torch.nn.Parameter):
-                optimizers.append(torch.optim.Adam([param], lr=3.0e-4))
+                optimizers.append(optimizer_cls([param], **optimizer_kwargs))
         return optimizers
 
     def _construct_target_net_updater(self) -> SoftUpdate:
         # Prefer polyak parameter from network layout critic if present
         eps = self.config.optim.target_update_polyak
         return SoftUpdate(self.loss_module, eps=eps)
-
-    # def _get_additional_optimizers(
-    #     self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
-    # ) -> list[torch.optim.Optimizer]:
-    #     """Get additional optimizers for SAC-specific components."""
-    #     additional_optimizers = []
-
-    #     # Alpha optimizer for SAC
-    #     if hasattr(self, "loss_module") and hasattr(self.loss_module, "log_alpha"):
-    #         alpha_optim = optimizer_cls(
-    #             [self.loss_module.log_alpha],
-    #             **optimizer_kwargs,
-    #         )
-    #         additional_optimizers.append(alpha_optim)
-
-    #     return additional_optimizers
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         cfg = self.config
@@ -336,18 +379,32 @@ class SAC(BaseAlgorithm):
                 LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir
             )
         )
-        if getattr(cfg.replay_buffer, "prb", False):
-            self.log.warning(
-                "Prioritized replay buffer (prb) is not supported; using uniform replay."
+        if cfg.replay_buffer.prb:
+            replay_buffer = TensorDictPrioritizedReplayBuffer(
+                alpha=0.7,
+                beta=0.5,
+                pin_memory=True,
+                prefetch=prefetch,
+                storage=storage_cls(
+                    max_size=buffer_size, compilable=cfg.compile.compile
+                ),
+                batch_size=batch_size,
+                priority_key=cfg.sac.priority_key,
+                shared=shared,
+                compilable=cfg.compile.compile,
             )
-        replay_buffer = TensorDictReplayBuffer(
-            pin_memory=False,
-            prefetch=prefetch,
-            sampler=sampler,
-            storage=storage_cls(max_size=buffer_size, compilable=cfg.compile.compile),
-            batch_size=batch_size,
-            shared=shared,
-        )
+        else:
+            replay_buffer = TensorDictReplayBuffer(
+                pin_memory=True,
+                prefetch=prefetch,
+                sampler=sampler,
+                storage=storage_cls(
+                    max_size=buffer_size, compilable=cfg.compile.compile
+                ),
+                batch_size=batch_size,
+                shared=shared,
+                compilable=cfg.compile.compile,
+            )
         if scratch_dir:
             replay_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
         return replay_buffer
@@ -361,25 +418,33 @@ class SAC(BaseAlgorithm):
         return None
 
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
+        assert isinstance(self.config, SACRLOptConfig)
+        policy_op = self.actor_critic.get_policy_operator()
+        kl_context = None
+        if (self.config.optim.scheduler or "").lower() == "adaptive":
+            kl_context = self._prepare_kl_context(sampled_tensordict, policy_op)
+
         # Compute loss
         loss_td = self.loss_module(sampled_tensordict)
-        # loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_loss")
 
         actor_loss = loss_td["loss_actor"]
         q_loss = loss_td["loss_qvalue"]
         alpha_loss = loss_td["loss_alpha"]
 
-        total_loss = (actor_loss + q_loss + alpha_loss).sum()  # type: ignore[operator]
-        # # debug: print out some losses
-        # print(
-        #     f"Actor loss: {actor_loss.mean().item():.6f}, Q loss: {q_loss.mean().item():.6f}, Alpha loss: {alpha_loss.mean().item():.6f}"
-        # )
-        # print(f"Total loss: {total_loss.item():.6f}")
-        # Backward pass
-        total_loss.backward()  # type: ignore[operator]
+        (actor_loss + q_loss + alpha_loss).sum().backward()  # type: ignore[operator]
+
+        # clip gradients
+        torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=1.0)
 
         # Update networks
         self.optim.step()
+
+        kl_approx = None
+        if kl_context is not None:
+            kl_approx = self._compute_kl_after_update(kl_context, policy_op)
+            if kl_approx is not None:
+                loss_td.set("kl_approx", kl_approx.detach())
+                self._maybe_adjust_lr(kl_approx, self.config.optim)
 
         # Zero gradients
         self.optim.zero_grad(set_to_none=True)
@@ -398,36 +463,36 @@ class SAC(BaseAlgorithm):
         utd_ratio = float(cfg.sac.utd_ratio)
         init_random_frames = int(self.config.collector.init_random_frames)
         # Compute updates per collector iteration based on UTD ratio and batch sizes
-        num_updates = max(int(frames_per_batch * utd_ratio), 3)
+        num_updates = int(frames_per_batch * utd_ratio)
 
-        # Compile the update function if requested
-        compile_mode = None
-        if cfg.compile.compile:
-            compile_mode = cfg.compile.compile_mode
-            if compile_mode in ("", None):
-                if cfg.compile.cudagraphs:
-                    compile_mode = "default"
-                else:
-                    compile_mode = "reduce-overhead"
+        # # Compile the update function if requested
+        # compile_mode = None
+        # if cfg.compile.compile:
+        #     compile_mode = cfg.compile.compile_mode
+        #     if compile_mode in ("", None):
+        #         if cfg.compile.cudagraphs:
+        #             compile_mode = "default"
+        #         else:
+        #             compile_mode = "reduce-overhead"
 
-            self.log.info(f"Compiling update function with mode: {compile_mode}")
-            self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)  # type: ignore[method-assign]
+        #     self.log.info(f"Compiling update function with mode: {compile_mode}")
+        #     self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)  # type: ignore[method-assign]
 
-        # Only use CUDAGraphs on CUDA devices
-        if cfg.compile.cudagraphs:
-            if self.device.type == "cuda":
-                warnings.warn(
-                    "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
-                    category=UserWarning,
-                )
-                self.log.warning("Wrapping update with CudaGraphModule (experimental)")
-                self.update = CudaGraphModule(
-                    self.update, in_keys=[], out_keys=[], warmup=5
-                )  # type: ignore[method-assign]
-            else:
-                self.log.warning(
-                    f"CUDAGraphs requested but device is {self.device.type}, not CUDA. Skipping CUDAGraphs."
-                )
+        # # Only use CUDAGraphs on CUDA devices
+        # if cfg.compile.cudagraphs:
+        #     if self.device.type == "cuda":
+        #         warnings.warn(
+        #             "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
+        #             category=UserWarning,
+        #         )
+        #         self.log.warning("Wrapping update with CudaGraphModule (experimental)")
+        #         self.update = CudaGraphModule(
+        #             self.update, in_keys=[], out_keys=[], warmup=5
+        #         )  # type: ignore[method-assign]
+        #     else:
+        #         self.log.warning(
+        #             f"CUDAGraphs requested but device is {self.device.type}, not CUDA. Skipping CUDAGraphs."
+        #         )
 
         collected_frames = 0
         collector_iter = iter(self.collector)
@@ -461,14 +526,11 @@ class SAC(BaseAlgorithm):
                     episode_length = data["next", "step_count"][data["next", "done"]]
                     self.episode_lengths.extend(episode_length.cpu().tolist())
                     self.episode_rewards.extend(episode_rewards.cpu().tolist())
-                    episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
 
                     metrics_to_log.update(
                         {
                             "episode/length": np.mean(self.episode_lengths),
                             "episode/return": np.mean(self.episode_rewards),
-                            "episode/return_latest": episode_rewards_mean,
-                            "episode/num_completed": len(self.episode_rewards),
                         }
                     )
 
@@ -486,12 +548,16 @@ class SAC(BaseAlgorithm):
                             sampled_tensordict = self.data_buffer.sample()
 
                         with timeit("update"):
-                            torch.compiler.cudagraph_mark_step_begin()
                             # Compute loss
                             loss = self.update(sampled_tensordict).clone()
-                        losses_list.append(
-                            loss.select("loss_actor", "loss_qvalue", "loss_alpha")
-                        )
+                        loss_keys = ["loss_actor", "loss_qvalue", "loss_alpha"]
+                        if "kl_approx" in loss:
+                            loss_keys.append("kl_approx")
+                        losses_list.append(loss.select(*loss_keys))
+                        if self.config.replay_buffer.prb:
+                            self.data_buffer.update_tensordict_priority(
+                                sampled_tensordict
+                            )
 
                     # Stack collected losses into a TensorDict
                     if len(losses_list) > 0:
@@ -504,8 +570,6 @@ class SAC(BaseAlgorithm):
                             )
                         losses = TensorDict(stacked, batch_size=[num_updates])
 
-                    # PRB updates disabled
-
             # Get training losses and times
             if losses is not None:
                 losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
@@ -515,6 +579,7 @@ class SAC(BaseAlgorithm):
                     except Exception:
                         scalar = value.detach().cpu().float().item()  # type: ignore[attr-defined]
                     metrics_to_log.update({f"train/{key}": scalar})
+                metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
 
                 # Log SAC-specific metrics
                 if hasattr(self.loss_module, "log_alpha"):
@@ -537,17 +602,10 @@ class SAC(BaseAlgorithm):
 
                 # Update progress bar with latest metrics
                 postfix = {}
-                if "train/step_reward_mean" in metrics_to_log:
-                    postfix["r_step"] = (
-                        f"{metrics_to_log['train/step_reward_mean']:.2f}"
-                    )
                 if "episode/return" in metrics_to_log:
-                    postfix["r_ep"] = f"{metrics_to_log['episode/return']:.1f}"
-                    postfix["n_ep"] = metrics_to_log["episode/num_completed"]
-                if "train/loss_actor" in metrics_to_log:
-                    postfix["π_loss"] = f"{metrics_to_log['train/loss_actor']:.3f}"
-                if "train/alpha" in metrics_to_log:
-                    postfix["α"] = f"{metrics_to_log['train/alpha']:.3f}"
+                    postfix["ep_ret"] = f"{metrics_to_log['episode/return']:.1f}"
+                if "episode/length" in metrics_to_log:
+                    postfix["ep_len"] = f"{metrics_to_log['episode/length']:.0f}"
                 if postfix:
                     pbar.set_postfix(postfix)
 

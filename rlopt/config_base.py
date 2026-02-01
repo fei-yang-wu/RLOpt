@@ -136,7 +136,7 @@ class LoggerConfig:
 class OptimizerConfig:
     """Optimizer configuration for RLOpt."""
 
-    optimizer: str = "adam"
+    optimizer: str = "adamw"
     """Name of the optimizer to use (e.g. ``"adamw"``, ``"adam"``, ``"sgd"``)."""
 
     lr: float = 3e-4
@@ -151,7 +151,8 @@ class OptimizerConfig:
     """Extra keyword arguments forwarded to the optimizer (defaults tailored for Adam-family optimizers)."""
 
     scheduler: str | None = "steplr"
-    """Optional learning-rate scheduler name (e.g. ``"steplr"``, ``"cosineannealinglr"``)."""
+    """Learning-rate schedule. Use ``"adaptive"`` for KL-based adjustment or a
+    PyTorch scheduler name (e.g. ``"steplr"``, ``"cosineannealinglr"``)."""
 
     scheduler_kwargs: dict[str, Any] = field(
         default_factory=lambda: {"step_size": 1_000, "gamma": 0.9}
@@ -170,6 +171,18 @@ class OptimizerConfig:
     max_grad_norm: float | None = 0.5
     """Maximum gradient norm for clipping; set to ``None`` to disable clipping."""
 
+    desired_kl: float = 0.01
+    """Target KL divergence for adaptive learning rate."""
+
+    lr_adaptation_factor: float = 1.5
+    """Factor to scale LR up/down for adaptive schedule."""
+
+    min_lr: float | None = 1e-6
+    """Lower bound for adaptive learning rate. None disables clamping."""
+
+    max_lr: float | None = 1e-2
+    """Upper bound for adaptive learning rate. None disables clamping."""
+
 
 @dataclass
 class LossConfig:
@@ -184,7 +197,7 @@ class LossConfig:
     epochs: int = 4
     """Number of training epochs."""
 
-    loss_critic_type: str = "l2"
+    loss_critic_type: str = "smooth_l1"
     """Type of critic loss."""
 
 
@@ -258,14 +271,14 @@ class NetworkConfig:
     """Network configuration for RLOpt  ."""
 
     num_cells: list[int] = field(
-        default_factory=lambda: [256, 256]
+        default_factory=lambda: [256, 128, 128]
     )  # Match TorchRL stable architecture
     """Number of cells in each layer."""
 
     input_dim: int | None = None
     """Input dimension of the network. Defaults to lazy initialization if None."""
 
-    output_dim: int = 256
+    output_dim: int = 128
     """Output dimension of the feature extractor."""
 
     input_keys: list[str] = field(default_factory=lambda: ["observation"])
@@ -274,7 +287,7 @@ class NetworkConfig:
     output_keys: list[str] = field(default_factory=list)
     """Output keys for the network."""
 
-    activation_fn: str = "relu"
+    activation_fn: str = "elu"
     """Activation function."""
 
     kwargs: dict[str, Any] = field(default_factory=dict)
