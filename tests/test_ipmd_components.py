@@ -171,13 +171,23 @@ def test_ipmd_update_with_expert_data():
         batch_size=[batch_size],
     )
 
-    # Perform update
-    loss_td = agent.update(policy_batch)
+    # Fixed-signature update (torch.compile / CUDA graph)
+    num_network_updates = torch.zeros((), dtype=torch.int64, device=agent.device)
+    expert_batch_raw = agent._next_expert_batch()
+    if expert_batch_raw is None or not agent._check_expert_batch_keys(expert_batch_raw):
+        expert_batch = agent._dummy_expert_batch(policy_batch)
+        has_expert = torch.tensor(0.0, device=agent.device, dtype=torch.float32)
+    else:
+        expert_batch = expert_batch_raw.to(agent.device)
+        has_expert = torch.tensor(1.0, device=agent.device, dtype=torch.float32)
+    loss_td, _ = agent.update(
+        policy_batch, num_network_updates, expert_batch, has_expert
+    )
 
-    # Check loss outputs
-    assert "loss_actor" in loss_td
-    assert "loss_qvalue" in loss_td
-    assert "loss_alpha" in loss_td
+    # Check loss outputs (PPO-based IPMD)
+    assert "loss_critic" in loss_td
+    assert "loss_objective" in loss_td
+    assert "loss_entropy" in loss_td
     assert "loss_reward_diff" in loss_td
     assert "loss_reward_l2" in loss_td
     assert "estimated_reward_mean" in loss_td

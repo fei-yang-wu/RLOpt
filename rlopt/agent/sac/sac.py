@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import (
     CudaGraphModule,
     InteractionType,
@@ -33,7 +33,7 @@ from torchrl.modules import (
     ValueOperator,
 )
 from torchrl.objectives import SoftUpdate
-from torchrl.objectives.sac import SACLoss
+from torchrl.objectives.sac import SACLoss, compute_log_prob
 from torchrl.objectives.utils import ValueEstimators
 from torchrl.record.loggers import Logger
 from tqdm.std import tqdm as Tqdm
@@ -107,6 +107,9 @@ class SACConfig:
     log_std_max: float = 2.0
     """Maximum log standard deviation (when clipping is enabled)."""
 
+    loss_type: str = "SAC"
+    """Loss type for SAC. Can be "SAC", "ClippedSAC", or "KLPenalizedSAC"."""
+
 
 @dataclass
 class SACRLOptConfig(RLOptConfig):
@@ -117,13 +120,19 @@ class SACRLOptConfig(RLOptConfig):
 
     def __post_init__(self):
         """Post-initialization setup."""
-        assert self.value_function is None, "SAC does not use a value function."
 
         self.q_function = NetworkConfig(
             num_cells=[256, 128, 128],
             activation_fn="elu",
             output_dim=1,
             input_keys=["observation"],
+        )
+
+        self.value_function = NetworkConfig(
+            num_cells=[256, 128, 128],
+            activation_fn="elu",
+            output_dim=1,
+            input_keys=["policy"],
         )
 
 
@@ -151,6 +160,7 @@ class SAC(BaseAlgorithm):
         # Narrow the type for static checkers
         self.config = cast(SACRLOptConfig, self.config)
         self.config: SACRLOptConfig
+        assert isinstance(self.config, SACRLOptConfig)
 
         assert self.q_function, "SAC requires a Q-function configuration."
 
@@ -164,7 +174,7 @@ class SAC(BaseAlgorithm):
         self.target_net_updater = self._construct_target_net_updater()
 
         if self.compile_mode:
-            self.update = compile_with_warmup(
+            self.update = compile_with_warmup(  # pyrefly: ignore
                 self.update, mode=self.compile_mode, warmup=1
             )
 
@@ -174,13 +184,16 @@ class SAC(BaseAlgorithm):
             #     category=UserWarning,
             # )
             self.update = CudaGraphModule(
-                self.update, in_keys=[], out_keys=[], warmup=5
+                self.update,  # pyrefly: ignore
+                in_keys=[],
+                out_keys=[],
+                warmup=5,
             )
 
     def _construct_policy(self) -> TensorDictModule:
         """Construct policy network with learned log-std (same as PPO)."""
         action_spec = self.env.action_spec_unbatched  # type: ignore
-        action_dim = int(action_spec.shape[-1])
+        action_dim = int(action_spec.shape[-1])  # pyrefly: ignore
 
         # Build the base MLP that outputs action means
         policy_mlp = MLP(
@@ -222,6 +235,10 @@ class SAC(BaseAlgorithm):
             distribution_class = IndependentNormal
             distribution_kwargs = {}
 
+        # Cache distribution metadata for reconstructing behavior policy stats.
+        self._policy_dist_class = distribution_class
+        self._policy_dist_kwargs = distribution_kwargs
+
         return ProbabilisticActor(
             policy_td,
             in_keys=["loc", "scale"],
@@ -242,10 +259,11 @@ class SAC(BaseAlgorithm):
             msg = "SAC requires a Q-function configuration."
             raise ValueError(msg)
 
+        num_cells = list(self.config.q_function.num_cells)
         q_function = MLP(
             in_features=self.config.q_function.input_dim,
             activation_class=get_activation_class(self.config.q_function.activation_fn),
-            num_cells=list(self.config.q_function.num_cells),
+            num_cells=num_cells,
             out_features=1,
             device=self.device,
         )
@@ -259,6 +277,24 @@ class SAC(BaseAlgorithm):
             module=q_function,
             in_keys=in_keys,
             out_keys=["state_action_value"],
+        )
+
+    def _construct_value_function(self) -> TensorDictModule:
+        assert self.config.value_function is not None
+        num_cells = list(self.config.value_function.num_cells)
+        value_function = MLP(
+            in_features=123,
+            activation_class=get_activation_class(
+                self.config.value_function.activation_fn
+            ),
+            num_cells=num_cells,
+            out_features=1,
+            device=self.device,
+        )
+        return ValueOperator(
+            module=value_function,
+            in_keys=list(self.config.value_function.input_keys),
+            out_keys=["state_value"],
         )
 
     def _construct_actor_critic(self) -> TensorDictModule:
@@ -305,9 +341,22 @@ class SAC(BaseAlgorithm):
         with torch.no_grad():
             _ = self.actor_critic(fake_tensordict)
 
-        loss_module = SACLoss(
+        loss_cls = {
+            "SAC": SACLoss,
+            "ClippedSAC": ClippedSACLoss,
+            "KLPenalizedSAC": KLPenalizedSACLoss,
+        }[sac_cfg.loss_type]
+
+        # Extra kwargs for clipped/KL loss variants (need dist class to reconstruct old dist)
+        extra_kwargs = {}
+        if sac_cfg.loss_type in ("ClippedSAC", "KLPenalizedSAC"):
+            extra_kwargs["dist_class"] = self._policy_dist_class
+            extra_kwargs["dist_kwargs"] = self._policy_dist_kwargs
+
+        loss_module = loss_cls(
             actor_network=self.actor_critic.get_policy_head(),  # type: ignore[arg-type]
             qvalue_network=self.actor_critic.get_value_head(),  # type: ignore[arg-type]
+            value_network=getattr(self, "value_function", None),
             num_qvalue_nets=sac_cfg.num_qvalue_nets,
             alpha_init=sac_cfg.alpha_init,
             loss_function=self.config.loss.loss_critic_type,
@@ -322,9 +371,10 @@ class SAC(BaseAlgorithm):
             reduction=sac_cfg.reduction,
             skip_done_states=sac_cfg.skip_done_states,
             deactivate_vmap=sac_cfg.deactivate_vmap,
+            **extra_kwargs,
         )
         loss_module.make_value_estimator(
-            value_type=ValueEstimators.TD1,
+            value_type=ValueEstimators.TD0,
             gamma=self.config.loss.gamma,
             # lmbda=0.95,
             average_rewards=False,
@@ -365,6 +415,7 @@ class SAC(BaseAlgorithm):
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         cfg = self.config
+        assert isinstance(cfg, SACRLOptConfig)
         sampler = RandomSampler()
         scratch_dir = cfg.replay_buffer.scratch_dir or cfg.collector.scratch_dir
         device = cfg.device
@@ -417,12 +468,27 @@ class SAC(BaseAlgorithm):
     def _construct_trainer(self):  # type: ignore[override]
         return None
 
+    def _ensure_old_policy_info(self, tensordict: TensorDict) -> TensorDict:
+        if "dist" in tensordict.keys(True):
+            return tensordict
+
+        if "loc" not in tensordict.keys(True) or "scale" not in tensordict.keys(True):
+            return tensordict
+
+        loc = tensordict.get("loc").detach()
+        scale = tensordict.get("scale").detach()
+        dist = self._policy_dist_class(loc, scale, **self._policy_dist_kwargs)
+        tensordict.set("dist", dist)
+        return tensordict
+
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
         assert isinstance(self.config, SACRLOptConfig)
         policy_op = self.actor_critic.get_policy_operator()
         kl_context = None
         if (self.config.optim.scheduler or "").lower() == "adaptive":
             kl_context = self._prepare_kl_context(sampled_tensordict, policy_op)
+
+        sampled_tensordict = self._ensure_old_policy_info(sampled_tensordict)
 
         # Compute loss
         loss_td = self.loss_module(sampled_tensordict)
@@ -465,35 +531,6 @@ class SAC(BaseAlgorithm):
         # Compute updates per collector iteration based on UTD ratio and batch sizes
         num_updates = int(frames_per_batch * utd_ratio)
 
-        # # Compile the update function if requested
-        # compile_mode = None
-        # if cfg.compile.compile:
-        #     compile_mode = cfg.compile.compile_mode
-        #     if compile_mode in ("", None):
-        #         if cfg.compile.cudagraphs:
-        #             compile_mode = "default"
-        #         else:
-        #             compile_mode = "reduce-overhead"
-
-        #     self.log.info(f"Compiling update function with mode: {compile_mode}")
-        #     self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)  # type: ignore[method-assign]
-
-        # # Only use CUDAGraphs on CUDA devices
-        # if cfg.compile.cudagraphs:
-        #     if self.device.type == "cuda":
-        #         warnings.warn(
-        #             "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
-        #             category=UserWarning,
-        #         )
-        #         self.log.warning("Wrapping update with CudaGraphModule (experimental)")
-        #         self.update = CudaGraphModule(
-        #             self.update, in_keys=[], out_keys=[], warmup=5
-        #         )  # type: ignore[method-assign]
-        #     else:
-        #         self.log.warning(
-        #             f"CUDAGraphs requested but device is {self.device.type}, not CUDA. Skipping CUDAGraphs."
-        #         )
-
         collected_frames = 0
         collector_iter = iter(self.collector)
         pbar: Tqdm = Tqdm(total=total_frames)  # type: ignore[assignment]
@@ -514,10 +551,18 @@ class SAC(BaseAlgorithm):
             # Log step rewards (always available)
             if ("next", "reward") in data.keys(True):
                 step_rewards = data["next", "reward"]
-                metrics_to_log["train/step_reward_mean"] = step_rewards.mean().item()
-                metrics_to_log["train/step_reward_std"] = step_rewards.std().item()
-                metrics_to_log["train/step_reward_max"] = step_rewards.max().item()
-                metrics_to_log["train/step_reward_min"] = step_rewards.min().item()
+                metrics_to_log["train/step_reward_mean"] = (
+                    step_rewards.mean().item()  # pyrefly: ignore
+                )
+                metrics_to_log["train/step_reward_std"] = (
+                    step_rewards.std().item()  # pyrefly: ignore
+                )
+                metrics_to_log["train/step_reward_max"] = (
+                    step_rewards.max().item()  # pyrefly: ignore
+                )
+                metrics_to_log["train/step_reward_min"] = (
+                    step_rewards.min().item()  # pyrefly: ignore
+                )
 
             # Get training rewards and episode lengths (if available)
             if ("next", "episode_reward") in data.keys(True):
@@ -555,7 +600,7 @@ class SAC(BaseAlgorithm):
                             loss_keys.append("kl_approx")
                         losses_list.append(loss.select(*loss_keys))
                         if self.config.replay_buffer.prb:
-                            self.data_buffer.update_tensordict_priority(
+                            self.data_buffer.update_tensordict_priority(  # pyrefly: ignore
                                 sampled_tensordict
                             )
 
@@ -583,7 +628,12 @@ class SAC(BaseAlgorithm):
 
                 # Log SAC-specific metrics
                 if hasattr(self.loss_module, "log_alpha"):
-                    alpha = self.loss_module.log_alpha.exp().detach().cpu().item()
+                    alpha = (
+                        self.loss_module.log_alpha.exp()  # pyrefly: ignore
+                        .detach()
+                        .cpu()
+                        .item()
+                    )
                     metrics_to_log["train/alpha"] = alpha
 
             # for IsaacLab, we need to log the metrics from the environment
@@ -628,3 +678,126 @@ class SAC(BaseAlgorithm):
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
             td = policy_op(td)
             return td.get("action")
+
+
+class ClippedSACLoss(SACLoss):
+    """
+    SAC with PPO-style clipped actor update.
+    """
+
+    def __init__(
+        self, *args, clip_eps=0.2, dist_class=None, dist_kwargs=None, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.clip_eps = clip_eps
+        self._dist_class = dist_class or TanhNormal
+        self._dist_kwargs = dist_kwargs or {}
+
+    def _actor_loss(
+        self, tensordict: TensorDictBase
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        with (
+            set_exploration_type(InteractionType.RANDOM),
+            self.actor_network_params.to_module(self.actor_network),  # pyrefly: ignore
+        ):
+            dist = self.actor_network.get_dist(tensordict)
+            a_reparm = dist.rsample()
+        log_prob = compute_log_prob(dist, a_reparm, self.tensor_keys.log_prob)
+
+        td_q = tensordict.select(
+            *self.qvalue_network.in_keys,  # pyrefly: ignore
+            strict=False,
+        )  # pyrefly: ignore
+        td_q.set(self.tensor_keys.action, a_reparm)
+        td_q = self._vmap_qnetworkN0(  # pyrefly: ignore
+            td_q,
+            self._cached_detached_qvalue_params,  # should we clone?
+        )
+        min_q_logprob = (
+            td_q.get(self.tensor_keys.state_action_value)  # pyrefly: ignore
+            .min(0)[0]
+            .squeeze(-1)
+        )
+
+        # Reconstruct old distribution from stored loc/scale (dist objects don't survive replay buffer)
+        old_loc = tensordict.get("loc")
+        old_scale = tensordict.get("scale")
+        if old_loc is None or old_scale is None:
+            msg = "Missing loc/scale for clipped SAC loss. Ensure policy outputs are stored."
+            raise KeyError(msg)
+        old_dist = self._dist_class(old_loc, old_scale, **self._dist_kwargs)
+
+        action = tensordict.get(self.tensor_keys.action)
+        old_log_prob = compute_log_prob(old_dist, action, self.tensor_keys.log_prob)
+        ratio = torch.exp(log_prob - old_log_prob)
+
+        clip_eps = self.clip_eps
+
+        # min_q_logprob_clipped = min_q_logprob * torch.clamp(
+        #     ratio, 1.0 - clip_eps, 1.0 + clip_eps
+        # )
+        min_q_logprob_clipped = min_q_logprob
+
+        if log_prob.shape != min_q_logprob_clipped.shape:
+            msg = f"Losses shape mismatch: {log_prob.shape} and {min_q_logprob_clipped.shape}"
+            raise RuntimeError(msg)
+        return self._alpha * log_prob - min_q_logprob_clipped, {
+            "log_prob": log_prob.detach()
+        }
+
+
+class KLPenalizedSACLoss(SACLoss):
+    """
+    SAC with KL trust-region penalty.
+    """
+
+    def __init__(self, *args, kl_beta=1.0, dist_class=None, dist_kwargs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kl_beta = kl_beta
+        self._dist_class = dist_class or TanhNormal
+        self._dist_kwargs = dist_kwargs or {}
+
+    def _actor_loss(
+        self, tensordict: TensorDictBase
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        with (
+            set_exploration_type(InteractionType.RANDOM),
+            self.actor_network_params.to_module(self.actor_network),  # pyrefly: ignore
+        ):
+            dist = self.actor_network.get_dist(tensordict)
+            a_reparm = dist.rsample()
+        log_prob = compute_log_prob(dist, a_reparm, self.tensor_keys.log_prob)
+
+        td_q = tensordict.select(
+            *self.qvalue_network.in_keys,  # pyrefly: ignore
+            strict=False,
+        )
+        td_q.set(self.tensor_keys.action, a_reparm)
+        td_q = self._vmap_qnetworkN0(  # pyrefly: ignore
+            td_q,
+            self._cached_detached_qvalue_params,  # should we clone?
+        )
+        min_q_logprob = (
+            td_q.get(self.tensor_keys.state_action_value)  # pyrefly: ignore
+            .min(0)[0]
+            .squeeze(-1)
+        )
+
+        if log_prob.shape != min_q_logprob.shape:
+            msg = f"Losses shape mismatch: {log_prob.shape} and {min_q_logprob.shape}"
+            raise RuntimeError(msg)
+        base_loss = self._alpha * log_prob - min_q_logprob
+
+        # Reconstruct old distribution from stored loc/scale (dist objects don't survive replay buffer)
+        old_loc = tensordict.get("loc")
+        old_scale = tensordict.get("scale")
+        if old_loc is None or old_scale is None:
+            msg = "Missing loc/scale for KL-penalized SAC loss. Ensure policy outputs are stored."
+            raise KeyError(msg)
+        old_dist = self._dist_class(old_loc, old_scale, **self._dist_kwargs)
+
+        kl = torch.distributions.kl.kl_divergence(old_dist, dist)  # pyrefly: ignore
+        return base_loss + self.kl_beta * kl, {
+            "log_prob": log_prob.detach(),
+            "kl": kl.detach(),
+        }

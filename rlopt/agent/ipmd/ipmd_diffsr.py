@@ -273,13 +273,24 @@ class IPMDDiffSR(IPMD):
             metrics_accum[key] /= float(steps)
         return metrics_accum
 
-    def update(self, sampled_tensordict: TensorDict) -> TensorDict:
+    def update(
+        self,
+        batch: TensorDict,
+        num_network_updates: int,
+        expert_batch: TensorDict,
+        has_expert: Tensor,
+    ) -> tuple[TensorDict, int]:
         if not self._diffusion_ready:
             if not self._warned_no_diffusion:
                 self.log.warning("Diffusion model not trained; skipping IPMD updates.")
                 self._warned_no_diffusion = True
-            return self._dummy_loss_tensordict()
-        return super().update(sampled_tensordict)
+            num_up = (
+                num_network_updates + 1
+                if isinstance(num_network_updates, int)
+                else num_network_updates + 1
+            )
+            return self._dummy_loss_tensordict(), num_up
+        return super().update(batch, num_network_updates, expert_batch, has_expert)
 
     def train(self) -> None:  # type: ignore[override]
         assert isinstance(self.config, IPMDDiffSRConfig)
@@ -400,50 +411,49 @@ class IPMDDiffSR(IPMD):
                 losses = None
                 if collected_frames >= init_random_frames and self._diffusion_ready:
                     losses_list: list[TensorDict] = []
+                    num_network_updates = torch.zeros(
+                        (), dtype=torch.int64, device=self.device
+                    )
+                    loss_keys = [
+                        "loss_critic",
+                        "loss_objective",
+                        "loss_entropy",
+                        "loss_reward_diff",
+                        "loss_reward_l2",
+                        "estimated_reward_mean",
+                        "estimated_reward_std",
+                        "expert_reward_mean",
+                        "expert_reward_std",
+                    ]
                     for i in range(num_updates):
                         with timeit("rb - sample"):
                             sampled_tensordict = self.data_buffer.sample()
 
-                        if not self._validate_tensordict(
-                            sampled_tensordict,
-                            f"train:mini_batch{i}:pre_update",
-                            raise_error=False,
+                        expert_batch_raw = self._next_expert_batch()
+                        if (
+                            expert_batch_raw is None
+                            or not self._check_expert_batch_keys(expert_batch_raw)
                         ):
-                            logging.getLogger(__name__).debug(
-                                "Discarding mini-batch %d due to non-finite values",
-                                i,
+                            expert_batch = self._dummy_expert_batch(sampled_tensordict)
+                            has_expert = torch.tensor(
+                                0.0, device=self.device, dtype=torch.float32
                             )
-                            losses_list.append(
-                                self._dummy_loss_tensordict().select(
-                                    "loss_actor",
-                                    "loss_qvalue",
-                                    "loss_alpha",
-                                    "loss_reward_diff",
-                                    "loss_reward_l2",
-                                    "estimated_reward_mean",
-                                    "estimated_reward_std",
-                                    "expert_reward_mean",
-                                    "expert_reward_std",
-                                )
+                        else:
+                            expert_batch = expert_batch_raw.to(self.device)
+                            has_expert = torch.tensor(
+                                1.0, device=self.device, dtype=torch.float32
                             )
-                            continue
 
                         with timeit("update"):
                             torch.compiler.cudagraph_mark_step_begin()
-                            loss = self.update(sampled_tensordict).clone()
-                        losses_list.append(
-                            loss.select(
-                                "loss_actor",
-                                "loss_qvalue",
-                                "loss_alpha",
-                                "loss_reward_diff",
-                                "loss_reward_l2",
-                                "estimated_reward_mean",
-                                "estimated_reward_std",
-                                "expert_reward_mean",
-                                "expert_reward_std",
+                            loss, num_network_updates = self.update(
+                                sampled_tensordict,
+                                num_network_updates,
+                                expert_batch,
+                                has_expert,
                             )
-                        )
+                            loss = loss.clone()
+                        losses_list.append(loss.select(*loss_keys))
 
                     if len(losses_list) > 0:
                         keys = list(losses_list[0].keys())
