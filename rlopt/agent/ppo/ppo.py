@@ -81,7 +81,7 @@ class PPOConfig:
     clip_log_std: bool = True
     """Whether to clip the learned log standard deviation."""
 
-    log_std_min: float = -20.0
+    log_std_min: float = -7.0
     """Minimum log standard deviation (when clipping is enabled)."""
 
     log_std_max: float = 2.0

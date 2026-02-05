@@ -1027,25 +1027,34 @@ class BaseAlgorithm(ABC):
         self, sampled_tensordict: TensorDict, policy_op: TensorDictModule
     ) -> dict[str, Tensor]:
         obs_td = sampled_tensordict.select(*policy_op.in_keys).detach()
-        with torch.no_grad():
-            dist = policy_op.get_dist(obs_td)
-            action = dist.sample()
-            logp_before = dist.log_prob(action)
-            logp_before = self._reduce_log_prob(logp_before, action)
+        if "loc" not in sampled_tensordict.keys(True) or "scale" not in sampled_tensordict.keys(True):
+            msg = "Expected 'loc' and 'scale' in sampled_tensordict for KL computation."
+            raise KeyError(msg)
         return {
             "obs_td": obs_td,
-            "action": action,
-            "logp_before": logp_before,
+            "old_loc": sampled_tensordict.get("loc").detach(),
+            "old_scale": sampled_tensordict.get("scale").detach(),
         }
 
     def _compute_kl_after_update(
         self, kl_context: dict[str, Tensor], policy_op: TensorDictModule
     ) -> Tensor | None:
         with torch.no_grad():
-            dist = policy_op.get_dist(kl_context["obs_td"])
-            logp_after = dist.log_prob(kl_context["action"])
-            logp_after = self._reduce_log_prob(logp_after, kl_context["action"])
-            kl_approx = (kl_context["logp_before"] - logp_after).mean()
+            obs_td = kl_context["obs_td"].clone()
+            obs_td = policy_op(obs_td)
+            new_loc = obs_td.get("loc")
+            new_scale = obs_td.get("scale")
+            old_loc = kl_context["old_loc"]
+            old_scale = kl_context["old_scale"]
+
+            var_old = old_scale.pow(2)
+            var_new = new_scale.pow(2)
+            kl = torch.log(new_scale / old_scale) + (
+                var_old + (old_loc - new_loc).pow(2)
+            ) / (2.0 * var_new) - 0.5
+            if kl.ndim > 0:
+                kl = kl.sum(dim=-1)
+            kl_approx = kl.mean()
         if not torch.isfinite(kl_approx):
             return None
         return kl_approx
