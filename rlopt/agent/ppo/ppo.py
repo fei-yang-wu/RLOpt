@@ -353,13 +353,11 @@ class PPO(BaseAlgorithm):
         self, batch: TensorDict, num_network_updates: int
     ) -> tuple[TensorDict, int]:
         """Update function"""
-        stage_prefix = self._update_stage_context or "update"
         self.optim.zero_grad(set_to_none=True)
         assert isinstance(self.config, PPORLOptConfig)
 
         # Forward pass PPO loss
         loss: TensorDict = self.loss_module(batch)
-        loss = self._sanitize_loss_tensordict(loss, f"{stage_prefix}:raw_loss")
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         total_loss = critic_loss + actor_loss
@@ -370,13 +368,17 @@ class PPO(BaseAlgorithm):
         # clone the loss
         output_loss = loss.clone().detach_()
 
-        grad_params = [
-            param for _, param in self._parameter_monitor if param.grad is not None
-        ]
-        grad_norm_tensor = None
         max_grad_norm = getattr(self.config.optim, "max_grad_norm", None)
-        if grad_params and max_grad_norm is not None and max_grad_norm > 0:
-            grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
+        grad_norm_tensor = None
+        if max_grad_norm is not None and max_grad_norm > 0:
+            grad_params = [
+                p
+                for group in self.optim.param_groups
+                for p in group["params"]
+                if p.grad is not None
+            ]
+            if grad_params:
+                grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
 
         # Update the networks
         self.optim.step()

@@ -182,6 +182,11 @@ class BaseAlgorithm(ABC):
         # episode rewards
         self.episode_rewards = deque(maxlen=100)
 
+        # Cache parameters for fast NaN checks during training
+        self._parameter_monitor: list[tuple[str, torch.nn.Parameter]] = []
+        self._refresh_parameter_monitor()
+        self._update_stage_context: str = ""
+
         # Print model overview once components are initialized
         try:  # noqa: SIM105
             self._print_model_overview()
