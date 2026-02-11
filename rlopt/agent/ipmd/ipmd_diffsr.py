@@ -167,7 +167,7 @@ class IPMDDiffSR(IPMD):
 
         policy_td = TensorDictModule(
             module=policy_head,
-            in_keys=list(self.config.policy.input_keys),
+            in_keys=self.config.policy.get_input_keys(),
             out_keys=["loc", "scale"],
         )
         distribution_kwargs = {
@@ -196,7 +196,7 @@ class IPMDDiffSR(IPMD):
         else:
             q_head = q_net
 
-        in_keys = list(self.config.q_function.input_keys)
+        in_keys = self.config.q_function.get_input_keys()
         if "action" not in in_keys:
             in_keys.append("action")
 
@@ -520,7 +520,7 @@ class IPMDDiffSR(IPMD):
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
             td = TensorDict(
-                dict.fromkeys(self.config.policy.input_keys, obs),
+                dict.fromkeys(self.config.policy.get_input_keys(), obs),
                 batch_size=[1],
                 device=self.device,
             )

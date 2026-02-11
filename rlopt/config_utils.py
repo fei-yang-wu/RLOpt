@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import yaml
+
+if TYPE_CHECKING:
+    import numpy as np
+    from tensordict import TensorDict
+    from torch import Tensor
+
+ObsKey: TypeAlias = str | tuple[str, ...]
+BatchKey: TypeAlias = str | tuple[str, ...]
 
 
 def load_env_config(env_name: str, config_dir: str | Path = "configs/env") -> dict[str, Any]:
@@ -169,3 +178,85 @@ def list_available_configs(config_dir: str | Path = "configs/env") -> list[str]:
     
     return sorted(configs)
 
+
+def dedupe_keys(keys: list[BatchKey]) -> list[BatchKey]:
+    """Return keys in insertion order, removing duplicates."""
+    return list(dict.fromkeys(keys))
+
+
+def next_obs_key(key: ObsKey) -> tuple[str, ...]:
+    """Prefix an observation key with ``"next"`` preserving nested paths."""
+    if isinstance(key, tuple):
+        return ("next", *key)
+    return ("next", key)
+
+
+def strip_next_prefix(key: BatchKey) -> ObsKey:
+    """Remove a leading ``"next"`` from a batch key if present."""
+    if isinstance(key, tuple) and len(key) > 0 and key[0] == "next":
+        rest = key[1:]
+        if len(rest) == 1:
+            return cast(ObsKey, rest[0])
+        return cast(ObsKey, rest)
+    return cast(ObsKey, key)
+
+
+def mapping_get_obs_value(obs: Mapping[Any, Any], key: ObsKey) -> Tensor | np.ndarray:
+    """Read an observation value from a flat-or-nested mapping."""
+    if key in obs:
+        return cast(Tensor | np.ndarray, obs[key])
+    if not isinstance(key, tuple):
+        return cast(Tensor | np.ndarray, obs[key])
+    cur: Any = obs
+    for part in key:
+        cur = cur[part]
+    return cast(Tensor | np.ndarray, cur)
+
+
+def flatten_feature_tensor(tensor: Tensor, feature_ndim: int) -> Tensor:
+    """Flatten feature dims while keeping leading batch dims unchanged."""
+    if feature_ndim <= 0:
+        return tensor.unsqueeze(-1)
+    if feature_ndim == 1:
+        return tensor
+    return tensor.flatten(start_dim=tensor.ndim - feature_ndim)
+
+
+def infer_batch_shape(tensor: Tensor, feature_ndim: int) -> tuple[int, ...]:
+    """Infer batch shape for a tensor with known feature rank."""
+    if feature_ndim <= 0:
+        return tuple(int(dim) for dim in tensor.shape)
+    return tuple(int(dim) for dim in tensor.shape[:-feature_ndim])
+
+
+def flatten_obs_group(td: TensorDict) -> TensorDict:
+    """Flatten nested ``observation`` groups to match on-policy batch layout."""
+    if "observation" in td:
+        obs_group = cast(TensorDict, td.pop("observation"))
+        for key in list(obs_group.keys()):
+            td.set(key, obs_group.get(key))
+    if "next" in td:
+        next_td = cast(TensorDict, td.get("next"))
+        if "observation" in next_td:
+            next_obs_group = cast(TensorDict, next_td.pop("observation"))
+            for key in list(next_obs_group.keys()):
+                next_td.set(key, next_obs_group.get(key))
+    return td
+
+
+def epic_distance(r_est: Tensor, r_true: Tensor) -> tuple[Tensor, Tensor]:
+    """Compute EPIC-style distance between estimated and true rewards."""
+    import torch
+
+    r_est = r_est.detach().float().flatten()
+    r_true = r_true.detach().float().flatten()
+    est_c = r_est - r_est.mean()
+    true_c = r_true - r_true.mean()
+    num = (est_c * true_c).sum()
+    denom = est_c.norm() * true_c.norm()
+    corr = (
+        torch.zeros((), device=r_est.device)
+        if denom < 1e-8
+        else (num / denom).clamp(-1.0, 1.0)
+    )
+    return corr, (0.5 * (1.0 - corr)).sqrt()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -25,7 +27,19 @@ from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import MLP
 from torchrl.record.loggers import Logger
 
-from rlopt.agent.ppo.ppo import PPO, PPORLOptConfig
+from rlopt.config_utils import (
+    BatchKey,
+    ObsKey,
+    dedupe_keys,
+    epic_distance,
+    flatten_feature_tensor,
+    flatten_obs_group,
+    infer_batch_shape,
+    mapping_get_obs_value,
+    next_obs_key,
+    strip_next_prefix,
+)
+from rlopt.agent.ppo.ppo import PPO, PPOConfig, PPORLOptConfig
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
@@ -35,10 +49,28 @@ logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 
 
 @dataclass
-class IPMDConfig:
+class IPMDConfig(PPOConfig):
     """IPMD-specific configuration (PPO-based)."""
 
     # Reward estimator network and loss settings
+    reward_input_type: str = "sas"
+    """Input type for the reward estimator.
+
+    Supported values:
+    - ``"s"``   - current state only  r(s)
+    - ``"s'"``  - next state only     r(s')
+    - ``"sa"``  - state-action         r(s, a)
+    - ``"sas"`` - state-action-state   r(s, a, s')  (default)
+    """
+
+    reward_input_keys: list[ObsKey] | None = None
+    """Observation keys used for reward state inputs.
+
+    If ``None`` (default), falls back to ``value_function.get_input_keys()``
+    (then ``policy.get_input_keys()``).  Set this to let the reward model
+    consume a different subset of observation keys than policy / value.
+    """
+
     reward_num_cells: tuple[int, ...] = (256, 256)
     """Hidden layer sizes for the reward estimator MLP."""
 
@@ -48,10 +80,22 @@ class IPMDConfig:
     reward_init: str = "orthogonal"
     """Weight init for reward estimator."""
 
+    reward_output_activation: str = "tanh"
+    """Output activation applied to the reward estimator.
+
+    Supported values:
+    - ``"none"``    - no activation (unbounded, default)
+    - ``"tanh"``    - tanh scaled by ``reward_output_scale``
+    - ``"sigmoid"`` - sigmoid scaled by ``reward_output_scale``
+    """
+
+    reward_output_scale: float = 1.0
+    """Scale factor for bounded output activations (tanh / sigmoid)."""
+
     reward_loss_coeff: float = 1.0
     """Scale for (sum r_pi - sum r_expert)."""
 
-    reward_l2_coeff: float = 1e-4
+    reward_l2_coeff: float = 0.05
     """L2 regularization weight for reward parameters."""
 
     reward_detach_features: bool = True
@@ -71,6 +115,14 @@ class IPMDConfig:
 
     Prevents PPO updates from backpropagating into the reward estimator.
     The reward network is then trained solely via the IPMD objective.
+    """
+
+    bc_loss_coeff: float = 0.0
+    """Behavior cloning (MLE) loss coefficient on expert actions.
+
+    When > 0, adds ``-bc_loss_coeff * mean(log_prob(expert_action | policy))``
+    to each update step.  This regularises the policy toward expert actions
+    during early training.  Set to 0 to disable (default).
     """
 
 
@@ -121,6 +173,30 @@ class IPMD(PPO):
 
         self.config = cast(IPMDRLOptConfig, self.config)
 
+        # Observation key groups can differ across policy, value, and reward model.
+        self._policy_obs_keys: list[ObsKey] = self.config.policy.get_input_keys()
+        value_cfg = self.config.value_function
+        self._value_obs_keys: list[ObsKey] = (
+            value_cfg.get_input_keys()
+            if value_cfg is not None
+            else list(self._policy_obs_keys)
+        )
+        self._reward_obs_keys: list[ObsKey] = self._resolve_reward_obs_keys()
+
+        all_obs_keys = dedupe_keys(
+            self._policy_obs_keys + self._value_obs_keys + self._reward_obs_keys
+        )
+        self._obs_feature_ndims: dict[ObsKey, int] = {
+            key: self._obs_key_feature_ndim(key) for key in all_obs_keys
+        }
+        self._obs_feature_dims: dict[ObsKey, int] = {
+            key: self._obs_key_feature_dim(key) for key in all_obs_keys
+        }
+        action_spec = getattr(self.env, "action_spec_unbatched", self.env.action_spec)
+        action_shape = tuple(int(dim) for dim in action_spec.shape)
+        self._action_feature_ndim = len(action_shape)
+        self._action_feature_dim = int(math.prod(action_shape)) if action_shape else 1
+
         # Reward estimator: r(s, a, s') -> scalar
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
         self.reward_estimator.to(self.device)
@@ -144,13 +220,102 @@ class IPMD(PPO):
         self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore[method-assign]
         self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore[method-assign]
 
-    def _construct_reward_estimator(self) -> torch.nn.Module:
-        """Create reward network mapping [phi(s), a, phi(s')] to scalar."""
+    _REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
+
+    def _resolve_reward_obs_keys(self) -> list[ObsKey]:
+        """Resolve observation keys used by reward estimator state inputs."""
         cfg = self.config
         assert isinstance(cfg, IPMDRLOptConfig)
-        obs_dim = int(self.env.observation_spec["observation"].shape[-1])
-        act_dim = self.env.action_spec.shape[-1]
-        in_dim = obs_dim * 2 + act_dim
+        reward_keys = cfg.ipmd.reward_input_keys
+        if not reward_keys:
+            reward_keys = (
+                cfg.value_function.get_input_keys()
+                if cfg.value_function is not None
+                else cfg.policy.get_input_keys()
+            )
+        return dedupe_keys(list(reward_keys))
+
+    def _obs_key_feature_shape(self, key: ObsKey) -> tuple[int, ...]:
+        """Return unbatched feature shape for an observation key."""
+        shape = tuple(int(dim) for dim in self.env.observation_spec[key].shape)
+        batch_prefix = tuple(int(dim) for dim in getattr(self.env, "batch_size", ()))
+        if (
+            len(batch_prefix) > 0
+            and len(shape) >= len(batch_prefix)
+            and shape[: len(batch_prefix)] == batch_prefix
+        ):
+            return shape[len(batch_prefix) :]
+        return shape
+
+    def _obs_key_feature_ndim(self, key: ObsKey) -> int:
+        return len(self._obs_key_feature_shape(key))
+
+    def _obs_key_feature_dim(self, key: ObsKey) -> int:
+        shape = self._obs_key_feature_shape(key)
+        return int(math.prod(shape)) if shape else 1
+
+    def _obs_features_from_td(
+        self,
+        td: TensorDict | Any,
+        keys: list[ObsKey],
+        *,
+        next_obs: bool,
+        detach: bool,
+    ) -> Tensor:
+        parts: list[Tensor] = []
+        for key in keys:
+            td_key: BatchKey = next_obs_key(key) if next_obs else key
+            obs = cast(Tensor, td.get(td_key))
+            obs = flatten_feature_tensor(obs, self._obs_feature_ndims[key])
+            parts.append(obs.detach() if detach else obs)
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=-1)
+
+    def _action_features_from_td(self, td: TensorDict | Any, *, detach: bool) -> Tensor:
+        action = cast(Tensor, td.get("action"))
+        action = flatten_feature_tensor(action, self._action_feature_ndim)
+        return action.detach() if detach else action
+
+    def _expert_required_keys(self) -> list[BatchKey]:
+        """Return expert-batch keys required by current IPMD settings."""
+        assert isinstance(self.config, IPMDRLOptConfig)
+        rit = self.config.ipmd.reward_input_type
+        bc_enabled = float(self.config.ipmd.bc_loss_coeff) > 0.0
+
+        required: list[BatchKey] = []
+        if rit in ("s", "sa", "sas"):
+            required.extend(self._reward_obs_keys)
+        if rit in ("s'", "sas"):
+            required.extend([next_obs_key(key) for key in self._reward_obs_keys])
+        if rit in ("sa", "sas") or bc_enabled:
+            required.append("action")
+        if bc_enabled:
+            required.extend(self._policy_obs_keys)
+        return dedupe_keys(required)
+
+    def _construct_reward_estimator(self) -> torch.nn.Module:
+        """Create reward network whose input depends on ``reward_input_type``."""
+        cfg = self.config
+        assert isinstance(cfg, IPMDRLOptConfig)
+        rit = cfg.ipmd.reward_input_type
+        if rit not in self._REWARD_INPUT_TYPES:
+            msg = f"Unknown reward_input_type {rit!r}; expected one of {sorted(self._REWARD_INPUT_TYPES)}"
+            raise ValueError(msg)
+        out_act = cfg.ipmd.reward_output_activation
+        if out_act not in self._REWARD_OUTPUT_ACTIVATIONS:
+            msg = f"Unknown reward_output_activation {out_act!r}; expected one of {sorted(self._REWARD_OUTPUT_ACTIVATIONS)}"
+            raise ValueError(msg)
+
+        obs_dim = sum(self._obs_feature_dims[key] for key in self._reward_obs_keys)
+        act_dim = self._action_feature_dim
+
+        if rit in ("s", "s'"):
+            in_dim = obs_dim
+        elif rit == "sa":
+            in_dim = obs_dim + act_dim
+        else:  # "sas"
+            in_dim = obs_dim * 2 + act_dim
 
         net = MLP(
             in_features=in_dim,
@@ -165,9 +330,16 @@ class IPMD(PPO):
     def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
-        """Single optimizer for actor-critic and reward estimator (PPO + IPMD)."""
-        base_optimizers = super()._set_optimizers(optimizer_cls, optimizer_kwargs)
+        """Single optimizer for actor-critic and reward estimator (PPO + IPMD).
+
+        During the first call from BaseAlgorithm.__init__, reward_estimator
+        doesn't exist yet — fall back to the PPO optimizer.  IPMD.__init__
+        re-creates the optimizer after the reward network is built.
+        """
+        if not hasattr(self, "reward_estimator"):
+            return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
         # PPO uses one optimizer for actor_critic; add reward_estimator to the same group
+        base_optimizers = super()._set_optimizers(optimizer_cls, optimizer_kwargs)
         assert len(base_optimizers) == 1
         all_params = list(self.actor_critic.parameters()) + list(
             self.reward_estimator.parameters()
@@ -178,7 +350,11 @@ class IPMD(PPO):
     # Expert data API
     # -------------------------
     def set_expert_buffer(self, buffer: TensorDictReplayBuffer) -> None:
-        """Attach an expert replay buffer with keys observation, action, ('next', 'observation')."""
+        """Attach an expert replay buffer.
+
+        Required keys depend on ``reward_input_type``, ``reward_input_keys``, and
+        whether behavior cloning is enabled.
+        """
         self._expert_buffer = buffer
 
     def create_expert_buffer(
@@ -219,7 +395,7 @@ class IPMD(PPO):
         return expert_buffer
 
     def _check_expert_batch_keys(self, expert_batch: TensorDict) -> bool:
-        required_keys = ["observation", "action", ("next", "observation")]
+        required_keys = self._expert_required_keys()
         available_keys = expert_batch.keys(True)
         missing = [key for key in required_keys if key not in available_keys]
         if missing:
@@ -231,7 +407,13 @@ class IPMD(PPO):
         if self._expert_buffer is None:
             return None
         try:
-            expert_batch = cast(TensorDict, self._expert_buffer.sample())
+            expert_batch = cast(
+                TensorDict,
+                self._expert_buffer.sample(
+                    batch_size=self.config.ipmd.expert_batch_size
+                ),
+            )
+            expert_batch = flatten_obs_group(expert_batch)
             assert isinstance(self.config, IPMDRLOptConfig)
             if (
                 self.config.ipmd.expert_batch_size is not None
@@ -247,9 +429,43 @@ class IPMD(PPO):
 
     def _dummy_expert_batch(self, batch: TensorDict) -> TensorDict:
         """Return a single-transition expert batch with same structure as batch (for compile/CUDA graph)."""
-        return batch.select("observation", "action", ("next", "observation")).clone()[
-            :1
-        ]
+        required_keys = self._expert_required_keys()
+        available_keys = batch.keys(True)
+        if all(key in available_keys for key in required_keys):
+            return batch.select(*required_keys).clone()[:1]
+
+        one = batch[:1]
+        dummy = TensorDict({}, batch_size=[1], device=batch.device)
+        action_spec = getattr(self.env, "action_spec_unbatched", self.env.action_spec)
+        action_shape = tuple(int(dim) for dim in action_spec.shape)
+        action_dtype = cast(
+            torch.dtype, getattr(self.env.action_spec, "dtype", torch.float32)
+        )
+        for key in required_keys:
+            if key in available_keys:
+                dummy.set(key, one.get(key).clone())
+                continue
+            if key == "action":
+                dummy_action = torch.zeros(
+                    (1, *action_shape),
+                    device=batch.device,
+                    dtype=action_dtype,
+                )
+                dummy.set("action", dummy_action)
+                continue
+            obs_key = strip_next_prefix(key)
+            obs_shape = self._obs_key_feature_shape(obs_key)
+            obs_dtype = cast(
+                torch.dtype,
+                getattr(self.env.observation_spec[obs_key], "dtype", torch.float32),
+            )
+            dummy_obs = torch.zeros(
+                (1, *obs_shape),
+                device=batch.device,
+                dtype=obs_dtype,
+            )
+            dummy.set(key, dummy_obs)
+        return dummy
 
     def _dummy_loss_tensordict(self) -> TensorDict:
         """Dummy loss TensorDict with same keys as update output (for compile/fallback)."""
@@ -268,20 +484,47 @@ class IPMD(PPO):
             batch_size=[],
         )
 
+    _REWARD_OUTPUT_ACTIVATIONS = frozenset({"none", "tanh", "sigmoid"})
+
     def _reward_from_batch(self, td: TensorDict | Any) -> Tensor:
-        """Compute estimated reward for a batch of transitions (obs, action, next_obs)."""
-        obs = cast(Tensor, td.get("observation"))
-        act = cast(Tensor, td.get("action"))
-        next_obs = cast(Tensor, td.get(("next", "observation")))
-
+        """Compute estimated reward for a batch of transitions."""
         assert isinstance(self.config, IPMDRLOptConfig)
-        if self.config.ipmd.reward_detach_features:
-            obs = obs.detach()
-            next_obs = next_obs.detach()
-            act = act.detach()
+        rit = self.config.ipmd.reward_input_type
+        detach = self.config.ipmd.reward_detach_features
 
-        x = torch.cat([obs, act, next_obs], dim=-1)
-        return self.reward_estimator(x).squeeze(-1)
+        parts: list[Tensor] = []
+        if rit in ("s", "sa", "sas"):
+            parts.append(
+                self._obs_features_from_td(
+                    td,
+                    self._reward_obs_keys,
+                    next_obs=False,
+                    detach=detach,
+                )
+            )
+        if rit in ("sa", "sas"):
+            parts.append(self._action_features_from_td(td, detach=detach))
+        if rit in ("s'", "sas"):
+            parts.append(
+                self._obs_features_from_td(
+                    td,
+                    self._reward_obs_keys,
+                    next_obs=True,
+                    detach=detach,
+                )
+            )
+
+        x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        r = self.reward_estimator(x)
+
+        # Apply output activation to bound the reward
+        out_act = self.config.ipmd.reward_output_activation
+        if out_act == "tanh":
+            r = torch.tanh(r) * self.config.ipmd.reward_output_scale
+        elif out_act == "sigmoid":
+            r = torch.sigmoid(r) * self.config.ipmd.reward_output_scale
+        # "none" — keep unbounded
+        return r
 
     def update(
         self,
@@ -306,18 +549,41 @@ class IPMD(PPO):
         # 2) IPMD reward loss (always computed; scaled by has_expert for fixed graph)
         r_pi = self._reward_from_batch(batch)
         r_exp = self._reward_from_batch(expert_batch.to(self.device))
-        diff = r_pi.sum() - r_exp.sum()
+        diff = r_pi.mean() - r_exp.mean()
         l2 = torch.zeros((), device=self.device)
-        for p in self.reward_estimator.parameters():
-            l2 = l2 + p.pow(2).sum()
+        # for p in self.reward_estimator.parameters():
+        #     l2 = l2 + p.pow(2).sum()
+        l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
         total_reward_loss = (
             float(self.config.ipmd.reward_loss_coeff) * diff
-            + float(self.config.ipmd.reward_l2_coeff) * l2
+            + float(self.config.ipmd.reward_l2_coeff) * l2.pow(0.5)
         ) * has_expert
         total_reward_loss.backward()
 
         reward_diff = diff.detach()
         reward_l2 = l2.detach()
+
+        # 3) Behavior cloning loss on expert actions (scaled by has_expert)
+        bc_coeff = float(self.config.ipmd.bc_loss_coeff)
+        if bc_coeff > 0.0:
+            expert_obs_td = expert_batch.select(*self._policy_obs_keys).to(self.device)
+            policy_op = self.actor_critic.get_policy_operator()
+            expert_policy_td = policy_op(expert_obs_td)
+            loc = expert_policy_td.get("loc")
+            scale = expert_policy_td.get("scale")
+            expert_action = expert_batch.get("action").to(self.device)
+            # Gaussian log-prob: sum over action dims, mean over batch
+            log_prob = -0.5 * (
+                ((expert_action - loc) / scale).pow(2)
+                + 2.0 * scale.log()
+                + math.log(2.0 * math.pi)
+            )
+            log_prob = log_prob.sum(dim=-1)  # sum over action dims
+            bc_loss = -log_prob.mean() * bc_coeff * has_expert
+            bc_loss.backward()
+            output_loss_bc = bc_loss.detach()
+        else:
+            output_loss_bc = torch.tensor(0.0, device=self.device)
 
         # Gradient clipping (always call for fixed graph)
         grad_params = list(self.actor_critic.parameters()) + list(
@@ -333,6 +599,7 @@ class IPMD(PPO):
         output_loss.set("alpha", torch.tensor(1.0, device=self.device))
         output_loss.set("loss_reward_diff", reward_diff)
         output_loss.set("loss_reward_l2", reward_l2)
+        output_loss.set("loss_bc", output_loss_bc)
         output_loss.set("grad_norm", grad_norm_tensor.detach())
         output_loss.set(
             "lr",
@@ -429,8 +696,9 @@ class IPMD(PPO):
                     est_rew = self._reward_from_batch(data)
                 if cfg.ipmd.detach_reward_when_used_for_ppo:
                     est_rew = est_rew.detach()
-                # Match shape of ("next", "reward")
+                # Save original env reward for metrics, then replace
                 data = data.clone()
+                data.set(("next", "env_reward"), data.get(("next", "reward")).clone())
                 data.set(("next", "reward"), est_rew)
 
             self.data_buffer.empty()
@@ -454,6 +722,7 @@ class IPMD(PPO):
                             expert_batch_raw is None
                             or not self._check_expert_batch_keys(expert_batch_raw)
                         ):
+                            self.log.warning("No expert batch found")
                             expert_batch = self._dummy_expert_batch(batch)
                             has_expert = torch.tensor(
                                 0.0, device=self.device, dtype=torch.float32
@@ -485,6 +754,7 @@ class IPMD(PPO):
                             "loss_objective",
                             "loss_reward_diff",
                             "loss_reward_l2",
+                            "loss_bc",
                             "estimated_reward_mean",
                             "estimated_reward_std",
                             "expert_reward_mean",
@@ -508,6 +778,28 @@ class IPMD(PPO):
 
                     if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
+
+            # EPIC distance between estimated and true env reward (invariant to
+            # potential-based shaping and positive rescaling).
+            with torch.no_grad():
+                if cfg.ipmd.use_estimated_rewards_for_ppo and (
+                    "next",
+                    "env_reward",
+                ) in data.keys(True):
+                    env_rew = data["next", "env_reward"]
+                    est_rew_diag = data["next", "reward"]  # already replaced
+                    metrics_to_log["train/env_reward_mean"] = env_rew.mean().item()
+                    metrics_to_log["train/env_reward_std"] = env_rew.std().item()
+                elif ("next", "reward") in data.keys(True):
+                    env_rew = data["next", "reward"]
+                    est_rew_diag = self._reward_from_batch(data)
+                else:
+                    env_rew = None
+                    est_rew_diag = None
+                if env_rew is not None and est_rew_diag is not None:
+                    pearson_corr, epic_dist = epic_distance(est_rew_diag, env_rew)
+                    metrics_to_log["reward/pearson_corr"] = pearson_corr.item()
+                    metrics_to_log["reward/epic_distance"] = epic_dist.item()
 
             # Aggregate and log losses
             losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
@@ -589,17 +881,55 @@ class IPMD(PPO):
                 "ppo_loss_entropy": ppo_loss_td["loss_entropy"].item(),
             }
 
-    def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
+    def predict(self, obs: Tensor | np.ndarray | Mapping[Any, Any]) -> Tensor:  # type: ignore[override]
         """Predict action given observation (deterministic)."""
-        obs = torch.as_tensor([obs], device=self.device)
         policy_op = self.actor_critic.get_policy_operator()
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
-            input_keys = list(self.config.policy.input_keys)
+            input_keys = list(self._policy_obs_keys)
+            td_data: dict[BatchKey, Tensor] = {}
+            batch_shape: tuple[int, ...] | None = None
+
+            if isinstance(obs, Mapping):
+                for key in input_keys:
+                    value = torch.as_tensor(
+                        mapping_get_obs_value(obs, key),
+                        device=self.device,
+                    )
+                    feature_ndim = self._obs_feature_ndims[key]
+                    if (feature_ndim == 0 and value.ndim == 0) or (
+                        feature_ndim > 0 and value.ndim == feature_ndim
+                    ):
+                        value = value.unsqueeze(0)
+                    current_batch_shape = infer_batch_shape(value, feature_ndim)
+                    if batch_shape is None:
+                        batch_shape = current_batch_shape
+                    elif current_batch_shape != batch_shape:
+                        msg = (
+                            "All observation tensors passed to predict() must have the "
+                            f"same batch shape, got {batch_shape} and {current_batch_shape}."
+                        )
+                        raise ValueError(msg)
+                    td_data[key] = value
+            else:
+                if len(input_keys) != 1:
+                    msg = (
+                        "predict() received a single tensor observation, but policy "
+                        f"expects multiple keys {input_keys}. Pass a dict instead."
+                    )
+                    raise ValueError(msg)
+                key = input_keys[0]
+                value = torch.as_tensor(obs, device=self.device)
+                feature_ndim = self._obs_feature_ndims[key]
+                if (feature_ndim == 0 and value.ndim == 0) or (
+                    feature_ndim > 0 and value.ndim == feature_ndim
+                ):
+                    value = value.unsqueeze(0)
+                td_data[key] = value
+                batch_shape = infer_batch_shape(value, feature_ndim)
+
             td = TensorDict(
-                dict.fromkeys(input_keys, obs),
-                batch_size=[1],
-                device=self.device,
+                td_data, batch_size=list(batch_shape or [1]), device=self.device
             )
             td = policy_op(td)
             return td.get("action")

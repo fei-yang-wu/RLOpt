@@ -160,7 +160,7 @@ class GAIL(BaseAlgorithm):
         # Wrap in TensorDictModule
         policy_td = TensorDictModule(
             module=net,
-            in_keys=list(self.config.policy.input_keys),
+            in_keys=self.config.policy.get_input_keys(),
             out_keys=["loc", "scale"],
         )
         
@@ -192,7 +192,7 @@ class GAIL(BaseAlgorithm):
             q_mlp = q_net
         
         # Q-function takes both observation and action
-        in_keys = list(self.config.q_function.input_keys)
+        in_keys = self.config.q_function.get_input_keys()
         if "action" not in in_keys:
             in_keys.append("action")
         
@@ -209,8 +209,8 @@ class GAIL(BaseAlgorithm):
         
         # Use identity module as common operator (no feature extraction)
         class IdentityModule(torch.nn.Module):
-            def forward(self, x):
-                return x
+            def forward(self, *x):
+                return x[0] if len(x) == 1 else x
         
         common_operator = TensorDictModule(
             module=IdentityModule(),

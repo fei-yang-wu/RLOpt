@@ -125,14 +125,12 @@ class SACRLOptConfig(RLOptConfig):
             num_cells=[256, 128, 128],
             activation_fn="elu",
             output_dim=1,
-            input_keys=["observation"],
         )
 
         self.value_function = NetworkConfig(
             num_cells=[256, 128, 128],
             activation_fn="elu",
             output_dim=1,
-            input_keys=["policy"],
         )
 
 
@@ -219,7 +217,7 @@ class SAC(BaseAlgorithm):
         # Wrap in TensorDictModule
         policy_td = TensorDictModule(
             module=net,
-            in_keys=list(self.config.policy.input_keys),
+            in_keys=self.config.policy.get_input_keys(),
             out_keys=["loc", "scale"],
         )
 
@@ -269,7 +267,7 @@ class SAC(BaseAlgorithm):
         )
 
         # SAC Q-function takes both observation and action as inputs
-        in_keys = list(self.config.q_function.input_keys)
+        in_keys = self.config.q_function.get_input_keys()
         if "action" not in in_keys:
             in_keys.append("action")
 
@@ -293,7 +291,7 @@ class SAC(BaseAlgorithm):
         )
         return ValueOperator(
             module=value_function,
-            in_keys=list(self.config.value_function.input_keys),
+            in_keys=self.config.value_function.get_input_keys(),
             out_keys=["state_value"],
         )
 
@@ -313,13 +311,13 @@ class SAC(BaseAlgorithm):
             )
 
         class IdentityModule(torch.nn.Module):
-            def forward(self, x):
-                return x
+            def forward(self, *x):
+                return x[0] if len(x) == 1 else x
 
         dummy = TensorDictModule(
             module=IdentityModule(),
-            in_keys=list(self.config.policy.input_keys),
-            out_keys=list(self.config.policy.input_keys),
+            in_keys=self.config.policy.get_input_keys(),
+            out_keys=self.config.policy.get_input_keys(),
         )
         return ActorCriticOperator(
             common_operator=dummy,

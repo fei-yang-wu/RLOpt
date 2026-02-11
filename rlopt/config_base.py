@@ -281,8 +281,18 @@ class NetworkConfig:
     output_dim: int = 128
     """Output dimension of the feature extractor."""
 
-    input_keys: list[str] = field(default_factory=lambda: ["observation"])
-    """Input keys for the network."""
+    input_keys: list[str] | None = None
+    """Input keys for the network.
+
+    ``None`` (default) means ``["policy"]``, the IsaacLab convention where
+    the observation group name is a top-level TensorDict key and
+    ``concatenate_terms=True`` (single tensor per group).
+
+    When ``concatenate_terms=False``, the IsaacLab wrapper flattens the
+    nested observation group so that each term name (e.g. ``"joint_pos"``)
+    becomes a top-level TensorDict key.  Set ``input_keys`` to the list of
+    term names the network should consume.
+    """
 
     output_keys: list[str] = field(default_factory=list)
     """Output keys for the network."""
@@ -292,6 +302,12 @@ class NetworkConfig:
 
     kwargs: dict[str, Any] = field(default_factory=dict)
     """Additional keyword arguments for the network."""
+
+    def get_input_keys(self) -> list[str]:
+        """Return the effective input keys (``["policy"]`` when *None*)."""
+        if self.input_keys is None:
+            return ["policy"]
+        return list(self.input_keys)
 
 
 @dataclass

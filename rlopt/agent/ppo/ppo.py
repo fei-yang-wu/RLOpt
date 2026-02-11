@@ -50,6 +50,24 @@ from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
 
+class CatInputs(torch.nn.Module):
+    """Concatenate multiple input tensors along the last dimension.
+
+    Used to adapt modules that expect a single tensor (e.g. MLP) when
+    ``TensorDictModule`` feeds multiple ``in_keys`` as separate positional
+    arguments (the ``concatenate_terms=False`` / multi-key case).
+    """
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        if len(inputs) == 1:
+            return self.module(inputs[0])
+        return self.module(torch.cat(inputs, dim=-1))
+
+
 @dataclass
 class PPOConfig:
     """PPO-specific configuration."""
@@ -97,13 +115,13 @@ class PPORLOptConfig(RLOptConfig):
 
     def __post_init__(self):
         self.use_value_function = True
-        # Initialize value_function config if not set
+        # Initialize value_function config if not set.
+        # input_keys=None → resolves to ["policy"] (IsaacLab default).
         if self.value_function is None:
             self.value_function = NetworkConfig(
                 num_cells=[256, 256],
                 activation_fn="relu",
                 output_dim=1,
-                input_keys=["observation"],
             )
 
 
@@ -196,7 +214,7 @@ class PPO(BaseAlgorithm):
         # Wrap in TensorDictModule
         policy_td = TensorDictModule(
             module=net,
-            in_keys=list(self.config.policy.input_keys),
+            in_keys=self.config.policy.get_input_keys(),
             out_keys=["loc", "scale"],
         )
 
@@ -233,10 +251,12 @@ class PPO(BaseAlgorithm):
         else:
             value_mlp = value_net
 
-        return ValueOperator(
-            module=value_mlp,
-            in_keys=list(self.config.value_function.input_keys),
-        )
+        in_keys = self.config.value_function.get_input_keys()
+        # When multiple in_keys (concatenate_terms=False), TensorDictModule
+        # passes each as a separate positional arg. MLP expects a single
+        # tensor, so wrap it to concatenate first.
+        module = CatInputs(value_mlp) if len(in_keys) > 1 else value_mlp
+        return ValueOperator(module=module, in_keys=in_keys)
 
     def _construct_q_function(self) -> TensorDictModule:  # type: ignore[override]
         """PPO does not use a state-action value function explicitly.
@@ -257,15 +277,16 @@ class PPO(BaseAlgorithm):
         if self.feature_extractor:
             common_operator = self.feature_extractor
         else:
-            # Create a dummy identity module when no feature extractor
+            # Identity pass-through: each input key is forwarded unchanged.
             class IdentityModule(torch.nn.Module):
-                def forward(self, x):
-                    return x
+                def forward(self, *x):
+                    return x[0] if len(x) == 1 else x
 
+            in_keys = self.config.policy.get_input_keys()
             common_operator = TensorDictModule(
                 module=IdentityModule(),
-                in_keys=list(self.config.policy.input_keys),
-                out_keys=list(self.config.policy.input_keys),
+                in_keys=in_keys,
+                out_keys=in_keys,
             )
 
         return ActorValueOperator(

@@ -120,16 +120,23 @@ class GaussianPolicyHead(nn.Module):
             device=device,
         )
 
-    def forward(self, obs: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, *obs: Tensor) -> tuple[Tensor, Tensor]:
         """Compute action mean and standard deviation.
 
         Args:
-            obs: Observation tensor.
+            obs: One or more observation tensors.
 
         Returns:
             Tuple of (loc, scale) tensors for the Gaussian distribution.
         """
-        loc = self.base(obs)
+        if len(obs) == 0:
+            msg = "GaussianPolicyHead.forward() expected at least one observation tensor."
+            raise ValueError(msg)
+        if len(obs) == 1:
+            loc = self.base(obs[0])
+        else:
+            # Support multi-key TensorDict inputs by concatenating feature tensors.
+            loc = self.base(torch.cat(list(obs), dim=-1))
         scale = self.log_std_module(loc)
         return loc, scale
 
