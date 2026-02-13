@@ -34,6 +34,7 @@ __all__ = [
 ROOT_LOGGER_NAME = "rlopt"
 _CONSOLE_HANDLER_NAME = "rlopt.console"
 _FILE_HANDLER_NAME = "rlopt.file"
+_TIMESTAMP_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 
 
 def resolve_log_level(level: str | int | None, *, default: int = logging.INFO) -> int:
@@ -147,6 +148,11 @@ def _slugify(value: Any, fallback: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text)
     text = text.strip("-_.")
     return text or fallback
+
+
+def _looks_like_run_dir(path: Path) -> bool:
+    """Return True when path already points to a timestamped run directory."""
+    return bool(_TIMESTAMP_DIR_PATTERN.fullmatch(path.name))
 
 
 def _build_console_handler(cfg: RLOptConfig, level: int) -> logging.Handler | None:
@@ -349,13 +355,17 @@ class LoggingManager:
         if not base_dir.is_absolute():
             base_dir = Path.cwd() / base_dir
 
-        # Create hierarchical structure: {base}/{algorithm}/{task}/{timestamp}
-        algo_slug = _slugify(component, "algorithm")
-        task_name = getattr(config.env, "env_name", None)
-        task_slug = _slugify(task_name, "task")
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        self.run_dir = base_dir / algo_slug / task_slug / timestamp
+        # Create hierarchical structure: {base}/{algorithm}/{task}/{timestamp}.
+        # If a caller already provides a timestamped run directory (common when an
+        # outer training script manages run folders), reuse it directly.
+        if _looks_like_run_dir(base_dir):
+            self.run_dir = base_dir
+        else:
+            algo_slug = _slugify(component, "algorithm")
+            task_name = getattr(config.env, "env_name", None)
+            task_slug = _slugify(task_name, "task")
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.run_dir = base_dir / algo_slug / task_slug / timestamp
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         root_logger = logging.getLogger(ROOT_LOGGER_NAME)
