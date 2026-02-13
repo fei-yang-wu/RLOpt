@@ -413,7 +413,7 @@ class IPMD(PPO):
                     batch_size=self.config.ipmd.expert_batch_size
                 ),
             )
-            expert_batch = flatten_obs_group(expert_batch)
+            # expert_batch = flatten_obs_group(expert_batch)
             assert isinstance(self.config, IPMDRLOptConfig)
             if (
                 self.config.ipmd.expert_batch_size is not None
