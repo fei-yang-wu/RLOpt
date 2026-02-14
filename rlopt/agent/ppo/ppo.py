@@ -1,71 +1,158 @@
-"""
-Only supports MuJoCo environments for now
-"""
-
 from __future__ import annotations
 
-from pathlib import Path
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn
 import torch.optim
 import tqdm
-from omegaconf import DictConfig
 from tensordict import TensorDict
 from tensordict.nn import (
-    AddStateIndependentNormalScale,
+    InteractionType,
     TensorDictModule,
-    TensorDictModuleBase,
 )
 from torch import Tensor
+from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
 
 # Import missing modules
-from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
-from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
+from torchrl.collectors import SyncDataCollector
+from torchrl.data import (
+    Bounded,
+    LazyTensorStorage,
+    ReplayBuffer,
+    TensorDictReplayBuffer,
+)
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
 from torchrl.envs.transforms import InitTracker
+from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import (
     MLP,
     ActorValueOperator,
+    IndependentNormal,
     LSTMModule,
     ProbabilisticActor,
     TanhNormal,
     ValueOperator,
 )
-from torchrl.objectives import ClipPPOLoss, group_optimizers
+from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
-from rlopt.common.base_class import BaseAlgorithm
+from rlopt.base_class import BaseAlgorithm
+from rlopt.config_base import NetworkConfig, RLOptConfig
+from rlopt.models import GaussianPolicyHead
+from rlopt.type_aliases import OptimizerClass
+from rlopt.utils import get_activation_class, log_info
+
+
+class CatInputs(torch.nn.Module):
+    """Concatenate multiple input tensors along the last dimension.
+
+    Used to adapt modules that expect a single tensor (e.g. MLP) when
+    ``TensorDictModule`` feeds multiple ``in_keys`` as separate positional
+    arguments (the ``concatenate_terms=False`` / multi-key case).
+    """
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        if len(inputs) == 1:
+            return self.module(inputs[0])
+        return self.module(torch.cat(inputs, dim=-1))
+
+
+@dataclass
+class PPOConfig:
+    """PPO-specific configuration."""
+
+    gae_lambda: float = 0.95
+    """GAE lambda parameter."""
+
+    clip_epsilon: float = 0.2
+    """Clipping epsilon for PPO."""
+
+    clip_value: bool = True
+    """Whether to clip value function."""
+
+    anneal_clip_epsilon: bool = False
+    """Whether to anneal clip epsilon."""
+
+    critic_coeff: float = 1.0
+    """Critic coefficient."""
+
+    entropy_coeff: float = 0.008
+    """Entropy coefficient."""
+
+    normalize_advantage: bool = True
+    """Whether to normalize the advantage estimates."""
+
+    log_std_init: float = 0.0
+    """Initial value for the policy log standard deviation (log std)."""
+
+    clip_log_std: bool = True
+    """Whether to clip the learned log standard deviation."""
+
+    log_std_min: float = -7.0
+    """Minimum log standard deviation (when clipping is enabled)."""
+
+    log_std_max: float = 2.0
+    """Maximum log standard deviation (when clipping is enabled)."""
+
+
+@dataclass
+class PPORLOptConfig(RLOptConfig):
+    """PPO configuration that extends RLOptConfig."""
+
+    ppo: PPOConfig = field(default_factory=PPOConfig)
+    """PPO configuration."""
+
+    def __post_init__(self):
+        self.use_value_function = True
+        # Initialize value_function config if not set.
+        # input_keys=None → resolves to ["policy"] (IsaacLab default).
+        if self.value_function is None:
+            self.value_function = NetworkConfig(
+                num_cells=[256, 256],
+                activation_fn="relu",
+                output_dim=1,
+            )
 
 
 class PPO(BaseAlgorithm):
     def __init__(
         self,
         env: TransformedEnv,
-        config: DictConfig,
+        config: PPORLOptConfig,
         policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,
-        reward_estimator_net: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
+        feature_extractor_net: torch.nn.Module | None = None,
         **kwargs,
     ):
         super().__init__(
-            env,
-            config,
-            policy_net,
-            value_net,
-            q_net,
-            reward_estimator_net,
-            replay_buffer,
-            logger,
+            env=env,
+            config=config,
+            policy_net=policy_net,
+            value_net=value_net,
+            q_net=q_net,
+            replay_buffer=replay_buffer,
+            logger=logger,
+            feature_extractor_net=feature_extractor_net,
             **kwargs,
         )
+
+        # Narrow the type for static checkers
+        self.config = cast(PPORLOptConfig, self.config)
+        self.config: PPORLOptConfig
 
         # construct the advantage module
         self.adv_module = self._construct_adv_module()
@@ -79,41 +166,9 @@ class PPO(BaseAlgorithm):
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        """Override to build your feature extractor network from config.
-        Note that if you don't want to use a shared feature extractor,
-        you can set `use_feature_extractor` to False, then this will be an identity map. Then do feature extraction separately in policy and value functions.
-        """
-        if feature_extractor_net is not None:
-            return TensorDictModule(
-                module=feature_extractor_net,
-                in_keys=self.total_input_keys,
-                out_keys=["hidden"],
-            )
-
-        if self.config.use_feature_extractor:
-            feature_extractor_mlp = MLP(
-                in_features=self.total_input_shape,
-                out_features=self.config.feature_extractor.output_dim,
-                num_cells=self.config.feature_extractor.num_cells,
-                activation_class=torch.nn.ELU,
-                device=self.device,
-            )
-
-            for layer in feature_extractor_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
-                    layer.bias.data.zero_()
-
-            return TensorDictModule(
-                module=feature_extractor_mlp,
-                in_keys=self.total_input_keys,
-                out_keys=["hidden"],
-            )
-        return TensorDictModule(
-            module=torch.nn.Identity(),
-            in_keys=self.total_input_keys,
-            out_keys=self.total_input_keys,
-        )
+        """Build feature extractor (optional for PPO)."""
+        msg = "PPO does not require a feature extractor by default."
+        raise NotImplementedError(msg)
 
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None
@@ -121,47 +176,51 @@ class PPO(BaseAlgorithm):
         """Construct policy"""
         # for PPO, we use a probabilistic actor
 
-        # Define policy output distribution class
-        distribution_class = TanhNormal
-        distribution_kwargs = {
-            "low": self.env.action_spec_unbatched.space.low.to(self.device),  # type: ignore
-            "high": self.env.action_spec_unbatched.space.high.to(self.device),  # type: ignore
-            "tanh_loc": False,
-        }
+        action_spec = self.env.action_spec_unbatched  # type: ignore
+        action_dim = int(action_spec.shape[-1])
+        if isinstance(action_spec, Bounded):
+            distribution_class = TanhNormal
+            distribution_kwargs = {
+                "low": action_spec.space.low,  # type: ignore[union-attr]
+                "high": action_spec.space.high,  # type: ignore[union-attr]
+                "tanh_loc": False,
+            }
+        else:
+            distribution_class = IndependentNormal
+            distribution_kwargs = {}
 
-        # Define policy architecture
+        # Build policy network
         if policy_net is None:
             policy_mlp = MLP(
-                in_features=self.policy_input_shape,
-                activation_class=torch.nn.ELU,
-                out_features=self.policy_output_shape,
-                num_cells=self.config.policy.num_cells,
+                in_features=self.config.policy.input_dim,
+                activation_class=get_activation_class(self.config.policy.activation_fn),
+                out_features=action_dim,
+                num_cells=list(self.config.policy.num_cells),
                 device=self.device,
             )
-            # Initialize policy weights
-            for layer in policy_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 1.0)  # type: ignore
-                    layer.bias.data.zero_()
         else:
             policy_mlp = policy_net
 
-        # Add state-independent normal scale
-        policy_mlp = torch.nn.Sequential(
-            policy_mlp,
-            AddStateIndependentNormalScale(
-                self.policy_output_shape,
-                # scale_lb=1e-8,  # type: ignore
-            ).to(self.device),
+        net = GaussianPolicyHead(
+            base=policy_mlp,
+            action_dim=action_dim,
+            log_std_init=self.config.ppo.log_std_init,
+            log_std_min=self.config.ppo.log_std_min,
+            log_std_max=self.config.ppo.log_std_max,
+            clip_log_std=self.config.ppo.clip_log_std,
+            device=self.device,
+        )
+
+        # Wrap in TensorDictModule
+        policy_td = TensorDictModule(
+            module=net,
+            in_keys=self.config.policy.get_input_keys(),
+            out_keys=["loc", "scale"],
         )
 
         # Add probabilistic sampling of the actions
         return ProbabilisticActor(
-            TensorDictModule(
-                module=policy_mlp,
-                in_keys=self.config.policy_in_keys,
-                out_keys=["loc", "scale"],
-            ),
+            policy_td,
             in_keys=["loc", "scale"],
             spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
             distribution_class=distribution_class,
@@ -174,88 +233,109 @@ class PPO(BaseAlgorithm):
         self, value_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
         """Construct value function"""
-        # Define value architecture
+        if self.config.value_function is None:
+            msg = "PPO requires a value function configuration."
+            raise ValueError(msg)
+
+        # Build value network
         if value_net is None:
             value_mlp = MLP(
-                in_features=self.value_input_shape,
-                activation_class=torch.nn.ELU,
-                out_features=self.value_output_shape,
-                num_cells=self.config.value_net.num_cells,
+                in_features=self.config.value_function.input_dim,
+                activation_class=get_activation_class(
+                    self.config.value_function.activation_fn
+                ),
+                out_features=1,
+                num_cells=list(self.config.value_function.num_cells),
                 device=self.device,
             )
-            # Initialize value weights
-            for layer in value_mlp.modules():
-                if isinstance(layer, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(layer.weight, 0.01)  # type: ignore
-                    layer.bias.data.zero_()
         else:
             value_mlp = value_net
 
-        # Define value module
-        return ValueOperator(
-            value_mlp,
-            in_keys=self.config.value_net_in_keys,
+        in_keys = self.config.value_function.get_input_keys()
+        # When multiple in_keys (concatenate_terms=False), TensorDictModule
+        # passes each as a separate positional arg. MLP expects a single
+        # tensor, so wrap it to concatenate first.
+        module = CatInputs(value_mlp) if len(in_keys) > 1 else value_mlp
+        return ValueOperator(module=module, in_keys=in_keys)
+
+    def _construct_q_function(self) -> TensorDictModule:  # type: ignore[override]
+        """PPO does not use a state-action value function explicitly.
+        This method is not used but required by BaseAlgorithm interface.
+        """
+        return TensorDictModule(
+            module=torch.nn.Identity(),
+            in_keys=[],
+            out_keys=[],
         )
 
     def _construct_actor_critic(self) -> TensorDictModule:
         """Construct actor-critic network"""
+        assert isinstance(self.value_function, TensorDictModule)
+        assert isinstance(self.policy, TensorDictModule)
+
+        # Use feature extractor if available, otherwise use identity
+        if self.feature_extractor:
+            common_operator = self.feature_extractor
+        else:
+            # Identity pass-through: each input key is forwarded unchanged.
+            class IdentityModule(torch.nn.Module):
+                def forward(self, *x):
+                    return x[0] if len(x) == 1 else x
+
+            in_keys = self.config.policy.get_input_keys()
+            common_operator = TensorDictModule(
+                module=IdentityModule(),
+                in_keys=in_keys,
+                out_keys=in_keys,
+            )
+
         return ActorValueOperator(
-            common_operator=self.feature_extractor,
+            common_operator=common_operator,
             policy_operator=self.policy,
             value_operator=self.value_function,
         )
 
-    def _construct_q_function(self, q_net: torch.nn.Module | None = None):
-        pass
-
     def _construct_loss_module(self) -> torch.nn.Module:
         """Construct loss module"""
+        assert isinstance(self.config, PPORLOptConfig)
         loss_config = self.config.loss
+        ppo_config = self.config.ppo
+
+        # Initialize lazy layers by performing a forward pass with dummy data
+        fake_tensordict = self.env.fake_tensordict()
+        with torch.no_grad():
+            _ = self.actor_critic(fake_tensordict)
+
         return ClipPPOLoss(
             actor_network=self.actor_critic.get_policy_operator(),
             critic_network=self.actor_critic.get_value_operator(),
-            clip_epsilon=loss_config.clip_epsilon,
+            clip_epsilon=ppo_config.clip_epsilon,
             loss_critic_type=loss_config.loss_critic_type,
-            entropy_coeff=loss_config.entropy_coeff,
-            critic_coeff=loss_config.critic_coeff,
-            normalize_advantage=False,
-            clip_value=loss_config.clip_value,
+            entropy_coeff=ppo_config.entropy_coeff,
+            critic_coeff=ppo_config.critic_coeff,
+            normalize_advantage=ppo_config.normalize_advantage,
+            clip_value=ppo_config.clip_value,
         )
-
-    def _configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizers"""
-        # Create optimizers
-        actor_optim = torch.optim.AdamW(
-            self.actor_critic.get_policy_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        critic_optim = torch.optim.AdamW(
-            self.actor_critic.get_value_head().parameters(),
-            lr=torch.tensor(self.config.optim.lr, device=self.device),
-            # eps=1e-5,
-        )
-        if self.config.use_feature_extractor:
-            feature_optim = torch.optim.AdamW(
-                self.feature_extractor.parameters(),
-                lr=torch.tensor(self.config.optim.lr, device=self.device),
-                # eps=1e-5,
-            )
-            return group_optimizers(actor_optim, critic_optim, feature_optim)
-
-        return group_optimizers(actor_optim, critic_optim)
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
+        assert isinstance(self.config, PPORLOptConfig)
         # Create advantage module
         return GAE(
             gamma=self.config.loss.gamma,
-            lmbda=self.config.loss.gae_lambda,
+            lmbda=self.config.ppo.gae_lambda,
             value_network=self.actor_critic.get_value_operator(),  # type: ignore
             average_gae=False,
             device=self.device,
             vectorized=False,
         )
+
+    def _set_optimizers(
+        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+    ) -> list[torch.optim.Optimizer]:
+        """Create optimizer for actor-critic parameters."""
+        # For PPO, we use a single optimizer for both policy and value
+        return [optimizer_cls(self.actor_critic.parameters(), **optimizer_kwargs)]
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer"""
@@ -295,29 +375,30 @@ class PPO(BaseAlgorithm):
     ) -> tuple[TensorDict, int]:
         """Update function"""
         self.optim.zero_grad(set_to_none=True)
-
-        # Linearly decrease the learning rate and clip epsilon
-        alpha = torch.ones((), device=self.device)
-        if self.config.optim.anneal_lr:
-            alpha = 1 - (num_network_updates / self.total_network_updates)
-            for group in self.optim.param_groups:
-                group["lr"] = self.config.optim.lr * alpha
-
-        if self.config.loss.anneal_clip_epsilon:
-            self.loss_module.clip_epsilon.copy_(self.config.loss.clip_epsilon * alpha)  # type: ignore
-
-        num_network_updates = num_network_updates + 1
+        assert isinstance(self.config, PPORLOptConfig)
 
         # Forward pass PPO loss
-        loss = self.loss_module(batch)
+        loss: TensorDict = self.loss_module(batch)
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         total_loss = critic_loss + actor_loss
-        loss_cap = getattr(self.config.loss, "max_loss", None)
-        if loss_cap is not None:
-            total_loss = total_loss.clamp(min=-loss_cap, max=loss_cap)
         # Backward pass
-        total_loss.backward()
+        total_loss.backward()  # type: ignore
+
+        # clone the loss
+        output_loss = loss.clone().detach_()
+
+        max_grad_norm = getattr(self.config.optim, "max_grad_norm", None)
+        grad_norm_tensor = None
+        if max_grad_norm is not None and max_grad_norm > 0:
+            grad_params = [
+                p
+                for group in self.optim.param_groups
+                for p in group["params"]
+                if p.grad is not None
+            ]
+            if grad_params:
+                grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
 
         # clip gradients per optimizer group
         for group in self.optim.param_groups:
@@ -327,39 +408,31 @@ class PPO(BaseAlgorithm):
 
         # Update the networks
         self.optim.step()
-        return loss.detach().set("alpha", alpha), num_network_updates
+        if self.lr_scheduler and self.lr_scheduler_step == "update":
+            self.lr_scheduler.step()
+        output_loss.set("alpha", torch.tensor(1.0, device=self.device))
+        if grad_norm_tensor is not None:
+            output_loss.set("grad_norm", grad_norm_tensor.detach())
+        current_lr = torch.tensor(
+            self.optim.param_groups[0]["lr"],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        output_loss.set("lr", current_lr)
+        output_loss.set("skipped_update", torch.tensor(False, device=self.device))
+        return output_loss, num_network_updates + 1
 
-    def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Predict action given observation"""
-        obs = torch.as_tensor([obs], device=self.device)
-        self.policy.eval()
-        with torch.inference_mode():
-            td = TensorDict(
-                dict.fromkeys(self.config.policy_in_keys, obs),
-                batch_size=[1],
-                device=self.policy.device,  # type: ignore
-            )
-            return self.policy(td).get("action")
+    def _collector_iter(self) -> Iterator[TensorDict]:
+        """Yield data from the collector while enforcing NaN guards per batch."""
 
-    def _construct_trainer(self) -> None:  # type: ignore
-        """Override to return None since we implement custom training loop"""
-        return
-
-    def _update_policy(self, batch: TensorDict) -> dict[str, float]:
-        msg = "PPO does not support _update_policy"
-        raise NotImplementedError(msg)
-
-    def _compute_action(self, tensordict: TensorDict) -> TensorDict:
-        msg = "PPO does not support _compute_action"
-        raise NotImplementedError(msg)
-
-    def _compute_returns(self, rollout: Tensor) -> Tensor:
-        msg = "PPO does not support _compute_returns"
-        raise NotImplementedError(msg)
+        for step_idx, tensordict in enumerate(self.collector):
+            yield tensordict
 
     def train(self) -> None:  # type: ignore
         """Train the agent"""
         cfg = self.config
+        assert isinstance(self.config, PPORLOptConfig)
+
         # Main loop
         collected_frames = 0
         num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -377,17 +450,15 @@ class PPO(BaseAlgorithm):
 
         # extract cfg variables
         cfg_loss_ppo_epochs: int = self.config.loss.epochs
-        cfg_optim_lr: torch.Tensor = torch.tensor(
-            self.config.optim.lr, device=self.device
-        )
-        cfg_loss_anneal_clip_eps: bool = self.config.loss.anneal_clip_epsilon
-        cfg_loss_clip_epsilon: float = self.config.loss.clip_epsilon
+        cfg_loss_anneal_clip_eps: bool = self.config.ppo.anneal_clip_epsilon
+        cfg_loss_clip_epsilon: float = self.config.ppo.clip_epsilon
 
         losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])  # type: ignore
 
-        self.collector: SyncDataCollector | MultiSyncDataCollector
+        self.collector: SyncDataCollector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
+        policy_op = self.actor_critic.get_policy_operator()
         for _i in range(total_iter):
             # timeit.printevery(1000, total_iter, erase=True)
             self.actor_critic.eval()
@@ -395,24 +466,36 @@ class PPO(BaseAlgorithm):
             with timeit("collecting"):
                 data = next(collector_iter)
 
-            metrics_to_log = {}
+            metrics_to_log: dict[str, Any] = {}
             frames_in_batch = data.numel()
             collected_frames += frames_in_batch
             pbar.update(frames_in_batch)
 
-            # Get training rewards and episode lengths
-            episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-            if len(episode_rewards) > 0:
-                episode_length = data["next", "step_count"][data["next", "done"]]
-                self.episode_lengths.extend(episode_length.cpu().tolist())
-                self.episode_rewards.extend(episode_rewards.cpu().tolist())
+            # Get training rewards and episode lengths (if available)
+            if ("next", "reward") in data.keys(True):
+                step_rewards = data["next", "reward"]
                 metrics_to_log.update(
                     {
-                        "episode/length": np.mean(self.episode_lengths),
-                        "episode/return": np.mean(self.episode_rewards),
-                        "train/reward": episode_rewards.mean().item(),
+                        "train/step_reward_mean": step_rewards.mean().item(),
+                        "train/step_reward_std": step_rewards.std().item(),
+                        "train/step_reward_max": step_rewards.max().item(),
+                        "train/step_reward_min": step_rewards.min().item(),
                     }
                 )
+            if ("next", "episode_reward") in data.keys(True):
+                episode_rewards = data["next", "episode_reward"][data["next", "done"]]
+                if len(episode_rewards) > 0:
+                    episode_length = data["next", "step_count"][data["next", "done"]]
+                    self.episode_lengths.extend(episode_length.cpu().tolist())
+                    self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                    episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
+                    metrics_to_log.update(
+                        {
+                            "episode/length": np.mean(self.episode_lengths),
+                            "episode/return": np.mean(self.episode_rewards),
+                            "train/reward": episode_rewards_mean,
+                        }
+                    )
             self.data_buffer.empty()
 
             self.actor_critic.train()
@@ -429,24 +512,7 @@ class PPO(BaseAlgorithm):
 
                     # Compute GAE
                     with torch.no_grad(), timeit("adv"):
-                        torch.compiler.cudagraph_mark_step_begin()
-
-                        # check if value network and gae module do not have NaNs
-                        if any(
-                            torch.isnan(param).any()
-                            for param in self.actor_critic.get_value_operator().parameters()
-                            if param.dtype.is_floating_point
-                        ):
-                            print("Before GAE")
-                            print("[WARNING] NaNs detected in value network")
-                        if any(
-                            torch.isnan(param).any()
-                            for param in self.adv_module.parameters()
-                            if param.dtype.is_floating_point
-                        ):
-                            print("Before GAE")
-                            print("[WARNING] NaNs detected in gae module")
-
+                        # torch.compiler.cudagraph_mark_step_begin()
                         data = self.adv_module(data)
                         if self.config.compile.compile_mode:
                             data = data.clone()
@@ -467,81 +533,102 @@ class PPO(BaseAlgorithm):
                                 )
 
                     for k, batch in enumerate(self.data_buffer):
+                        kl_context = None
+                        if (self.config.optim.scheduler or "").lower() == "adaptive":
+                            kl_context = self._prepare_kl_context(batch, policy_op)
                         with timeit("update"):
-                            torch.compiler.cudagraph_mark_step_begin()
+                            # torch.compiler.cudagraph_mark_step_begin()
                             loss, num_network_updates = self.update(  # type: ignore
                                 batch, num_network_updates=num_network_updates
                             )
                             loss = loss.clone()
+                        if kl_context is not None:
+                            kl_approx = self._compute_kl_after_update(
+                                kl_context, policy_op
+                            )
+                            if kl_approx is not None:
+                                loss.set("kl_approx", kl_approx.detach())
+                                self._maybe_adjust_lr(kl_approx, self.config.optim)
                         num_network_updates = num_network_updates.clone()  # type: ignore
-                        losses[j, k] = loss.select(
-                            "loss_critic", "loss_entropy", "loss_objective"
-                        )
+                        loss_keys = ["loss_critic", "loss_entropy", "loss_objective"]
+                        optional_keys = [
+                            "entropy",
+                            "explained_variance",
+                            "clip_fraction",
+                            "value_clip_fraction",
+                            "ESS",
+                            "kl_approx",
+                            "grad_norm",
+                        ]
+                        for key in optional_keys:
+                            if key in loss.keys():
+                                loss_keys.append(key)
+                        losses[j, k] = loss.select(*loss_keys)
+
+                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
+                        self.lr_scheduler.step()
 
             # Get training losses and times
             losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
             for key, value in losses_mean.items():  # type: ignore
-                metrics_to_log.update({f"train/{key}": value.item()})
-            metrics_to_log.update(
+                metrics_to_log.update({f"train/{key}": value.item()})  # type: ignore
+            metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
+            clip_attr = getattr(self.loss_module, "clip_epsilon", None)
+            if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
+                clip_epsilon_value = clip_attr.detach()
+            else:
+                clip_epsilon_value = torch.tensor(
+                    cfg_loss_clip_epsilon,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            metrics_to_log.update(  # type: ignore
                 {
-                    "train/lr": loss["alpha"] * cfg_optim_lr,
-                    "train/clip_epsilon": (
-                        loss["alpha"] * cfg_loss_clip_epsilon
-                        if cfg_loss_anneal_clip_eps
-                        else cfg_loss_clip_epsilon
-                    ),
+                    # "train/lr": current_lr_tensor,
+                    "train/clip_epsilon": clip_epsilon_value,
                 }
             )
 
             # for IsaacLab, we need to log the metrics from the environment
             if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                for _ in range(len(self.env.log_infos)):
-                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                    # log all the keys
-                    for key, value in log_info_dict.items():
-                        if "/" in key:
-                            metrics_to_log.update(
-                                {
-                                    key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
-                        else:
-                            metrics_to_log.update(
-                                {
-                                    "Episode/"
-                                    + key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
+                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                log_info(log_info_dict, metrics_to_log)
 
-            # Log metrics
-            if self.logger:
-                metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-                metrics_to_log["time/speed"] = pbar.format_dict["rate"]
-                for key, value in metrics_to_log.items():
-                    self.logger.log_scalar(key, value, collected_frames)
+            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
+            rate = pbar.format_dict.get("rate")
+            if rate is not None:
+                metrics_to_log["time/speed"] = rate
+
+            # Stream metrics to both TorchRL backends and python logs via the base helper
+            self.log_metrics(metrics_to_log, step=collected_frames)
 
             self.collector.update_policy_weights_()
 
             # Save model periodically
             if (
                 self.config.save_interval > 0
-                and collected_frames % self.config.save_interval == 0
+                and num_network_updates % self.config.save_interval == 0
             ):
                 self.save_model(
-                    path=Path(self.config.logger.get("log_dir", "logs"))
-                    / self.config.get("save_path", "models"),
+                    path=self.log_dir / self.config.logger.save_path,
                     step=collected_frames,
                 )
 
         self.collector.shutdown()
+
+    def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
+        """Predict action given observation."""
+        obs = torch.as_tensor([obs], device=self.device)
+        policy_op = self.actor_critic.get_policy_operator()
+        policy_op.eval()
+        with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
+            td = TensorDict(
+                dict.fromkeys(self.total_input_keys, obs),
+                batch_size=[1],
+                device=self.device,
+            )
+            td = policy_op(td)
+            return td.get("action")
 
 
 class PPORecurrent(PPO):
@@ -572,13 +659,13 @@ class PPORecurrent(PPO):
     def __init__(
         self,
         env: TransformedEnv,
-        config: DictConfig,
+        config: PPORLOptConfig,
         policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,
-        reward_estimator_net: torch.nn.Module | None = None,
         replay_buffer: type[ReplayBuffer] = ReplayBuffer,
         logger: Logger | None = None,
+        feature_extractor_net: torch.nn.Module | None = None,
         **kwargs,
     ):
         # Store LSTM module reference for primer creation
@@ -593,9 +680,9 @@ class PPORecurrent(PPO):
             policy_net,
             value_net,
             q_net,
-            reward_estimator_net,
             replay_buffer,
             logger,
+            feature_extractor_net,
             **kwargs,
         )
 
@@ -609,14 +696,18 @@ class PPORecurrent(PPO):
                 if isinstance(self.env.transform, Compose):
                     self.env.transform.append(primer)
                 else:
-                    self.env.transform = Compose(self.env.transform, primer)
+                    self.env.transform = Compose([self.env.transform, primer])
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
-    ) -> TensorDictModuleBase:
+    ) -> TensorDictModule:
         """Override to build LSTM-based feature extractor using TorchRL's LSTMModule."""
         if feature_extractor_net is not None:
-            return feature_extractor_net
+            return TensorDictModule(
+                module=feature_extractor_net,
+                in_keys=list(self.total_input_keys),
+                out_keys=["hidden"],
+            )
 
         if self.config.use_feature_extractor:
             # Get LSTM configuration with defaults
@@ -644,21 +735,22 @@ class PPORecurrent(PPO):
                 out_key="hidden",
             )
 
-            return self.lstm_module
+            return self.lstm_module  # type: ignore
 
         # If not using feature extractor, return identity
         return TensorDictModule(
             module=torch.nn.Identity(),
-            in_keys=self.total_input_keys,
-            out_keys=self.total_input_keys,
+            in_keys=list(self.total_input_keys),
+            out_keys=list(self.total_input_keys),
         )
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
+        assert isinstance(self.config, PPORLOptConfig)
         # Create advantage module
         return GAE(
             gamma=self.config.loss.gamma,
-            lmbda=self.config.loss.gae_lambda,
+            lmbda=self.config.ppo.gae_lambda,
             value_network=self.actor_critic.get_value_operator(),  # type: ignore
             average_gae=False,
             device=self.device,
@@ -667,27 +759,12 @@ class PPORecurrent(PPO):
             shifted=True,  # to be compatible with lstm
         )
 
-    def predict(self, obs: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Predict action given observation with LSTM state management"""
-        obs = torch.as_tensor([obs], device=self.device)
-        self.policy.eval()
-
-        with torch.inference_mode():
-            td = TensorDict(
-                dict.fromkeys(self.config.policy_in_keys, obs),
-                batch_size=[1],
-                device=self.policy.device,  # type: ignore
-            )
-
-            # The LSTMModule automatically handles recurrent states through TensorDict
-            # No need for manual state management - TorchRL handles this
-            return self.policy(td).get("action")
-
     def reset_recurrent_states(self):
         """Reset LSTM recurrent states - called at episode boundaries"""
         # With TorchRL's LSTMModule, states are automatically managed
         # This method is provided for compatibility but may not be needed
         # as the InitTracker transform and proper episode boundaries handle this
+        return
 
     @classmethod
     def check_environment_compatibility(
@@ -750,8 +827,8 @@ class PPORecurrent(PPO):
                         for transform in new_transforms:
                             env.transform.append(transform)
                     else:
-                        env.transform = Compose(env.transform, *new_transforms)
+                        env.transform = Compose([env.transform, *new_transforms])
                 else:
-                    env.transform = Compose(*new_transforms)
+                    env.transform = Compose([*new_transforms])
 
         return env

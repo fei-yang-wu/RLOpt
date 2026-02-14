@@ -1,8 +1,17 @@
-from .l2t.recurrent_l2t import RecurrentL2T
-from .l2t.l2t import L2T
+"""Agent algorithms module with backward compatibility."""
 
-# from .ppo.ppo import PPO
-from .tsl.teacher_student_learning import TeacherStudentLearning
-from .tsl.student_only import RecurrentStudent
+# New organized imports
+from __future__ import annotations
 
-__all__ = ["RecurrentL2T", "L2T", "TeacherStudentLearning"]
+from rlopt.agent.ppo import PPO, PPORLOptConfig
+from rlopt.agent.sac import SAC, SACRLOptConfig
+from rlopt.agent.ipmd import IPMD, IPMDRLOptConfig
+
+__all__ = [
+    "PPO",
+    "SAC",
+    "PPORLOptConfig",
+    "SACRLOptConfig",
+    "IPMD",
+    "IPMDRLOptConfig",
+]

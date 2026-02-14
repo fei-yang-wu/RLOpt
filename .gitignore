@@ -1,6 +1,7 @@
 # outputs
 outputs/
-
+.DS_Store
+logs/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -11,6 +12,9 @@ __pycache__/
 
 # vscode
 .vscode/
+
+# idea
+.idea
 
 # Distribution / packaging
 .Python
@@ -170,3 +174,7 @@ cython_debug/
 #.idea/
 
 MUJOCO_LOG.TXT
+
+# expert data
+expert_data/
+comparison_results/
