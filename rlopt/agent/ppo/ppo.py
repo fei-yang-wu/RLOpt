@@ -226,7 +226,7 @@ class PPO(BaseAlgorithm):
             distribution_class=distribution_class,
             distribution_kwargs=distribution_kwargs,
             return_log_prob=True,
-            default_interaction_type=ExplorationType.DETERMINISTIC,
+            default_interaction_type=ExplorationType.RANDOM,
         )
 
     def _construct_value_function(
@@ -327,7 +327,7 @@ class PPO(BaseAlgorithm):
             value_network=self.actor_critic.get_value_operator(),  # type: ignore
             average_gae=False,
             device=self.device,
-            vectorized=not self.config.compile.compile,
+            vectorized=False,
         )
 
     def _set_optimizers(
@@ -382,7 +382,6 @@ class PPO(BaseAlgorithm):
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
         total_loss = critic_loss + actor_loss
-
         # Backward pass
         total_loss.backward()  # type: ignore
 
@@ -400,6 +399,12 @@ class PPO(BaseAlgorithm):
             ]
             if grad_params:
                 grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
+
+        # clip gradients per optimizer group
+        for group in self.optim.param_groups:
+            torch.nn.utils.clip_grad_norm_(
+                group["params"], self.config.optim.max_grad_norm
+            )
 
         # Update the networks
         self.optim.step()
@@ -456,7 +461,8 @@ class PPO(BaseAlgorithm):
         policy_op = self.actor_critic.get_policy_operator()
         for _i in range(total_iter):
             # timeit.printevery(1000, total_iter, erase=True)
-
+            self.actor_critic.eval()
+            self.adv_module.eval()
             with timeit("collecting"):
                 data = next(collector_iter)
 
@@ -491,8 +497,19 @@ class PPO(BaseAlgorithm):
                         }
                     )
             self.data_buffer.empty()
+
+            self.actor_critic.train()
+            self.adv_module.train()
             with timeit("training"):
                 for j in range(cfg_loss_ppo_epochs):
+                    # Check for NaNs in data_reshape tensordict
+                    for key in data.keys(include_nested=True):
+                        value = data.get(key)
+                        if isinstance(value, Tensor):
+                            if torch.isnan(value).any():
+                                print("Before GAE")
+                                print(f"[WARNING] NaNs detected in data at key: {key}")
+
                     # Compute GAE
                     with torch.no_grad(), timeit("adv"):
                         # torch.compiler.cudagraph_mark_step_begin()
@@ -504,6 +521,16 @@ class PPO(BaseAlgorithm):
                         # Update the data buffer
                         data_reshape = data.reshape(-1)
                         self.data_buffer.extend(data_reshape)
+
+                    # Check for NaNs in data_reshape tensordict
+                    for key in data_reshape.keys(include_nested=True):
+                        value = data_reshape.get(key)
+                        if isinstance(value, Tensor):
+                            if torch.isnan(value).any():
+                                print("after GAE")
+                                print(
+                                    f"[WARNING] NaNs detected in data_reshape at key: {key}"
+                                )
 
                     for k, batch in enumerate(self.data_buffer):
                         kl_context = None
