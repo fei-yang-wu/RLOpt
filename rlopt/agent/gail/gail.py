@@ -1,585 +1,569 @@
-"""GAIL (Generative Adversarial Imitation Learning) implementation."""
+"""PPO-based GAIL and AMP implementations."""
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch import Tensor
+import tqdm
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
-from torchrl.data import TensorDictReplayBuffer, ReplayBuffer
-from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.envs import EnvBase
-from torchrl.envs.utils import ExplorationType
-from torchrl.modules import (
-    ActorCriticOperator,
-    MLP,
-    NormalParamExtractor,
-    ProbabilisticActor,
-    TanhNormal,
-    ValueOperator,
-)
-from torchrl.objectives import SACLoss, SoftUpdate
+from torch import Tensor
+from torch.nn.utils import clip_grad_norm_
+from torchrl._utils import timeit
+from torchrl.collectors import SyncDataCollector
 
-from rlopt.base_class import BaseAlgorithm, RLOptConfig
-from rlopt.configs import OptimizerConfig, NetworkConfig
-from rlopt.imitation.expert_buffer import ExpertReplayBuffer
-from rlopt.utils import get_activation_class
+from rlopt.agent.ppo import PPO, PPOConfig, PPORLOptConfig
+from rlopt.config_utils import (
+    BatchKey,
+    ObsKey,
+    dedupe_keys,
+    flatten_feature_tensor,
+)
+
 from .discriminator import Discriminator
+
+
+class ExpertReplayBuffer(Protocol):
+    def sample(self) -> TensorDict: ...
+
+    def __len__(self) -> int: ...
 
 
 @dataclass
 class GAILConfig:
-    """Configuration for GAIL-specific parameters."""
+    """Configuration for PPO-based GAIL."""
 
-    # Discriminator configuration
     discriminator_hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     discriminator_activation: str = "relu"
     discriminator_lr: float = 3e-4
-
-    # Training configuration
+    discriminator_steps: int = 1
+    discriminator_grad_clip_norm: float = 1.0
+    discriminator_loss_coeff: float = 1.0
     expert_batch_size: int = 256
-    discriminator_steps: int = 1  # Number of discriminator updates per policy update
-    discriminator_loss_coeff: float = 1.0  # Coefficient for discriminator loss
-
-    # Reward configuration
-    use_gail_reward: bool = True  # If False, use environment reward (for debugging)
-    gail_reward_coeff: float = 1.0  # Coefficient for GAIL reward
+    use_gail_reward: bool = True
+    gail_reward_coeff: float = 1.0
+    proportion_env_reward: float = 0.0
+    amp_reward_clip: bool = True
+    discriminator_input_group: ObsKey | None = None
+    """Optional observation group key for discriminator inputs (e.g. ``"policy"``)."""
+    discriminator_input_keys: list[ObsKey] | None = None
+    """Optional subset of observation keys for discriminator/reward input."""
+    discriminator_use_action: bool = False
+    """Whether discriminator additionally consumes ``action`` features."""
 
 
 @dataclass
-class GAILRLOptConfig(RLOptConfig):
-    """Configuration for GAIL with RLOpt."""
+class GAILRLOptConfig(PPORLOptConfig):
+    """PPO config extended with GAIL parameters."""
 
+    ppo: PPOConfig = field(default_factory=PPOConfig)
     gail: GAILConfig = field(default_factory=GAILConfig)
 
-    # Override default SAC config for imitation learning
-    # Use lower learning rates for more stable training
-    actor_optimizer: OptimizerConfig = field(
-        default_factory=lambda: OptimizerConfig(lr=3e-4)
-    )
-    critic_optimizer: OptimizerConfig = field(
-        default_factory=lambda: OptimizerConfig(lr=3e-4)
-    )
-    alpha_optimizer: OptimizerConfig = field(
-        default_factory=lambda: OptimizerConfig(lr=3e-4)
-    )
+
+@dataclass
+class AMPRLOptConfig(GAILRLOptConfig):
+    """Configuration alias for AMP (same fields as GAIL)."""
 
 
-class GAIL(BaseAlgorithm):
-    """GAIL (Generative Adversarial Imitation Learning).
+class GAIL(PPO):
+    """GAIL with PPO policy optimization and discriminator reward."""
 
-    GAIL uses adversarial training to learn from expert demonstrations.
-    A discriminator is trained to distinguish between expert and policy
-    state-action pairs, while the policy is trained to fool the discriminator.
-
-    The discriminator provides rewards: r(s,a) = -log(1 - D(s,a))
-    where D(s,a) is the discriminator output.
-
-    Args:
-        env: Environment to train on
-        config: Configuration for GAIL
-    """
-
-    def __init__(self, env: EnvBase, config: GAILRLOptConfig):
-        self.config: GAILRLOptConfig = config
-        self.log = logging.getLogger(__name__)
-        
-        # Expert replay buffer
+    def __init__(self, env, config: GAILRLOptConfig):
+        self.config = cast(GAILRLOptConfig, config)
         self._expert_buffer: ExpertReplayBuffer | None = None
-        self._expert_iter = None
         self._warned_no_expert = False
-        
-        # Store discriminator dimensions (will initialize in _set_optimizers)
-        self._obs_dim = env.observation_spec["observation"].shape[-1]
-        self._action_dim = env.action_spec.shape[-1]
-        self.discriminator: Discriminator = None  # type: ignore
-
-        # Call super().__init__() which will build networks, loss, and optimizers
-        super().__init__(env, config)
-        
-        # Construct target network updater for SAC
-        self.target_net_updater = self._construct_target_net_updater()
-
-        self.log.info("GAIL initialized")
-        self.log.info(
-            f"  Discriminator: {sum(p.numel() for p in self.discriminator.parameters())} parameters"
-        )
-        # Count policy parameters from actor_critic
-        if hasattr(self, 'actor_critic'):
-            policy_params = sum(p.numel() for p in self.actor_critic.get_policy_operator().parameters())
-            self.log.info(f"  Policy: {policy_params} parameters")
-    
-    # ========================================================================
-    # Abstract method implementations (required by BaseAlgorithm)
-    # ========================================================================
-    
-    def _construct_feature_extractor(
-        self, feature_extractor_net: torch.nn.Module | None = None
-    ) -> TensorDictModule:
-        """GAIL does not require a feature extractor."""
-        raise NotImplementedError("GAIL does not require a feature extractor by default")
-    
-    def _construct_policy(
-        self, policy_net: torch.nn.Module | None = None
-    ) -> TensorDictModule:
-        """Construct SAC policy for GAIL."""
-        # Define policy output distribution
-        distribution_class = TanhNormal
-        distribution_kwargs = {
-            "low": self.env.action_spec_unbatched.space.low.to(self.device),
-            "high": self.env.action_spec_unbatched.space.high.to(self.device),
-            "tanh_loc": False,
+        self._disc_obs_keys = self._resolve_discriminator_obs_keys(env, self.config)
+        self._disc_obs_feature_ndims = {
+            key: self._obs_key_feature_ndim(env, key) for key in self._disc_obs_keys
         }
-        
-        # Build policy network
-        if policy_net is None:
-            policy_mlp = MLP(
-                in_features=self.config.policy.input_dim,
-                activation_class=get_activation_class(self.config.policy.activation_fn),
-                out_features=2 * self.env.action_spec_unbatched.shape[-1],
-                num_cells=list(self.config.policy.num_cells),
-                device=self.device,
-            )
+        self._disc_obs_dim = sum(
+            self._obs_key_feature_dim(env, key) for key in self._disc_obs_keys
+        )
+        action_spec = getattr(env, "action_spec_unbatched", env.action_spec)
+        action_shape = tuple(int(dim) for dim in action_spec.shape)
+        self._action_feature_ndim = len(action_shape)
+        self._action_dim = int(np.prod(action_shape)) if action_shape else 1
+        self.discriminator: Discriminator | None = None
+        self.discriminator_optim: torch.optim.Optimizer | None = None
+        super().__init__(env, config)
+        self.log.info(
+            "Initialized PPO-based GAIL (policy params=%d, discriminator params=%d, disc_keys=%s, use_action=%s)",
+            sum(p.numel() for p in self.actor_critic.get_policy_operator().parameters()),
+            sum(p.numel() for p in self.discriminator.parameters()) if self.discriminator else 0,
+            self._disc_obs_keys,
+            self.config.gail.discriminator_use_action,
+        )
+
+    @staticmethod
+    def _compose_grouped_key(group: ObsKey, key: ObsKey) -> ObsKey:
+        if isinstance(group, tuple):
+            if isinstance(key, tuple):
+                return (*group, *key)
+            return (*group, key)
+        if isinstance(key, tuple):
+            return (group, *key)
+        return (group, key)
+
+    @classmethod
+    def _resolve_discriminator_obs_keys(
+        cls, env, cfg: GAILRLOptConfig
+    ) -> list[ObsKey]:
+        gail_cfg = cfg.gail
+        group = gail_cfg.discriminator_input_group
+        keys = gail_cfg.discriminator_input_keys
+        if keys:
+            base = list(keys)
+            if group is not None:
+                base = [cls._compose_grouped_key(group, key) for key in base]
+        elif group is not None:
+            base = [group]
         else:
-            policy_mlp = policy_net
-        
-        # Add parameter extractor for Normal distribution
-        extractor = NormalParamExtractor(
-            scale_mapping="biased_softplus_1.0",
-            scale_lb=0.1,
-        ).to(self.device)
-        net = torch.nn.Sequential(policy_mlp, extractor)
-        
-        # Wrap in TensorDictModule
-        policy_td = TensorDictModule(
-            module=net,
-            in_keys=self.config.policy.get_input_keys(),
-            out_keys=["loc", "scale"],
-        )
-        
-        return ProbabilisticActor(
-            policy_td,
-            in_keys=["loc", "scale"],
-            spec=self.env.full_action_spec_unbatched.to(self.device),
-            distribution_class=distribution_class,
-            distribution_kwargs=distribution_kwargs,
-            return_log_prob=False,
-            default_interaction_type=ExplorationType.RANDOM,
-        )
-    
-    def _construct_q_function(self, q_net: nn.Module | None = None) -> TensorDictModule:
-        """Construct Q-function for SAC."""
-        if self.config.q_function is None:
-            raise ValueError("GAIL requires a Q-function configuration")
-        
-        # Build Q-network
-        if q_net is None:
-            q_mlp = MLP(
-                in_features=self.config.q_function.input_dim,
-                activation_class=get_activation_class(self.config.q_function.activation_fn),
-                out_features=1,
-                num_cells=list(self.config.q_function.num_cells),
-                device=self.device,
+            value_cfg = cfg.value_function
+            base = (
+                value_cfg.get_input_keys()
+                if value_cfg is not None
+                else cfg.policy.get_input_keys()
             )
-        else:
-            q_mlp = q_net
-        
-        # Q-function takes both observation and action
-        in_keys = self.config.q_function.get_input_keys()
-        if "action" not in in_keys:
-            in_keys.append("action")
-        
-        return ValueOperator(
-            module=q_mlp,
-            in_keys=in_keys,
-            out_keys=["state_action_value"],
-        )
-    
-    def _construct_actor_critic(self) -> TensorDictModule:
-        """Construct actor-critic for SAC."""
-        assert isinstance(self.q_function, TensorDictModule)
-        assert isinstance(self.policy, TensorDictModule)
-        
-        # Use identity module as common operator (no feature extraction)
-        class IdentityModule(torch.nn.Module):
-            def forward(self, *x):
-                return x[0] if len(x) == 1 else x
-        
-        common_operator = TensorDictModule(
-            module=IdentityModule(),
-            in_keys=["observation"],
-            out_keys=["observation"],
-        )
-        
-        return ActorCriticOperator(
-            common_operator=common_operator,
-            policy_operator=self.policy,
-            value_operator=self.q_function,
-        )
-    
-    def _construct_loss_module(self) -> nn.Module:
-        """Construct SAC loss module."""
-        assert isinstance(self.config, GAILRLOptConfig)
-        
-        # Initialize lazy layers
-        fake_tensordict = self.env.fake_tensordict()
-        with torch.no_grad():
-            _ = self.actor_critic(fake_tensordict)
-        
-        loss_module = SACLoss(
-            actor_network=self.actor_critic.get_policy_operator(),
-            qvalue_network=self.actor_critic.get_critic_operator(),
-            num_qvalue_nets=2,
-            loss_function=self.config.loss.loss_critic_type,
-            delay_actor=False,
-            delay_qvalue=True,
-        )
-        loss_module.make_value_estimator(gamma=self.config.loss.gamma)
-        
-        return loss_module
-    
-    def _construct_data_buffer(self) -> ReplayBuffer:
-        """Construct replay buffer for policy samples."""
-        storage = LazyTensorStorage(max_size=self.config.replay_buffer.size)
-        return TensorDictReplayBuffer(
-            storage=storage,
-            batch_size=self.config.loss.mini_batch_size,
-        )
-    
-    def _construct_target_net_updater(self) -> SoftUpdate:
-        """Construct target network updater for SAC."""
-        eps = self.config.optim.target_update_polyak
-        return SoftUpdate(self.loss_module, eps=eps)
-    
-    def predict(self, observation: Tensor, deterministic: bool = False) -> Tensor:
-        """Predict action from observation."""
-        with torch.no_grad():
-            td = TensorDict(
-                {"observation": observation},
-                batch_size=observation.shape[:-1],
-            )
-            td = self.policy_module(td)
-            if deterministic:
-                # Use mean of distribution
-                return td["loc"]
-            else:
-                # Sample from distribution
-                return td["action"]
 
-    # ========================================================================
-    # GAIL-specific methods
-    # ========================================================================
+        # Keep only keys that exist in current observation spec.
+        available = set(env.observation_spec.keys(True))
+        resolved: list[ObsKey] = []
+        for key in dedupe_keys(list(base)):
+            if key in available:
+                resolved.append(cast(ObsKey, key))
+                continue
+            # If a grouped key was requested but observations are flattened, fallback.
+            if isinstance(key, tuple) and len(key) > 0:
+                flat_candidate = cast(ObsKey, key[-1])
+                if flat_candidate in available:
+                    resolved.append(flat_candidate)
+                    continue
+            msg = f"Discriminator observation key '{key}' not found in env.observation_spec."
+            raise KeyError(msg)
+        return resolved
 
-    def set_expert_buffer(self, expert_buffer: ExpertReplayBuffer) -> None:
-        """Set the expert replay buffer."""
-        self._expert_buffer = expert_buffer
-        self.log.info(f"Expert buffer attached: {len(expert_buffer)} samples")
+    @staticmethod
+    def _obs_key_feature_shape(env, key: ObsKey) -> tuple[int, ...]:
+        shape = tuple(int(dim) for dim in env.observation_spec[key].shape)
+        batch_prefix = tuple(int(dim) for dim in getattr(env, "batch_size", ()))
+        if (
+            len(batch_prefix) > 0
+            and len(shape) >= len(batch_prefix)
+            and shape[: len(batch_prefix)] == batch_prefix
+        ):
+            return shape[len(batch_prefix) :]
+        return shape
 
-    def _next_expert_batch(self) -> TensorDict | None:
-        """Sample a batch from expert buffer."""
-        if self._expert_buffer is None:
-            return None
+    @classmethod
+    def _obs_key_feature_ndim(cls, env, key: ObsKey) -> int:
+        return len(cls._obs_key_feature_shape(env, key))
 
-        try:
-            # ExpertReplayBuffer.sample() doesn't take arguments - batch_size is set at init
-            return self._expert_buffer.sample().to(self.device)
-        except Exception as e:
-            self.log.warning(f"Failed to sample expert batch: {e}")
-            return None
+    @classmethod
+    def _obs_key_feature_dim(cls, env, key: ObsKey) -> int:
+        shape = cls._obs_key_feature_shape(env, key)
+        return int(np.prod(shape)) if shape else 1
 
     def _set_optimizers(
-        self, optimizer_cls: type, optimizer_kwargs: dict
+        self, optimizer_cls: type[torch.optim.Optimizer], optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
-        """Set up optimizers for all trainable components."""
-        # Initialize discriminator (needs device from parent __init__)
+        optimizers = super()._set_optimizers(optimizer_cls, optimizer_kwargs)
         if self.discriminator is None:
             self.discriminator = Discriminator(
-                observation_dim=self._obs_dim,
-                action_dim=self._action_dim,
+                observation_dim=self._disc_obs_dim,
+                action_dim=(
+                    self._action_dim if self.config.gail.discriminator_use_action else 0
+                ),
                 hidden_dims=self.config.gail.discriminator_hidden_dims,
                 activation=self.config.gail.discriminator_activation,
             ).to(self.device)
-        
-        # Create SAC optimizers (actor, critic, alpha)
-        critic_params = list(
-            self.loss_module.qvalue_network_params.flatten_keys().values()  # type: ignore[attr-defined]
-        )
-        actor_params = list(
-            self.loss_module.actor_network_params.flatten_keys().values()  # type: ignore[attr-defined]
-        )
-
-        optimizers = [
-            optimizer_cls(actor_params, **optimizer_kwargs),
-            optimizer_cls(critic_params, **optimizer_kwargs),
-        ]
-
-        # Alpha optimizer for SAC entropy temperature
-        if hasattr(self.loss_module, "log_alpha"):
-            param = self.loss_module.log_alpha
-            if isinstance(param, torch.nn.Parameter):
-                optimizers.append(torch.optim.Adam([param], lr=3.0e-4))
-
-        # Discriminator optimizer
         self.discriminator_optim = torch.optim.Adam(
             self.discriminator.parameters(),
             lr=self.config.gail.discriminator_lr,
         )
-
-        self.log.info("Optimizers configured:")
-        self.log.info(f"  Actor: {optimizer_kwargs.get('lr', 'N/A')}")
-        self.log.info(f"  Critic: {optimizer_kwargs.get('lr', 'N/A')}")
-        self.log.info(f"  Alpha: 3.0e-4")
-        self.log.info(f"  Discriminator: {self.config.gail.discriminator_lr}")
-        
         return optimizers
 
-    def update(self, sampled_tensordict: TensorDict) -> TensorDict:
-        """Perform one GAIL update step.
+    def set_expert_buffer(self, expert_buffer: ExpertReplayBuffer) -> None:
+        self._expert_buffer = expert_buffer
+        self.log.info("Expert buffer attached: %d samples", len(expert_buffer))
 
-        Args:
-            sampled_tensordict: Batch of transitions from replay buffer
+    def _next_expert_batch(self) -> TensorDict | None:
+        if self._expert_buffer is None:
+            return None
+        try:
+            return self._expert_buffer.sample().to(self.device)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.log.warning("Failed to sample expert batch: %s", exc)
+            return None
 
-        Returns:
-            TensorDict with loss values and diagnostics
-        """
-        # Validate input
-        if not self._validate_tensordict(
-            sampled_tensordict, "update:input", raise_error=False
-        ):
-            self.log.debug("Discarding batch due to non-finite values")
-            return self._dummy_loss_tensordict()
+    def _obs_features_from_td(self, td: TensorDict, *, detach: bool) -> Tensor:
+        parts: list[Tensor] = []
+        for key in self._disc_obs_keys:
+            obs = cast(Tensor, td.get(cast(BatchKey, key)))
+            obs = flatten_feature_tensor(obs, self._disc_obs_feature_ndims[key])
+            parts.append(obs.detach() if detach else obs)
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=-1)
 
-        # Zero all grads
-        self.optim.zero_grad(set_to_none=True)
-        self.discriminator_optim.zero_grad(set_to_none=True)
+    def _action_features_from_td(self, td: TensorDict, *, detach: bool) -> Tensor:
+        action = cast(Tensor, td.get("action"))
+        action = flatten_feature_tensor(action, self._action_feature_ndim)
+        return action.detach() if detach else action
 
-        # Extract policy data
-        policy_obs = sampled_tensordict["observation"]
-        policy_action = sampled_tensordict["action"]
-
-        # Sample expert data
-        expert_td = self._next_expert_batch()
-        if expert_td is None and not self._warned_no_expert:
-            self.log.warning("No expert data available, skipping discriminator update")
-            self._warned_no_expert = True
-
-        # ====================================================================
-        # 1. Update discriminator
-        # ====================================================================
-        discriminator_info = {}
-        if expert_td is not None:
-            expert_obs = expert_td["observation"].to(self.device)
-            expert_action = expert_td["action"].to(self.device)
-
-            for _ in range(self.config.gail.discriminator_steps):
-                # Compute discriminator loss
-                disc_loss, disc_info = self.discriminator.compute_loss(
-                    expert_obs=expert_obs,
-                    expert_action=expert_action,
-                    policy_obs=policy_obs.detach(),  # Don't backprop through policy
-                    policy_action=policy_action.detach(),
-                )
-
-                # Update discriminator
-                disc_loss = disc_loss * self.config.gail.discriminator_loss_coeff
-                disc_loss.backward()
-
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(
-                    self.discriminator.parameters(),
-                    max_norm=1.0,
-                )
-
-                self.discriminator_optim.step()
-                self.discriminator_optim.zero_grad(set_to_none=True)
-
-                discriminator_info = disc_info
-
-        # ====================================================================
-        # 2. Compute GAIL rewards for policy update
-        # ====================================================================
-        if self.config.gail.use_gail_reward:
-            # Use discriminator-based rewards
-            with torch.no_grad():
-                gail_rewards = self.discriminator.compute_reward(
-                    policy_obs, policy_action
-                )
-
-            # Replace rewards in tensordict
-            sampled_tensordict_for_sac = sampled_tensordict.clone()
-            sampled_tensordict_for_sac["reward"] = (
-                gail_rewards * self.config.gail.gail_reward_coeff
-            ).unsqueeze(-1)
-        else:
-            # Use environment rewards (for debugging)
-            sampled_tensordict_for_sac = sampled_tensordict
-
-        # ====================================================================
-        # 3. Update policy with SAC
-        # ====================================================================
-        loss_td = cast(TensorDict, self.loss_module(sampled_tensordict_for_sac))
-        loss_td = self._sanitize_loss_tensordict(loss_td, "update:raw_sac_loss")
-
-        actor_loss = cast(Tensor, loss_td["loss_actor"])
-        q_loss = cast(Tensor, loss_td["loss_qvalue"])
-        alpha_loss = cast(Tensor, loss_td["loss_alpha"])
-        total_sac_loss = (actor_loss + q_loss + alpha_loss).sum()
-        total_sac_loss.backward()
-
-        # Validate gradients
-        if not self._validate_gradients("update:post_backward", raise_error=False):
-            self.log.debug("Non-finite gradients detected, skipping update")
-            self.optim.zero_grad(set_to_none=True)
-            return self._dummy_loss_tensordict()
-
-        # Step SAC optimizers
-        self.optim.step()
-        self.optim.zero_grad(set_to_none=True)
-
-        # Update target networks
-        self.target_net_updater.step()
-
-        # ====================================================================
-        # 4. Attach diagnostics
-        # ====================================================================
-        out = cast(TensorDict, loss_td.clone())
-
-        # Add discriminator diagnostics
-        for key, value in discriminator_info.items():
-            out[key] = value
-
-        # Add GAIL reward diagnostics
-        if self.config.gail.use_gail_reward:
-            with torch.no_grad():
-                out["gail_reward_mean"] = gail_rewards.mean()
-                out["gail_reward_std"] = gail_rewards.std()
-
-        return out
-
-    def _dummy_loss_tensordict(self) -> TensorDict:
-        """Return dummy loss tensordict for error cases."""
-        return TensorDict(
-            {
-                "loss_actor": torch.tensor(0.0, device=self.device),
-                "loss_qvalue": torch.tensor(0.0, device=self.device),
-                "loss_alpha": torch.tensor(0.0, device=self.device),
-                "discriminator_loss": torch.tensor(0.0, device=self.device),
-                "gail_reward_mean": torch.tensor(0.0, device=self.device),
-                "gail_reward_std": torch.tensor(0.0, device=self.device),
-            },
-            batch_size=[],
+    def _gail_discriminator_loss(
+        self,
+        expert_obs: Tensor,
+        expert_action: Tensor | None,
+        policy_obs: Tensor,
+        policy_action: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        assert self.discriminator is not None
+        if expert_action is None:
+            expert_action = torch.zeros(
+                expert_obs.shape[0], 0, device=expert_obs.device, dtype=expert_obs.dtype
+            )
+        if policy_action is None:
+            policy_action = torch.zeros(
+                policy_obs.shape[0], 0, device=policy_obs.device, dtype=policy_obs.dtype
+            )
+        return self.discriminator.compute_loss(
+            expert_obs=expert_obs,
+            expert_action=expert_action,
+            policy_obs=policy_obs,
+            policy_action=policy_action,
         )
 
-    def train(self) -> None:
-        """Train GAIL on the environment."""
+    def _gail_reward(self, obs: Tensor, action: Tensor | None) -> Tensor:
+        assert self.discriminator is not None
+        if action is None:
+            action = torch.zeros(obs.shape[0], 0, device=obs.device, dtype=obs.dtype)
+        return self.discriminator.compute_reward(obs, action)
+
+    def _update_discriminator(self, rollout_flat: TensorDict) -> dict[str, float]:
+        if self._expert_buffer is None:
+            if not self._warned_no_expert:
+                self.log.warning(
+                    "No expert buffer set. Training falls back to environment reward."
+                )
+                self._warned_no_expert = True
+            return {}
+        assert self.discriminator is not None
+        assert self.discriminator_optim is not None
+
+        policy_obs = self._obs_features_from_td(rollout_flat, detach=False).to(self.device)
+        policy_action: Tensor | None = None
+        if self.config.gail.discriminator_use_action:
+            policy_action = self._action_features_from_td(rollout_flat, detach=False).to(
+                self.device
+            )
+        if policy_obs.shape[0] == 0:
+            return {}
+
+        stats_accum: dict[str, float] = {}
+        steps = max(1, int(self.config.gail.discriminator_steps))
+        for _ in range(steps):
+            expert_td = self._next_expert_batch()
+            if expert_td is None:
+                continue
+            expert_obs = self._obs_features_from_td(expert_td, detach=False).to(self.device)
+            expert_action: Tensor | None = None
+            if self.config.gail.discriminator_use_action:
+                expert_action = self._action_features_from_td(expert_td, detach=False).to(
+                    self.device
+                )
+            if expert_obs.shape[0] == 0:
+                continue
+
+            batch_size = int(
+                min(
+                    self.config.gail.expert_batch_size,
+                    expert_obs.shape[0],
+                    policy_obs.shape[0],
+                )
+            )
+            if batch_size <= 0:
+                continue
+            p_idx = torch.randint(
+                policy_obs.shape[0], (batch_size,), device=self.device
+            )
+            e_idx = torch.randint(
+                expert_obs.shape[0], (batch_size,), device=self.device
+            )
+
+            loss, info = self._gail_discriminator_loss(
+                expert_obs[e_idx],
+                expert_action[e_idx] if expert_action is not None else None,
+                policy_obs[p_idx].detach(),
+                policy_action[p_idx].detach() if policy_action is not None else None,
+            )
+            loss = loss * self.config.gail.discriminator_loss_coeff
+            self.discriminator_optim.zero_grad(set_to_none=True)
+            loss.backward()
+            clip_grad_norm_(
+                self.discriminator.parameters(),
+                self.config.gail.discriminator_grad_clip_norm,
+            )
+            self.discriminator_optim.step()
+
+            for key, value in info.items():
+                stats_accum[key] = stats_accum.get(key, 0.0) + float(value.detach().item())
+
+        if not stats_accum:
+            return {}
+        return {k: v / steps for k, v in stats_accum.items()}
+
+    def _replace_rewards_with_discriminator(self, data: TensorDict) -> dict[str, float]:
+        if not self.config.gail.use_gail_reward or self.discriminator is None:
+            return {}
+
+        with torch.no_grad():
+            obs = self._obs_features_from_td(data, detach=True).to(self.device)
+            action: Tensor | None = None
+            if self.config.gail.discriminator_use_action:
+                action = self._action_features_from_td(data, detach=True).to(self.device)
+            disc_reward = self._gail_reward(obs, action)
+            disc_reward = self.config.gail.gail_reward_coeff * disc_reward
+
+            env_reward = data["next", "reward"].to(self.device)
+            squeeze_last = env_reward.ndim == disc_reward.ndim + 1 and env_reward.shape[-1] == 1
+            env_reward_base = env_reward.squeeze(-1) if squeeze_last else env_reward
+            p_env = float(np.clip(self.config.gail.proportion_env_reward, 0.0, 1.0))
+            mixed_reward = p_env * env_reward_base + (1.0 - p_env) * disc_reward
+            if squeeze_last:
+                mixed_reward = mixed_reward.unsqueeze(-1)
+            data.set(("next", "reward"), mixed_reward)
+
+        return {
+            "gail/reward_mean": float(disc_reward.mean().item()),
+            "gail/reward_std": float(disc_reward.std().item()),
+        }
+
+    def train(self) -> None:  # type: ignore[override]
         cfg = self.config
         assert isinstance(cfg, GAILRLOptConfig)
-        
-        frames_per_batch = cfg.collector.frames_per_batch
-        total_frames = cfg.collector.total_frames
-        init_random_frames = int(cfg.collector.init_random_frames)
-        
-        # UTD ratio for SAC updates
-        utd_ratio = 1.0  # Standard SAC update ratio
-        num_updates = max(1, int(frames_per_batch * utd_ratio))
 
-        # Compilation (if requested)
-        compile_mode = None
-        if cfg.compile.compile:
-            compile_mode = cfg.compile.compile_mode
-            if compile_mode in ("", None):
-                compile_mode = "reduce-overhead" if not cfg.compile.cudagraphs else "default"
-            
-            self.log.info(f"Compiling update function with mode: {compile_mode}")
-            from torchrl._utils import compile_with_warmup
-            self.update = compile_with_warmup(self.update, mode=compile_mode, warmup=1)  # type: ignore[method-assign]
-        
-        # CUDAGraphs (experimental)
-        if cfg.compile.cudagraphs:
-            if self.device.type == "cuda":
-                import warnings
-                from tensordict.nn import CudaGraphModule
-                warnings.warn(
-                    "CudaGraphModule is experimental and may lead to silently wrong results.",
-                    category=UserWarning,
-                )
-                self.log.warning("Wrapping update with CudaGraphModule (experimental)")
-                self.update = CudaGraphModule(
-                    self.update, in_keys=[], out_keys=[], warmup=5
-                )  # type: ignore[method-assign]
-            else:
-                self.log.warning(f"CUDAGraphs requested but device is {self.device.type}, not CUDA. Skipping.")
-
-        # Training loop
         collected_frames = 0
-        pbar = self.collector
+        num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
+        pbar = tqdm.tqdm(total=cfg.collector.total_frames)
 
-        self.log.info("Starting GAIL training")
-        self.log.info(f"  Total frames: {total_frames:,}")
-        self.log.info(f"  Frames per batch: {frames_per_batch:,}")
-        self.log.info(f"  Updates per batch: {num_updates:,}")
+        num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
+        if cfg.collector.frames_per_batch % cfg.loss.mini_batch_size != 0:
+            num_mini_batches += 1
+        self.total_network_updates = (
+            (cfg.collector.total_frames // cfg.collector.frames_per_batch)
+            * cfg.loss.epochs
+            * num_mini_batches
+        )
 
-        for i, data in enumerate(pbar):
-            # Add episode rewards/lengths if available
-            if ("next", "done") in data.keys(True):
-                done_indices = data["next", "done"]
-                if done_indices.any():
-                    episode_rewards = data["next", "episode_reward"][done_indices]
-                    episode_length = data["next", "step_count"][done_indices]
+        cfg_loss_ppo_epochs = cfg.loss.epochs
+        cfg_loss_anneal_clip_eps = cfg.ppo.anneal_clip_epsilon
+        cfg_loss_clip_epsilon = cfg.ppo.clip_epsilon
+        losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])
+
+        self.collector = cast(SyncDataCollector, self.collector)
+        collector_iter = iter(self.collector)
+        total_iter = len(self.collector)
+        policy_op = self.actor_critic.get_policy_operator()
+
+        for _i in range(total_iter):
+            self.actor_critic.eval()
+            self.adv_module.eval()
+            with timeit("collecting"):
+                data = next(collector_iter)
+
+            metrics_to_log: dict[str, Any] = {}
+            frames_in_batch = data.numel()
+            collected_frames += frames_in_batch
+            pbar.update(frames_in_batch)
+
+            if ("next", "reward") in data.keys(True):
+                step_rewards = data["next", "reward"]
+                metrics_to_log.update(
+                    {
+                        "train/step_reward_mean": step_rewards.mean().item(),
+                        "train/step_reward_std": step_rewards.std().item(),
+                        "train/step_reward_max": step_rewards.max().item(),
+                        "train/step_reward_min": step_rewards.min().item(),
+                    }
+                )
+            if ("next", "episode_reward") in data.keys(True):
+                episode_rewards = data["next", "episode_reward"][data["next", "done"]]
+                if len(episode_rewards) > 0:
+                    episode_length = data["next", "step_count"][data["next", "done"]]
                     self.episode_lengths.extend(episode_length.cpu().tolist())
                     self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                    metrics_to_log.update(
+                        {
+                            "episode/length": float(np.mean(self.episode_lengths)),
+                            "episode/return": float(np.mean(self.episode_rewards)),
+                            "train/reward": float(np.mean(episode_rewards.cpu().tolist())),
+                        }
+                    )
 
-            # Store in replay buffer
-            self.data_buffer.extend(data.reshape(-1))  # type: ignore[arg-type]
-            collected_frames += data.numel()
+            discriminator_metrics = self._update_discriminator(data.reshape(-1))
+            if discriminator_metrics:
+                metrics_to_log.update(
+                    {f"train/{k}": v for k, v in discriminator_metrics.items()}
+                )
+            reward_metrics = self._replace_rewards_with_discriminator(data)
+            if reward_metrics:
+                metrics_to_log.update(
+                    {f"train/{k}": v for k, v in reward_metrics.items()}
+                )
 
-            # Training updates
-            if collected_frames >= init_random_frames:
-                for _ in range(num_updates):
-                    # Sample from policy replay buffer
-                    sampled_td = self.data_buffer.sample().to(self.device)
-                    
-                    # Perform GAIL update (discriminator + policy)
-                    loss_td = self.update(sampled_td).clone()
-                    
-                    # Log metrics - convert TensorDict to dict
-                    metrics_dict = {k: v.item() if isinstance(v, torch.Tensor) else v 
-                                   for k, v in loss_td.items()}
-                    if self.episode_rewards:
-                        metrics_dict["episode/reward"] = float(np.mean(list(self.episode_rewards)[-10:]))
-                    self.log_metrics(metrics_dict, step=collected_frames)
+            self.data_buffer.empty()
+            self.actor_critic.train()
+            self.adv_module.train()
+            with timeit("training"):
+                for j in range(cfg_loss_ppo_epochs):
+                    with torch.no_grad(), timeit("adv"):
+                        data = self.adv_module(data)
+                        if self.config.compile.compile_mode:
+                            data = data.clone()
 
-            # Check if done
-            if collected_frames >= total_frames:
-                break
+                    with timeit("rb - extend"):
+                        data_reshape = data.reshape(-1)
+                        self.data_buffer.extend(data_reshape)
 
-        self.log.info("Training complete")
+                    for k, batch in enumerate(self.data_buffer):
+                        kl_context = None
+                        if (self.config.optim.scheduler or "").lower() == "adaptive":
+                            kl_context = self._prepare_kl_context(batch, policy_op)
+                        with timeit("update"):
+                            loss, num_network_updates = self.update(  # type: ignore[misc]
+                                batch, num_network_updates=num_network_updates
+                            )
+                            loss = loss.clone()
+                        if kl_context is not None:
+                            kl_approx = self._compute_kl_after_update(kl_context, policy_op)
+                            if kl_approx is not None:
+                                loss.set("kl_approx", kl_approx.detach())
+                                self._maybe_adjust_lr(kl_approx, self.config.optim)
+
+                        num_network_updates = num_network_updates.clone()
+                        loss_keys = ["loss_critic", "loss_entropy", "loss_objective"]
+                        optional_keys = [
+                            "entropy",
+                            "explained_variance",
+                            "clip_fraction",
+                            "value_clip_fraction",
+                            "ESS",
+                            "kl_approx",
+                            "grad_norm",
+                        ]
+                        for key in optional_keys:
+                            if key in loss:
+                                loss_keys.append(key)
+                        losses[j, k] = loss.select(*loss_keys)
+
+                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
+                        self.lr_scheduler.step()
+
+            losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
+            for key, value in losses_mean.items():
+                metrics_to_log[f"train/{key}"] = value.item()
+            metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
+
+            clip_attr = getattr(self.loss_module, "clip_epsilon", None)
+            if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
+                clip_epsilon_value = clip_attr.detach()
+            else:
+                clip_epsilon_value = torch.tensor(
+                    cfg_loss_clip_epsilon,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            metrics_to_log["train/clip_epsilon"] = clip_epsilon_value
+
+            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
+                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                for key, value in log_info_dict.items():
+                    metrics_to_log[f"env/{key}"] = (
+                        value.mean().item() if isinstance(value, Tensor) else value
+                    )
+
+            metrics_to_log.update(timeit.todict(prefix="time"))
+            rate = pbar.format_dict.get("rate")
+            if rate is not None:
+                metrics_to_log["time/speed"] = rate
+
+            self.log_metrics(metrics_to_log, step=collected_frames)
+            self.collector.update_policy_weights_()
+
+            if (
+                self.config.save_interval > 0
+                and num_network_updates % self.config.save_interval == 0
+            ):
+                self.save_model(
+                    path=self.log_dir / self.config.logger.save_path,
+                    step=int(collected_frames),
+                )
+
         self.collector.shutdown()
 
     def save(self, path: str | Path) -> None:
-        """Save GAIL model."""
         path = Path(path)
         torch.save(
             {
                 "actor_critic": self.actor_critic.state_dict(),
-                "discriminator": self.discriminator.state_dict(),
+                "discriminator": self.discriminator.state_dict() if self.discriminator else {},
                 "config": self.config,
             },
             path,
         )
-        self.log.info(f"Model saved to {path}")
+        self.log.info("Model saved to %s", path)
 
     def load(self, path: str | Path) -> None:
-        """Load GAIL model."""
         path = Path(path)
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.actor_critic.load_state_dict(checkpoint["actor_critic"])
-        self.discriminator.load_state_dict(checkpoint["discriminator"])
-        self.log.info(f"Model loaded from {path}")
+        if self.discriminator is not None and "discriminator" in checkpoint:
+            self.discriminator.load_state_dict(checkpoint["discriminator"])
+        self.log.info("Model loaded from %s", path)
+
+
+class AMP(GAIL):
+    """Adversarial Motion Prior using PPO + least-squares discriminator."""
+
+    def _gail_discriminator_loss(
+        self,
+        expert_obs: Tensor,
+        expert_action: Tensor | None,
+        policy_obs: Tensor,
+        policy_action: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        assert self.discriminator is not None
+        if expert_action is None:
+            expert_action = torch.zeros(
+                expert_obs.shape[0], 0, device=expert_obs.device, dtype=expert_obs.dtype
+            )
+        if policy_action is None:
+            policy_action = torch.zeros(
+                policy_obs.shape[0], 0, device=policy_obs.device, dtype=policy_obs.dtype
+            )
+        expert_logits = self.discriminator(expert_obs, expert_action).squeeze(-1)
+        policy_logits = self.discriminator(policy_obs, policy_action).squeeze(-1)
+        expert_target = torch.ones_like(expert_logits)
+        policy_target = -torch.ones_like(policy_logits)
+        loss = torch.mean((expert_logits - expert_target) ** 2) + torch.mean(
+            (policy_logits - policy_target) ** 2
+        )
+        info = {
+            "discriminator_loss": loss.detach(),
+            "expert_d_mean": expert_logits.mean().detach(),
+            "policy_d_mean": policy_logits.mean().detach(),
+        }
+        return loss, info
+
+    def _gail_reward(self, obs: Tensor, action: Tensor | None) -> Tensor:
+        assert self.discriminator is not None
+        if action is None:
+            action = torch.zeros(obs.shape[0], 0, device=obs.device, dtype=obs.dtype)
+        logits = self.discriminator(obs, action).squeeze(-1)
+        reward = 1.0 - 0.25 * (logits - 1.0) ** 2
+        if self.config.gail.amp_reward_clip:
+            reward = torch.clamp_min(reward, 0.0)
+        return reward
