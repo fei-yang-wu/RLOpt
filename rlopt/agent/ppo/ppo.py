@@ -157,6 +157,9 @@ class PPO(BaseAlgorithm):
         # construct the advantage module
         self.adv_module = self._construct_adv_module()
 
+        # Cache optimizer parameters for compile-friendly grad clipping.
+        self._refresh_grad_clip_params()
+
         # Compile if requested
         self._compile_components()
 
@@ -337,6 +340,14 @@ class PPO(BaseAlgorithm):
         # For PPO, we use a single optimizer for both policy and value
         return [optimizer_cls(self.actor_critic.parameters(), **optimizer_kwargs)]
 
+    def _refresh_grad_clip_params(self) -> None:
+        """Cache optimizer parameters to avoid dynamic traversal in update."""
+        self._grad_clip_params: list[Tensor] = [
+            param
+            for group in self.optim.param_groups
+            for param in group["params"]
+        ]
+
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer"""
         # Create data buffer
@@ -357,6 +368,10 @@ class PPO(BaseAlgorithm):
 
     def _compile_components(self):
         """Compile components"""
+        if not hasattr(self, "adv_module"):
+            return
+        if getattr(self, "_components_compiled", False):
+            return
         compile_mode = None
         cfg = self.config
         if cfg.compile.compile:
@@ -369,6 +384,7 @@ class PPO(BaseAlgorithm):
 
             self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore
             self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore
+            self._components_compiled = True
 
     def update(
         self, batch: TensorDict, num_network_updates: int
@@ -385,40 +401,28 @@ class PPO(BaseAlgorithm):
         # Backward pass
         total_loss.backward()  # type: ignore
 
-        # clone the loss
-        output_loss = loss.clone().detach_()
+        output_loss = loss.detach()
 
-        max_grad_norm = getattr(self.config.optim, "max_grad_norm", None)
-        grad_norm_tensor = None
+        max_grad_norm = self.config.optim.max_grad_norm
         if max_grad_norm is not None and max_grad_norm > 0:
-            grad_params = [
-                p
-                for group in self.optim.param_groups
-                for p in group["params"]
-                if p.grad is not None
-            ]
-            if grad_params:
-                grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
-
-        # clip gradients per optimizer group
-        for group in self.optim.param_groups:
-            torch.nn.utils.clip_grad_norm_(
-                group["params"], self.config.optim.max_grad_norm
+            grad_norm_tensor = clip_grad_norm_(
+                self._grad_clip_params, float(max_grad_norm)
             )
+        else:
+            grad_norm_tensor = torch.zeros((), device=self.device)
 
         # Update the networks
         self.optim.step()
-        if self.lr_scheduler and self.lr_scheduler_step == "update":
-            self.lr_scheduler.step()
         output_loss.set("alpha", torch.tensor(1.0, device=self.device))
-        if grad_norm_tensor is not None:
-            output_loss.set("grad_norm", grad_norm_tensor.detach())
-        current_lr = torch.tensor(
-            self.optim.param_groups[0]["lr"],
-            device=self.device,
-            dtype=torch.float32,
+        output_loss.set("grad_norm", grad_norm_tensor.detach())
+        output_loss.set(
+            "lr",
+            torch.tensor(
+                self.config.optim.lr,
+                device=self.device,
+                dtype=torch.float32,
+            ),
         )
-        output_loss.set("lr", current_lr)
         output_loss.set("skipped_update", torch.tensor(False, device=self.device))
         return output_loss, num_network_updates + 1
 
@@ -542,6 +546,8 @@ class PPO(BaseAlgorithm):
                                 batch, num_network_updates=num_network_updates
                             )
                             loss = loss.clone()
+                        if self.lr_scheduler and self.lr_scheduler_step == "update":
+                            self.lr_scheduler.step()
                         if kl_context is not None:
                             kl_approx = self._compute_kl_after_update(
                                 kl_context, policy_op

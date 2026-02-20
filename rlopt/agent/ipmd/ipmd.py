@@ -207,11 +207,21 @@ class IPMD(PPO):
 
         # Re-create optimizer to include reward_estimator parameters
         self.optim = self._configure_optimizers()
+        self._refresh_grad_clip_params()
+
+        # Compile only after all IPMD-specific components are initialized.
+        self._compile_components()
 
     def _compile_components(self) -> None:
         """Compile update (fixed signature for torch.compile and CUDA graphs)."""
         cfg = self.config
         assert isinstance(cfg, IPMDRLOptConfig)
+        if not hasattr(self, "adv_module"):
+            return
+        if not hasattr(self, "reward_estimator"):
+            return
+        if getattr(self, "_components_compiled", False):
+            return
         if not cfg.compile.compile:
             return
         compile_mode = cfg.compile.compile_mode or (
@@ -219,6 +229,7 @@ class IPMD(PPO):
         )
         self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore[method-assign]
         self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore[method-assign]
+        self._components_compiled = True
 
     _REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
 
@@ -544,11 +555,11 @@ class IPMD(PPO):
         total_ppo_loss = critic_loss + actor_loss
         total_ppo_loss.backward()
 
-        output_loss = loss.clone().detach_()
+        output_loss = loss.detach()
 
         # 2) IPMD reward loss (always computed; scaled by has_expert for fixed graph)
         r_pi = self._reward_from_batch(batch)
-        r_exp = self._reward_from_batch(expert_batch.to(self.device))
+        r_exp = self._reward_from_batch(expert_batch)
         diff = r_pi.mean() - r_exp.mean()
         l2 = torch.zeros((), device=self.device)
         # for p in self.reward_estimator.parameters():
@@ -566,12 +577,11 @@ class IPMD(PPO):
         # 3) Behavior cloning loss on expert actions (scaled by has_expert)
         bc_coeff = float(self.config.ipmd.bc_loss_coeff)
         if bc_coeff > 0.0:
-            expert_obs_td = expert_batch.select(*self._policy_obs_keys).to(self.device)
-            policy_op = self.actor_critic.get_policy_operator()
-            expert_policy_td = policy_op(expert_obs_td)
+            expert_obs_td = expert_batch.select(*self._policy_obs_keys)
+            expert_policy_td = self.actor_critic.get_policy_operator()(expert_obs_td)
             loc = expert_policy_td.get("loc")
             scale = expert_policy_td.get("scale")
-            expert_action = expert_batch.get("action").to(self.device)
+            expert_action = expert_batch.get("action")
             # Gaussian log-prob: sum over action dims, mean over batch
             log_prob = -0.5 * (
                 ((expert_action - loc) / scale).pow(2)
@@ -586,15 +596,16 @@ class IPMD(PPO):
             output_loss_bc = torch.tensor(0.0, device=self.device)
 
         # Gradient clipping (always call for fixed graph)
-        grad_params = list(self.actor_critic.parameters()) + list(
-            self.reward_estimator.parameters()
-        )
-        max_grad_norm = getattr(self.config.optim, "max_grad_norm", None) or 1e10
-        grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
+        max_grad_norm = self.config.optim.max_grad_norm
+        if max_grad_norm is not None and max_grad_norm > 0:
+            grad_norm_tensor = clip_grad_norm_(
+                self._grad_clip_params,
+                float(max_grad_norm),
+            )
+        else:
+            grad_norm_tensor = torch.zeros((), device=self.device)
 
         self.optim.step()
-        if self.lr_scheduler and self.lr_scheduler_step == "update":
-            self.lr_scheduler.step()
 
         output_loss.set("alpha", torch.tensor(1.0, device=self.device))
         output_loss.set("loss_reward_diff", reward_diff)
@@ -604,7 +615,7 @@ class IPMD(PPO):
         output_loss.set(
             "lr",
             torch.tensor(
-                self.optim.param_groups[0]["lr"],
+                self.config.optim.lr,
                 device=self.device,
                 dtype=torch.float32,
             ),
@@ -740,6 +751,8 @@ class IPMD(PPO):
                                 has_expert,
                             )
                             loss = loss.clone()
+                        if self.lr_scheduler and self.lr_scheduler_step == "update":
+                            self.lr_scheduler.step()
                         if kl_context is not None:
                             kl_approx = self._compute_kl_after_update(
                                 kl_context, policy_op
