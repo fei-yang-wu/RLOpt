@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import tqdm
 from tensordict import TensorDict
 from tensordict.nn import InteractionType
@@ -125,6 +126,108 @@ class IPMDConfig(PPOConfig):
     during early training.  Set to 0 to disable (default).
     """
 
+    reward_optimizer: str | None = None
+    """Optional reward-optimizer name (defaults to ``optim.optimizer`` when None)."""
+
+    reward_lr: float | None = None
+    """Optional reward learning rate (defaults to ``optim.lr`` when None)."""
+
+    reward_weight_decay: float | None = None
+    """Optional reward weight decay (defaults to ``optim.weight_decay`` when None)."""
+
+    reward_optimizer_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Extra kwargs merged into the reward optimizer configuration."""
+
+    reward_max_grad_norm: float | None = None
+    """Optional grad clip norm for reward optimizer (falls back to ``optim.max_grad_norm``)."""
+
+    reward_update_interval: int = 1
+    """Update reward estimator every N PPO updates (1 = every update)."""
+
+    use_reward_target_network: bool = False
+    """Whether to maintain a Polyak target copy of the reward estimator."""
+
+    use_reward_target_for_ppo: bool = False
+    """Use target reward network (instead of online reward net) for PPO reward replacement."""
+
+    reward_target_polyak: float = 0.995
+    """Polyak coefficient for reward-target update (higher = slower target updates)."""
+
+    reward_target_update_interval: int = 1
+    """Update reward target every N reward updates."""
+
+    reward_margin: float = 0.0
+    """Optional margin for reward-gap hinge: ``relu(mean(r_pi)-mean(r_exp)+margin)``."""
+
+    reward_consistency_coeff: float = 0.0
+    """Trust-region coefficient to keep reward close to target reward predictions."""
+
+    reward_grad_penalty_coeff: float = 0.0
+    """R1-style gradient penalty coefficient on expert reward inputs."""
+
+    reward_logit_reg_coeff: float = 0.0
+    """Regularization coefficient on reward logits to reduce saturation."""
+
+    reward_param_weight_decay_coeff: float = 0.0
+    """Explicit L2 regularization coefficient over reward-estimator parameters."""
+
+    normalize_reward_input: bool = False
+    """Whether to apply running mean/std normalization to reward-model inputs."""
+
+    reward_input_norm_momentum: float = 0.01
+    """EMA momentum for reward input running statistics."""
+
+    reward_input_norm_eps: float = 1.0e-5
+    """Numerical epsilon for reward input normalization."""
+
+    reward_input_norm_clip: float | None = None
+    """Optional absolute clip value applied after reward input normalization."""
+
+    reward_replay_size: int = 0
+    """Size of optional policy-transition replay for reward updates (0 disables)."""
+
+    reward_replay_ratio: float = 0.0
+    """Extra replay samples per on-policy sample for reward updates."""
+
+    reward_replay_batch_size: int | None = None
+    """Fixed replay sample size for reward updates (overrides ratio when set)."""
+
+    reward_replay_keep_prob: float = 1.0
+    """Probability of keeping each on-policy transition when filling reward replay."""
+
+    reward_mix_alpha_start: float = 1.0
+    """Initial blend weight for estimated reward in PPO reward mixing."""
+
+    reward_mix_alpha_end: float = 1.0
+    """Final blend weight for estimated reward in PPO reward mixing."""
+
+    reward_mix_anneal_updates: int = 0
+    """Linear anneal duration (in updates) for reward mixing alpha."""
+
+    reward_mix_gate_estimated_std_min: float = 0.0
+    """If estimated reward std is below this threshold, reduce alpha to fallback."""
+
+    reward_mix_alpha_when_unstable: float = 1.0
+    """Fallback alpha when estimated reward variance is too low."""
+
+    reward_mix_gate_after_updates: int = 0
+    """Only activate std-gating after this many updates."""
+
+    entropy_coeff_start: float | None = None
+    """Optional starting entropy coefficient for exploration schedule."""
+
+    entropy_coeff_end: float | None = None
+    """Optional ending entropy coefficient for exploration schedule."""
+
+    entropy_schedule_updates: int = 0
+    """Linear schedule duration (in updates) for entropy coefficient."""
+
+    bc_warmup_updates: int = 0
+    """Linear anneal duration (in updates) for BC coefficient."""
+
+    bc_final_coeff: float = 0.0
+    """Final BC coefficient after warmup schedule."""
+
 
 @dataclass
 class IPMDRLOptConfig(PPORLOptConfig):
@@ -201,13 +304,35 @@ class IPMD(PPO):
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
         self.reward_estimator.to(self.device)
 
+        self.reward_target_estimator: torch.nn.Module | None = None
+        if (
+            self.config.ipmd.use_reward_target_network
+            or self.config.ipmd.use_reward_target_for_ppo
+            or float(self.config.ipmd.reward_consistency_coeff) > 0.0
+        ):
+            self.reward_target_estimator = self._construct_reward_estimator()
+            self.reward_target_estimator.load_state_dict(self.reward_estimator.state_dict())
+            self.reward_target_estimator.to(self.device)
+            self.reward_target_estimator.eval()
+
+        # Running reward-input normalization stats (initialized lazily).
+        self._reward_input_running_mean: Tensor | None = None
+        self._reward_input_running_var: Tensor | None = None
+        self._reward_input_stats_initialized: bool = False
+        self._reward_target_update_counter: int = 0
+
         # Expert data source
         self._expert_buffer: TensorDictReplayBuffer | None = None
         self._warned_no_expert = False
+        self._reward_replay_buffer: TensorDictReplayBuffer | None = (
+            self._construct_reward_replay_buffer()
+        )
 
-        # Re-create optimizer to include reward_estimator parameters
+        # Re-create PPO optimizer (actor-critic only) after IPMD initialization.
         self.optim = self._configure_optimizers()
         self._refresh_grad_clip_params()
+        self.reward_optim = self._configure_reward_optimizer()
+        self._refresh_reward_grad_clip_params()
 
         # Compile only after all IPMD-specific components are initialized.
         self._compile_components()
@@ -232,6 +357,235 @@ class IPMD(PPO):
         self._components_compiled = True
 
     _REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
+
+    @staticmethod
+    def _counter_as_int(value: int | Tensor) -> int:
+        if isinstance(value, Tensor):
+            return int(value.detach().item())
+        return int(value)
+
+    @staticmethod
+    def _linear_schedule(start: float, end: float, step: int, total_steps: int) -> float:
+        if total_steps <= 0:
+            return end
+        step_clamped = min(max(step, 0), total_steps)
+        alpha = step_clamped / float(total_steps)
+        return float(start + alpha * (end - start))
+
+    def _current_entropy_coeff(self, update_idx: int) -> float:
+        cfg = self.config
+        assert isinstance(cfg, IPMDRLOptConfig)
+        base = float(cfg.ppo.entropy_coeff)
+        start = (
+            base
+            if cfg.ipmd.entropy_coeff_start is None
+            else float(cfg.ipmd.entropy_coeff_start)
+        )
+        end = (
+            base
+            if cfg.ipmd.entropy_coeff_end is None
+            else float(cfg.ipmd.entropy_coeff_end)
+        )
+        steps = int(cfg.ipmd.entropy_schedule_updates)
+        if start == end or steps <= 0:
+            return end
+        return self._linear_schedule(start, end, update_idx, steps)
+
+    def _set_loss_entropy_coeff(self, coeff: float) -> None:
+        entropy_attr = getattr(self.loss_module, "entropy_coeff", None)
+        if isinstance(entropy_attr, Tensor):
+            entropy_attr.copy_(
+                torch.tensor(coeff, device=entropy_attr.device, dtype=entropy_attr.dtype)
+            )
+        elif entropy_attr is not None:
+            setattr(self.loss_module, "entropy_coeff", float(coeff))
+
+    def _current_bc_coeff(self, update_idx: int) -> float:
+        cfg = self.config
+        assert isinstance(cfg, IPMDRLOptConfig)
+        start = float(cfg.ipmd.bc_loss_coeff)
+        end = float(cfg.ipmd.bc_final_coeff)
+        steps = int(cfg.ipmd.bc_warmup_updates)
+        if steps <= 0 or start == end:
+            return start
+        return self._linear_schedule(start, end, update_idx, steps)
+
+    def _current_reward_mix_alpha(
+        self, update_idx: int, estimated_reward_std: float
+    ) -> float:
+        cfg = self.config
+        assert isinstance(cfg, IPMDRLOptConfig)
+        alpha = self._linear_schedule(
+            float(cfg.ipmd.reward_mix_alpha_start),
+            float(cfg.ipmd.reward_mix_alpha_end),
+            update_idx,
+            int(cfg.ipmd.reward_mix_anneal_updates),
+        )
+        if (
+            update_idx >= int(cfg.ipmd.reward_mix_gate_after_updates)
+            and float(cfg.ipmd.reward_mix_gate_estimated_std_min) > 0.0
+            and estimated_reward_std < float(cfg.ipmd.reward_mix_gate_estimated_std_min)
+        ):
+            alpha = min(alpha, float(cfg.ipmd.reward_mix_alpha_when_unstable))
+        return float(np.clip(alpha, 0.0, 1.0))
+
+    def _reward_policy_required_keys(self) -> list[BatchKey]:
+        """Return policy-batch keys required by the reward estimator."""
+        assert isinstance(self.config, IPMDRLOptConfig)
+        rit = self.config.ipmd.reward_input_type
+        required: list[BatchKey] = []
+        if rit in ("s", "sa", "sas"):
+            required.extend(self._reward_obs_keys)
+        if rit in ("s'", "sas"):
+            required.extend([next_obs_key(key) for key in self._reward_obs_keys])
+        if rit in ("sa", "sas"):
+            required.append("action")
+        return dedupe_keys(required)
+
+    def _construct_reward_replay_buffer(self) -> TensorDictReplayBuffer | None:
+        cfg = self.config
+        assert isinstance(cfg, IPMDRLOptConfig)
+        replay_size = int(cfg.ipmd.reward_replay_size)
+        if replay_size <= 0:
+            return None
+        replay_batch_size = (
+            int(cfg.ipmd.reward_replay_batch_size)
+            if cfg.ipmd.reward_replay_batch_size is not None
+            else int(cfg.loss.mini_batch_size)
+        )
+        return TensorDictReplayBuffer(
+            pin_memory=False,
+            prefetch=cfg.collector.prefetch,
+            sampler=RandomSampler(),
+            storage=LazyTensorStorage(
+                max_size=replay_size,
+                compilable=cfg.compile.compile,
+                device="cpu",
+            ),
+            batch_size=max(1, replay_batch_size),
+            shared=cfg.collector.shared,
+        )
+
+    def _store_reward_replay_samples(self, batch: TensorDict) -> None:
+        if self._reward_replay_buffer is None:
+            return
+        required_keys = self._reward_policy_required_keys()
+        available = batch.keys(True)
+        if any(key not in available for key in required_keys):
+            return
+        keep_prob = float(np.clip(self.config.ipmd.reward_replay_keep_prob, 0.0, 1.0))
+        replay_batch = batch.select(*required_keys).reshape(-1).detach()
+        if keep_prob < 1.0 and replay_batch.numel() > 0:
+            keep_mask = torch.rand(replay_batch.numel(), device=batch.device) < keep_prob
+            if not bool(keep_mask.any()):
+                return
+            replay_batch = replay_batch[keep_mask]
+        if replay_batch.numel() > 0:
+            self._reward_replay_buffer.extend(replay_batch.clone())
+
+    def _sample_reward_replay_batch(
+        self, current_batch_size: int
+    ) -> TensorDict | None:
+        if self._reward_replay_buffer is None:
+            return None
+        ratio = max(0.0, float(self.config.ipmd.reward_replay_ratio))
+        replay_batch_size_cfg = self.config.ipmd.reward_replay_batch_size
+        if replay_batch_size_cfg is not None:
+            replay_batch_size = int(replay_batch_size_cfg)
+        else:
+            replay_batch_size = int(round(current_batch_size * ratio))
+        if replay_batch_size <= 0:
+            return None
+        try:
+            replay_batch = cast(
+                TensorDict,
+                self._reward_replay_buffer.sample(batch_size=replay_batch_size),
+            )
+        except Exception:
+            return None
+        if replay_batch.numel() <= 0:
+            return None
+        return replay_batch.to(self.device)
+
+    def _reward_batch_with_replay(self, batch: TensorDict) -> TensorDict:
+        required_keys = self._reward_policy_required_keys()
+        available = batch.keys(True)
+        if any(key not in available for key in required_keys):
+            return batch
+        reward_batch = batch.select(*required_keys)
+        replay_batch = self._sample_reward_replay_batch(reward_batch.numel())
+        if replay_batch is None:
+            return reward_batch
+        replay_available = replay_batch.keys(True)
+        if any(key not in replay_available for key in required_keys):
+            return reward_batch
+        # ReplayBuffer.sample can add metadata keys (e.g. "index"). Keep only reward keys.
+        replay_batch = replay_batch.select(*required_keys)
+        return cast(TensorDict, torch.cat([reward_batch, replay_batch], dim=0))
+
+    def _configure_reward_optimizer(self) -> torch.optim.Optimizer:
+        cfg = self.config
+        assert isinstance(cfg, IPMDRLOptConfig)
+        optimizer_map: dict[str, OptimizerClass] = {
+            "adam": torch.optim.Adam,
+            "adamw": torch.optim.AdamW,
+            "adamax": torch.optim.Adamax,
+            "sgd": torch.optim.SGD,
+            "rmsprop": torch.optim.RMSprop,
+        }
+        optimizer_name = (cfg.ipmd.reward_optimizer or cfg.optim.optimizer).lower()
+        if optimizer_name not in optimizer_map:
+            available = ", ".join(sorted(optimizer_map))
+            msg = f"Unknown reward optimizer '{optimizer_name}'. Choose one of: {available}."
+            raise ValueError(msg)
+        optimizer_cls = optimizer_map[optimizer_name]
+        kwargs = {
+            "lr": (
+                float(cfg.optim.lr)
+                if cfg.ipmd.reward_lr is None
+                else float(cfg.ipmd.reward_lr)
+            ),
+            "weight_decay": (
+                float(cfg.optim.weight_decay)
+                if cfg.ipmd.reward_weight_decay is None
+                else float(cfg.ipmd.reward_weight_decay)
+            ),
+        }
+        kwargs.update(dict(cfg.optim.optimizer_kwargs))
+        kwargs.update(dict(cfg.ipmd.reward_optimizer_kwargs))
+        return optimizer_cls(self.reward_estimator.parameters(), **kwargs)
+
+    def _refresh_reward_grad_clip_params(self) -> None:
+        self._reward_grad_clip_params: list[Tensor] = [
+            param
+            for group in self.reward_optim.param_groups
+            for param in group["params"]
+        ]
+
+    def _maybe_update_reward_target(self) -> None:
+        if self.reward_target_estimator is None:
+            return
+        cfg = self.config
+        assert isinstance(cfg, IPMDRLOptConfig)
+        self._reward_target_update_counter += 1
+        if self._reward_target_update_counter % max(
+            1, int(cfg.ipmd.reward_target_update_interval)
+        ):
+            return
+        polyak = float(np.clip(cfg.ipmd.reward_target_polyak, 0.0, 1.0))
+        with torch.no_grad():
+            for target_param, src_param in zip(
+                self.reward_target_estimator.parameters(),
+                self.reward_estimator.parameters(),
+                strict=False,
+            ):
+                target_param.mul_(polyak).add_(src_param, alpha=1.0 - polyak)
+            for target_buffer, src_buffer in zip(
+                self.reward_target_estimator.buffers(),
+                self.reward_estimator.buffers(),
+                strict=False,
+            ):
+                target_buffer.copy_(src_buffer)
 
     def _resolve_reward_obs_keys(self) -> list[ObsKey]:
         """Resolve observation keys used by reward estimator state inputs."""
@@ -341,21 +695,12 @@ class IPMD(PPO):
     def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
-        """Single optimizer for actor-critic and reward estimator (PPO + IPMD).
+        """Create optimizer(s) for actor-critic only.
 
-        During the first call from BaseAlgorithm.__init__, reward_estimator
-        doesn't exist yet — fall back to the PPO optimizer.  IPMD.__init__
-        re-creates the optimizer after the reward network is built.
+        IPMD uses a dedicated optimizer for the reward estimator to decouple
+        reward and PPO update dynamics.
         """
-        if not hasattr(self, "reward_estimator"):
-            return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
-        # PPO uses one optimizer for actor_critic; add reward_estimator to the same group
-        base_optimizers = super()._set_optimizers(optimizer_cls, optimizer_kwargs)
-        assert len(base_optimizers) == 1
-        all_params = list(self.actor_critic.parameters()) + list(
-            self.reward_estimator.parameters()
-        )
-        return [optimizer_cls(all_params, **optimizer_kwargs)]
+        return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
 
     # -------------------------
     # Expert data API
@@ -486,22 +831,86 @@ class IPMD(PPO):
                 "loss_objective": torch.tensor(0.0, device=self.device),
                 "loss_entropy": torch.tensor(0.0, device=self.device),
                 "loss_reward_diff": torch.tensor(0.0, device=self.device),
+                "loss_reward_gap_term": torch.tensor(0.0, device=self.device),
                 "loss_reward_l2": torch.tensor(0.0, device=self.device),
+                "loss_reward_consistency": torch.tensor(0.0, device=self.device),
+                "loss_reward_grad_penalty": torch.tensor(0.0, device=self.device),
+                "loss_reward_logit_reg": torch.tensor(0.0, device=self.device),
+                "loss_reward_param_decay": torch.tensor(0.0, device=self.device),
                 "estimated_reward_mean": torch.tensor(0.0, device=self.device),
                 "estimated_reward_std": torch.tensor(0.0, device=self.device),
                 "expert_reward_mean": torch.tensor(0.0, device=self.device),
                 "expert_reward_std": torch.tensor(0.0, device=self.device),
+                "reward_update_mask": torch.tensor(0.0, device=self.device),
+                "reward_mix_alpha": torch.tensor(1.0, device=self.device),
+                "bc_coeff": torch.tensor(0.0, device=self.device),
             },
             batch_size=[],
         )
 
     _REWARD_OUTPUT_ACTIVATIONS = frozenset({"none", "tanh", "sigmoid"})
 
-    def _reward_from_batch(self, td: TensorDict | Any) -> Tensor:
-        """Compute estimated reward for a batch of transitions."""
+    def _normalize_reward_inputs(
+        self, reward_inputs: Tensor, *, update_stats: bool
+    ) -> Tensor:
+        assert isinstance(self.config, IPMDRLOptConfig)
+        cfg = self.config.ipmd
+        if not cfg.normalize_reward_input:
+            return reward_inputs
+        eps = float(cfg.reward_input_norm_eps)
+        stats_source = reward_inputs
+        squeeze_last_dim = False
+        if stats_source.ndim == 1:
+            # Scalar-feature case: treat as (batch, feature=1) for stable stats.
+            stats_source = stats_source.unsqueeze(-1)
+            squeeze_last_dim = True
+        flat_stats_source = stats_source.reshape(-1, stats_source.shape[-1])
+        feature_dim = int(flat_stats_source.shape[-1])
+        if (
+            not self._reward_input_stats_initialized
+            or self._reward_input_running_mean is None
+            or self._reward_input_running_var is None
+            or int(self._reward_input_running_mean.shape[-1]) != feature_dim
+        ):
+            self._reward_input_running_mean = flat_stats_source.detach().mean(dim=0)
+            self._reward_input_running_var = flat_stats_source.detach().var(
+                dim=0, unbiased=False
+            )
+            self._reward_input_stats_initialized = True
+        assert self._reward_input_running_mean is not None
+        assert self._reward_input_running_var is not None
+        if update_stats:
+            momentum = float(np.clip(cfg.reward_input_norm_momentum, 0.0, 1.0))
+            batch_mean = flat_stats_source.detach().mean(dim=0)
+            batch_var = flat_stats_source.detach().var(dim=0, unbiased=False)
+            self._reward_input_running_mean = (1.0 - momentum) * (
+                self._reward_input_running_mean
+            ) + momentum * batch_mean
+            self._reward_input_running_var = (1.0 - momentum) * (
+                self._reward_input_running_var
+            ) + momentum * batch_var
+        normalized = (stats_source - self._reward_input_running_mean) / torch.sqrt(
+            self._reward_input_running_var + eps
+        )
+        clip_value = cfg.reward_input_norm_clip
+        if clip_value is not None and clip_value > 0.0:
+            normalized = normalized.clamp(-float(clip_value), float(clip_value))
+        if squeeze_last_dim:
+            normalized = normalized.squeeze(-1)
+        return normalized
+
+    def _reward_inputs_from_batch(
+        self,
+        td: TensorDict | Any,
+        *,
+        detach: bool | None = None,
+        update_input_stats: bool = False,
+    ) -> Tensor:
+        """Assemble reward-model inputs according to ``reward_input_type``."""
         assert isinstance(self.config, IPMDRLOptConfig)
         rit = self.config.ipmd.reward_input_type
-        detach = self.config.ipmd.reward_detach_features
+        if detach is None:
+            detach = self.config.ipmd.reward_detach_features
 
         parts: list[Tensor] = []
         if rit in ("s", "sa", "sas"):
@@ -525,30 +934,105 @@ class IPMD(PPO):
                 )
             )
 
-        x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-        r = self.reward_estimator(x)
+        reward_inputs = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        return self._normalize_reward_inputs(reward_inputs, update_stats=update_input_stats)
 
-        # Apply output activation to bound the reward
+    def _apply_reward_output_activation(self, reward_logits: Tensor) -> Tensor:
+        """Apply configured output activation to reward logits."""
         out_act = self.config.ipmd.reward_output_activation
         if out_act == "tanh":
-            r = torch.tanh(r) * self.config.ipmd.reward_output_scale
+            reward_logits = torch.tanh(reward_logits) * self.config.ipmd.reward_output_scale
         elif out_act == "sigmoid":
-            r = torch.sigmoid(r) * self.config.ipmd.reward_output_scale
+            reward_logits = (
+                torch.sigmoid(reward_logits) * self.config.ipmd.reward_output_scale
+            )
         # "none" — keep unbounded
-        return r
+        return reward_logits
+
+    def _reward_logits_from_inputs(
+        self, reward_inputs: Tensor, *, use_target_network: bool = False
+    ) -> Tensor:
+        reward_net = self.reward_estimator
+        if use_target_network and self.reward_target_estimator is not None:
+            reward_net = self.reward_target_estimator
+        return reward_net(reward_inputs)
+
+    def _reward_from_inputs(
+        self, reward_inputs: Tensor, *, use_target_network: bool = False
+    ) -> Tensor:
+        reward_logits = self._reward_logits_from_inputs(
+            reward_inputs, use_target_network=use_target_network
+        )
+        return self._apply_reward_output_activation(reward_logits)
+
+    def _reward_logits_from_batch(
+        self,
+        td: TensorDict | Any,
+        *,
+        use_target_network: bool = False,
+        detach: bool | None = None,
+        update_input_stats: bool = False,
+    ) -> Tensor:
+        reward_inputs = self._reward_inputs_from_batch(
+            td,
+            detach=detach,
+            update_input_stats=update_input_stats,
+        )
+        return self._reward_logits_from_inputs(
+            reward_inputs, use_target_network=use_target_network
+        )
+
+    def _reward_from_batch(
+        self,
+        td: TensorDict | Any,
+        *,
+        use_target_network: bool = False,
+        detach: bool | None = None,
+        update_input_stats: bool = False,
+    ) -> Tensor:
+        """Compute estimated reward for a batch of transitions."""
+        reward_inputs = self._reward_inputs_from_batch(
+            td,
+            detach=detach,
+            update_input_stats=update_input_stats,
+        )
+        return self._reward_from_inputs(
+            reward_inputs, use_target_network=use_target_network
+        )
+
+    def _reward_input_grad_penalty(self, expert_batch: TensorDict) -> Tensor:
+        expert_inputs = self._reward_inputs_from_batch(
+            expert_batch,
+            detach=False,
+            update_input_stats=False,
+        ).detach()
+        expert_inputs.requires_grad_(True)
+        expert_rewards = self._reward_from_inputs(expert_inputs)
+        gradients = torch.autograd.grad(
+            outputs=expert_rewards.sum(),
+            inputs=expert_inputs,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        return gradients.pow(2).sum(dim=-1).mean()
 
     def update(
         self,
         batch: TensorDict,
-        num_network_updates: int,
+        num_network_updates: int | Tensor,
         expert_batch: TensorDict,
         has_expert: Tensor,
+        reward_update_mask: Tensor | None = None,
+        bc_coeff_override: float | None = None,
+        reward_mix_alpha: float = 1.0,
     ) -> tuple[TensorDict, int]:
         """PPO update plus IPMD reward loss; fixed path for torch.compile and CUDA graphs."""
         self.optim.zero_grad(set_to_none=True)
+        self.reward_optim.zero_grad(set_to_none=True)
         assert isinstance(self.config, IPMDRLOptConfig)
 
-        # 1) PPO loss
+        # 1) PPO + BC losses (policy/value optimizer)
         loss: TensorDict = self.loss_module(batch)
         critic_loss = loss["loss_critic"]
         actor_loss = loss["loss_objective"] + loss["loss_entropy"]
@@ -557,25 +1041,11 @@ class IPMD(PPO):
 
         output_loss = loss.detach()
 
-        # 2) IPMD reward loss (always computed; scaled by has_expert for fixed graph)
-        r_pi = self._reward_from_batch(batch)
-        r_exp = self._reward_from_batch(expert_batch)
-        diff = r_pi.mean() - r_exp.mean()
-        l2 = torch.zeros((), device=self.device)
-        # for p in self.reward_estimator.parameters():
-        #     l2 = l2 + p.pow(2).sum()
-        l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
-        total_reward_loss = (
-            float(self.config.ipmd.reward_loss_coeff) * diff
-            + float(self.config.ipmd.reward_l2_coeff) * l2.pow(0.5)
-        ) * has_expert
-        total_reward_loss.backward()
-
-        reward_diff = diff.detach()
-        reward_l2 = l2.detach()
-
-        # 3) Behavior cloning loss on expert actions (scaled by has_expert)
-        bc_coeff = float(self.config.ipmd.bc_loss_coeff)
+        bc_coeff = (
+            float(self.config.ipmd.bc_loss_coeff)
+            if bc_coeff_override is None
+            else float(bc_coeff_override)
+        )
         if bc_coeff > 0.0:
             expert_obs_td = expert_batch.select(*self._policy_obs_keys)
             expert_policy_td = self.actor_critic.get_policy_operator()(expert_obs_td)
@@ -595,7 +1065,7 @@ class IPMD(PPO):
         else:
             output_loss_bc = torch.tensor(0.0, device=self.device)
 
-        # Gradient clipping (always call for fixed graph)
+        # PPO gradient step
         max_grad_norm = self.config.optim.max_grad_norm
         if max_grad_norm is not None and max_grad_norm > 0:
             grad_norm_tensor = clip_grad_norm_(
@@ -607,15 +1077,125 @@ class IPMD(PPO):
 
         self.optim.step()
 
+        # 2) Reward estimator loss (dedicated optimizer)
+        if reward_update_mask is None:
+            reward_update_mask = torch.tensor(1.0, device=self.device, dtype=torch.float32)
+        reward_batch = self._reward_batch_with_replay(batch)
+        r_pi = self._reward_from_batch(
+            reward_batch,
+            update_input_stats=True,
+        )
+        r_exp = self._reward_from_batch(
+            expert_batch,
+            update_input_stats=True,
+        )
+        reward_diff = r_pi.mean() - r_exp.mean()
+        if float(self.config.ipmd.reward_margin) > 0.0:
+            reward_gap_term = torch.relu(reward_diff + float(self.config.ipmd.reward_margin))
+        else:
+            reward_gap_term = reward_diff
+        reward_l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
+
+        reward_consistency = torch.zeros((), device=self.device)
+        if (
+            float(self.config.ipmd.reward_consistency_coeff) > 0.0
+            and self.reward_target_estimator is not None
+        ):
+            with torch.no_grad():
+                r_pi_target = self._reward_from_batch(
+                    reward_batch,
+                    use_target_network=True,
+                    update_input_stats=False,
+                )
+                r_exp_target = self._reward_from_batch(
+                    expert_batch,
+                    use_target_network=True,
+                    update_input_stats=False,
+                )
+            reward_consistency = F.mse_loss(r_pi, r_pi_target) + F.mse_loss(
+                r_exp, r_exp_target
+            )
+
+        reward_grad_penalty = torch.zeros((), device=self.device)
+        if float(self.config.ipmd.reward_grad_penalty_coeff) > 0.0:
+            reward_grad_penalty = self._reward_input_grad_penalty(expert_batch)
+
+        reward_logit_reg = torch.zeros((), device=self.device)
+        if float(self.config.ipmd.reward_logit_reg_coeff) > 0.0:
+            logits_pi = self._reward_logits_from_batch(
+                reward_batch,
+                update_input_stats=False,
+            )
+            logits_exp = self._reward_logits_from_batch(
+                expert_batch,
+                update_input_stats=False,
+            )
+            reward_logit_reg = logits_pi.pow(2).mean() + logits_exp.pow(2).mean()
+
+        reward_param_decay = torch.zeros((), device=self.device)
+        if float(self.config.ipmd.reward_param_weight_decay_coeff) > 0.0:
+            for param in self.reward_estimator.parameters():
+                reward_param_decay = reward_param_decay + param.pow(2).mean()
+
+        total_reward_loss = (
+            float(self.config.ipmd.reward_loss_coeff) * reward_gap_term
+            + float(self.config.ipmd.reward_l2_coeff) * reward_l2.pow(0.5)
+            + float(self.config.ipmd.reward_consistency_coeff) * reward_consistency
+            + float(self.config.ipmd.reward_grad_penalty_coeff) * reward_grad_penalty
+            + float(self.config.ipmd.reward_logit_reg_coeff) * reward_logit_reg
+            + float(self.config.ipmd.reward_param_weight_decay_coeff) * reward_param_decay
+        ) * has_expert * reward_update_mask
+        apply_reward_update = float((has_expert * reward_update_mask).detach().item()) > 0.0
+        if apply_reward_update:
+            total_reward_loss.backward()
+
+            reward_max_grad_norm = self.config.ipmd.reward_max_grad_norm
+            if reward_max_grad_norm is None:
+                reward_max_grad_norm = self.config.optim.max_grad_norm
+            if reward_max_grad_norm is not None and reward_max_grad_norm > 0:
+                reward_grad_norm = clip_grad_norm_(
+                    self._reward_grad_clip_params,
+                    float(reward_max_grad_norm),
+                )
+            else:
+                reward_grad_norm = torch.zeros((), device=self.device)
+            self.reward_optim.step()
+            self._maybe_update_reward_target()
+        else:
+            reward_grad_norm = torch.zeros((), device=self.device)
+
         output_loss.set("alpha", torch.tensor(1.0, device=self.device))
-        output_loss.set("loss_reward_diff", reward_diff)
-        output_loss.set("loss_reward_l2", reward_l2)
+        output_loss.set("loss_reward_diff", reward_diff.detach())
+        output_loss.set("loss_reward_gap_term", reward_gap_term.detach())
+        output_loss.set("loss_reward_l2", reward_l2.detach())
+        output_loss.set("loss_reward_consistency", reward_consistency.detach())
+        output_loss.set("loss_reward_grad_penalty", reward_grad_penalty.detach())
+        output_loss.set("loss_reward_logit_reg", reward_logit_reg.detach())
+        output_loss.set("loss_reward_param_decay", reward_param_decay.detach())
         output_loss.set("loss_bc", output_loss_bc)
         output_loss.set("grad_norm", grad_norm_tensor.detach())
+        output_loss.set("reward_grad_norm", reward_grad_norm.detach())
+        output_loss.set("reward_update_mask", reward_update_mask.detach())
+        output_loss.set(
+            "reward_mix_alpha",
+            torch.tensor(float(reward_mix_alpha), device=self.device, dtype=torch.float32),
+        )
+        output_loss.set(
+            "bc_coeff",
+            torch.tensor(float(bc_coeff), device=self.device, dtype=torch.float32),
+        )
         output_loss.set(
             "lr",
             torch.tensor(
-                self.config.optim.lr,
+                self.optim.param_groups[0]["lr"],
+                device=self.device,
+                dtype=torch.float32,
+            ),
+        )
+        output_loss.set(
+            "reward_lr",
+            torch.tensor(
+                self.reward_optim.param_groups[0]["lr"],
                 device=self.device,
                 dtype=torch.float32,
             ),
@@ -623,7 +1203,7 @@ class IPMD(PPO):
         output_loss.set("skipped_update", torch.tensor(False, device=self.device))
 
         with torch.no_grad():
-            diag_rewards = self._reward_from_batch(batch)
+            diag_rewards = self._reward_from_batch(batch, update_input_stats=False)
             output_loss.set("estimated_reward_mean", diag_rewards.mean())
             output_loss.set("estimated_reward_std", diag_rewards.std())
             output_loss.set("expert_reward_mean", r_exp.mean().nan_to_num(0.0))
@@ -701,16 +1281,35 @@ class IPMD(PPO):
                         }
                     )
 
+            rollout_update_idx = self._counter_as_int(num_network_updates)
+            reward_mix_alpha_for_update = 0.0
+
             # Optionally replace env rewards with estimated rewards for PPO (before GAE)
             if cfg.ipmd.use_estimated_rewards_for_ppo:
                 with torch.no_grad():
-                    est_rew = self._reward_from_batch(data)
+                    est_rew = self._reward_from_batch(
+                        data,
+                        use_target_network=cfg.ipmd.use_reward_target_for_ppo,
+                        update_input_stats=False,
+                    )
                 if cfg.ipmd.detach_reward_when_used_for_ppo:
                     est_rew = est_rew.detach()
+                reward_mix_alpha_for_update = self._current_reward_mix_alpha(
+                    rollout_update_idx,
+                    float(est_rew.std().item()),
+                )
                 # Save original env reward for metrics, then replace
                 data = data.clone()
-                data.set(("next", "env_reward"), data.get(("next", "reward")).clone())
-                data.set(("next", "reward"), est_rew)
+                env_rew = data.get(("next", "reward")).clone()
+                mixed_rew = (1.0 - reward_mix_alpha_for_update) * env_rew + (
+                    reward_mix_alpha_for_update * est_rew
+                )
+                data.set(("next", "env_reward"), env_rew)
+                data.set(("next", "estimated_reward"), est_rew)
+                data.set(("next", "reward"), mixed_rew)
+                metrics_to_log["train/reward_mix_alpha"] = reward_mix_alpha_for_update
+                metrics_to_log["train/estimated_reward_std_rollout"] = est_rew.std().item()
+                metrics_to_log["train/ppo_reward_std_rollout"] = mixed_rew.std().item()
 
             self.data_buffer.empty()
             with timeit("training"):
@@ -724,6 +1323,25 @@ class IPMD(PPO):
                         self.data_buffer.extend(data.reshape(-1))
 
                     for k, batch in enumerate(self.data_buffer):
+                        # Add on-policy transitions to reward replay (if enabled).
+                        self._store_reward_replay_samples(batch)
+
+                        update_idx = self._counter_as_int(num_network_updates)
+                        entropy_coeff = self._current_entropy_coeff(update_idx)
+                        self._set_loss_entropy_coeff(entropy_coeff)
+                        metrics_to_log["train/entropy_coeff_active"] = entropy_coeff
+
+                        reward_update_interval = max(
+                            1, int(cfg.ipmd.reward_update_interval)
+                        )
+                        should_update_reward = (update_idx % reward_update_interval) == 0
+                        reward_update_mask = torch.tensor(
+                            1.0 if should_update_reward else 0.0,
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        bc_coeff_value = self._current_bc_coeff(update_idx)
+
                         kl_context = None
                         if (cfg.optim.scheduler or "").lower() == "adaptive":
                             kl_context = self._prepare_kl_context(batch, policy_op)
@@ -749,6 +1367,9 @@ class IPMD(PPO):
                                 num_network_updates,
                                 expert_batch,
                                 has_expert,
+                                reward_update_mask=reward_update_mask,
+                                bc_coeff_override=bc_coeff_value,
+                                reward_mix_alpha=reward_mix_alpha_for_update,
                             )
                             loss = loss.clone()
                         if self.lr_scheduler and self.lr_scheduler_step == "update":
@@ -766,12 +1387,21 @@ class IPMD(PPO):
                             "loss_entropy",
                             "loss_objective",
                             "loss_reward_diff",
+                            "loss_reward_gap_term",
                             "loss_reward_l2",
+                            "loss_reward_consistency",
+                            "loss_reward_grad_penalty",
+                            "loss_reward_logit_reg",
+                            "loss_reward_param_decay",
                             "loss_bc",
                             "estimated_reward_mean",
                             "estimated_reward_std",
                             "expert_reward_mean",
                             "expert_reward_std",
+                            "reward_update_mask",
+                            "reward_mix_alpha",
+                            "bc_coeff",
+                            "reward_lr",
                         ]
                         optional_keys = [
                             "entropy",
@@ -781,6 +1411,7 @@ class IPMD(PPO):
                             "ESS",
                             "kl_approx",
                             "grad_norm",
+                            "reward_grad_norm",
                         ]
                         for key in optional_keys:
                             if key in loss:
@@ -800,12 +1431,17 @@ class IPMD(PPO):
                     "env_reward",
                 ) in data.keys(True):
                     env_rew = data["next", "env_reward"]
-                    est_rew_diag = data["next", "reward"]  # already replaced
+                    if ("next", "estimated_reward") in data.keys(True):
+                        est_rew_diag = data["next", "estimated_reward"]
+                    else:
+                        est_rew_diag = data["next", "reward"]
                     metrics_to_log["train/env_reward_mean"] = env_rew.mean().item()
                     metrics_to_log["train/env_reward_std"] = env_rew.std().item()
                 elif ("next", "reward") in data.keys(True):
                     env_rew = data["next", "reward"]
-                    est_rew_diag = self._reward_from_batch(data)
+                    est_rew_diag = self._reward_from_batch(
+                        data, update_input_stats=False
+                    )
                 else:
                     env_rew = None
                     est_rew_diag = None
@@ -819,6 +1455,7 @@ class IPMD(PPO):
             for key, value in losses_mean.items():  # type: ignore
                 metrics_to_log[f"train/{key}"] = value.item()  # type: ignore
             metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
+            metrics_to_log["train/reward_lr"] = self.reward_optim.param_groups[0]["lr"]
             clip_attr = getattr(self.loss_module, "clip_epsilon", None)
             if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
                 clip_epsilon_value = clip_attr.detach()
