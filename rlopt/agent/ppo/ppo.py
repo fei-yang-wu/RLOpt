@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -343,9 +344,7 @@ class PPO(BaseAlgorithm):
     def _refresh_grad_clip_params(self) -> None:
         """Cache optimizer parameters to avoid dynamic traversal in update."""
         self._grad_clip_params: list[Tensor] = [
-            param
-            for group in self.optim.param_groups
-            for param in group["params"]
+            param for group in self.optim.param_groups for param in group["params"]
         ]
 
     def _construct_data_buffer(self) -> ReplayBuffer:

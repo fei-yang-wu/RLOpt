@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
 from rlopt.agent import IPMD, PPO, IPMDRLOptConfig, PPORLOptConfig
 from rlopt.env_utils import make_parallel_env
+
+
+def _apply_obs_input_keys_to_ppo(cfg: PPORLOptConfig) -> None:
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+
+
+def _apply_obs_input_keys_to_ipmd(cfg: IPMDRLOptConfig) -> None:
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.reward_input_keys = ["observation"]
 
 
 def test_ipmd_baseline_vs_ppo():
@@ -34,6 +49,7 @@ def test_ipmd_baseline_vs_ppo():
     ppo_cfg.compile.compile = False
     ppo_cfg.seed = 42
     ppo_cfg.logger.backend = ""
+    _apply_obs_input_keys_to_ppo(ppo_cfg)
 
     # IPMD configuration (PPO-based; same as PPO)
     ipmd_cfg = IPMDRLOptConfig()
@@ -48,6 +64,7 @@ def test_ipmd_baseline_vs_ppo():
     ipmd_cfg.compile.compile = False
     ipmd_cfg.seed = 42
     ipmd_cfg.logger.backend = ""
+    _apply_obs_input_keys_to_ipmd(ipmd_cfg)
 
     # IPMD-specific: use environment rewards, no expert buffer
     ipmd_cfg.ipmd.use_estimated_rewards_for_ppo = False
@@ -71,7 +88,13 @@ def test_ipmd_baseline_vs_ppo():
     print("=" * 60)
     ipmd_env = make_parallel_env(ipmd_cfg)
     ipmd_agent = IPMD(ipmd_env, ipmd_cfg, logger=None)
-    ipmd_agent.train()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"std\(\): degrees of freedom is <= 0.*",
+            category=UserWarning,
+        )
+        ipmd_agent.train()
     ipmd_rewards = list(ipmd_agent.episode_rewards)
 
     # Compare performance
@@ -126,10 +149,17 @@ def test_ipmd_baseline_smoke():
     cfg.logger.backend = ""
     cfg.ipmd.use_estimated_rewards_for_ppo = False
     cfg.ipmd.reward_num_cells = (32, 32)
+    _apply_obs_input_keys_to_ipmd(cfg)
 
     env = make_parallel_env(cfg)
     agent = IPMD(env, cfg, logger=None)
-    agent.train()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"std\(\): degrees of freedom is <= 0.*",
+            category=UserWarning,
+        )
+        agent.train()
 
     assert agent.__class__.__name__ == "IPMD"
     print("✅ IPMD baseline smoke test passed!")
