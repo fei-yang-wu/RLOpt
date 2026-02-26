@@ -1,10 +1,12 @@
-"""Multi-discriminator for ASE."""
+"""Multi-discriminator helpers for ASE compatibility."""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from rlopt.agent.imitation.gail.discriminator import Discriminator
+from rlopt.agent.gail.discriminator import Discriminator
 
 
 class MultiDiscriminator(nn.Module):
@@ -15,69 +17,80 @@ class MultiDiscriminator(nn.Module):
         num_skills: int,
         observation_dim: int,
         action_dim: int,
-        hidden_dims: list[int] = [256, 256],
+        hidden_dims: list[int] | None = None,
         activation: str = "relu",
     ):
         super().__init__()
         self.num_skills = num_skills
-        
+        if hidden_dims is None:
+            hidden_dims = [256, 256]
+
         # Create one discriminator per skill
-        self.discriminators = nn.ModuleList([
-            Discriminator(
-                observation_dim=observation_dim,
-                action_dim=action_dim,
-                hidden_dims=hidden_dims,
-                activation=activation,
-            )
-            for _ in range(num_skills)
-        ])
-    
-    def forward(self, observation: Tensor, action: Tensor, skill_idx: Tensor) -> Tensor:
+        self.discriminators = nn.ModuleList(
+            [
+                Discriminator(
+                    observation_dim=observation_dim,
+                    action_dim=action_dim,
+                    hidden_dims=list(hidden_dims),
+                    activation=activation,
+                )
+                for _ in range(num_skills)
+            ]
+        )
+
+    def forward_logits(self, observation: Tensor, action: Tensor, skill_idx: Tensor) -> Tensor:
         """Classify state-action for specific skill.
-        
+
         Args:
             observation: [batch, obs_dim]
             action: [batch, action_dim]
             skill_idx: [batch] - skill indices (0 to num_skills-1)
-            
+
         Returns:
-            prob: Probability of being expert [batch, 1]
+            logits: [batch, 1]
         """
-        batch_size = observation.shape[0]
-        outputs = []
-        
-        for i in range(batch_size):
-            skill_id = skill_idx[i].item()
-            disc = self.discriminators[skill_id]
-            out = disc(observation[i:i+1], action[i:i+1])
-            outputs.append(out)
-        
-        return torch.cat(outputs, dim=0)
-    
+        if skill_idx.ndim > 1:
+            skill_idx = skill_idx.squeeze(-1)
+        skill_idx = skill_idx.to(dtype=torch.long, device=observation.device)
+
+        logits = torch.zeros(
+            observation.shape[0], 1, device=observation.device, dtype=observation.dtype
+        )
+        for skill_id, disc in enumerate(self.discriminators):
+            mask = skill_idx == skill_id
+            if not bool(mask.any()):
+                continue
+            logits[mask] = disc(observation[mask], action[mask])
+        return logits
+
+    def forward(self, observation: Tensor, action: Tensor, skill_idx: Tensor) -> Tensor:
+        """Return expert probability for each (obs, action, skill_idx)."""
+        return torch.sigmoid(self.forward_logits(observation, action, skill_idx))
+
     def forward_all(self, observation: Tensor, action: Tensor) -> Tensor:
         """Get discriminator outputs for all skills.
-        
+
         Args:
             observation: [batch, obs_dim]
             action: [batch, action_dim]
-            
+
         Returns:
             probs: [batch, num_skills] - probabilities for each skill
         """
         outputs = []
         for disc in self.discriminators:
-            out = disc(observation, action)
+            out = disc.predict_proba(observation, action)
             outputs.append(out)
         return torch.cat(outputs, dim=-1)  # [batch, num_skills]
-    
+
     def compute_reward(self, observation: Tensor, action: Tensor, skill_idx: Tensor) -> Tensor:
         """Compute GAIL reward for specific skill.
-        
+
         Args:
             observation: [batch, obs_dim]
             action: [batch, action_dim]
             skill_idx: [batch] - skill indices
-            
+
         Returns:
             reward: GAIL reward [batch, 1]
         """
@@ -100,7 +113,7 @@ class StyleDiscriminator(nn.Module):
     ):
         super().__init__()
         self.num_skills = num_skills
-        
+
         # GRU for processing trajectory
         self.gru = nn.GRU(
             input_size=obs_dim + action_dim,
@@ -108,16 +121,16 @@ class StyleDiscriminator(nn.Module):
             num_layers=num_layers,
             batch_first=True,
         )
-        
+
         # Classifier head
         self.fc_out = nn.Linear(hidden_dim, num_skills)
-        
+
     def forward(self, trajectory: Tensor) -> Tensor:
         """Classify trajectory into skills.
-        
+
         Args:
             trajectory: [batch, seq_len, obs_dim + action_dim]
-            
+
         Returns:
             logits: Skill logits [batch, num_skills]
         """
@@ -130,4 +143,3 @@ class StyleDiscriminator(nn.Module):
         """Get skill probabilities."""
         logits = self.forward(trajectory)
         return torch.softmax(logits, dim=-1)
-

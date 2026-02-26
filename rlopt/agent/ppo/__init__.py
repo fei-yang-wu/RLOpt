@@ -1,5 +1,5 @@
 from __future__ import annotations
 
-from .ppo import PPO, PPORecurrent, PPORLOptConfig
+from .ppo import PPO, PPOConfig, PPORecurrent, PPORLOptConfig
 
-__all__ = ["PPO", "PPORLOptConfig", "PPORecurrent"]
+__all__ = ["PPO", "PPOConfig", "PPORLOptConfig", "PPORecurrent"]

@@ -63,6 +63,10 @@ class Discriminator(nn.Module):
         x = torch.cat([observation, action], dim=-1)
         return self.network(x)
 
+    def forward_logits(self, observation: Tensor, action: Tensor) -> Tensor:
+        """Alias for :meth:`forward` to make logit access explicit in callers."""
+        return self.forward(observation, action)
+
     def predict_proba(self, observation: Tensor, action: Tensor) -> Tensor:
         """Compute discriminator output.
 
@@ -74,6 +78,17 @@ class Discriminator(nn.Module):
             Probability that (observation, action) is from expert [..., 1]
         """
         return torch.sigmoid(self.forward(observation, action))
+
+    def get_logit_layer(self) -> nn.Linear | None:
+        """Return the final linear logit layer when available."""
+        for module in reversed(list(self.network.modules())):
+            if isinstance(module, nn.Linear):
+                return module
+        return None
+
+    def all_weights(self) -> list[Tensor]:
+        """Return all learnable 2D weight tensors for explicit L2 regularization."""
+        return [param for param in self.parameters() if param.ndim >= 2]
 
     def compute_reward(self, observation: Tensor, action: Tensor) -> Tensor:
         """Compute GAIL reward from discriminator output.
