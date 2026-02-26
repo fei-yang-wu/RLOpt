@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
-from torch import Tensor
+import torch.nn.functional as F
+from torch import Tensor, nn
 
 
 class Discriminator(nn.Module):
@@ -25,10 +25,12 @@ class Discriminator(nn.Module):
         self,
         observation_dim: int,
         action_dim: int,
-        hidden_dims: list[int] = [256, 256],
+        hidden_dims: list[int] | None = None,
         activation: str = "relu",
     ):
         super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [256, 256]
 
         self.observation_dim = observation_dim
         self.action_dim = action_dim
@@ -47,16 +49,25 @@ class Discriminator(nn.Module):
             elif activation == "elu":
                 layers.append(nn.ELU())
             else:
-                raise ValueError(f"Unknown activation: {activation}")
+                msg = f"Unknown activation: {activation}"
+                raise ValueError(msg)
             input_dim = hidden_dim
 
-        # Output layer: probability that input is from expert
+        # Output layer: logits (probabilities are computed on demand).
         layers.append(nn.Linear(input_dim, 1))
-        layers.append(nn.Sigmoid())
 
         self.network = nn.Sequential(*layers)
 
     def forward(self, observation: Tensor, action: Tensor) -> Tensor:
+        """Compute discriminator logits."""
+        x = torch.cat([observation, action], dim=-1)
+        return self.network(x)
+
+    def forward_logits(self, observation: Tensor, action: Tensor) -> Tensor:
+        """Alias for :meth:`forward` to make logit access explicit in callers."""
+        return self.forward(observation, action)
+
+    def predict_proba(self, observation: Tensor, action: Tensor) -> Tensor:
         """Compute discriminator output.
 
         Args:
@@ -66,9 +77,18 @@ class Discriminator(nn.Module):
         Returns:
             Probability that (observation, action) is from expert [..., 1]
         """
-        # Concatenate observation and action
-        x = torch.cat([observation, action], dim=-1)
-        return self.network(x)
+        return torch.sigmoid(self.forward(observation, action))
+
+    def get_logit_layer(self) -> nn.Linear | None:
+        """Return the final linear logit layer when available."""
+        for module in reversed(list(self.network.modules())):
+            if isinstance(module, nn.Linear):
+                return module
+        return None
+
+    def all_weights(self) -> list[Tensor]:
+        """Return all learnable 2D weight tensors for explicit L2 regularization."""
+        return [param for param in self.parameters() if param.ndim >= 2]
 
     def compute_reward(self, observation: Tensor, action: Tensor) -> Tensor:
         """Compute GAIL reward from discriminator output.
@@ -86,12 +106,11 @@ class Discriminator(nn.Module):
         Returns:
             GAIL reward tensor [...]
         """
-        d_sa = self.forward(observation, action)
+        d_sa = self.predict_proba(observation, action)
         # r(s,a) = -log(1 - D(s,a))
         # Add small epsilon for numerical stability
         eps = 1e-8
-        reward = -torch.log(1 - d_sa + eps).squeeze(-1)
-        return reward
+        return -torch.log(1 - d_sa + eps).squeeze(-1)
 
     def compute_loss(
         self,
@@ -116,23 +135,22 @@ class Discriminator(nn.Module):
         Returns:
             Tuple of (loss, info_dict)
         """
-        # Discriminator output for expert data (should be close to 1)
+        # Discriminator output for expert/policy data (logits).
         expert_logits = self.forward(expert_obs, expert_action)
-
-        # Discriminator output for policy data (should be close to 0)
         policy_logits = self.forward(policy_obs, policy_action)
 
-        # Binary cross-entropy loss
-        # Expert samples should be classified as 1 (expert)
-        expert_loss = -torch.log(expert_logits + 1e-8).mean()
-        # Policy samples should be classified as 0 (policy)
-        policy_loss = -torch.log(1 - policy_logits + 1e-8).mean()
+        expert_targets = torch.ones_like(expert_logits)
+        policy_targets = torch.zeros_like(policy_logits)
+        expert_loss = F.binary_cross_entropy_with_logits(expert_logits, expert_targets)
+        policy_loss = F.binary_cross_entropy_with_logits(policy_logits, policy_targets)
 
         loss = expert_loss + policy_loss
 
         # Accuracy metrics
-        expert_acc = (expert_logits > 0.5).float().mean()
-        policy_acc = (policy_logits < 0.5).float().mean()
+        expert_probs = torch.sigmoid(expert_logits)
+        policy_probs = torch.sigmoid(policy_logits)
+        expert_acc = (expert_probs > 0.5).float().mean()
+        policy_acc = (policy_probs < 0.5).float().mean()
 
         info = {
             "discriminator_loss": loss.detach(),
@@ -140,8 +158,8 @@ class Discriminator(nn.Module):
             "policy_loss": policy_loss.detach(),
             "expert_accuracy": expert_acc,
             "policy_accuracy": policy_acc,
-            "expert_d_mean": expert_logits.mean().detach(),
-            "policy_d_mean": policy_logits.mean().detach(),
+            "expert_d_mean": expert_probs.mean().detach(),
+            "policy_d_mean": policy_probs.mean().detach(),
         }
 
         return loss, info

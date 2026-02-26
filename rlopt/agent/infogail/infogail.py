@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch import Tensor
 from tensordict import TensorDict
 
-from rlopt.agent.imitation.gail.gail import GAIL, GAILConfig, GAILRLOptConfig
+from rlopt.agent.gail.gail import GAIL, GAILConfig, GAILRLOptConfig
 from rlopt.configs import NetworkConfig
 from .skill_encoder import SkillEncoder
 from .posterior import SkillPosterior
@@ -311,4 +311,3 @@ class InfoGAIL(GAIL):
         self.skill_encoder.load_state_dict(checkpoint["skill_encoder"])
         self.posterior.load_state_dict(checkpoint["posterior"])
         self.log.info(f"Model loaded from {path}")
-
