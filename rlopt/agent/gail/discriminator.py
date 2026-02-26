@@ -107,10 +107,10 @@ class Discriminator(nn.Module):
             GAIL reward tensor [...]
         """
         d_sa = self.predict_proba(observation, action)
-        # r(s,a) = -log(1 - D(s,a))
-        # Add small epsilon for numerical stability
-        eps = 1e-8
-        return -torch.log(1 - d_sa + eps).squeeze(-1)
+        one_minus_prob = torch.clamp_min(
+            1.0 - d_sa, torch.tensor(1.0e-4, device=d_sa.device, dtype=d_sa.dtype)
+        )
+        return -torch.log(one_minus_prob).squeeze(-1)
 
     def compute_loss(
         self,
@@ -143,8 +143,7 @@ class Discriminator(nn.Module):
         policy_targets = torch.zeros_like(policy_logits)
         expert_loss = F.binary_cross_entropy_with_logits(expert_logits, expert_targets)
         policy_loss = F.binary_cross_entropy_with_logits(policy_logits, policy_targets)
-
-        loss = expert_loss + policy_loss
+        loss = 0.5 * (expert_loss + policy_loss)
 
         # Accuracy metrics
         expert_probs = torch.sigmoid(expert_logits)

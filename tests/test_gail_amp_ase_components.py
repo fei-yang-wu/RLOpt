@@ -27,7 +27,12 @@ def test_discriminator_reward_and_regularizer_helpers() -> None:
     assert reward.shape == (16,)
     assert torch.isfinite(reward).all()
 
-    manual_reward = -torch.log(1.0 - torch.sigmoid(logits).squeeze(-1) + 1e-8)
+    manual_reward = -torch.log(
+        torch.clamp_min(
+            1.0 - torch.sigmoid(logits).squeeze(-1),
+            torch.tensor(1.0e-4, device=logits.device, dtype=logits.dtype),
+        )
+    )
     assert torch.allclose(reward, manual_reward, atol=1e-6)
 
     all_weights = discriminator.all_weights()
