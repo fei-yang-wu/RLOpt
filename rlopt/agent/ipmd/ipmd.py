@@ -899,6 +899,7 @@ class IPMD(PPO):
         whether behavior cloning is enabled.
         """
         self._expert_buffer = buffer
+        self._expert_buffer.append_transform(lambda td: td.to(self.device))
 
     def create_expert_buffer(
         self, expert_data: TensorDict, buffer_size: int | None = None
@@ -1622,7 +1623,16 @@ class IPMD(PPO):
 
         collected_frames = 0
         num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
-        pbar = tqdm.tqdm(total=self.config.collector.total_frames)
+        trainer_cfg = cfg.trainer
+        show_progress_bar = (
+            True if trainer_cfg is None else bool(trainer_cfg.progress_bar)
+        )
+        periodic_log_interval = (
+            1000 if trainer_cfg is None else max(1, int(trainer_cfg.log_interval))
+        )
+        pbar = tqdm.tqdm(
+            total=self.config.collector.total_frames, disable=not show_progress_bar
+        )
 
         num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
         if cfg.collector.frames_per_batch % cfg.loss.mini_batch_size != 0:
@@ -1655,274 +1665,319 @@ class IPMD(PPO):
             with timeit("collecting"):
                 data = next(collector_iter)
 
-            metrics_to_log: dict[str, Any] = {}
-            frames_in_batch = data.numel()
-            collected_frames += frames_in_batch
-            pbar.update(frames_in_batch)
+            with timeit("iter_prep"):
+                # Logging
+                metrics_to_log: dict[str, Any] = {}
+                frames_in_batch = data.numel()
+                collected_frames += frames_in_batch
+                if show_progress_bar:
+                    pbar.update(frames_in_batch)
 
-            if ("next", "reward") in data.keys(True):
-                step_rewards = data["next", "reward"]
-                metrics_to_log.update(
-                    {
-                        "train/step_reward_mean": step_rewards.mean().item(),
-                        "train/step_reward_std": step_rewards.std().item(),
-                        "train/step_reward_max": step_rewards.max().item(),
-                        "train/step_reward_min": step_rewards.min().item(),
-                    }
-                )
-            if ("next", "episode_reward") in data.keys(True):
-                episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-                if len(episode_rewards) > 0:
-                    episode_length = data["next", "step_count"][data["next", "done"]]
-                    self.episode_lengths.extend(episode_length.cpu().tolist())
-                    self.episode_rewards.extend(episode_rewards.cpu().tolist())
-                    episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
+                if ("next", "reward") in data.keys(True):
+                    step_rewards = data["next", "reward"]
                     metrics_to_log.update(
                         {
-                            "episode/length": np.mean(self.episode_lengths),
-                            "episode/return": np.mean(self.episode_rewards),
-                            "train/reward": episode_rewards_mean,
+                            "train/step_reward_mean": step_rewards.mean().item(),
+                            "train/step_reward_std": step_rewards.std().item(),
+                            "train/step_reward_max": step_rewards.max().item(),
+                            "train/step_reward_min": step_rewards.min().item(),
                         }
                     )
+                if ("next", "episode_reward") in data.keys(True):
+                    episode_rewards = data["next", "episode_reward"][
+                        data["next", "done"]
+                    ]
+                    if len(episode_rewards) > 0:
+                        episode_length = data["next", "step_count"][
+                            data["next", "done"]
+                        ]
+                        self.episode_lengths.extend(episode_length.cpu().tolist())
+                        self.episode_rewards.extend(episode_rewards.cpu().tolist())
+                        episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
+                        metrics_to_log.update(
+                            {
+                                "episode/length": np.mean(self.episode_lengths),
+                                "episode/return": np.mean(self.episode_rewards),
+                                "train/reward": episode_rewards_mean,
+                            }
+                        )
 
-            rollout_update_idx = self._counter_as_int(num_network_updates)
-            reward_mix_alpha_for_update = 0.0
-            action_random_prob = self._current_policy_random_action_prob(
-                rollout_update_idx
-            )
+            # Reward mixing
+            with timeit("reward_mix_prep"):
+                rollout_update_idx = self._counter_as_int(num_network_updates)
+                reward_mix_alpha_for_update = 0.0
+                action_random_prob = self._current_policy_random_action_prob(
+                    rollout_update_idx
+                )
+
+            # Random action injection for exploration
             if action_random_prob > 0.0:
-                data = data.clone()
-                injected_fraction = self._inject_random_actions_inplace(
-                    data, action_random_prob
-                )
-                metrics_to_log["train/policy_random_action_prob"] = action_random_prob
-                metrics_to_log["train/policy_random_action_applied_fraction"] = (
-                    injected_fraction
-                )
+                with timeit("random_action_injection"):
+                    data = data.clone()
+                    injected_fraction = self._inject_random_actions_inplace(
+                        data, action_random_prob
+                    )
+                    metrics_to_log["train/policy_random_action_prob"] = (
+                        action_random_prob
+                    )
+                    metrics_to_log["train/policy_random_action_applied_fraction"] = (
+                        injected_fraction
+                    )
 
             # Optionally replace env rewards with estimated rewards for PPO (before GAE)
             if cfg.ipmd.use_estimated_rewards_for_ppo:
-                with torch.no_grad():
-                    est_rew = self._reward_from_batch(
-                        data,
-                        use_target_network=cfg.ipmd.use_reward_target_for_ppo,
-                        update_input_stats=False,
+                with timeit("reward_estimation_rollout"):
+                    with torch.no_grad():
+                        est_rew = self._reward_from_batch(
+                            data,
+                            use_target_network=cfg.ipmd.use_reward_target_for_ppo,
+                            update_input_stats=False,
+                        )
+                    if cfg.ipmd.detach_reward_when_used_for_ppo:
+                        est_rew = est_rew.detach()
+                    env_rew = data.get(("next", "reward"))
+                    reward_abs_gap = float(
+                        (est_rew.mean() - env_rew.mean()).abs().item()
                     )
-                if cfg.ipmd.detach_reward_when_used_for_ppo:
-                    est_rew = est_rew.detach()
-                env_rew = data.get(("next", "reward"))
-                reward_abs_gap = float((est_rew.mean() - env_rew.mean()).abs().item())
-                reward_mix_alpha_for_update = self._current_reward_mix_alpha(
-                    rollout_update_idx,
-                    float(est_rew.std().item()),
-                    reward_abs_gap,
-                )
-                # Save original env reward for metrics, then replace
-                data = data.clone()
-                env_rew = env_rew.clone()
-                mixed_rew = (1.0 - reward_mix_alpha_for_update) * env_rew + (
-                    reward_mix_alpha_for_update * est_rew
-                )
-                data.set(("next", "env_reward"), env_rew)
-                data.set(("next", "estimated_reward"), est_rew)
-                data.set(("next", "reward"), mixed_rew)
-                metrics_to_log["train/reward_mix_alpha"] = reward_mix_alpha_for_update
-                metrics_to_log["train/reward_mix_abs_gap"] = reward_abs_gap
-                metrics_to_log["train/estimated_reward_std_rollout"] = (
-                    est_rew.std().item()
-                )
-                metrics_to_log["train/ppo_reward_std_rollout"] = mixed_rew.std().item()
+                    reward_mix_alpha_for_update = self._current_reward_mix_alpha(
+                        rollout_update_idx,
+                        float(est_rew.std().item()),
+                        reward_abs_gap,
+                    )
+                    # Save original env reward for metrics, then replace
+                    data = data.clone()
+                    env_rew = env_rew.clone()
+                    mixed_rew = (1.0 - reward_mix_alpha_for_update) * env_rew + (
+                        reward_mix_alpha_for_update * est_rew
+                    )
+                    data.set(("next", "env_reward"), env_rew)
+                    data.set(("next", "estimated_reward"), est_rew)
+                    data.set(("next", "reward"), mixed_rew)
+                    metrics_to_log["train/reward_mix_alpha"] = (
+                        reward_mix_alpha_for_update
+                    )
+                    metrics_to_log["train/reward_mix_abs_gap"] = reward_abs_gap
+                    metrics_to_log["train/estimated_reward_std_rollout"] = (
+                        est_rew.std().item()
+                    )
+                    metrics_to_log["train/ppo_reward_std_rollout"] = (
+                        mixed_rew.std().item()
+                    )
 
-            self.data_buffer.empty()
+            # Training
             with timeit("training"):
+                with timeit("rb - empty"):
+                    self.data_buffer.empty()
                 for j in range(cfg_loss_ppo_epochs):
-                    with torch.no_grad(), timeit("adv"):
-                        data = self.adv_module(data)
-                        if getattr(self.config.compile, "compile_mode", None):
-                            data = data.clone()
+                    with timeit("epoch"):
+                        with torch.no_grad(), timeit("adv"):
+                            data = self.adv_module(data)
+                            if getattr(self.config.compile, "compile_mode", None):
+                                data = data.clone()
 
-                    with timeit("rb - extend"):
-                        self.data_buffer.extend(data.reshape(-1))
+                        with timeit("rb - extend"):
+                            self.data_buffer.extend(data.reshape(-1))
 
-                    for k, batch in enumerate(self.data_buffer):
-                        # Add on-policy transitions to reward replay (if enabled).
-                        self._maybe_reset_reward_replay(
-                            self._counter_as_int(num_network_updates)
-                        )
-                        self._store_reward_replay_samples(batch)
+                        for k, batch in enumerate(self.data_buffer):
+                            with timeit("update_prep"):
+                                # Add on-policy transitions to reward replay (if enabled).
+                                self._maybe_reset_reward_replay(
+                                    self._counter_as_int(num_network_updates)
+                                )
+                                self._store_reward_replay_samples(batch)
 
-                        update_idx = self._counter_as_int(num_network_updates)
-                        entropy_coeff = self._current_entropy_coeff(update_idx)
-                        self._set_loss_entropy_coeff(entropy_coeff)
-                        metrics_to_log["train/entropy_coeff_active"] = entropy_coeff
+                                update_idx = self._counter_as_int(num_network_updates)
+                                entropy_coeff = self._current_entropy_coeff(update_idx)
+                                self._set_loss_entropy_coeff(entropy_coeff)
+                                metrics_to_log["train/entropy_coeff_active"] = (
+                                    entropy_coeff
+                                )
 
-                        reward_update_interval = max(
-                            1, int(cfg.ipmd.reward_update_interval)
-                        )
-                        reward_warmup = max(
-                            0, int(cfg.ipmd.reward_update_warmup_updates)
-                        )
-                        should_update_reward = (
-                            update_idx >= reward_warmup
-                            and (update_idx % reward_update_interval) == 0
-                        )
-                        reward_update_mask = torch.tensor(
-                            1.0 if should_update_reward else 0.0,
-                            device=self.device,
-                            dtype=torch.float32,
-                        )
-                        bc_coeff_value = self._current_bc_coeff(update_idx)
+                                reward_update_interval = max(
+                                    1, int(cfg.ipmd.reward_update_interval)
+                                )
+                                reward_warmup = max(
+                                    0, int(cfg.ipmd.reward_update_warmup_updates)
+                                )
+                                should_update_reward = (
+                                    update_idx >= reward_warmup
+                                    and (update_idx % reward_update_interval) == 0
+                                )
+                                reward_update_mask = torch.tensor(
+                                    1.0 if should_update_reward else 0.0,
+                                    device=self.device,
+                                    dtype=torch.float32,
+                                )
+                                bc_coeff_value = self._current_bc_coeff(update_idx)
 
-                        kl_context = None
-                        if (cfg.optim.scheduler or "").lower() == "adaptive":
-                            kl_context = self._prepare_kl_context(batch, policy_op)
-                        # Fixed inputs for torch.compile / CUDA graph
-                        expert_batch_raw = self._next_expert_batch()
-                        if (
-                            expert_batch_raw is None
-                            or not self._check_expert_batch_keys(expert_batch_raw)
-                        ):
-                            self.log.warning("No expert batch found")
-                            expert_batch = self._dummy_expert_batch(batch)
-                            has_expert = torch.tensor(
-                                0.0, device=self.device, dtype=torch.float32
-                            )
-                        else:
-                            expert_batch = expert_batch_raw.to(self.device)
-                            has_expert = torch.tensor(
-                                1.0, device=self.device, dtype=torch.float32
-                            )
-                        with timeit("update"):
-                            loss, num_network_updates = self.update(
-                                batch,
-                                num_network_updates,
-                                expert_batch,
-                                has_expert,
-                                reward_update_mask=reward_update_mask,
-                                bc_coeff_override=bc_coeff_value,
-                                reward_mix_alpha=reward_mix_alpha_for_update,
-                                reward_updates_override=int(
-                                    cfg.ipmd.reward_updates_per_policy_update
-                                ),
-                            )
-                            loss = loss.clone()
-                        if self.lr_scheduler and self.lr_scheduler_step == "update":
-                            self.lr_scheduler.step()
-                        if (
-                            self.reward_lr_scheduler is not None
-                            and self.reward_lr_scheduler_step == "update"
-                            and should_update_reward
-                        ):
-                            self.reward_lr_scheduler.step()
-                        if kl_context is not None:
-                            kl_approx = self._compute_kl_after_update(
-                                kl_context, policy_op
-                            )
-                            if kl_approx is not None:
-                                loss.set("kl_approx", kl_approx.detach())
-                                self._maybe_adjust_lr(kl_approx, cfg.optim)
-                        num_network_updates = num_network_updates.clone()  # type: ignore
-                        loss_keys = [
-                            "loss_critic",
-                            "loss_entropy",
-                            "loss_objective",
-                            "loss_reward_diff",
-                            "loss_reward_gap_term",
-                            "loss_reward_l2",
-                            "loss_reward_consistency",
-                            "loss_reward_grad_penalty",
-                            "loss_reward_logit_reg",
-                            "loss_reward_param_decay",
-                            "loss_bc",
-                            "estimated_reward_mean",
-                            "estimated_reward_std",
-                            "expert_reward_mean",
-                            "expert_reward_std",
-                            "reward_update_mask",
-                            "reward_mix_alpha",
-                            "reward_updates_performed",
-                            "bc_coeff",
-                            "reward_lr",
-                        ]
-                        optional_keys = [
-                            "entropy",
-                            "explained_variance",
-                            "clip_fraction",
-                            "value_clip_fraction",
-                            "ESS",
-                            "kl_approx",
-                            "grad_norm",
-                            "reward_grad_norm",
-                        ]
-                        for key in optional_keys:
-                            if key in loss:
-                                loss_keys.append(key)
-                        losses[j, k] = loss.select(
-                            *[lk for lk in loss_keys if lk in loss]
-                        )
+                                kl_context = None
+                                if (cfg.optim.scheduler or "").lower() == "adaptive":
+                                    kl_context = self._prepare_kl_context(
+                                        batch, policy_op
+                                    )
+                                # Fixed inputs for torch.compile / CUDA graph
+                                with timeit("expert_batch_fetch"):
+                                    expert_batch_raw = self._next_expert_batch()
+                                    if (
+                                        expert_batch_raw is None
+                                        or not self._check_expert_batch_keys(
+                                            expert_batch_raw
+                                        )
+                                    ):
+                                        self.log.warning("No expert batch found")
+                                        expert_batch = self._dummy_expert_batch(batch)
+                                        has_expert = torch.tensor(
+                                            0.0, device=self.device, dtype=torch.float32
+                                        )
+                                    else:
+                                        expert_batch = expert_batch_raw.to(self.device)
+                                        has_expert = torch.tensor(
+                                            1.0, device=self.device, dtype=torch.float32
+                                        )
+                            with timeit("update"):
+                                loss, num_network_updates = self.update(
+                                    batch,
+                                    num_network_updates,
+                                    expert_batch,
+                                    has_expert,
+                                    reward_update_mask=reward_update_mask,
+                                    bc_coeff_override=bc_coeff_value,
+                                    reward_mix_alpha=reward_mix_alpha_for_update,
+                                    reward_updates_override=int(
+                                        cfg.ipmd.reward_updates_per_policy_update
+                                    ),
+                                )
+                                loss = loss.clone()
+                            with timeit("scheduler_step_update"):
+                                if (
+                                    self.lr_scheduler
+                                    and self.lr_scheduler_step == "update"
+                                ):
+                                    self.lr_scheduler.step()
+                                if (
+                                    self.reward_lr_scheduler is not None
+                                    and self.reward_lr_scheduler_step == "update"
+                                    and should_update_reward
+                                ):
+                                    self.reward_lr_scheduler.step()
+                            if kl_context is not None:
+                                with timeit("adaptive_kl"):
+                                    kl_approx = self._compute_kl_after_update(
+                                        kl_context, policy_op
+                                    )
+                                    if kl_approx is not None:
+                                        loss.set("kl_approx", kl_approx.detach())
+                                        self._maybe_adjust_lr(kl_approx, cfg.optim)
+                            with timeit("loss_record"):
+                                num_network_updates = num_network_updates.clone()  # type: ignore
+                                loss_keys = [
+                                    "loss_critic",
+                                    "loss_entropy",
+                                    "loss_objective",
+                                    "loss_reward_diff",
+                                    "loss_reward_gap_term",
+                                    "loss_reward_l2",
+                                    "loss_reward_consistency",
+                                    "loss_reward_grad_penalty",
+                                    "loss_reward_logit_reg",
+                                    "loss_reward_param_decay",
+                                    "loss_bc",
+                                    "estimated_reward_mean",
+                                    "estimated_reward_std",
+                                    "expert_reward_mean",
+                                    "expert_reward_std",
+                                    "reward_update_mask",
+                                    "reward_mix_alpha",
+                                    "reward_updates_performed",
+                                    "bc_coeff",
+                                    "reward_lr",
+                                ]
+                                optional_keys = [
+                                    "entropy",
+                                    "explained_variance",
+                                    "clip_fraction",
+                                    "value_clip_fraction",
+                                    "ESS",
+                                    "kl_approx",
+                                    "grad_norm",
+                                    "reward_grad_norm",
+                                ]
+                                for key in optional_keys:
+                                    if key in loss:
+                                        loss_keys.append(key)
+                                losses[j, k] = loss.select(
+                                    *[lk for lk in loss_keys if lk in loss]
+                                )
 
-                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
-                        self.lr_scheduler.step()
-                    if (
-                        self.reward_lr_scheduler is not None
-                        and self.reward_lr_scheduler_step == "epoch"
-                    ):
-                        self.reward_lr_scheduler.step()
+                        with timeit("scheduler_step_epoch"):
+                            if self.lr_scheduler and self.lr_scheduler_step == "epoch":
+                                self.lr_scheduler.step()
+                            if (
+                                self.reward_lr_scheduler is not None
+                                and self.reward_lr_scheduler_step == "epoch"
+                            ):
+                                self.reward_lr_scheduler.step()
 
             # EPIC distance between estimated and true env reward (invariant to
             # potential-based shaping and positive rescaling).
-            with torch.no_grad():
-                if cfg.ipmd.use_estimated_rewards_for_ppo and (
-                    "next",
-                    "env_reward",
-                ) in data.keys(True):
-                    env_rew = data["next", "env_reward"]
-                    if ("next", "estimated_reward") in data.keys(True):
-                        est_rew_diag = data["next", "estimated_reward"]
+            with timeit("reward_diagnostics"):
+                with torch.no_grad():
+                    if cfg.ipmd.use_estimated_rewards_for_ppo and (
+                        "next",
+                        "env_reward",
+                    ) in data.keys(True):
+                        env_rew = data["next", "env_reward"]
+                        if ("next", "estimated_reward") in data.keys(True):
+                            est_rew_diag = data["next", "estimated_reward"]
+                        else:
+                            est_rew_diag = data["next", "reward"]
+                        metrics_to_log["train/env_reward_mean"] = env_rew.mean().item()
+                        metrics_to_log["train/env_reward_std"] = env_rew.std().item()
+                    elif ("next", "reward") in data.keys(True):
+                        env_rew = data["next", "reward"]
+                        est_rew_diag = self._reward_from_batch(
+                            data, update_input_stats=False
+                        )
                     else:
-                        est_rew_diag = data["next", "reward"]
-                    metrics_to_log["train/env_reward_mean"] = env_rew.mean().item()
-                    metrics_to_log["train/env_reward_std"] = env_rew.std().item()
-                elif ("next", "reward") in data.keys(True):
-                    env_rew = data["next", "reward"]
-                    est_rew_diag = self._reward_from_batch(
-                        data, update_input_stats=False
-                    )
-                else:
-                    env_rew = None
-                    est_rew_diag = None
-                if env_rew is not None and est_rew_diag is not None:
-                    pearson_corr, epic_dist = epic_distance(est_rew_diag, env_rew)
-                    metrics_to_log["reward/pearson_corr"] = pearson_corr.item()
-                    metrics_to_log["reward/epic_distance"] = epic_dist.item()
+                        env_rew = None
+                        est_rew_diag = None
+                    if env_rew is not None and est_rew_diag is not None:
+                        pearson_corr, epic_dist = epic_distance(est_rew_diag, env_rew)
+                        metrics_to_log["reward/pearson_corr"] = pearson_corr.item()
+                        metrics_to_log["reward/epic_distance"] = epic_dist.item()
 
             # Aggregate and log losses
-            losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
-            for key, value in losses_mean.items():  # type: ignore
-                metrics_to_log[f"train/{key}"] = value.item()  # type: ignore
-            metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
-            metrics_to_log["train/reward_lr"] = self.reward_optim.param_groups[0]["lr"]
-            clip_attr = getattr(self.loss_module, "clip_epsilon", None)
-            if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
-                clip_epsilon_value = clip_attr.detach()
-            else:
-                clip_epsilon_value = torch.tensor(
-                    cfg_loss_clip_epsilon,
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            metrics_to_log["train/clip_epsilon"] = clip_epsilon_value
+            with timeit("log_aggregate"):
+                losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
+                for key, value in losses_mean.items():  # type: ignore
+                    metrics_to_log[f"train/{key}"] = value.item()  # type: ignore
+                metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
+                metrics_to_log["train/reward_lr"] = self.reward_optim.param_groups[0][
+                    "lr"
+                ]
+                clip_attr = getattr(self.loss_module, "clip_epsilon", None)
+                if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
+                    clip_epsilon_value = clip_attr.detach()
+                else:
+                    clip_epsilon_value = torch.tensor(
+                        cfg_loss_clip_epsilon,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                metrics_to_log["train/clip_epsilon"] = clip_epsilon_value
 
-            if "Isaac" in cfg.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                log_info(log_info_dict, metrics_to_log)
+            with timeit("env_log_info"):
+                if "Isaac" in cfg.env.env_name and hasattr(self.env, "log_infos"):
+                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                    log_info(log_info_dict, metrics_to_log)
 
-            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-            rate = pbar.format_dict.get("rate")
-            if rate is not None:
-                metrics_to_log["time/speed"] = rate
-            self.log_metrics(metrics_to_log, step=collected_frames)
-            self.collector.update_policy_weights_()
+            with timeit("metrics_flush"):
+                metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
+                rate = pbar.format_dict.get("rate") if show_progress_bar else None
+                if rate is not None:
+                    metrics_to_log["time/speed"] = rate
+                self.log_metrics(metrics_to_log, step=collected_frames)
+                self.collector.update_policy_weights_()
 
             postfix = {}
             if "train/step_reward_mean" in metrics_to_log:
@@ -1935,17 +1990,37 @@ class IPMD(PPO):
                 postfix["reward_diff"] = (
                     f"{metrics_to_log['train/loss_reward_diff']:.3f}"
                 )
-            if postfix:
+            if show_progress_bar and postfix:
                 pbar.set_postfix(postfix)
+            elif not show_progress_bar and (
+                (_i + 1) % periodic_log_interval == 0 or (_i + 1) == total_iter
+            ):
+                status_parts = [
+                    f"iter={_i + 1}/{total_iter}",
+                    f"frames={collected_frames}/{cfg.collector.total_frames}",
+                ]
+                summary_metrics: tuple[tuple[str, str], ...] = (
+                    ("train/step_reward_mean", "r_step"),
+                    ("episode/return", "r_ep"),
+                    ("train/loss_objective", "pi_loss"),
+                    ("train/loss_reward_diff", "reward_diff"),
+                    ("time/speed", "fps"),
+                )
+                for metric_key, alias in summary_metrics:
+                    metric_value = metrics_to_log.get(metric_key)
+                    if isinstance(metric_value, (int, float, np.floating)):
+                        status_parts.append(f"{alias}={float(metric_value):.4f}")
+                self.log.info(" | ".join(status_parts))
 
             if (
                 self.config.save_interval > 0
                 and num_network_updates % self.config.save_interval == 0
             ):
-                self.save_model(
-                    path=self.log_dir / self.config.logger.save_path,
-                    step=collected_frames,
-                )
+                with timeit("checkpoint_save"):
+                    self.save_model(
+                        path=self.log_dir / self.config.logger.save_path,
+                        step=collected_frames,
+                    )
 
         pbar.close()
         self.collector.shutdown()

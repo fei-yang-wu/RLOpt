@@ -333,29 +333,11 @@ class FeatureExtractorNetworkConfig(NetworkConfig):
 class TrainerConfig:
     """Trainer configuration for RLOpt  ."""
 
-    optim_steps_per_batch: int = 10
-    """Number of optimization steps per batch."""
-
-    clip_grad_norm: bool = True
-    """Whether to clip gradient norm."""
-
-    clip_norm: float = 0.5
-    """Gradient clipping norm."""
-
-    progress_bar: bool = True
+    progress_bar: bool = False
     """Whether to show progress bar."""
 
-    save_trainer_interval: int = 10_000
-    """Interval for saving trainer."""
-
-    log_interval: int = 1000
+    log_interval: int = 10000
     """Interval for logging."""
-
-    save_trainer_file: str | None = None
-    """File to save trainer to."""
-
-    frame_skip: int = 1
-    """Frame skip for training."""
 
 
 @dataclass
@@ -395,7 +377,7 @@ class RLOptConfig:
     feature_extractor: FeatureExtractorNetworkConfig | None = None
     """Feature extractor configuration."""
 
-    trainer: TrainerConfig | None = None
+    trainer: TrainerConfig | None = field(default_factory=TrainerConfig)
     """Trainer configuration."""
 
     device: str = "cuda:0"
