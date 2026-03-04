@@ -695,12 +695,12 @@ class IPMD(PPO):
                     est_rew = self._reward_from_batch(data)
                 if cfg.ipmd.detach_reward_when_used_for_ppo:
                     est_rew = est_rew.detach()
+                est_rew = torch.clamp(est_rew, 0.0, 0.25)
                 # Save original env reward for metrics, then replace
-                data = data.clone()
-                data.set(("next", "env_reward"), data.get(("next", "reward")).clone())
+                data.set(("next", "env_reward"), data.get(("next", "reward")))
                 data.set(
                     ("next", "reward"),
-                    0.5 * est_rew + 0.5 * data.get(("next", "reward")).clone(),
+                    0.3 * est_rew + data.get(("next", "env_reward")),
                 )
 
             self.data_buffer.empty()
@@ -819,9 +819,9 @@ class IPMD(PPO):
                 )
             metrics_to_log["train/clip_epsilon"] = clip_epsilon_value
 
-            # if "Isaac" in cfg.env.env_name and hasattr(self.env, "log_infos"):
-            #     log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-            #     log_info(log_info_dict, metrics_to_log)
+            if "Isaac" in cfg.env.env_name and hasattr(self.env, "log_infos"):
+                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                log_info(log_info_dict, metrics_to_log)
 
             metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
             rate = pbar.format_dict.get("rate")

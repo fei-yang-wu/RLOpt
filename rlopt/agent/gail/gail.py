@@ -626,7 +626,9 @@ class GAIL(PPO):
         assert self.discriminator is not None
         if action is None:
             action = self._empty_action_like(obs)
-        return self.discriminator.compute_reward(obs, action)
+        logits = self.discriminator.forward_logits(obs, action).squeeze(-1)
+        # beyondAMP gail_ppo.py: numerically stable -log(1 - sigmoid(logit)).
+        return -F.logsigmoid(-logits)
 
     def _discriminator_grad_penalty_for_batch(
         self, obs: Tensor, action: Tensor | None
@@ -1212,7 +1214,7 @@ class GAIL(PPO):
 
 
 class AMP(GAIL):
-    """Adversarial Motion Prior using MimicKit-style BCE discriminator training."""
+    """AMP variant with beyondAMP-style discriminator loss and reward shaping."""
 
     def _gail_discriminator_loss(
         self,
@@ -1221,73 +1223,52 @@ class AMP(GAIL):
         policy_obs: Tensor,
         policy_action: Tensor | None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        # MimicKit AMP uses BCEWithLogits discriminator loss.
-        return super()._gail_discriminator_loss(
-            expert_obs=expert_obs,
-            expert_action=expert_action,
-            policy_obs=policy_obs,
-            policy_action=policy_action,
+        """beyondAMP amp_ppo.py style discriminator loss (MSE to +1/-1 logits)."""
+        assert self.discriminator is not None
+        if expert_action is None:
+            expert_action = self._empty_action_like(expert_obs)
+        if policy_action is None:
+            policy_action = self._empty_action_like(policy_obs)
+
+        expert_logits = self.discriminator.forward_logits(expert_obs, expert_action)
+        policy_logits = self.discriminator.forward_logits(policy_obs, policy_action)
+
+        expert_loss = F.mse_loss(
+            expert_logits,
+            torch.ones_like(expert_logits, device=self.device),
         )
+        policy_loss = F.mse_loss(
+            policy_logits,
+            -1.0 * torch.ones_like(policy_logits, device=self.device),
+        )
+        loss = 0.5 * (expert_loss + policy_loss)
 
-    def _gail_reward(self, obs: Tensor, action: Tensor | None) -> Tensor:
-        return super()._gail_reward(obs=obs, action=action)
-
-    def _replace_rewards_with_discriminator(
-        self, data: TensorDict, update_idx: int
-    ) -> dict[str, float]:
-        """ProtoMotions-style weighted task/style reward composition for AMP."""
-        if not self.config.gail.use_gail_reward or self.discriminator is None:
-            return {}
-
-        del update_idx
-        with torch.no_grad():
-            obs = self._obs_features_from_td(data, detach=True).to(self.device)
-            action: Tensor | None = None
-            if self.config.gail.discriminator_use_action:
-                action = self._action_features_from_td(data, detach=True).to(
-                    self.device
-                )
-            condition = self._discriminator_condition_from_td(data, detach=True)
-            if condition is not None:
-                condition = condition.to(self.device)
-
-            obs, action = self._prepare_disc_obs_action(
-                obs,
-                action,
-                condition,
-                update_stats=False,
-                apply_augmentation=False,
-            )
-
-            style_reward = self._gail_reward(obs, action)
-            style_reward = self._apply_discriminator_reward_normalization(
-                style_reward, update_stats=True
-            )
-
-            env_reward = data[("next", "reward")].to(self.device)
-            squeeze_last = (
-                env_reward.ndim == style_reward.ndim + 1 and env_reward.shape[-1] == 1
-            )
-            env_reward_base = env_reward.squeeze(-1) if squeeze_last else env_reward
-
-            task_weight = float(
-                np.clip(self.config.gail.proportion_env_reward, 0.0, 1.0)
-            )
-            style_weight = float(self.config.gail.gail_reward_coeff)
-            mixed_reward = task_weight * env_reward_base + style_weight * style_reward
-            if squeeze_last:
-                mixed_reward = mixed_reward.unsqueeze(-1)
-            data.set(("next", "reward"), mixed_reward)
-
-        return {
-            "gail/reward_mean": float(style_reward.mean().item()),
-            "gail/reward_std": float(style_reward.std().item()),
-            "gail/task_reward_weight": task_weight,
-            "gail/style_reward_weight": style_weight,
+        info = {
+            "discriminator_loss": loss.detach(),
+            "expert_loss": expert_loss.detach(),
+            "policy_loss": policy_loss.detach(),
+            "expert_accuracy": (expert_logits.squeeze(-1) > 0.0).float().mean().detach(),
+            "policy_accuracy": (policy_logits.squeeze(-1) < 0.0).float().mean().detach(),
+            "expert_d_mean": expert_logits.mean().detach(),
+            "policy_d_mean": policy_logits.mean().detach(),
         }
+        return loss, info
 
-    def _amp_weight_decay_sum(self) -> Tensor:
-        """ProtoMotions-style discriminator L2 penalty over all discriminator weights."""
+    def _discriminator_grad_penalty(
+        self,
+        expert_obs: Tensor,
+        expert_action: Tensor | None,
+        policy_obs: Tensor,
+        policy_action: Tensor | None,
+    ) -> Tensor:
+        """beyondAMP amp_ppo.py style: gradient penalty on expert batch only."""
+        del policy_obs, policy_action
+        if float(self.config.gail.discriminator_grad_penalty_coeff) <= 0.0:
+            return torch.zeros((), dtype=expert_obs.dtype, device=expert_obs.device)
+        return self._discriminator_grad_penalty_for_batch(expert_obs, expert_action)
+
+    def _discriminator_weight_decay(self) -> Tensor:
+        """AMP-style explicit L2 penalty over all discriminator weights (sum)."""
         coeff = float(self.config.gail.discriminator_weight_decay_coeff)
         assert self.discriminator is not None
         if coeff <= 0.0:
@@ -1297,259 +1278,13 @@ class AMP(GAIL):
             total = total + weight.pow(2).sum()
         return total
 
-    def _sample_amp_replay_batch(self, batch_size: int) -> TensorDict | None:
-        """Sample replay negatives with explicit batch size, matching AMP behavior."""
-        if self._disc_replay_buffer is None or batch_size <= 0:
-            return None
-        try:
-            replay_batch = cast(
-                TensorDict, self._disc_replay_buffer.sample(batch_size=batch_size)
-            )
-        except Exception:
-            return None
-        if replay_batch.numel() <= 0:
-            return None
-        return replay_batch.to(self.device)
-
-    def _update_discriminator(
-        self, rollout_flat: TensorDict, update_idx: int
-    ) -> dict[str, float]:
-        """ProtoMotions-style AMP discriminator update under the RLOpt loop."""
-        if self._expert_buffer is None:
-            if not self._warned_no_expert:
-                self.log.warning(
-                    "No expert buffer set. Training falls back to environment reward."
-                )
-                self._warned_no_expert = True
-            return {}
-
-        if update_idx < int(self.config.gail.discriminator_update_warmup_updates):
-            return {"discriminator_update_mask": 0.0}
-        ratio = max(1, int(self.config.gail.discriminator_optimization_ratio))
-        if (update_idx % ratio) != 0:
-            return {"discriminator_update_mask": 0.0}
-
+    def _gail_reward(self, obs: Tensor, action: Tensor | None) -> Tensor:
         assert self.discriminator is not None
-        assert self.discriminator_optim is not None
+        if action is None:
+            action = self._empty_action_like(obs)
 
-        required_keys = self._discriminator_policy_required_keys()
-        rollout_flat = rollout_flat.reshape(-1)
-        rollout_keys = rollout_flat.keys(True)
-        if any(key not in rollout_keys for key in required_keys):
-            return {}
-
-        policy_batch = rollout_flat.select(*required_keys)
-        self._store_discriminator_replay_samples(policy_batch)
-
-        policy_obs_all = self._obs_features_from_td(policy_batch, detach=False).to(
-            self.device
-        )
-        policy_action_all: Tensor | None = None
-        if self.config.gail.discriminator_use_action:
-            policy_action_all = self._action_features_from_td(
-                policy_batch, detach=False
-            ).to(self.device)
-        policy_condition_all = self._discriminator_condition_from_td(
-            policy_batch, detach=False
-        )
-        if policy_condition_all is not None:
-            policy_condition_all = policy_condition_all.to(self.device)
-        if policy_obs_all.shape[0] == 0:
-            return {}
-
-        stats_accum: dict[str, float] = {"discriminator_update_mask": 1.0}
-        performed_steps = 0
-
-        for _ in range(self._discriminator_step_count()):
-            expert_td = self._next_expert_batch(
-                batch_size=self.config.gail.expert_batch_size
-            )
-            if expert_td is None:
-                continue
-
-            expert_obs_all = self._obs_features_from_td(expert_td, detach=False).to(
-                self.device
-            )
-            expert_action_all: Tensor | None = None
-            if self.config.gail.discriminator_use_action:
-                expert_action_all = self._action_features_from_td(
-                    expert_td, detach=False
-                ).to(self.device)
-            expert_condition_all = self._discriminator_condition_from_td(
-                expert_td, detach=False
-            )
-            if expert_condition_all is not None:
-                expert_condition_all = expert_condition_all.to(self.device)
-            if expert_obs_all.shape[0] == 0:
-                continue
-
-            batch_size = self._discriminator_batch_size(
-                policy_obs_all.shape[0], expert_obs_all.shape[0]
-            )
-            if batch_size <= 0:
-                continue
-
-            p_idx = torch.randint(
-                policy_obs_all.shape[0], (batch_size,), device=self.device
-            )
-            e_idx = torch.randint(
-                expert_obs_all.shape[0], (batch_size,), device=self.device
-            )
-
-            # Agent negatives
-            agent_obs = policy_obs_all[p_idx].detach()
-            agent_action = (
-                policy_action_all[p_idx].detach()
-                if policy_action_all is not None
-                else None
-            )
-            agent_condition = (
-                policy_condition_all[p_idx].detach()
-                if policy_condition_all is not None
-                else None
-            )
-
-            # Expert positives
-            expert_obs = expert_obs_all[e_idx]
-            expert_action = (
-                expert_action_all[e_idx] if expert_action_all is not None else None
-            )
-            expert_condition = (
-                expert_condition_all[e_idx]
-                if expert_condition_all is not None
-                else None
-            )
-
-            # Replay negatives (fallback to agent negatives when replay is unavailable).
-            replay_td = self._sample_amp_replay_batch(batch_size)
-            replay_obs = agent_obs
-            replay_action = agent_action
-            replay_condition = agent_condition
-            if replay_td is not None:
-                replay_keys = replay_td.keys(True)
-                if all(key in replay_keys for key in required_keys):
-                    replay_td = replay_td.select(*required_keys)
-                    replay_obs_all = self._obs_features_from_td(
-                        replay_td, detach=False
-                    ).to(self.device)
-                    if replay_obs_all.shape[0] > 0:
-                        r_idx = torch.randint(
-                            replay_obs_all.shape[0], (batch_size,), device=self.device
-                        )
-                        replay_obs = replay_obs_all[r_idx].detach()
-                        if self.config.gail.discriminator_use_action:
-                            replay_action_all = self._action_features_from_td(
-                                replay_td, detach=False
-                            ).to(self.device)
-                            replay_action = replay_action_all[r_idx].detach()
-                        replay_condition_all = self._discriminator_condition_from_td(
-                            replay_td, detach=False
-                        )
-                        if replay_condition_all is not None:
-                            replay_condition_all = replay_condition_all.to(self.device)
-                            replay_condition = replay_condition_all[r_idx].detach()
-                        else:
-                            replay_condition = None
-
-            expert_obs, expert_action = self._prepare_disc_obs_action(
-                expert_obs,
-                expert_action,
-                expert_condition,
-                update_stats=True,
-                apply_augmentation=True,
-            )
-            agent_obs, agent_action = self._prepare_disc_obs_action(
-                agent_obs,
-                agent_action,
-                agent_condition,
-                update_stats=True,
-                apply_augmentation=True,
-            )
-            replay_obs, replay_action = self._prepare_disc_obs_action(
-                replay_obs,
-                replay_action,
-                replay_condition,
-                update_stats=True,
-                apply_augmentation=True,
-            )
-
-            if expert_action is None:
-                expert_action = self._empty_action_like(expert_obs)
-            if agent_action is None:
-                agent_action = self._empty_action_like(agent_obs)
-            if replay_action is None:
-                replay_action = self._empty_action_like(replay_obs)
-
-            expert_logits = self.discriminator(expert_obs, expert_action).squeeze(-1)
-            agent_logits = self.discriminator(agent_obs, agent_action).squeeze(-1)
-            replay_logits = self.discriminator(replay_obs, replay_action).squeeze(-1)
-
-            expert_loss = -F.logsigmoid(expert_logits).mean()
-            agent_neg_loss = F.softplus(agent_logits).mean()
-            replay_neg_loss = F.softplus(replay_logits).mean()
-            neg_loss = 0.5 * (agent_neg_loss + replay_neg_loss)
-            class_loss = 0.5 * (expert_loss + neg_loss)
-
-            gp_coeff = float(self.config.gail.discriminator_grad_penalty_coeff)
-            if gp_coeff > 0.0:
-                gp = self._discriminator_grad_penalty_for_batch(
-                    expert_obs, expert_action
-                )
-            else:
-                gp = torch.zeros((), dtype=expert_obs.dtype, device=expert_obs.device)
-            logit_reg = self._discriminator_logit_regularizer()
-            weight_decay = self._amp_weight_decay_sum()
-
-            total_loss = (
-                float(self.config.gail.discriminator_loss_coeff) * class_loss
-                + gp_coeff * gp
-                + float(self.config.gail.discriminator_logit_reg_coeff) * logit_reg
-                + float(self.config.gail.discriminator_weight_decay_coeff)
-                * weight_decay
-            )
-
-            self.discriminator_optim.zero_grad(set_to_none=True)
-            total_loss.backward()
-            clip_grad_norm_(
-                self.discriminator.parameters(),
-                float(self.config.gail.discriminator_grad_clip_norm),
-            )
-            self.discriminator_optim.step()
-            performed_steps += 1
-
-            pos_acc = (expert_logits > 0).float().mean()
-            agent_acc = (agent_logits < 0).float().mean()
-            replay_acc = (replay_logits < 0).float().mean()
-            neg_acc = 0.5 * (agent_acc + replay_acc)
-
-            scalars = {
-                "discriminator_loss": class_loss.detach(),
-                "discriminator_total_loss": total_loss.detach(),
-                "discriminator_class_loss": class_loss.detach(),
-                "discriminator_expert_loss": expert_loss.detach(),
-                "discriminator_neg_loss": neg_loss.detach(),
-                "discriminator_agent_neg_loss": agent_neg_loss.detach(),
-                "discriminator_replay_neg_loss": replay_neg_loss.detach(),
-                "discriminator_grad_penalty": gp.detach(),
-                "discriminator_logit_reg": logit_reg.detach(),
-                "discriminator_weight_decay": weight_decay.detach(),
-                "discriminator_pos_acc": pos_acc.detach(),
-                "discriminator_agent_acc": agent_acc.detach(),
-                "discriminator_replay_acc": replay_acc.detach(),
-                "discriminator_neg_acc": neg_acc.detach(),
-                "expert_d_mean": torch.sigmoid(expert_logits).mean().detach(),
-                "policy_d_mean": torch.sigmoid(agent_logits).mean().detach(),
-                "replay_d_mean": torch.sigmoid(replay_logits).mean().detach(),
-            }
-            for key, value in scalars.items():
-                stats_accum[key] = stats_accum.get(key, 0.0) + float(value.item())
-
-        if performed_steps <= 0:
-            return {"discriminator_update_mask": 0.0}
-
-        stats_accum["discriminator_updates_performed"] = float(performed_steps)
-        for key in list(stats_accum.keys()):
-            if key in {"discriminator_update_mask", "discriminator_updates_performed"}:
-                continue
-            stats_accum[key] = stats_accum[key] / float(performed_steps)
-        return stats_accum
+        logits = self.discriminator.forward_logits(obs, action).squeeze(-1)
+        reward = 1.0 - 0.25 * (logits - 1.0).pow(2)
+        if self.config.gail.amp_reward_clip:
+            reward = reward.clamp_min(0.0)
+        return reward
