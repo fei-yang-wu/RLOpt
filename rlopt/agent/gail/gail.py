@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -152,6 +153,9 @@ class GAIL(PPO):
     def __init__(self, env, config: GAILRLOptConfig):
         self.config = config
         self._expert_buffer: ExpertReplayBuffer | None = None
+        self._expert_batch_sampler: (
+            Callable[[int, list[BatchKey]], TensorDict | None] | None
+        ) = None
         self._warned_no_expert = False
 
         self._disc_obs_keys = self._resolve_discriminator_obs_keys(env, self.config)
@@ -182,6 +186,7 @@ class GAIL(PPO):
         self._reward_stats_initialized = False
 
         super().__init__(env, config)
+        self._auto_attach_env_expert_sampler()
 
         self.log.info(
             "Initialized PPO-based GAIL (policy params=%d, discriminator params=%d, disc_keys=%s, cond_dim=%d, use_action=%s)",
@@ -426,27 +431,56 @@ class GAIL(PPO):
         self._expert_buffer = expert_buffer
         self.log.info("Expert buffer attached: %d samples", len(expert_buffer))
 
+    def _discriminator_expert_required_keys(self) -> list[BatchKey]:
+        """Return expert keys required for discriminator updates.
+
+        Conditioning keys are intentionally not required, because subclasses
+        (for example ASE latents) can synthesize them if absent.
+        """
+        required: list[BatchKey] = list(self._disc_obs_keys)
+        if self.config.gail.discriminator_use_action:
+            required.append("action")
+        return dedupe_keys(required)
+
     def _next_expert_batch(self, batch_size: int | None = None) -> TensorDict | None:
-        if self._expert_buffer is None:
-            return None
         if batch_size is None:
             batch_size = int(self.config.gail.expert_batch_size)
 
-        try:
-            batch = cast(TensorDict, self._expert_buffer.sample(batch_size=batch_size))
-        except TypeError:
+        if self._expert_buffer is not None:
             try:
-                batch = cast(TensorDict, self._expert_buffer.sample())
+                batch = cast(
+                    TensorDict,
+                    self._expert_buffer.sample(batch_size=batch_size),
+                )
+            except TypeError:
+                try:
+                    batch = cast(TensorDict, self._expert_buffer.sample())
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.log.warning("Failed to sample expert batch: %s", exc)
+                    return None
             except Exception as exc:  # pragma: no cover - defensive
                 self.log.warning("Failed to sample expert batch: %s", exc)
                 return None
-        except Exception as exc:  # pragma: no cover - defensive
-            self.log.warning("Failed to sample expert batch: %s", exc)
-            return None
 
-        if batch_size is not None and batch.numel() > batch_size:
-            batch = cast(TensorDict, batch[:batch_size])
-        return batch.to(self.device)
+            if batch_size is not None and batch.numel() > batch_size:
+                batch = cast(TensorDict, batch[:batch_size])
+            return batch.to(self.device)
+
+        if self._expert_batch_sampler is None:
+            return None
+        try:
+            sampled = self._expert_batch_sampler(
+                int(batch_size),
+                self._discriminator_expert_required_keys(),
+            )
+        except Exception as exc:
+            self.log.warning("Failed to sample expert batch from sampler: %s", exc)
+            return None
+        if sampled is None:
+            return None
+        if sampled.numel() > int(batch_size):
+            sampled = cast(TensorDict, sampled[: int(batch_size)])
+        return sampled.to(self.device)
 
     def _obs_features_from_td(self, td: TensorDict, *, detach: bool) -> Tensor:
         parts: list[Tensor] = []
@@ -762,10 +796,10 @@ class GAIL(PPO):
     def _update_discriminator(
         self, rollout_flat: TensorDict, update_idx: int
     ) -> dict[str, float]:
-        if self._expert_buffer is None:
+        if self._expert_buffer is None and self._expert_batch_sampler is None:
             if not self._warned_no_expert:
                 self.log.warning(
-                    "No expert buffer set. Training falls back to environment reward."
+                    "No expert source set. Training falls back to environment reward."
                 )
                 self._warned_no_expert = True
             return {}

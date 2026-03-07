@@ -1502,6 +1502,8 @@ class IPMD(PPO):
                 collected_frames += frames_in_batch
                 if show_progress_bar:
                     pbar.update(frames_in_batch)
+                self._maybe_dump_video(collected_frames)
+                self._strip_video_payload(data)
 
                 if ("next", "reward") in data.keys(True):
                     step_rewards = data["next", "reward"]
@@ -1806,6 +1808,7 @@ class IPMD(PPO):
                     )
 
         pbar.close()
+        self._maybe_dump_video(collected_frames, final=True)
         self.collector.shutdown()
 
     def validate_ipmd_loss(

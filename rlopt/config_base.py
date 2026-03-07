@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from rlopt.config_utils import ObsKey, normalize_batch_key
+
 
 @dataclass
 class EnvConfig:
@@ -48,6 +50,9 @@ class CollectorConfig:
 
     prefetch: int | None = None
     """Number of prefetch batches."""
+
+    no_cuda_sync: bool = False
+    """Whether to disable CUDA synchronization in the collector. This can improve performance but may lead to less accurate timing measurements."""
 
 
 @dataclass
@@ -281,17 +286,17 @@ class NetworkConfig:
     output_dim: int = 128
     """Output dimension of the feature extractor."""
 
-    input_keys: list[str] | None = None
+    input_keys: list[ObsKey] | None = None
     """Input keys for the network.
 
     ``None`` (default) means ``["policy"]``, the IsaacLab convention where
     the observation group name is a top-level TensorDict key and
     ``concatenate_terms=True`` (single tensor per group).
 
-    When ``concatenate_terms=False``, the IsaacLab wrapper flattens the
-    nested observation group so that each term name (e.g. ``"joint_pos"``)
-    becomes a top-level TensorDict key.  Set ``input_keys`` to the list of
-    term names the network should consume.
+    Nested TensorDict keys are supported using tuples
+    (for example ``("policy", "joint_pos_rel")``).
+    This enables explicit group/key composition when
+    ``concatenate_terms=False`` in IsaacLab observation groups.
     """
 
     output_keys: list[str] = field(default_factory=list)
@@ -303,11 +308,11 @@ class NetworkConfig:
     kwargs: dict[str, Any] = field(default_factory=dict)
     """Additional keyword arguments for the network."""
 
-    def get_input_keys(self) -> list[str]:
+    def get_input_keys(self) -> list[ObsKey]:
         """Return the effective input keys (``["policy"]`` when *None*)."""
         if self.input_keys is None:
             return ["policy"]
-        return list(self.input_keys)
+        return [normalize_batch_key(key) for key in self.input_keys]
 
 
 @dataclass

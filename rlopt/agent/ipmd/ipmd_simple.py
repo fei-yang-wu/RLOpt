@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -106,6 +106,25 @@ class IPMDConfig(PPOConfig):
     Default is False. Set to True to train PPO on estimated rewards.
     """
 
+    estimated_reward_clamp_min: float | None = 0.0
+    """Optional lower bound applied to estimated rewards before PPO reward mixing.
+
+    Set to ``None`` to disable lower clipping.
+    """
+
+    estimated_reward_clamp_max: float | None = 0.25
+    """Optional upper bound applied to estimated rewards before PPO reward mixing.
+
+    Set to ``None`` to disable upper clipping.
+    """
+
+    estimated_reward_mix_coeff: float = 0.3
+    """Linear mixing coefficient for estimated rewards in PPO.
+
+    Mixed reward is computed as:
+    ``reward = estimated_reward_mix_coeff * est_rew + env_reward``.
+    """
+
     expert_batch_size: int | None = None
     """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
 
@@ -202,7 +221,11 @@ class IPMD(PPO):
 
         # Expert data source
         self._expert_buffer: TensorDictReplayBuffer | None = None
+        self._expert_batch_sampler: (
+            Callable[[int, list[BatchKey]], TensorDict | None] | None
+        ) = None
         self._warned_no_expert = False
+        self._auto_attach_env_expert_sampler()
 
         # Re-create optimizer to include reward_estimator parameters
         self.optim = self._configure_optimizers()
@@ -345,6 +368,53 @@ class IPMD(PPO):
         )
         return [optimizer_cls(all_params, **optimizer_kwargs)]
 
+    @staticmethod
+    def _discover_env_method(env: object, method_name: str) -> Callable | None:
+        """Discover a callable by walking common wrapper attributes."""
+        stack: list[object] = [env]
+        visited: set[int] = set()
+
+        while len(stack) > 0:
+            current = stack.pop()
+            obj_id = id(current)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
+
+            method = getattr(current, method_name, None)
+            if callable(method):
+                return method
+
+            for attr_name in ("base_env", "env", "_env", "unwrapped"):
+                try:
+                    next_obj = getattr(current, attr_name, None)
+                except Exception:
+                    continue
+                if next_obj is None:
+                    continue
+                if isinstance(next_obj, (list, tuple)):
+                    stack.extend(next_obj)
+                else:
+                    stack.append(next_obj)
+        return None
+
+    def _auto_attach_env_expert_sampler(self) -> None:
+        """Auto-attach expert sampler from env if available."""
+        sampler = self._discover_env_method(self.env, "sample_expert_batch")
+        if sampler is None:
+            return
+
+        def _wrapped_sampler(
+            batch_size: int, required_keys: list[BatchKey]
+        ) -> TensorDict | None:
+            return cast(
+                TensorDict | None,
+                sampler(batch_size=batch_size, required_keys=required_keys),
+            )
+
+        self._expert_batch_sampler = _wrapped_sampler
+        self.log.info("Using environment-provided expert sampler: sample_expert_batch")
+
     # -------------------------
     # Expert data API
     # -------------------------
@@ -355,6 +425,12 @@ class IPMD(PPO):
         whether behavior cloning is enabled.
         """
         self._expert_buffer = buffer
+
+    def set_expert_batch_sampler(
+        self, sampler: Callable[[int, list[BatchKey]], TensorDict | None]
+    ) -> None:
+        """Attach a callable expert sampler that returns TensorDict batches."""
+        self._expert_batch_sampler = sampler
 
     def create_expert_buffer(
         self, expert_data: TensorDict, buffer_size: int | None = None
@@ -403,28 +479,45 @@ class IPMD(PPO):
         return True
 
     def _next_expert_batch(self) -> TensorDict | None:
-        if self._expert_buffer is None:
-            return None
-        try:
-            expert_batch = cast(
-                TensorDict,
-                self._expert_buffer.sample(
-                    batch_size=self.config.ipmd.expert_batch_size
-                ),
-            )
-            # expert_batch = flatten_obs_group(expert_batch)
-            assert isinstance(self.config, IPMDRLOptConfig)
-            if (
-                self.config.ipmd.expert_batch_size is not None
-                and expert_batch.numel() > self.config.ipmd.expert_batch_size
-            ):
+        assert isinstance(self.config, IPMDRLOptConfig)
+        effective_batch_size = int(
+            self.config.ipmd.expert_batch_size or self.config.loss.mini_batch_size
+        )
+
+        if self._expert_buffer is not None:
+            try:
                 expert_batch = cast(
                     TensorDict,
-                    expert_batch[: self.config.ipmd.expert_batch_size],
+                    self._expert_buffer.sample(
+                        batch_size=self.config.ipmd.expert_batch_size
+                    ),
                 )
-            return expert_batch
-        except Exception:
+                if (
+                    self.config.ipmd.expert_batch_size is not None
+                    and expert_batch.numel() > self.config.ipmd.expert_batch_size
+                ):
+                    expert_batch = cast(
+                        TensorDict,
+                        expert_batch[: self.config.ipmd.expert_batch_size],
+                    )
+                return expert_batch
+            except Exception:
+                return None
+
+        if self._expert_batch_sampler is None:
             return None
+        try:
+            expert_batch = self._expert_batch_sampler(
+                effective_batch_size, self._expert_required_keys()
+            )
+        except Exception as err:
+            self.log.warning("Failed to sample expert batch from sampler: %s", err)
+            return None
+        if expert_batch is None:
+            return None
+        if expert_batch.numel() > effective_batch_size:
+            expert_batch = cast(TensorDict, expert_batch[:effective_batch_size])
+        return expert_batch
 
     def _dummy_expert_batch(self, batch: TensorDict) -> TensorDict:
         """Return a single-transition expert batch with same structure as batch (for compile/CUDA graph)."""
@@ -626,7 +719,17 @@ class IPMD(PPO):
 
         collected_frames = 0
         num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
-        pbar = tqdm.tqdm(total=self.config.collector.total_frames)
+        trainer_cfg = cfg.trainer
+        show_progress_bar = (
+            True if trainer_cfg is None else bool(trainer_cfg.progress_bar)
+        )
+        periodic_log_interval_frames = (
+            1000 if trainer_cfg is None else max(1, int(trainer_cfg.log_interval))
+        )
+        next_periodic_log_frames = periodic_log_interval_frames
+        pbar = tqdm.tqdm(
+            total=self.config.collector.total_frames, disable=not show_progress_bar
+        )
 
         num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
         if cfg.collector.frames_per_batch % cfg.loss.mini_batch_size != 0:
@@ -649,9 +752,13 @@ class IPMD(PPO):
         total_iter = len(self.collector)
         policy_op = self.actor_critic.get_policy_operator()
 
-        if self._expert_buffer is None and not self._warned_no_expert:
+        if (
+            self._expert_buffer is None
+            and self._expert_batch_sampler is None
+            and not self._warned_no_expert
+        ):
             logging.getLogger(__name__).warning(
-                "Expert buffer not set; reward estimator updates will use dummy batch (has_expert=0)."
+                "Expert source not set; reward estimator updates will use dummy batch (has_expert=0)."
             )
             self._warned_no_expert = True
 
@@ -662,7 +769,8 @@ class IPMD(PPO):
             metrics_to_log: dict[str, Any] = {}
             frames_in_batch = data.numel()
             collected_frames += frames_in_batch
-            pbar.update(frames_in_batch)
+            if show_progress_bar:
+                pbar.update(frames_in_batch)
 
             if ("next", "reward") in data.keys(True):
                 step_rewards = data["next", "reward"]
@@ -700,20 +808,23 @@ class IPMD(PPO):
                 data.set(("next", "env_reward"), data.get(("next", "reward")))
                 data.set(
                     ("next", "reward"),
-                    0.3 * est_rew + data.get(("next", "env_reward")),
+                    self.config.ipmd.estimated_reward_mix_coeff * est_rew
+                    + (1 - self.config.ipmd.estimated_reward_mix_coeff)
+                    * data.get(("next", "env_reward")),
                 )
 
             self.data_buffer.empty()
             with timeit("training"):
+                # Compute GAE and populate replay buffer once per rollout.
+                with torch.no_grad(), timeit("training/adv"):
+                    data = self.adv_module(data)
+                    if getattr(self.config.compile, "compile_mode", None):
+                        data = data.clone()
+
+                with timeit("training/rb_extend"):
+                    self.data_buffer.extend(data.reshape(-1))
+
                 for j in range(cfg_loss_ppo_epochs):
-                    with torch.no_grad(), timeit("adv"):
-                        data = self.adv_module(data)
-                        if getattr(self.config.compile, "compile_mode", None):
-                            data = data.clone()
-
-                    with timeit("rb - extend"):
-                        self.data_buffer.extend(data.reshape(-1))
-
                     for k, batch in enumerate(self.data_buffer):
                         kl_context = None
                         if (cfg.optim.scheduler or "").lower() == "adaptive":
@@ -734,7 +845,7 @@ class IPMD(PPO):
                             has_expert = torch.tensor(
                                 1.0, device=self.device, dtype=torch.float32
                             )
-                        with timeit("update"):
+                        with timeit("training/update"):
                             loss, num_network_updates = self.update(
                                 batch,
                                 num_network_updates,
@@ -817,14 +928,19 @@ class IPMD(PPO):
                     device=self.device,
                     dtype=torch.float32,
                 )
-            metrics_to_log["train/clip_epsilon"] = clip_epsilon_value
+            metrics_to_log["train/clip_epsilon"] = clip_epsilon_value.item()
 
-            if "Isaac" in cfg.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+            if (
+                "Isaac" in cfg.env.env_name
+                and hasattr(self.env, "log_infos")
+                and len(self.env.log_infos) > 0
+            ):
+                log_info_dict: dict[str, Tensor] = self.env.log_infos.pop()
+                self.env.log_infos.clear()
                 log_info(log_info_dict, metrics_to_log)
 
             metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-            rate = pbar.format_dict.get("rate")
+            rate = pbar.format_dict.get("rate") if show_progress_bar else None
             if rate is not None:
                 metrics_to_log["time/speed"] = rate
             self.log_metrics(metrics_to_log, step=collected_frames)
@@ -841,8 +957,31 @@ class IPMD(PPO):
                 postfix["reward_diff"] = (
                     f"{metrics_to_log['train/loss_reward_diff']:.3f}"
                 )
-            if postfix:
+            if show_progress_bar and postfix:
                 pbar.set_postfix(postfix)
+            elif not show_progress_bar and (
+                collected_frames >= next_periodic_log_frames or (_i + 1) == total_iter
+            ):
+                status_parts = [
+                    f"iter={_i + 1}/{total_iter}",
+                    f"frames={collected_frames}/{cfg.collector.total_frames}",
+                ]
+                summary_metrics: tuple[tuple[str, str], ...] = (
+                    ("train/step_reward_mean", "r_step"),
+                    ("episode/length", "ep_len"),
+                    ("episode/return", "r_ep"),
+                    ("train/loss_objective", "pi_loss"),
+                    ("train/loss_reward_diff", "reward_diff"),
+                    ("train/expert_reward_mean", "exp_r"),
+                    ("time/speed", "fps"),
+                )
+                for metric_key, alias in summary_metrics:
+                    metric_value = metrics_to_log.get(metric_key)
+                    if isinstance(metric_value, (int, float, np.floating)):
+                        status_parts.append(f"{alias}={float(metric_value):.4f}")
+                self.log.info(" | ".join(status_parts))
+                while collected_frames >= next_periodic_log_frames:
+                    next_periodic_log_frames += periodic_log_interval_frames
 
             if (
                 self.config.save_interval > 0

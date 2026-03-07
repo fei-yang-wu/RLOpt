@@ -4,9 +4,9 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -265,6 +265,65 @@ class BaseAlgorithm(ABC):
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(device_str)
 
+    @staticmethod
+    def _discover_env_method(
+        env: object, method_name: str
+    ) -> Callable[..., Any] | None:
+        """Discover a callable by walking common wrapper attributes."""
+        stack: list[object] = [env]
+        visited: set[int] = set()
+
+        while len(stack) > 0:
+            current = stack.pop()
+            obj_id = id(current)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
+
+            method = getattr(current, method_name, None)
+            if callable(method):
+                return method
+
+            for attr_name in ("base_env", "env", "_env", "unwrapped"):
+                try:
+                    next_obj = getattr(current, attr_name, None)
+                except Exception:
+                    continue
+                if next_obj is None:
+                    continue
+                if isinstance(next_obj, (list, tuple)):
+                    stack.extend(next_obj)
+                else:
+                    stack.append(next_obj)
+        return None
+
+    def _auto_attach_env_expert_sampler(self) -> None:
+        """Attach ``sample_expert_batch`` from env wrappers when available."""
+        sampler = self._discover_env_method(self.env, "sample_expert_batch")
+        if sampler is None:
+            return
+
+        def _wrapped_sampler(
+            batch_size: int, required_keys: list[str | tuple[str, ...]]
+        ) -> TensorDict | None:
+            return cast(
+                TensorDict | None,
+                sampler(batch_size=batch_size, required_keys=required_keys),
+            )
+
+        self._expert_batch_sampler = _wrapped_sampler  # type: ignore[attr-defined]
+        self.log.info("Using environment-provided expert sampler: sample_expert_batch")
+
+    def set_expert_batch_sampler(
+        self,
+        sampler: Callable[
+            [int, list[str | tuple[str, ...]]],
+            TensorDict | None,
+        ],
+    ) -> None:
+        """Attach a callable expert sampler that returns TensorDict batches."""
+        self._expert_batch_sampler = sampler  # type: ignore[attr-defined]
+
     def _initialize_weights(
         self, module: torch.nn.Module, init_type: str | None
     ) -> None:
@@ -342,6 +401,7 @@ class BaseAlgorithm(ABC):
             # storing_device=self.device,
             # reset_at_each_iter=False,
             # set_truncated=self.config.collector.set_truncated,
+            no_cuda_sync=self.config.collector.no_cuda_sync,
         )
         collector.set_seed(self.config.seed)
         return collector
@@ -1027,7 +1087,9 @@ class BaseAlgorithm(ABC):
         self, sampled_tensordict: TensorDict, policy_op: TensorDictModule
     ) -> dict[str, Tensor]:
         obs_td = sampled_tensordict.select(*policy_op.in_keys).detach()
-        if "loc" not in sampled_tensordict.keys(True) or "scale" not in sampled_tensordict.keys(True):
+        if "loc" not in sampled_tensordict.keys(
+            True
+        ) or "scale" not in sampled_tensordict.keys(True):
             msg = "Expected 'loc' and 'scale' in sampled_tensordict for KL computation."
             raise KeyError(msg)
         return {
@@ -1049,9 +1111,11 @@ class BaseAlgorithm(ABC):
 
             var_old = old_scale.pow(2)
             var_new = new_scale.pow(2)
-            kl = torch.log(new_scale / old_scale) + (
-                var_old + (old_loc - new_loc).pow(2)
-            ) / (2.0 * var_new) - 0.5
+            kl = (
+                torch.log(new_scale / old_scale)
+                + (var_old + (old_loc - new_loc).pow(2)) / (2.0 * var_new)
+                - 0.5
+            )
             if kl.ndim > 0:
                 kl = kl.sum(dim=-1)
             kl_approx = kl.mean()
