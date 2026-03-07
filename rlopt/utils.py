@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+import math
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import gymnasium as gym
@@ -573,3 +574,13 @@ def get_activation_class(activation_name: str) -> type[th.nn.Module]:
         "gelu": th.nn.GELU,
     }
     return activation_map.get(activation_name, th.nn.ELU)
+
+@torch.compile
+def gaussian_log_prob(action: th.Tensor, loc: th.Tensor, scale: th.Tensor) -> th.Tensor:
+    """Diagonal-Gaussian log probability, summed over action dims.
+
+    Returns shape ``[batch]``.
+    """
+    return -0.5 * (
+        ((action - loc) / scale).pow(2) + 2.0 * scale.log() + math.log(2.0 * math.pi)
+    ).sum(dim=-1)

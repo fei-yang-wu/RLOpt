@@ -50,7 +50,6 @@ from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
-
 class CatInputs(torch.nn.Module):
     """Concatenate multiple input tensors along the last dimension.
 

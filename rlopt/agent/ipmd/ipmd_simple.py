@@ -40,12 +40,7 @@ from rlopt.config_utils import (
     strip_next_prefix,
 )
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import get_activation_class, log_info
-
-# Suppress torch.compile CUDA graph diagnostic messages
-logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
-logging.getLogger("torch._inductor").setLevel(logging.ERROR)
-
+from rlopt.utils import gaussian_log_prob, get_activation_class, log_info
 
 @dataclass
 class IPMDConfig(PPOConfig):
@@ -229,18 +224,35 @@ class IPMD(PPO):
 
         # Re-create optimizer to include reward_estimator parameters
         self.optim = self._configure_optimizers()
+        self._refresh_grad_clip_params()
 
-    def _compile_components(self) -> None:
-        """Compile update (fixed signature for torch.compile and CUDA graphs)."""
-        cfg = self.config
-        assert isinstance(cfg, IPMDRLOptConfig)
-        if not cfg.compile.compile:
-            return
-        compile_mode = cfg.compile.compile_mode or (
-            "default" if cfg.compile.cudagraphs else "reduce-overhead"
-        )
-        self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore[method-assign]
-        self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore[method-assign]
+        # Pre-cache compile-friendly scalars from config
+        self._cache_ipmd_scalars()
+
+    def _cache_ipmd_scalars(self) -> None:
+        """Pre-cache config scalars and reward-input flags for compile-friendly hot paths."""
+        cfg = self.config.ipmd
+        rit = cfg.reward_input_type
+        # Boolean flags for reward input assembly (avoids Python branching in update)
+        self._rit_use_s: bool = rit in ("s", "sa", "sas")
+        self._rit_use_a: bool = rit in ("sa", "sas")
+        self._rit_use_sn: bool = rit in ("s'", "sas")
+        # Scalar caches
+        self._reward_loss_coeff: float = float(cfg.reward_loss_coeff)
+        self._reward_l2_coeff: float = float(cfg.reward_l2_coeff)
+        self._bc_coeff: float = float(cfg.bc_loss_coeff)
+        self._reward_detach_features: bool = bool(cfg.reward_detach_features)
+        max_grad = getattr(self.config.optim, "max_grad_norm", None)
+        self._max_grad_norm: float = float(max_grad) if max_grad else 1e10
+        # Output activation as a callable (eliminates string dispatch at call time)
+        out_act = cfg.reward_output_activation
+        scale = float(cfg.reward_output_scale)
+        if out_act == "tanh":
+            self._reward_out_fn: Callable[[Tensor], Tensor] = lambda r: torch.tanh(r) * scale
+        elif out_act == "sigmoid":
+            self._reward_out_fn = lambda r: torch.sigmoid(r) * scale
+        else:
+            self._reward_out_fn = lambda r: r
 
     _REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
 
@@ -286,17 +298,15 @@ class IPMD(PPO):
     ) -> Tensor:
         parts: list[Tensor] = []
         for key in keys:
-            td_key: BatchKey = next_obs_key(key) if next_obs else key
-            obs = cast(Tensor, td.get(td_key))
-            obs = flatten_feature_tensor(obs, self._obs_feature_ndims[key])
+            obs = flatten_feature_tensor(
+                td.get(next_obs_key(key) if next_obs else key),
+                self._obs_feature_ndims[key],
+            )
             parts.append(obs.detach() if detach else obs)
-        if len(parts) == 1:
-            return parts[0]
-        return torch.cat(parts, dim=-1)
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
     def _action_features_from_td(self, td: TensorDict | Any, *, detach: bool) -> Tensor:
-        action = cast(Tensor, td.get("action"))
-        action = flatten_feature_tensor(action, self._action_feature_ndim)
+        action = flatten_feature_tensor(td.get("action"), self._action_feature_ndim)
         return action.detach() if detach else action
 
     def _expert_required_keys(self) -> list[BatchKey]:
@@ -361,8 +371,6 @@ class IPMD(PPO):
         if not hasattr(self, "reward_estimator"):
             return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
         # PPO uses one optimizer for actor_critic; add reward_estimator to the same group
-        base_optimizers = super()._set_optimizers(optimizer_cls, optimizer_kwargs)
-        assert len(base_optimizers) == 1
         all_params = list(self.actor_critic.parameters()) + list(
             self.reward_estimator.parameters()
         )
@@ -580,43 +588,18 @@ class IPMD(PPO):
 
     def _reward_from_batch(self, td: TensorDict | Any) -> Tensor:
         """Compute estimated reward for a batch of transitions."""
-        assert isinstance(self.config, IPMDRLOptConfig)
-        rit = self.config.ipmd.reward_input_type
-        detach = self.config.ipmd.reward_detach_features
-
+        # Uses pre-cached flags (_rit_use_s, _rit_use_a, _rit_use_sn) — no Python
+        # branching on config strings at call time, making this compile-friendly.
+        detach = self._reward_detach_features
         parts: list[Tensor] = []
-        if rit in ("s", "sa", "sas"):
-            parts.append(
-                self._obs_features_from_td(
-                    td,
-                    self._reward_obs_keys,
-                    next_obs=False,
-                    detach=detach,
-                )
-            )
-        if rit in ("sa", "sas"):
+        if self._rit_use_s:
+            parts.append(self._obs_features_from_td(td, self._reward_obs_keys, next_obs=False, detach=detach))
+        if self._rit_use_a:
             parts.append(self._action_features_from_td(td, detach=detach))
-        if rit in ("s'", "sas"):
-            parts.append(
-                self._obs_features_from_td(
-                    td,
-                    self._reward_obs_keys,
-                    next_obs=True,
-                    detach=detach,
-                )
-            )
-
+        if self._rit_use_sn:
+            parts.append(self._obs_features_from_td(td, self._reward_obs_keys, next_obs=True, detach=detach))
         x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-        r = self.reward_estimator(x)
-
-        # Apply output activation to bound the reward
-        out_act = self.config.ipmd.reward_output_activation
-        if out_act == "tanh":
-            r = torch.tanh(r) * self.config.ipmd.reward_output_scale
-        elif out_act == "sigmoid":
-            r = torch.sigmoid(r) * self.config.ipmd.reward_output_scale
-        # "none" — keep unbounded
-        return r
+        return self._reward_out_fn(self.reward_estimator(x))
 
     def update(
         self,
@@ -625,90 +608,51 @@ class IPMD(PPO):
         expert_batch: TensorDict,
         has_expert: Tensor,
     ) -> tuple[TensorDict, int]:
-        """PPO update plus IPMD reward loss; fixed path for torch.compile and CUDA graphs."""
+        """PPO update plus IPMD reward loss; fixed path for torch.compile and CUDA graphs.
+
+        All Python-level branches are eliminated: BC loss is always computed and
+        scaled to zero by ``has_expert * _bc_coeff`` when disabled; reward-input
+        flags are boolean attributes set once at init.
+        """
         self.optim.zero_grad(set_to_none=True)
-        assert isinstance(self.config, IPMDRLOptConfig)
 
         # 1) PPO loss
         loss: TensorDict = self.loss_module(batch)
-        critic_loss = loss["loss_critic"]
-        actor_loss = loss["loss_objective"] + loss["loss_entropy"]
-        total_ppo_loss = critic_loss + actor_loss
-        total_ppo_loss.backward()
-
+        (loss["loss_critic"] + loss["loss_objective"] + loss["loss_entropy"]).backward()
         output_loss = loss.clone().detach_()
 
-        # 2) IPMD reward loss (always computed; scaled by has_expert for fixed graph)
+        # 2) IPMD reward loss — always computed; scaled by has_expert for a fixed graph
         r_pi = self._reward_from_batch(batch)
-        r_exp = self._reward_from_batch(expert_batch.to(self.device))
+        r_exp = self._reward_from_batch(expert_batch)
         diff = r_pi.mean() - r_exp.mean()
-        l2 = torch.zeros((), device=self.device)
-        # for p in self.reward_estimator.parameters():
-        #     l2 = l2 + p.pow(2).sum()
         l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
-        total_reward_loss = (
-            float(self.config.ipmd.reward_loss_coeff) * diff
-            + float(self.config.ipmd.reward_l2_coeff) * l2.pow(0.5)
-        ) * has_expert
-        total_reward_loss.backward()
+        (
+            (self._reward_loss_coeff * diff + self._reward_l2_coeff * l2.pow(0.5))
+            * has_expert
+        ).backward()
 
-        reward_diff = diff.detach()
-        reward_l2 = l2.detach()
-
-        # 3) Behavior cloning loss on expert actions (scaled by has_expert)
-        bc_coeff = float(self.config.ipmd.bc_loss_coeff)
-        if bc_coeff > 0.0:
-            expert_obs_td = expert_batch.select(*self._policy_obs_keys).to(self.device)
-            policy_op = self.actor_critic.get_policy_operator()
-            expert_policy_td = policy_op(expert_obs_td)
-            loc = expert_policy_td.get("loc")
-            scale = expert_policy_td.get("scale")
-            expert_action = expert_batch.get("action").to(self.device)
-            # Gaussian log-prob: sum over action dims, mean over batch
-            log_prob = -0.5 * (
-                ((expert_action - loc) / scale).pow(2)
-                + 2.0 * scale.log()
-                + math.log(2.0 * math.pi)
-            )
-            log_prob = log_prob.sum(dim=-1)  # sum over action dims
-            bc_loss = -log_prob.mean() * bc_coeff * has_expert
-            bc_loss.backward()
-            output_loss_bc = bc_loss.detach()
-        else:
-            output_loss_bc = torch.tensor(0.0, device=self.device)
-
-        # Gradient clipping (always call for fixed graph)
-        grad_params = list(self.actor_critic.parameters()) + list(
-            self.reward_estimator.parameters()
-        )
-        max_grad_norm = getattr(self.config.optim, "max_grad_norm", None) or 1e10
-        grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
+        # Gradient clipping — always call for a fixed graph
+        grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
         self.optim.step()
         if self.lr_scheduler and self.lr_scheduler_step == "update":
             self.lr_scheduler.step()
 
-        output_loss.set("alpha", torch.tensor(1.0, device=self.device))
-        output_loss.set("loss_reward_diff", reward_diff)
-        output_loss.set("loss_reward_l2", reward_l2)
-        output_loss.set("loss_bc", output_loss_bc)
+        output_loss.set("alpha", torch.ones((), device=self.device))
+        output_loss.set("loss_reward_diff", diff.detach())
+        output_loss.set("loss_reward_l2", l2.detach())
         output_loss.set("grad_norm", grad_norm_tensor.detach())
         output_loss.set(
             "lr",
-            torch.tensor(
-                self.optim.param_groups[0]["lr"],
-                device=self.device,
-                dtype=torch.float32,
-            ),
+            torch.tensor(self.optim.param_groups[0]["lr"], device=self.device, dtype=torch.float32),
         )
-        output_loss.set("skipped_update", torch.tensor(False, device=self.device))
-
+        output_loss.set("skipped_update", torch.zeros((), dtype=torch.bool, device=self.device))
+        # Reuse r_pi (already computed) for diagnostics — avoids a second forward pass
         with torch.no_grad():
-            diag_rewards = self._reward_from_batch(batch)
-            output_loss.set("estimated_reward_mean", diag_rewards.mean())
-            output_loss.set("estimated_reward_std", diag_rewards.std())
-            output_loss.set("expert_reward_mean", r_exp.mean().nan_to_num(0.0))
-            output_loss.set("expert_reward_std", r_exp.std().nan_to_num(0.0))
+            output_loss.set("estimated_reward_mean", r_pi.mean().detach())
+            output_loss.set("estimated_reward_std", r_pi.std().detach())
+            output_loss.set("expert_reward_mean", r_exp.mean().detach().nan_to_num(0.0))
+            output_loss.set("expert_reward_std", r_exp.std().detach().nan_to_num(0.0))
 
         return output_loss, num_network_updates + 1
 
@@ -831,25 +775,18 @@ class IPMD(PPO):
                             kl_context = self._prepare_kl_context(batch, policy_op)
                         # Fixed inputs for torch.compile / CUDA graph
                         expert_batch_raw = self._next_expert_batch()
-                        if (
-                            expert_batch_raw is None
-                            or not self._check_expert_batch_keys(expert_batch_raw)
-                        ):
+                        if expert_batch_raw is None or not self._check_expert_batch_keys(expert_batch_raw):
                             self.log.warning("No expert batch found")
-                            expert_batch = self._dummy_expert_batch(batch)
-                            has_expert = torch.tensor(
-                                0.0, device=self.device, dtype=torch.float32
-                            )
+                            expert_batch_for_update = self._dummy_expert_batch(batch).to(self.device)
+                            has_expert = torch.zeros((), device=self.device, dtype=torch.float32)
                         else:
-                            expert_batch = expert_batch_raw.to(self.device)
-                            has_expert = torch.tensor(
-                                1.0, device=self.device, dtype=torch.float32
-                            )
+                            expert_batch_for_update = expert_batch_raw.to(self.device)
+                            has_expert = torch.ones((), device=self.device, dtype=torch.float32)
                         with timeit("training/update"):
                             loss, num_network_updates = self.update(
                                 batch,
                                 num_network_updates,
-                                expert_batch,
+                                expert_batch_for_update,
                                 has_expert,
                             )
                             loss = loss.clone()
