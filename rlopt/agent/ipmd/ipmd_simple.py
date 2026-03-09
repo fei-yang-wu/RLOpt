@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import logging
 import math
 from collections.abc import Callable, Mapping
@@ -17,12 +16,9 @@ from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
-    LazyMemmapStorage,
-    LazyTensorStorage,
     ReplayBuffer,
     TensorDictReplayBuffer,
 )
-from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import MLP
 from torchrl.record.loggers import Logger
@@ -40,7 +36,8 @@ from rlopt.config_utils import (
     strip_next_prefix,
 )
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import gaussian_log_prob, get_activation_class, log_info
+from rlopt.utils import get_activation_class, log_info
+
 
 @dataclass
 class IPMDConfig(PPOConfig):
@@ -117,18 +114,11 @@ class IPMDConfig(PPOConfig):
     """Linear mixing coefficient for estimated rewards in PPO.
 
     Mixed reward is computed as:
-    ``reward = estimated_reward_mix_coeff * est_rew + env_reward``.
+    ``reward = estimated_reward_mix_coeff * est_rew + (1 - estimated_reward_mix_coeff) * env_reward``.
     """
 
     expert_batch_size: int | None = None
     """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
-
-    detach_reward_when_used_for_ppo: bool = True
-    """Detach the estimated reward when injecting into PPO (GAE/reward).
-
-    Prevents PPO updates from backpropagating into the reward estimator.
-    The reward network is then trained solely via the IPMD objective.
-    """
 
     bc_loss_coeff: float = 0.0
     """Behavior cloning (MLE) loss coefficient on expert actions.
@@ -172,18 +162,6 @@ class IPMD(PPO):
         self.config: IPMDRLOptConfig
         self.env = env
 
-        super().__init__(
-            env=env,
-            config=config,
-            policy_net=policy_net,
-            value_net=value_net,
-            q_net=q_net,
-            replay_buffer=replay_buffer,
-            logger=logger,
-            feature_extractor_net=feature_extractor_net,
-            **kwargs,
-        )
-
         self.config = cast(IPMDRLOptConfig, self.config)
 
         # Observation key groups can differ across policy, value, and reward model.
@@ -222,12 +200,22 @@ class IPMD(PPO):
         self._warned_no_expert = False
         self._auto_attach_env_expert_sampler()
 
-        # Re-create optimizer to include reward_estimator parameters
-        self.optim = self._configure_optimizers()
-        self._refresh_grad_clip_params()
-
         # Pre-cache compile-friendly scalars from config
         self._cache_ipmd_scalars()
+
+        super().__init__(
+            env=env,
+            config=config,
+            policy_net=policy_net,
+            value_net=value_net,
+            q_net=q_net,
+            replay_buffer=replay_buffer,
+            logger=logger,
+            feature_extractor_net=feature_extractor_net,
+            **kwargs,
+        )
+
+        self._refresh_grad_clip_params()
 
     def _cache_ipmd_scalars(self) -> None:
         """Pre-cache config scalars and reward-input flags for compile-friendly hot paths."""
@@ -248,7 +236,9 @@ class IPMD(PPO):
         out_act = cfg.reward_output_activation
         scale = float(cfg.reward_output_scale)
         if out_act == "tanh":
-            self._reward_out_fn: Callable[[Tensor], Tensor] = lambda r: torch.tanh(r) * scale
+            self._reward_out_fn: Callable[[Tensor], Tensor] = lambda r: (
+                torch.tanh(r) * scale
+            )
         elif out_act == "sigmoid":
             self._reward_out_fn = lambda r: torch.sigmoid(r) * scale
         else:
@@ -359,6 +349,13 @@ class IPMD(PPO):
         self._initialize_weights(net, cfg.ipmd.reward_init)
         return net
 
+    def _compile_components(self) -> None:
+        """Compile reward estimator and update method with torch.compile (if enabled)."""
+        if not self.config.compile.compile:
+            return
+        super()._compile_components()
+        self.reward_estimator = torch.compile(self.reward_estimator)
+
     def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
@@ -421,61 +418,6 @@ class IPMD(PPO):
             )
 
         self._expert_batch_sampler = _wrapped_sampler
-        self.log.info("Using environment-provided expert sampler: sample_expert_batch")
-
-    # -------------------------
-    # Expert data API
-    # -------------------------
-    def set_expert_buffer(self, buffer: TensorDictReplayBuffer) -> None:
-        """Attach an expert replay buffer.
-
-        Required keys depend on ``reward_input_type``, ``reward_input_keys``, and
-        whether behavior cloning is enabled.
-        """
-        self._expert_buffer = buffer
-
-    def set_expert_batch_sampler(
-        self, sampler: Callable[[int, list[BatchKey]], TensorDict | None]
-    ) -> None:
-        """Attach a callable expert sampler that returns TensorDict batches."""
-        self._expert_batch_sampler = sampler
-
-    def create_expert_buffer(
-        self, expert_data: TensorDict, buffer_size: int | None = None
-    ) -> TensorDictReplayBuffer:
-        """Create an expert replay buffer from expert demonstration data."""
-        if buffer_size is None:
-            buffer_size = expert_data.numel()
-
-        cfg = self.config
-        assert isinstance(cfg, IPMDRLOptConfig)
-        sampler = RandomSampler()
-        scratch_dir = cfg.collector.scratch_dir
-        device = cfg.device
-        batch_size = cfg.loss.mini_batch_size
-        shared = cfg.collector.shared
-        prefetch = cfg.collector.prefetch
-
-        storage_cls = (
-            functools.partial(LazyTensorStorage, device=device)
-            if not scratch_dir
-            else functools.partial(
-                LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir
-            )
-        )
-
-        expert_buffer = TensorDictReplayBuffer(
-            pin_memory=False,
-            prefetch=prefetch,
-            sampler=sampler,
-            storage=storage_cls(max_size=buffer_size, compilable=cfg.compile.compile),
-            batch_size=batch_size,
-            shared=shared,
-        )
-        expert_buffer.extend(expert_data.reshape(-1))
-        if scratch_dir:
-            expert_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
-        return expert_buffer
 
     def _check_expert_batch_keys(self, expert_batch: TensorDict) -> bool:
         required_keys = self._expert_required_keys()
@@ -593,11 +535,19 @@ class IPMD(PPO):
         detach = self._reward_detach_features
         parts: list[Tensor] = []
         if self._rit_use_s:
-            parts.append(self._obs_features_from_td(td, self._reward_obs_keys, next_obs=False, detach=detach))
+            parts.append(
+                self._obs_features_from_td(
+                    td, self._reward_obs_keys, next_obs=False, detach=detach
+                )
+            )
         if self._rit_use_a:
             parts.append(self._action_features_from_td(td, detach=detach))
         if self._rit_use_sn:
-            parts.append(self._obs_features_from_td(td, self._reward_obs_keys, next_obs=True, detach=detach))
+            parts.append(
+                self._obs_features_from_td(
+                    td, self._reward_obs_keys, next_obs=True, detach=detach
+                )
+            )
         x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         return self._reward_out_fn(self.reward_estimator(x))
 
@@ -627,8 +577,7 @@ class IPMD(PPO):
         diff = r_pi.mean() - r_exp.mean()
         l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
         (
-            (self._reward_loss_coeff * diff + self._reward_l2_coeff * l2.pow(0.5))
-            * has_expert
+            self._reward_loss_coeff * diff + self._reward_l2_coeff * l2.pow(0.5)
         ).backward()
 
         # Gradient clipping — always call for a fixed graph
@@ -644,15 +593,21 @@ class IPMD(PPO):
         output_loss.set("grad_norm", grad_norm_tensor.detach())
         output_loss.set(
             "lr",
-            torch.tensor(self.optim.param_groups[0]["lr"], device=self.device, dtype=torch.float32),
+            torch.tensor(
+                self.optim.param_groups[0]["lr"],
+                device=self.device,
+                dtype=torch.float32,
+            ),
         )
-        output_loss.set("skipped_update", torch.zeros((), dtype=torch.bool, device=self.device))
-        # Reuse r_pi (already computed) for diagnostics — avoids a second forward pass
-        with torch.no_grad():
-            output_loss.set("estimated_reward_mean", r_pi.mean().detach())
-            output_loss.set("estimated_reward_std", r_pi.std().detach())
-            output_loss.set("expert_reward_mean", r_exp.mean().detach().nan_to_num(0.0))
-            output_loss.set("expert_reward_std", r_exp.std().detach().nan_to_num(0.0))
+        # output_loss.set(
+        #     "skipped_update", torch.zeros((), dtype=torch.bool, device=self.device)
+        # )
+        # # Reuse r_pi (already computed) for diagnostics — avoids a second forward pass
+        # with torch.no_grad():
+        #     output_loss.set("estimated_reward_mean", r_pi.mean().detach())
+        #     output_loss.set("estimated_reward_std", r_pi.std().detach())
+        #     output_loss.set("expert_reward_mean", r_exp.mean().detach().nan_to_num(0.0))
+        #     output_loss.set("expert_reward_std", r_exp.std().detach().nan_to_num(0.0))
 
         return output_loss, num_network_updates + 1
 
@@ -741,12 +696,11 @@ class IPMD(PPO):
                         }
                     )
 
-            # Optionally replace env rewards with estimated rewards for PPO (before GAE)
-            if cfg.ipmd.use_estimated_rewards_for_ppo:
+            self.data_buffer.empty()
+            with timeit("training"):
                 with torch.no_grad():
                     est_rew = self._reward_from_batch(data)
-                if cfg.ipmd.detach_reward_when_used_for_ppo:
-                    est_rew = est_rew.detach()
+                est_rew = est_rew.detach()
                 est_rew = torch.clamp(est_rew, 0.0, 0.25)
                 # Save original env reward for metrics, then replace
                 data.set(("next", "env_reward"), data.get(("next", "reward")))
@@ -756,9 +710,6 @@ class IPMD(PPO):
                     + (1 - self.config.ipmd.estimated_reward_mix_coeff)
                     * data.get(("next", "env_reward")),
                 )
-
-            self.data_buffer.empty()
-            with timeit("training"):
                 # Compute GAE and populate replay buffer once per rollout.
                 with torch.no_grad(), timeit("training/adv"):
                     data = self.adv_module(data)
@@ -775,13 +726,22 @@ class IPMD(PPO):
                             kl_context = self._prepare_kl_context(batch, policy_op)
                         # Fixed inputs for torch.compile / CUDA graph
                         expert_batch_raw = self._next_expert_batch()
-                        if expert_batch_raw is None or not self._check_expert_batch_keys(expert_batch_raw):
+                        if (
+                            expert_batch_raw is None
+                            or not self._check_expert_batch_keys(expert_batch_raw)
+                        ):
                             self.log.warning("No expert batch found")
-                            expert_batch_for_update = self._dummy_expert_batch(batch).to(self.device)
-                            has_expert = torch.zeros((), device=self.device, dtype=torch.float32)
+                            expert_batch_for_update = self._dummy_expert_batch(
+                                batch
+                            ).to(self.device)
+                            has_expert = torch.zeros(
+                                (), device=self.device, dtype=torch.float32
+                            )
                         else:
                             expert_batch_for_update = expert_batch_raw.to(self.device)
-                            has_expert = torch.ones((), device=self.device, dtype=torch.float32)
+                            has_expert = torch.ones(
+                                (), device=self.device, dtype=torch.float32
+                            )
                         with timeit("training/update"):
                             loss, num_network_updates = self.update(
                                 batch,
@@ -931,33 +891,6 @@ class IPMD(PPO):
 
         pbar.close()
         self.collector.shutdown()
-
-    def validate_ipmd_loss(
-        self, test_batch: TensorDict, expert_batch: TensorDict
-    ) -> dict[str, float]:
-        """Validate IPMD loss computation (reward diff + L2) and PPO loss on test data."""
-        for m in (self.actor_critic, self.reward_estimator):
-            if hasattr(m, "eval"):
-                m.eval()
-        with torch.no_grad():
-            estimated_rewards = self._reward_from_batch(test_batch)
-            expert_rewards = self._reward_from_batch(expert_batch)
-            reward_diff = (estimated_rewards.sum() - expert_rewards.sum()).item()
-            l2_reg = sum(
-                p.pow(2).sum().item() for p in self.reward_estimator.parameters()
-            )
-            ppo_loss_td = self.loss_module(test_batch)
-            return {
-                "reward_diff": reward_diff,
-                "reward_l2": l2_reg,
-                "estimated_reward_mean": estimated_rewards.mean().item(),
-                "estimated_reward_std": estimated_rewards.std().item(),
-                "expert_reward_mean": expert_rewards.mean().item(),
-                "expert_reward_std": expert_rewards.std().item(),
-                "ppo_loss_critic": ppo_loss_td["loss_critic"].item(),
-                "ppo_loss_objective": ppo_loss_td["loss_objective"].item(),
-                "ppo_loss_entropy": ppo_loss_td["loss_entropy"].item(),
-            }
 
     def predict(self, obs: Tensor | np.ndarray | Mapping[Any, Any]) -> Tensor:  # type: ignore[override]
         """Predict action given observation (deterministic)."""
