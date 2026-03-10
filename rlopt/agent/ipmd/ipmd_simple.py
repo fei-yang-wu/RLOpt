@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -662,8 +663,10 @@ class IPMD(PPO):
             self._warned_no_expert = True
 
         for _i in range(total_iter):
+            collect_start = time.perf_counter()
             with timeit("collecting"):
                 data = next(collector_iter)
+            collect_time = time.perf_counter() - collect_start
 
             metrics_to_log: dict[str, Any] = {}
             frames_in_batch = data.numel()
@@ -697,6 +700,7 @@ class IPMD(PPO):
                     )
 
             self.data_buffer.empty()
+            learn_start = time.perf_counter()
             with timeit("training"):
                 with torch.no_grad():
                     est_rew = self._reward_from_batch(data)
@@ -788,6 +792,9 @@ class IPMD(PPO):
 
                     if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
+            learn_time = time.perf_counter() - learn_start
+            iter_time = collect_time + learn_time
+            fps = float(frames_in_batch) / iter_time if iter_time > 0.0 else 0.0
 
             # EPIC distance between estimated and true env reward (invariant to
             # potential-based shaping and positive rescaling).
@@ -826,6 +833,10 @@ class IPMD(PPO):
                     dtype=torch.float32,
                 )
             metrics_to_log["train/clip_epsilon"] = clip_epsilon_value.item()
+            metrics_to_log["time/collection_time"] = collect_time
+            metrics_to_log["time/learning_time"] = learn_time
+            metrics_to_log["time/iteration_time"] = iter_time
+            metrics_to_log["time/speed"] = fps
 
             if (
                 "Isaac" in cfg.env.env_name
@@ -837,9 +848,6 @@ class IPMD(PPO):
                 log_info(log_info_dict, metrics_to_log)
 
             metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-            rate = pbar.format_dict.get("rate") if show_progress_bar else None
-            if rate is not None:
-                metrics_to_log["time/speed"] = rate
             self.log_metrics(metrics_to_log, step=collected_frames)
             self.collector.update_policy_weights_()
 
@@ -871,6 +879,8 @@ class IPMD(PPO):
                     ("train/loss_reward_diff", "reward_diff"),
                     ("train/expert_reward_mean", "exp_r"),
                     ("time/speed", "fps"),
+                    ("time/collection_time", "t_col"),
+                    ("time/learning_time", "t_lrn"),
                 )
                 for metric_key, alias in summary_metrics:
                     metric_value = metrics_to_log.get(metric_key)
