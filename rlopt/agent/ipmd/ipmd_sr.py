@@ -7,7 +7,8 @@ from typing import Any, cast
 import torch
 from tensordict import TensorDict
 from torch import Tensor
-from torchrl.data import ReplayBuffer
+from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
+from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.record.loggers import Logger
 
 from rlopt.agent.ipmd.ipmd_simple import IPMD, IPMDRLOptConfig
@@ -31,11 +32,15 @@ class SRConfig:
     rff_dim: int | None = None
     feature_lr: float = 1e-4
     reward_loss_coeff: float = 0.0
-    update_steps: int = 1
+    update_steps: int = 8
 
     # DiffSR-specific
     sample_steps: int = 16
     sample_eval_interval: int = 50  # 0 = disabled; run sampling check every N SR updates
+
+    # History buffer for learning from all past transitions
+    history_buffer_size: int = 10_000_000
+    sr_batch_size: int = 4096
 
     # CTRL-SR-specific
     num_noises: int = 16
@@ -95,6 +100,15 @@ class IPMDSR(IPMD):
         )
         self._sr_update_count = 0
         self._pending_sr_metrics: dict[str, list[float]] = {}
+
+        # History buffer to accumulate (s, a, s') from all past rollouts
+        self._sr_history_buffer = TensorDictReplayBuffer(
+            storage=LazyTensorStorage(
+                max_size=self.config.sr.history_buffer_size, device=self.device
+            ),
+            sampler=RandomSampler(),
+            batch_size=self.config.sr.sr_batch_size,
+        )
 
     def _construct_sr_model(self) -> DDPM | FactorizedNCE:
         """Construct the spectral representation model."""
@@ -182,39 +196,53 @@ class IPMDSR(IPMD):
             "sample/recon_l1": l1.item(),
         }
 
-    def _train_sr_steps(
-        self, batch: TensorDict, steps: int
-    ) -> dict[str, float]:
-        """Train the SR model for the given number of steps on mini-batches."""
+    def _store_transitions(self, batch: TensorDict) -> None:
+        """Extract (s, a, s') from the batch and add to the history buffer."""
+        obs_key = self._sr_obs_key()
+        transitions = TensorDict(
+            {
+                obs_key: batch.get(obs_key),
+                "action": batch.get("action"),
+                ("next", obs_key): batch.get(("next", obs_key)),
+            },
+            batch_size=batch.batch_size,
+        )
+        # Include reward if present (used by SR reward loss)
+        reward = batch.get("reward", None)
+        if reward is None:
+            reward = batch.get(("next", "reward"), None)
+        if reward is not None:
+            transitions.set("reward", reward)
+        self._sr_history_buffer.extend(transitions.reshape(-1).detach())
+
+    def _train_sr_steps(self, steps: int) -> dict[str, float]:
+        """Train the SR model for the given number of steps, sampling from history."""
         metrics_accum: dict[str, float] = {}
-        if steps <= 0:
+        if steps <= 0 or len(self._sr_history_buffer) == 0:
             return metrics_accum
 
         self.sr_model.train()
-        batch_size = batch.batch_size[0]
-        mini_batch_size = max(1, int(batch_size // steps))
 
-        for i in range(steps):
-            start = i * mini_batch_size
-            end = batch_size if i == steps - 1 else (i + 1) * mini_batch_size
-            mini_batch = batch[start:end]
+        for _ in range(steps):
+            mini_batch = self._sr_history_buffer.sample()
 
             metrics, loss = self._sr_loss_from_batch(mini_batch)
             self.sr_optim.zero_grad(set_to_none=True)
             loss.backward()
             self.sr_optim.step()
-            self._sr_update_count += 1
 
             for key, value in metrics.items():
                 metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
 
+        self._sr_update_count += 1
         for key in list(metrics_accum.keys()):
             metrics_accum[key] /= float(steps)
 
         # Periodic sampling evaluation (DiffSR only)
         interval = self.config.sr.sample_eval_interval
         if interval > 0 and self._sr_update_count % interval == 0:
-            sample_metrics = self._sr_sample_eval(batch)
+            sample_batch = self._sr_history_buffer.sample()
+            sample_metrics = self._sr_sample_eval(sample_batch)
             metrics_accum.update(sample_metrics)
 
         return metrics_accum
@@ -226,12 +254,20 @@ class IPMDSR(IPMD):
         expert_batch: TensorDict,
         has_expert: Tensor,
     ) -> tuple[TensorDict, int]:
-        """SR update followed by IPMD update; SR metrics accumulated for logging."""
-        sr_metrics = self._train_sr_steps(batch, self.config.sr.update_steps)
+        """Store transitions, run SR update from history, then IPMD update."""
+        # Add current batch transitions to the history buffer
+        self._store_transitions(batch)
+
+        sr_metrics = self._train_sr_steps(self.config.sr.update_steps)
 
         # Accumulate SR metrics (averaged at log time)
         for key, value in sr_metrics.items():
             self._pending_sr_metrics.setdefault(key, []).append(value)
+
+        # Log history buffer size
+        self._pending_sr_metrics.setdefault("history_buffer_size", []).append(
+            float(len(self._sr_history_buffer))
+        )
 
         return super().update(
             batch, num_network_updates, expert_batch, has_expert

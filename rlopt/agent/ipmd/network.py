@@ -254,7 +254,7 @@ class DDPM(nn.Module):
         s: torch.Tensor,
         a: torch.Tensor,
         sp: torch.Tensor,
-        r: torch.Tensor=None,
+        r: torch.Tensor,
     ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
         # Perturbation on s
         x0 = s
