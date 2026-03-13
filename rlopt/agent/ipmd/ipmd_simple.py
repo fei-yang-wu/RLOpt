@@ -121,10 +121,10 @@ class IPMDConfig(PPOConfig):
     expert_batch_size: int | None = None
     """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
 
-    bc_loss_coeff: float = 0.0
+    bc_coef: float = 1.0
     """Behavior cloning (MLE) loss coefficient on expert actions.
 
-    When > 0, adds ``-bc_loss_coeff * mean(log_prob(expert_action | policy))``
+    When > 0, adds ``-bc_coef * mean(log_prob(expert_action | policy))``
     to each update step.  This regularises the policy toward expert actions
     during early training.  Set to 0 to disable (default).
     """
@@ -217,6 +217,8 @@ class IPMD(PPO):
         )
 
         self._refresh_grad_clip_params()
+        self._policy_operator = self.actor_critic.get_policy_operator()
+        self._bc_debug_anomaly_prints = 0
 
     def _cache_ipmd_scalars(self) -> None:
         """Pre-cache config scalars and reward-input flags for compile-friendly hot paths."""
@@ -229,7 +231,7 @@ class IPMD(PPO):
         # Scalar caches
         self._reward_loss_coeff: float = float(cfg.reward_loss_coeff)
         self._reward_l2_coeff: float = float(cfg.reward_l2_coeff)
-        self._bc_coeff: float = float(cfg.bc_loss_coeff)
+        self._bc_coeff: float = float(cfg.bc_coef)
         self._reward_detach_features: bool = bool(cfg.reward_detach_features)
         max_grad = getattr(self.config.optim, "max_grad_norm", None)
         self._max_grad_norm: float = float(max_grad) if max_grad else 1e10
@@ -304,7 +306,7 @@ class IPMD(PPO):
         """Return expert-batch keys required by current IPMD settings."""
         assert isinstance(self.config, IPMDRLOptConfig)
         rit = self.config.ipmd.reward_input_type
-        bc_enabled = float(self.config.ipmd.bc_loss_coeff) > 0.0
+        bc_enabled = float(self.config.ipmd.bc_coef) > 0.0
 
         required: list[BatchKey] = []
         if rit in ("s", "sa", "sas"):
@@ -423,11 +425,26 @@ class IPMD(PPO):
     def _check_expert_batch_keys(self, expert_batch: TensorDict) -> bool:
         required_keys = self._expert_required_keys()
         available_keys = expert_batch.keys(True)
-        missing = [key for key in required_keys if key not in available_keys]
+        missing = [
+            key
+            for key in required_keys
+            if key not in available_keys
+            and not (key == "action" and "expert_action" in available_keys)
+        ]
         if missing:
             self.log.warning("Expert batch missing required keys: %s", missing)
             return False
         return True
+
+    @staticmethod
+    def _expert_action_from_td(td: TensorDict | Any) -> Tensor | None:
+        action = td.get("expert_action")
+        if action is not None:
+            return cast(Tensor, action)
+        action = td.get("action")
+        if action is not None:
+            return cast(Tensor, action)
+        return None
 
     def _next_expert_batch(self) -> TensorDict | None:
         assert isinstance(self.config, IPMDRLOptConfig)
@@ -519,6 +536,19 @@ class IPMD(PPO):
                 "loss_entropy": torch.tensor(0.0, device=self.device),
                 "loss_reward_diff": torch.tensor(0.0, device=self.device),
                 "loss_reward_l2": torch.tensor(0.0, device=self.device),
+                "loss_bc": torch.tensor(0.0, device=self.device),
+                "bc_nll": torch.tensor(0.0, device=self.device),
+                "bc_has_expert": torch.tensor(0.0, device=self.device),
+                "bc_log_prob_mean": torch.tensor(0.0, device=self.device),
+                "bc_log_prob_nan_frac": torch.tensor(0.0, device=self.device),
+                "bc_expert_action_abs_mean": torch.tensor(0.0, device=self.device),
+                "bc_expert_action_zero_frac": torch.tensor(0.0, device=self.device),
+                "bc_expert_action_nan_frac": torch.tensor(0.0, device=self.device),
+                "bc_policy_action_abs_mean": torch.tensor(0.0, device=self.device),
+                "bc_policy_action_mae": torch.tensor(0.0, device=self.device),
+                "bc_policy_action_rmse": torch.tensor(0.0, device=self.device),
+                "bc_actor_grad_norm": torch.tensor(0.0, device=self.device),
+                "bc_policy_scale_mean": torch.tensor(0.0, device=self.device),
                 "estimated_reward_mean": torch.tensor(0.0, device=self.device),
                 "estimated_reward_std": torch.tensor(0.0, device=self.device),
                 "expert_reward_mean": torch.tensor(0.0, device=self.device),
@@ -552,6 +582,96 @@ class IPMD(PPO):
         x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         return self._reward_out_fn(self.reward_estimator(x))
 
+    @staticmethod
+    def _reward_tensor_stats(prefix: str, reward: Tensor) -> dict[str, float]:
+        reward_f = reward.detach().float()
+        return {
+            f"{prefix}_mean": reward_f.mean().item(),
+            f"{prefix}_std": reward_f.std().item(),
+            f"{prefix}_min": reward_f.min().item(),
+            f"{prefix}_max": reward_f.max().item(),
+        }
+
+    @staticmethod
+    def _reward_alignment_metrics(
+        prefix: str, reward_pred: Tensor, reward_true: Tensor
+    ) -> dict[str, float]:
+        pred = reward_pred.detach().float().flatten()
+        true = reward_true.detach().float().flatten()
+        diff = pred - true
+
+        pred_mean = pred.mean()
+        true_mean = true.mean()
+        pred_centered = pred - pred_mean
+        true_centered = true - true_mean
+
+        pred_var = pred_centered.pow(2).mean()
+        true_var = true_centered.pow(2).mean()
+        cov = (pred_centered * true_centered).mean()
+
+        pearson_corr, corr_distance = epic_distance(pred, true)
+
+        eps = 1e-8
+        if pred_var <= eps:
+            affine_scale = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            affine_bias = true_mean
+            fitted = torch.full_like(true, true_mean)
+        else:
+            affine_scale = cov / pred_var
+            affine_bias = true_mean - affine_scale * pred_mean
+            fitted = affine_scale * pred + affine_bias
+
+        resid = true - fitted
+        ss_res = resid.pow(2).sum()
+        ss_tot = true_centered.pow(2).sum()
+        if ss_tot <= eps:
+            affine_r2 = torch.ones((), device=pred.device, dtype=pred.dtype)
+        else:
+            affine_r2 = 1.0 - ss_res / ss_tot
+
+        return {
+            f"{prefix}/pearson_corr": pearson_corr.item(),
+            f"{prefix}/corr_distance": corr_distance.item(),
+            f"{prefix}/mae": diff.abs().mean().item(),
+            f"{prefix}/rmse": diff.pow(2).mean().sqrt().item(),
+            f"{prefix}/affine_scale": affine_scale.item(),
+            f"{prefix}/affine_bias": affine_bias.item(),
+            f"{prefix}/affine_r2": affine_r2.item(),
+            f"{prefix}/target_std": true_var.sqrt().item(),
+            f"{prefix}/pred_std": pred_var.sqrt().item(),
+        }
+
+    @staticmethod
+    def _policy_action_from_dist(dist: Any) -> Tensor | None:
+        for attr_name in ("mean", "loc", "mode"):
+            try:
+                value = getattr(dist, attr_name, None)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    continue
+            if isinstance(value, Tensor):
+                return value
+        return None
+
+    def _param_grad_norm(self, params: Any) -> Tensor:
+        total_sq: Tensor | None = None
+        for param in params:
+            grad = getattr(param, "grad", None)
+            if grad is None:
+                continue
+            grad_tensor = grad.detach().float()
+            grad_sq = grad_tensor.pow(2).sum()
+            total_sq = grad_sq if total_sq is None else total_sq + grad_sq
+        if total_sq is None:
+            return torch.zeros((), device=self.device)
+        return total_sq.sqrt()
+
     def update(
         self,
         batch: TensorDict,
@@ -559,12 +679,7 @@ class IPMD(PPO):
         expert_batch: TensorDict,
         has_expert: Tensor,
     ) -> tuple[TensorDict, int]:
-        """PPO update plus IPMD reward loss; fixed path for torch.compile and CUDA graphs.
-
-        All Python-level branches are eliminated: BC loss is always computed and
-        scaled to zero by ``has_expert * _bc_coeff`` when disabled; reward-input
-        flags are boolean attributes set once at init.
-        """
+        """PPO update plus optional BC loss and IPMD reward loss."""
         self.optim.zero_grad(set_to_none=True)
 
         # 1) PPO loss
@@ -572,7 +687,26 @@ class IPMD(PPO):
         (loss["loss_critic"] + loss["loss_objective"] + loss["loss_entropy"]).backward()
         output_loss = loss.clone().detach_()
 
-        # 2) IPMD reward loss — always computed; scaled by has_expert for a fixed graph
+        # 2) Behavior cloning on expert actions.
+        bc_loss = torch.zeros((), device=self.device)
+
+        expert_action = self._expert_action_from_td(expert_batch)
+        expert_obs_td = expert_batch.select(*self._policy_obs_keys)
+        dist = self._policy_operator.get_dist(expert_obs_td)
+        log_prob = dist.log_prob(expert_action)
+        log_prob = self._reduce_log_prob(log_prob, expert_action)
+        has_expert_float = has_expert.to(dtype=log_prob.dtype)
+        bc_nll = -log_prob.mean() * has_expert_float
+        bc_loss = bc_nll * self._bc_coeff
+        bc_loss.backward()
+        policy_action = self._policy_action_from_dist(dist)
+        action_delta = policy_action.detach() - expert_action.detach()
+        expert_action_f = expert_action.detach().float()
+        policy_action_f = policy_action.detach().float()
+        log_prob_f = log_prob.detach().float()
+        actor_grad_norm = self._param_grad_norm(self._policy_operator.parameters())
+
+        # 3) IPMD reward loss
         r_pi = self._reward_from_batch(batch)
         r_exp = self._reward_from_batch(expert_batch)
         diff = r_pi.mean() - r_exp.mean()
@@ -585,12 +719,26 @@ class IPMD(PPO):
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
         self.optim.step()
-        if self.lr_scheduler and self.lr_scheduler_step == "update":
-            self.lr_scheduler.step()
 
         output_loss.set("alpha", torch.ones((), device=self.device))
         output_loss.set("loss_reward_diff", diff.detach())
         output_loss.set("loss_reward_l2", l2.detach())
+        output_loss.set("loss_bc", bc_loss.detach())
+        output_loss.set("bc_nll", bc_nll.detach())
+        output_loss.set("bc_has_expert", has_expert_float.detach())
+        output_loss.set("bc_log_prob_mean", log_prob_f.mean())
+        output_loss.set("bc_log_prob_nan_frac", torch.isnan(log_prob_f).float().mean())
+        output_loss.set("bc_expert_action_abs_mean", expert_action_f.abs().mean())
+        output_loss.set(
+            "bc_expert_action_zero_frac", expert_action_f.abs().lt(1e-6).float().mean()
+        )
+        output_loss.set(
+            "bc_expert_action_nan_frac", torch.isnan(expert_action_f).float().mean()
+        )
+        output_loss.set("bc_policy_action_abs_mean", policy_action_f.abs().mean())
+        output_loss.set("bc_policy_action_mae", action_delta.abs().mean())
+        output_loss.set("bc_policy_action_rmse", action_delta.pow(2).mean().sqrt())
+        output_loss.set("bc_actor_grad_norm", actor_grad_norm.detach())
         output_loss.set("grad_norm", grad_norm_tensor.detach())
         output_loss.set(
             "lr",
@@ -600,15 +748,11 @@ class IPMD(PPO):
                 dtype=torch.float32,
             ),
         )
-        # output_loss.set(
-        #     "skipped_update", torch.zeros((), dtype=torch.bool, device=self.device)
-        # )
-        # # Reuse r_pi (already computed) for diagnostics — avoids a second forward pass
-        # with torch.no_grad():
-        #     output_loss.set("estimated_reward_mean", r_pi.mean().detach())
-        #     output_loss.set("estimated_reward_std", r_pi.std().detach())
-        #     output_loss.set("expert_reward_mean", r_exp.mean().detach().nan_to_num(0.0))
-        #     output_loss.set("expert_reward_std", r_exp.std().detach().nan_to_num(0.0))
+        with torch.no_grad():
+            output_loss.set("estimated_reward_mean", r_pi.mean().detach())
+            output_loss.set("estimated_reward_std", r_pi.std().detach())
+            output_loss.set("expert_reward_mean", r_exp.mean().detach().nan_to_num(0.0))
+            output_loss.set("expert_reward_std", r_exp.std().detach().nan_to_num(0.0))
 
         return output_loss, num_network_updates + 1
 
@@ -658,7 +802,7 @@ class IPMD(PPO):
             and not self._warned_no_expert
         ):
             logging.getLogger(__name__).warning(
-                "Expert source not set; reward estimator updates will use dummy batch (has_expert=0)."
+                "Expert source not set; reward estimator updates will use a dummy expert batch."
             )
             self._warned_no_expert = True
 
@@ -703,17 +847,48 @@ class IPMD(PPO):
             learn_start = time.perf_counter()
             with timeit("training"):
                 with torch.no_grad():
-                    est_rew = self._reward_from_batch(data)
-                est_rew = est_rew.detach()
-                est_rew = torch.clamp(est_rew, 0.0, 0.25)
+                    est_rew_raw = self._reward_from_batch(data)
+                est_rew_raw = est_rew_raw.detach()
+                clamp_min = cfg.ipmd.estimated_reward_clamp_min
+                clamp_max = cfg.ipmd.estimated_reward_clamp_max
+                est_rew = est_rew_raw
+                if clamp_min is not None or clamp_max is not None:
+                    est_rew = torch.clamp(est_rew_raw, min=clamp_min, max=clamp_max)
                 # Save original env reward for metrics, then replace
-                data.set(("next", "env_reward"), data.get(("next", "reward")))
+                env_rew = data.get(("next", "reward"))
+                mixed_rew = (
+                    self.config.ipmd.estimated_reward_mix_coeff * est_rew
+                    + (1 - self.config.ipmd.estimated_reward_mix_coeff) * env_rew
+                )
+                data.set(("next", "env_reward"), env_rew)
+                data.set(("next", "estimated_reward_raw"), est_rew_raw)
+                data.set(("next", "estimated_reward_clamped"), est_rew)
                 data.set(
                     ("next", "reward"),
-                    self.config.ipmd.estimated_reward_mix_coeff * est_rew
-                    + (1 - self.config.ipmd.estimated_reward_mix_coeff)
-                    * data.get(("next", "env_reward")),
+                    mixed_rew,
                 )
+                metrics_to_log["train/estimated_reward_mix_coeff"] = float(
+                    self.config.ipmd.estimated_reward_mix_coeff
+                )
+                metrics_to_log.update(
+                    self._reward_tensor_stats("train/estimated_reward_raw", est_rew_raw)
+                )
+                metrics_to_log.update(
+                    self._reward_tensor_stats("train/estimated_reward_clamped", est_rew)
+                )
+                metrics_to_log.update(
+                    self._reward_tensor_stats("train/ppo_reward", mixed_rew)
+                )
+                if clamp_min is not None:
+                    metrics_to_log["reward/clip_low_frac"] = (
+                        (est_rew_raw <= clamp_min).float().mean().item()
+                    )
+                    metrics_to_log["reward/clamp_min"] = float(clamp_min)
+                if clamp_max is not None:
+                    metrics_to_log["reward/clip_high_frac"] = (
+                        (est_rew_raw >= clamp_max).float().mean().item()
+                    )
+                    metrics_to_log["reward/clamp_max"] = float(clamp_max)
                 # Compute GAE and populate replay buffer once per rollout.
                 with torch.no_grad(), timeit("training/adv"):
                     data = self.adv_module(data)
@@ -754,6 +929,8 @@ class IPMD(PPO):
                                 has_expert,
                             )
                             loss = loss.clone()
+                        if self.lr_scheduler and self.lr_scheduler_step == "update":
+                            self.lr_scheduler.step()
                         if kl_context is not None:
                             kl_approx = self._compute_kl_after_update(
                                 kl_context, policy_op
@@ -769,6 +946,18 @@ class IPMD(PPO):
                             "loss_reward_diff",
                             "loss_reward_l2",
                             "loss_bc",
+                            "bc_nll",
+                            "bc_has_expert",
+                            "bc_log_prob_mean",
+                            "bc_log_prob_nan_frac",
+                            "bc_expert_action_abs_mean",
+                            "bc_expert_action_zero_frac",
+                            "bc_expert_action_nan_frac",
+                            "bc_policy_action_abs_mean",
+                            "bc_policy_action_mae",
+                            "bc_policy_action_rmse",
+                            "bc_actor_grad_norm",
+                            "bc_policy_scale_mean",
                             "estimated_reward_mean",
                             "estimated_reward_std",
                             "expert_reward_mean",
@@ -799,24 +988,51 @@ class IPMD(PPO):
             # EPIC distance between estimated and true env reward (invariant to
             # potential-based shaping and positive rescaling).
             with torch.no_grad():
-                if cfg.ipmd.use_estimated_rewards_for_ppo and (
-                    "next",
-                    "env_reward",
-                ) in data.keys(True):
+                if ("next", "env_reward") in data.keys(True):
                     env_rew = data["next", "env_reward"]
-                    est_rew_diag = data["next", "reward"]  # already replaced
-                    metrics_to_log["train/env_reward_mean"] = env_rew.mean().item()
-                    metrics_to_log["train/env_reward_std"] = env_rew.std().item()
-                elif ("next", "reward") in data.keys(True):
-                    env_rew = data["next", "reward"]
-                    est_rew_diag = self._reward_from_batch(data)
                 else:
-                    env_rew = None
-                    est_rew_diag = None
-                if env_rew is not None and est_rew_diag is not None:
-                    pearson_corr, epic_dist = epic_distance(est_rew_diag, env_rew)
-                    metrics_to_log["reward/pearson_corr"] = pearson_corr.item()
-                    metrics_to_log["reward/epic_distance"] = epic_dist.item()
+                    env_rew = (
+                        data["next", "reward"]
+                        if ("next", "reward") in data.keys(True)
+                        else None
+                    )
+                raw_est_rew_diag = (
+                    data["next", "estimated_reward_raw"]
+                    if ("next", "estimated_reward_raw") in data.keys(True)
+                    else None
+                )
+                clamped_est_rew_diag = (
+                    data["next", "estimated_reward_clamped"]
+                    if ("next", "estimated_reward_clamped") in data.keys(True)
+                    else None
+                )
+                mixed_est_rew_diag = (
+                    data["next", "reward"]
+                    if ("next", "reward") in data.keys(True)
+                    else None
+                )
+                if env_rew is not None:
+                    metrics_to_log.update(
+                        self._reward_tensor_stats("train/env_reward", env_rew)
+                    )
+                if env_rew is not None and raw_est_rew_diag is not None:
+                    metrics_to_log.update(
+                        self._reward_alignment_metrics(
+                            "reward/raw_vs_env", raw_est_rew_diag, env_rew
+                        )
+                    )
+                if env_rew is not None and clamped_est_rew_diag is not None:
+                    metrics_to_log.update(
+                        self._reward_alignment_metrics(
+                            "reward/clamped_vs_env", clamped_est_rew_diag, env_rew
+                        )
+                    )
+                if env_rew is not None and mixed_est_rew_diag is not None:
+                    metrics_to_log.update(
+                        self._reward_alignment_metrics(
+                            "reward/mixed_vs_env", mixed_est_rew_diag, env_rew
+                        )
+                    )
 
             # Aggregate and log losses
             losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
