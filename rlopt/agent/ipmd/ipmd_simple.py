@@ -690,21 +690,22 @@ class IPMD(PPO):
         # 2) Behavior cloning on expert actions.
         bc_loss = torch.zeros((), device=self.device)
 
-        expert_action = self._expert_action_from_td(expert_batch)
-        expert_obs_td = expert_batch.select(*self._policy_obs_keys)
-        dist = self._policy_operator.get_dist(expert_obs_td)
-        log_prob = dist.log_prob(expert_action)
-        log_prob = self._reduce_log_prob(log_prob, expert_action)
-        has_expert_float = has_expert.to(dtype=log_prob.dtype)
-        bc_nll = -log_prob.mean() * has_expert_float
-        bc_loss = bc_nll * self._bc_coeff
-        bc_loss.backward()
-        policy_action = self._policy_action_from_dist(dist)
-        action_delta = policy_action.detach() - expert_action.detach()
-        expert_action_f = expert_action.detach().float()
-        policy_action_f = policy_action.detach().float()
-        log_prob_f = log_prob.detach().float()
-        actor_grad_norm = self._param_grad_norm(self._policy_operator.parameters())
+        if self._bc_coeff > 0.0:
+            expert_action = self._expert_action_from_td(expert_batch)
+            expert_obs_td = expert_batch.select(*self._policy_obs_keys)
+            dist = self._policy_operator.get_dist(expert_obs_td)
+            log_prob = dist.log_prob(expert_action)
+            log_prob = self._reduce_log_prob(log_prob, expert_action)
+            has_expert_float = has_expert.to(dtype=log_prob.dtype)
+            bc_nll = -log_prob.mean() * has_expert_float
+            bc_loss = bc_nll * self._bc_coeff
+            bc_loss.backward()
+            policy_action = self._policy_action_from_dist(dist)
+            action_delta = policy_action.detach() - expert_action.detach()
+            expert_action_f = expert_action.detach().float()
+            policy_action_f = policy_action.detach().float()
+            log_prob_f = log_prob.detach().float()
+            actor_grad_norm = self._param_grad_norm(self._policy_operator.parameters())
 
         # 3) IPMD reward loss
         r_pi = self._reward_from_batch(batch)
@@ -723,22 +724,26 @@ class IPMD(PPO):
         output_loss.set("alpha", torch.ones((), device=self.device))
         output_loss.set("loss_reward_diff", diff.detach())
         output_loss.set("loss_reward_l2", l2.detach())
-        output_loss.set("loss_bc", bc_loss.detach())
-        output_loss.set("bc_nll", bc_nll.detach())
-        output_loss.set("bc_has_expert", has_expert_float.detach())
-        output_loss.set("bc_log_prob_mean", log_prob_f.mean())
-        output_loss.set("bc_log_prob_nan_frac", torch.isnan(log_prob_f).float().mean())
-        output_loss.set("bc_expert_action_abs_mean", expert_action_f.abs().mean())
-        output_loss.set(
-            "bc_expert_action_zero_frac", expert_action_f.abs().lt(1e-6).float().mean()
-        )
-        output_loss.set(
-            "bc_expert_action_nan_frac", torch.isnan(expert_action_f).float().mean()
-        )
-        output_loss.set("bc_policy_action_abs_mean", policy_action_f.abs().mean())
-        output_loss.set("bc_policy_action_mae", action_delta.abs().mean())
-        output_loss.set("bc_policy_action_rmse", action_delta.pow(2).mean().sqrt())
-        output_loss.set("bc_actor_grad_norm", actor_grad_norm.detach())
+        if self._bc_coeff > 0.0:
+            output_loss.set("loss_bc", bc_loss.detach())
+            output_loss.set("bc_nll", bc_nll.detach())
+            output_loss.set("bc_has_expert", has_expert_float.detach())
+            output_loss.set("bc_log_prob_mean", log_prob_f.mean())
+            output_loss.set(
+                "bc_log_prob_nan_frac", torch.isnan(log_prob_f).float().mean()
+            )
+            output_loss.set("bc_expert_action_abs_mean", expert_action_f.abs().mean())
+            output_loss.set(
+                "bc_expert_action_zero_frac",
+                expert_action_f.abs().lt(1e-6).float().mean(),
+            )
+            output_loss.set(
+                "bc_expert_action_nan_frac", torch.isnan(expert_action_f).float().mean()
+            )
+            output_loss.set("bc_policy_action_abs_mean", policy_action_f.abs().mean())
+            output_loss.set("bc_policy_action_mae", action_delta.abs().mean())
+            output_loss.set("bc_policy_action_rmse", action_delta.pow(2).mean().sqrt())
+            output_loss.set("bc_actor_grad_norm", actor_grad_norm.detach())
         output_loss.set("grad_norm", grad_norm_tensor.detach())
         output_loss.set(
             "lr",
