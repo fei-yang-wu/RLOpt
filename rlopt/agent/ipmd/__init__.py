@@ -11,5 +11,9 @@ from rlopt.agent.ipmd.ipmd_simple import (
     IPMD,
     IPMDRLOptConfig,
 )
+from rlopt.agent.ipmd.ipmd_sr import (
+    IPMDSR,
+    IPMDSRRLOptConfig,
+)
 
-__all__ = ["IPMD", "DiffSR", "DiffSRRLOptConfig", "IPMDRLOptConfig"]
+__all__ = ["IPMD", "IPMDSR", "DiffSR", "DiffSRRLOptConfig", "IPMDRLOptConfig", "IPMDSRRLOptConfig"]
