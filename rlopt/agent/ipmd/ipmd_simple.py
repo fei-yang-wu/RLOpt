@@ -90,6 +90,9 @@ class IPMDConfig(PPOConfig):
     reward_l2_coeff: float = 0.05
     """L2 regularization weight for reward parameters."""
 
+    reward_grad_penalty_coeff: float = 0.5
+    """Gradient penalty weight for reward parameters."""
+
     reward_detach_features: bool = True
     """Detach features when computing reward loss (avoid leaking grads)."""
 
@@ -116,6 +119,13 @@ class IPMDConfig(PPOConfig):
 
     Mixed reward is computed as:
     ``reward = estimated_reward_mix_coeff * est_rew + (1 - estimated_reward_mix_coeff) * env_reward``.
+    """
+
+    estimated_reward_done_penalty: float = 0.0
+    """Penalty subtracted from estimated reward on terminal (non-truncated) steps.
+
+    This is applied only when ``next.done`` is true and ``next.truncated`` is false.
+    Set to 0 to disable.
     """
 
     expert_batch_size: int | None = None
@@ -231,6 +241,7 @@ class IPMD(PPO):
         # Scalar caches
         self._reward_loss_coeff: float = float(cfg.reward_loss_coeff)
         self._reward_l2_coeff: float = float(cfg.reward_l2_coeff)
+        self._reward_grad_penalty_coeff: float = float(cfg.reward_grad_penalty_coeff)
         self._bc_coeff: float = float(cfg.bc_coef)
         self._reward_detach_features: bool = bool(cfg.reward_detach_features)
         max_grad = getattr(self.config.optim, "max_grad_norm", None)
@@ -536,6 +547,13 @@ class IPMD(PPO):
                 "loss_entropy": torch.tensor(0.0, device=self.device),
                 "loss_reward_diff": torch.tensor(0.0, device=self.device),
                 "loss_reward_l2": torch.tensor(0.0, device=self.device),
+                "loss_reward_grad_penalty": torch.tensor(0.0, device=self.device),
+                "loss_reward_grad_penalty_batch": torch.tensor(
+                    0.0, device=self.device
+                ),
+                "loss_reward_grad_penalty_expert": torch.tensor(
+                    0.0, device=self.device
+                ),
                 "loss_bc": torch.tensor(0.0, device=self.device),
                 "bc_nll": torch.tensor(0.0, device=self.device),
                 "bc_has_expert": torch.tensor(0.0, device=self.device),
@@ -559,11 +577,18 @@ class IPMD(PPO):
 
     _REWARD_OUTPUT_ACTIVATIONS = frozenset({"none", "tanh", "sigmoid"})
 
-    def _reward_from_batch(self, td: TensorDict | Any) -> Tensor:
-        """Compute estimated reward for a batch of transitions."""
+    def _reward_input_from_batch(
+        self,
+        td: TensorDict | Any,
+        *,
+        detach: bool | None = None,
+        requires_grad: bool = False,
+    ) -> Tensor:
+        """Construct the reward-estimator input tensor from a transition batch."""
         # Uses pre-cached flags (_rit_use_s, _rit_use_a, _rit_use_sn) — no Python
         # branching on config strings at call time, making this compile-friendly.
-        detach = self._reward_detach_features
+        if detach is None:
+            detach = self._reward_detach_features
         parts: list[Tensor] = []
         if self._rit_use_s:
             parts.append(
@@ -580,7 +605,44 @@ class IPMD(PPO):
                 )
             )
         x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-        return self._reward_out_fn(self.reward_estimator(x))
+        if requires_grad:
+            x = x.detach().requires_grad_(True)
+        return x
+
+    def _reward_from_input(self, reward_input: Tensor) -> Tensor:
+        """Evaluate the reward estimator on an already-assembled input tensor."""
+        return self._reward_out_fn(self.reward_estimator(reward_input))
+
+    def _reward_from_batch(
+        self,
+        td: TensorDict | Any,
+        *,
+        detach: bool | None = None,
+        requires_grad: bool = False,
+        return_input: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Compute estimated reward for a batch of transitions."""
+        x = self._reward_input_from_batch(
+            td, detach=detach, requires_grad=requires_grad
+        )
+        reward = self._reward_from_input(x)
+        if return_input:
+            return reward, x
+        return reward
+
+    @staticmethod
+    def _reward_grad_penalty_from_input(
+        reward: Tensor, reward_input: Tensor
+    ) -> Tensor:
+        """Squared gradient norm of reward with respect to its input features."""
+        reward_grad = torch.autograd.grad(
+            outputs=reward.sum(),
+            inputs=reward_input,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        return reward_grad.pow(2).sum(dim=-1).mean()
 
     @staticmethod
     def _reward_tensor_stats(prefix: str, reward: Tensor) -> dict[str, float]:
@@ -708,12 +770,43 @@ class IPMD(PPO):
             actor_grad_norm = self._param_grad_norm(self._policy_operator.parameters())
 
         # 3) IPMD reward loss
-        r_pi = self._reward_from_batch(batch)
-        r_exp = self._reward_from_batch(expert_batch)
+        reward_grad_penalty_batch = torch.zeros((), device=self.device)
+        reward_grad_penalty_expert = torch.zeros((), device=self.device)
+        if self._reward_grad_penalty_coeff > 0.0:
+            r_pi, r_pi_input = cast(
+                tuple[Tensor, Tensor],
+                self._reward_from_batch(
+                    batch,
+                    requires_grad=True,
+                    return_input=True,
+                ),
+            )
+            r_exp, r_exp_input = cast(
+                tuple[Tensor, Tensor],
+                self._reward_from_batch(
+                    expert_batch,
+                    requires_grad=True,
+                    return_input=True,
+                ),
+            )
+            reward_grad_penalty_batch = self._reward_grad_penalty_from_input(
+                r_pi, r_pi_input
+            )
+            reward_grad_penalty_expert = self._reward_grad_penalty_from_input(
+                r_exp, r_exp_input
+            )
+        else:
+            r_pi = cast(Tensor, self._reward_from_batch(batch))
+            r_exp = cast(Tensor, self._reward_from_batch(expert_batch))
         diff = r_pi.mean() - r_exp.mean()
         l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
+        reward_grad_penalty = (
+            reward_grad_penalty_batch + reward_grad_penalty_expert
+        )
         (
-            self._reward_loss_coeff * diff + self._reward_l2_coeff * l2.pow(0.5)
+            self._reward_loss_coeff * diff
+            + self._reward_l2_coeff * l2.pow(0.5)
+            + self._reward_grad_penalty_coeff * reward_grad_penalty
         ).backward()
 
         # Gradient clipping — always call for a fixed graph
@@ -724,6 +817,13 @@ class IPMD(PPO):
         output_loss.set("alpha", torch.ones((), device=self.device))
         output_loss.set("loss_reward_diff", diff.detach())
         output_loss.set("loss_reward_l2", l2.detach())
+        output_loss.set("loss_reward_grad_penalty", reward_grad_penalty.detach())
+        output_loss.set(
+            "loss_reward_grad_penalty_batch", reward_grad_penalty_batch.detach()
+        )
+        output_loss.set(
+            "loss_reward_grad_penalty_expert", reward_grad_penalty_expert.detach()
+        )
         if self._bc_coeff > 0.0:
             output_loss.set("loss_bc", bc_loss.detach())
             output_loss.set("bc_nll", bc_nll.detach())
@@ -856,9 +956,20 @@ class IPMD(PPO):
                 est_rew_raw = est_rew_raw.detach()
                 clamp_min = cfg.ipmd.estimated_reward_clamp_min
                 clamp_max = cfg.ipmd.estimated_reward_clamp_max
+                done_penalty = float(cfg.ipmd.estimated_reward_done_penalty)
                 est_rew = est_rew_raw
                 if clamp_min is not None or clamp_max is not None:
                     est_rew = torch.clamp(est_rew_raw, min=clamp_min, max=clamp_max)
+                terminal_penalty_mask = None
+                if done_penalty != 0.0 and ("next", "done") in data.keys(True):
+                    terminal_penalty_mask = data["next", "done"].bool()
+                    if ("next", "truncated") in data.keys(True):
+                        terminal_penalty_mask = terminal_penalty_mask & ~data[
+                            "next", "truncated"
+                        ].bool()
+                    est_rew = est_rew - done_penalty * terminal_penalty_mask.to(
+                        dtype=est_rew.dtype
+                    )
                 # Save original env reward for metrics, then replace
                 env_rew = data.get(("next", "reward"))
                 mixed_rew = (
@@ -875,6 +986,7 @@ class IPMD(PPO):
                 metrics_to_log["train/estimated_reward_mix_coeff"] = float(
                     self.config.ipmd.estimated_reward_mix_coeff
                 )
+                metrics_to_log["train/estimated_reward_done_penalty"] = done_penalty
                 metrics_to_log.update(
                     self._reward_tensor_stats("train/estimated_reward_raw", est_rew_raw)
                 )
@@ -884,6 +996,10 @@ class IPMD(PPO):
                 metrics_to_log.update(
                     self._reward_tensor_stats("train/ppo_reward", mixed_rew)
                 )
+                if terminal_penalty_mask is not None:
+                    metrics_to_log["reward/done_penalty_frac"] = (
+                        terminal_penalty_mask.float().mean().item()
+                    )
                 if clamp_min is not None:
                     metrics_to_log["reward/clip_low_frac"] = (
                         (est_rew_raw <= clamp_min).float().mean().item()
@@ -950,6 +1066,9 @@ class IPMD(PPO):
                             "loss_objective",
                             "loss_reward_diff",
                             "loss_reward_l2",
+                            "loss_reward_grad_penalty",
+                            "loss_reward_grad_penalty_batch",
+                            "loss_reward_grad_penalty_expert",
                             "loss_bc",
                             "bc_nll",
                             "bc_has_expert",
