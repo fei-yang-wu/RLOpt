@@ -146,7 +146,7 @@ class L2TActorValueOperatorWrapper(SafeSequential):
         return self.get_student_operator()(tensordict)
 
 
-class L2T(BaseAlgorithm):
+class L2T(BaseAlgorithm[L2TRLOptConfig]):
     def __init__(
         self,
         env: TransformedEnv,
@@ -158,10 +158,9 @@ class L2T(BaseAlgorithm):
         logger: Logger | None = None,
         **kwargs,
     ):
-        # Narrow the type for static checkers early
-        self.config = config  # type: ignore
-        self.config: L2TRLOptConfig
-
+        # This class builds student modules before calling BaseAlgorithm.__init__(),
+        # so we temporarily store the typed config/env early.
+        self.config: L2TRLOptConfig = config
         self.env = env
 
         # construct the student actor-critic (separate layout and keys)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import time
@@ -8,7 +9,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Generic, TypeVar, cast
 
 import numpy as np
 import torch
@@ -34,6 +35,9 @@ from rlopt.config_utils import ObsKey
 from rlopt.logging_utils import ROOT_LOGGER_NAME, LoggingManager, MetricReporter
 from rlopt.type_aliases import OptimizerClass, SchedulerClass
 from rlopt.utils import as_float
+
+
+CfgT = TypeVar("CfgT", bound=RLOptConfig)
 
 
 @dataclass(kw_only=True)
@@ -75,7 +79,7 @@ class IterationData:
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
-class BaseAlgorithm(ABC):
+class BaseAlgorithm(Generic[CfgT], ABC):
     """Abstract base class for reinforcement learning algorithms.
 
     This class provides a unified framework for implementing various RL algorithms
@@ -136,7 +140,7 @@ class BaseAlgorithm(ABC):
     def __init__(
         self,
         env: TransformedEnv,
-        config: RLOptConfig,
+        config: CfgT,
         logger: Logger | None = None,
         **kwargs,
     ):
@@ -154,7 +158,7 @@ class BaseAlgorithm(ABC):
         """
         super().__init__()
         self.env = env
-        self.config = config
+        self.config: CfgT = config
         self.kwargs = kwargs
 
         # Keep Python logger and TorchRL logger state on the instance for reuse
@@ -356,9 +360,11 @@ class BaseAlgorithm(ABC):
                 continue
             visited.add(obj_id)
 
-            method = getattr(current, method_name, None)
-            if callable(method):
-                return method
+            explicit_attr = inspect.getattr_static(current, method_name, None)
+            if explicit_attr is not None:
+                method = getattr(current, method_name, None)
+                if callable(method):
+                    return method
 
             for attr_name in ("base_env", "env", "_env", "unwrapped"):
                 try:
@@ -388,17 +394,47 @@ class BaseAlgorithm(ABC):
             )
 
         self._expert_batch_sampler = _wrapped_sampler  # type: ignore[attr-defined]
+        self._expert_sampler_source_name = "env.sample_expert_batch"  # type: ignore[attr-defined]
         self.log.info("Using environment-provided expert sampler: sample_expert_batch")
 
-    def set_expert_batch_sampler(
+    def _set_test_expert_batch_sampler(
         self,
         sampler: Callable[
             [int, list[str | tuple[str, ...]]],
             TensorDict | None,
         ],
     ) -> None:
-        """Attach a callable expert sampler that returns TensorDict batches."""
+        """Attach a private expert sampler override used only by tests and smoke envs."""
         self._expert_batch_sampler = sampler  # type: ignore[attr-defined]
+        self._expert_sampler_source_name = "test_override"  # type: ignore[attr-defined]
+
+    def _log_batch_contract_once(
+        self,
+        *,
+        flag_attr: str,
+        context: str,
+        batch: TensorDictBase | TensorDict,
+        required_keys: list[str | tuple[str, ...]] | None = None,
+    ) -> None:
+        """Log one concrete batch contract so key expectations stay explicit."""
+        if bool(getattr(self, flag_attr, False)):
+            return
+
+        available_keys = list(batch.keys(True))
+        shape_map: dict[str, tuple[int, ...]] = {}
+        for key in available_keys:
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor):
+                shape_map[str(key)] = tuple(int(dim) for dim in value.shape)
+
+        self.log.info(
+            "%s batch contract | required=%s | available=%s | shapes=%s",
+            context,
+            [] if required_keys is None else required_keys,
+            available_keys,
+            shape_map,
+        )
+        setattr(self, flag_attr, True)
 
     def _initialize_weights(
         self, module: torch.nn.Module, init_type: str | None

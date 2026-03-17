@@ -409,7 +409,7 @@ class FastTD3Loss(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class FastTD3(BaseAlgorithm):
+class FastTD3(BaseAlgorithm[FastTD3RLOptConfig]):
     """FastTD3: High-performance TD3 with distributional critics.
 
     Uses distributional Q-learning (C51-style), per-environment exploration
@@ -440,9 +440,6 @@ class FastTD3(BaseAlgorithm):
             **kwargs,
         )
 
-        self.config = cast(FastTD3RLOptConfig, self.config)
-        self.config: FastTD3RLOptConfig
-        assert isinstance(self.config, FastTD3RLOptConfig)
         assert self.q_function, "FastTD3 requires a Q-function configuration."
         
         # Build target critic (deep copy of online critic)

@@ -86,10 +86,9 @@ class InfoGAIL(GAIL):
         # Discriminator placeholder (will be skill-conditioned)
         self.discriminator = None  # type: ignore
         
-        # Call parent __init__ (BaseAlgorithm, not GAIL)
-        # We override discriminator construction
-        from rlopt.base_class import BaseAlgorithm
-        BaseAlgorithm.__init__(self, env, config)
+        # Initialize the PPO/GAIL base stack (includes BaseAlgorithm init).
+        # This keeps typing consistent now that BaseAlgorithm is generic.
+        super().__init__(env, config)
         
         # Construct target network updater
         self.target_net_updater = self._construct_target_net_updater()

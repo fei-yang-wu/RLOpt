@@ -134,7 +134,7 @@ class SACRLOptConfig(RLOptConfig):
         )
 
 
-class SAC(BaseAlgorithm):
+class SAC(BaseAlgorithm[SACRLOptConfig]):
     """Soft Actor-Critic algorithm.
 
     The class mirrors the PPO structure (custom train loop) while adapting
@@ -154,11 +154,6 @@ class SAC(BaseAlgorithm):
             logger=logger,
             **kwargs,
         )
-
-        # Narrow the type for static checkers
-        self.config = cast(SACRLOptConfig, self.config)
-        self.config: SACRLOptConfig
-        assert isinstance(self.config, SACRLOptConfig)
 
         assert self.q_function, "SAC requires a Q-function configuration."
 

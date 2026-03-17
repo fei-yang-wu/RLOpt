@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 from tensordict import TensorDict
-from torchrl.data import TensorDictReplayBuffer
 
 from rlopt.agent import IPMD, IPMDRLOptConfig
 from rlopt.config_base import NetworkConfig
@@ -18,20 +17,23 @@ def _apply_obs_input_keys(cfg: IPMDRLOptConfig) -> None:
     if cfg.value_function is not None:
         cfg.value_function.input_keys = ["observation"]
     cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.latent_key = "observation"
+    cfg.ipmd.latent_dim = 3
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.latent_input_type = "s'"
+    cfg.ipmd.diversity_bonus_coeff = 0.0
 
 
-def _sample_expert_batch_for_smoke(
-    agent: IPMD, buffer: TensorDictReplayBuffer, batch_size: int | None
-) -> TensorDict:
-    """Sample expert data across torchrl versions with minimal assumptions."""
-    batch = agent._next_expert_batch(batch_size=batch_size)
-    if batch is not None:
-        return batch
-    try:
-        sampled = buffer.sample()
-    except TypeError:
-        sampled = buffer.sample(batch_size=batch_size)
-    return sampled
+def _make_test_expert_sampler(expert_data: TensorDict):
+    """Return a private expert sampler override matching the new agent contract."""
+
+    def _sample(batch_size: int, required_keys):
+        batch = expert_data
+        if batch.numel() > batch_size:
+            batch = batch[:batch_size]
+        return batch.select(*required_keys).clone()
+
+    return _sample
 
 
 def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
@@ -116,14 +118,14 @@ def test_ipmd_reward_estimator():
     )
 
     # Compute estimated rewards
-    rewards = agent._reward_from_batch(td)
+    rewards = agent._reward_from_batch(td, batch_role="rollout")
     assert rewards.shape[0] == batch_size
     assert not torch.isnan(rewards).any()
     assert not torch.isinf(rewards).any()
 
 
-def test_ipmd_expert_buffer_integration():
-    """Test IPMD integration with ExpertReplayBuffer."""
+def test_ipmd_private_expert_sampler_integration():
+    """Test IPMD integration with the private expert sampler override."""
     cfg = IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
     cfg.env.device = "cpu"
@@ -141,19 +143,10 @@ def test_ipmd_expert_buffer_integration():
 
     # Create synthetic expert data
     expert_data = create_synthetic_expert_data(env, num_transitions=50)
-
-    # Create expert buffer using agent's helper method
-    expert_buffer = agent.create_expert_buffer(expert_data, buffer_size=50)
-    assert isinstance(expert_buffer, TensorDictReplayBuffer)
-
-    # Set expert buffer on agent
-    agent.set_expert_buffer(expert_buffer)
+    agent._set_test_expert_batch_sampler(_make_test_expert_sampler(expert_data))
 
     # Sample from expert buffer
-    expert_batch = _sample_expert_batch_for_smoke(
-        agent, expert_buffer, cfg.ipmd.expert_batch_size
-    )
-    assert expert_batch is not None
+    expert_batch = agent._next_expert_batch(batch_size=cfg.ipmd.expert_batch_size)
     assert isinstance(expert_batch, TensorDict)
     assert expert_batch.numel() > 0
 
@@ -178,8 +171,7 @@ def test_ipmd_update_with_expert_data():
 
     # Create synthetic expert data
     expert_data = create_synthetic_expert_data(env, num_transitions=50)
-    expert_buffer = agent.create_expert_buffer(expert_data, buffer_size=50)
-    agent.set_expert_buffer(expert_buffer)
+    agent._set_test_expert_batch_sampler(_make_test_expert_sampler(expert_data))
 
     # Create policy data batch
     obs_dim = env.observation_spec["observation"].shape[-1]
@@ -204,15 +196,8 @@ def test_ipmd_update_with_expert_data():
 
     # Fixed-signature update (torch.compile / CUDA graph)
     num_network_updates = torch.zeros((), dtype=torch.int64, device=agent.device)
-    expert_batch_raw = _sample_expert_batch_for_smoke(
-        agent, expert_buffer, cfg.ipmd.expert_batch_size
-    )
-    if expert_batch_raw is None or not agent._check_expert_batch_keys(expert_batch_raw):
-        expert_batch = agent._dummy_expert_batch(policy_batch)
-        has_expert = torch.tensor(0.0, device=agent.device, dtype=torch.float32)
-    else:
-        expert_batch = expert_batch_raw.to(agent.device)
-        has_expert = torch.tensor(1.0, device=agent.device, dtype=torch.float32)
+    expert_batch = agent._next_expert_batch(batch_size=cfg.ipmd.expert_batch_size)
+    has_expert = torch.tensor(1.0, device=agent.device, dtype=torch.float32)
     loss_td, _ = agent.update(
         policy_batch, num_network_updates, expert_batch, has_expert
     )
@@ -233,8 +218,8 @@ def test_ipmd_update_with_expert_data():
         assert not torch.isinf(value).any(), f"Inf in {key}"
 
 
-def test_ipmd_set_expert_source_compatibility():
-    """Test IPMD set_expert_source method with different sources."""
+def test_ipmd_missing_sampler_raises() -> None:
+    """IPMD training should fail fast when no expert sampler is available."""
     cfg = IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
     cfg.env.device = "cpu"
@@ -246,12 +231,66 @@ def test_ipmd_set_expert_source_compatibility():
 
     env = make_parallel_env(cfg)
     agent = IPMD(env, cfg, logger=None)
+    agent._expert_batch_sampler = None
 
-    # Test: Set source with TensorDictReplayBuffer directly
-    expert_data = create_synthetic_expert_data(env, num_transitions=20)
-    buffer = agent.create_expert_buffer(expert_data, buffer_size=20)
-    agent.set_expert_buffer(buffer)
-    assert agent._expert_buffer is not None
+    with pytest.raises(RuntimeError, match="sample_expert_batch"):
+        agent.validate_training()
+
+
+def test_ipmd_latent_input_requires_exact_keys() -> None:
+    """Latent encoder input selection must request the configured transition keys exactly."""
+    cfg = IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.compile.compile = False
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    _apply_obs_input_keys(cfg)
+
+    env = make_parallel_env(cfg)
+    agent = IPMD(env, cfg, logger=None)
+    obs_dim = env.observation_spec["observation"].shape[-1]
+
+    current_only = TensorDict(
+        {"observation": torch.randn(4, obs_dim)},
+        batch_size=[4],
+    )
+    with pytest.raises(KeyError, match="expert latent batch"):
+        agent._latent_encoder_features_from_td(
+            current_only,
+            detach=False,
+            context="expert latent batch",
+        )
+
+
+def test_ipmd_rollout_has_no_mi_targets() -> None:
+    """Prepared IPMD rollouts should not attach MI value targets anymore."""
+    cfg = IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.collector.init_random_frames = 0
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    _apply_obs_input_keys(cfg)
+
+    env = make_parallel_env(cfg)
+    agent = IPMD(env, cfg, logger=None)
+    agent._set_test_expert_batch_sampler(
+        _make_test_expert_sampler(create_synthetic_expert_data(env, num_transitions=20))
+    )
+
+    rollout = next(iter(agent.collector))
+    agent._prepare_latent_rollout_batch_for_training(rollout)
+    agent._prepare_rollout_rewards(rollout)
+
+    prepared = agent.pre_iteration_compute(rollout)
+    assert "mi_value" not in prepared.keys(True)
+    assert "mi_returns" not in prepared.keys(True)
+    assert "mi_advantage" not in prepared.keys(True)
 
 
 if __name__ == "__main__":

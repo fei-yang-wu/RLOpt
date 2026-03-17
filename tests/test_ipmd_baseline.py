@@ -22,6 +22,36 @@ def _apply_obs_input_keys_to_ipmd(cfg: IPMDRLOptConfig) -> None:
     if cfg.value_function is not None:
         cfg.value_function.input_keys = ["observation"]
     cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.latent_key = "observation"
+    cfg.ipmd.latent_dim = 3
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.latent_input_type = "s'"
+
+
+def _install_test_expert_sampler(agent: IPMD, env, num_transitions: int = 256) -> None:
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    expert_data = {
+        "observation": np.random.randn(num_transitions, obs_dim).astype(np.float32),
+        "action": np.random.randn(num_transitions, act_dim).astype(np.float32),
+        ("next", "observation"): np.random.randn(num_transitions, obs_dim).astype(
+            np.float32
+        ),
+    }
+
+    def _sample(batch_size: int, required_keys):
+        import torch
+        from tensordict import TensorDict
+
+        batch = TensorDict(
+            {key: torch.as_tensor(value) for key, value in expert_data.items()},
+            batch_size=[num_transitions],
+        )
+        if batch.numel() > batch_size:
+            batch = batch[:batch_size]
+        return batch.select(*required_keys).clone()
+
+    agent._set_test_expert_batch_sampler(_sample)
 
 
 def test_ipmd_baseline_vs_ppo():
@@ -66,12 +96,14 @@ def test_ipmd_baseline_vs_ppo():
     ipmd_cfg.logger.backend = ""
     _apply_obs_input_keys_to_ipmd(ipmd_cfg)
 
-    # IPMD-specific: use environment rewards, no expert buffer
+    # IPMD-specific: use environment rewards and disable imitation-specific shaping.
     ipmd_cfg.ipmd.use_estimated_rewards_for_ppo = False
-    ipmd_cfg.ipmd.reward_num_cells = (
-        64,
-        64,
-    )  # Won't be used meaningfully without expert
+    ipmd_cfg.ipmd.reward_num_cells = (64, 64)
+    ipmd_cfg.ipmd.reward_loss_coeff = 0.0
+    ipmd_cfg.ipmd.mi_loss_coeff = 0.0
+    ipmd_cfg.ipmd.mi_reward_weight = 0.0
+    ipmd_cfg.ipmd.diversity_bonus_coeff = 0.0
+    ipmd_cfg.ipmd.latent_uniformity_coeff = 0.0
 
     # Train PPO
     print("\n" + "=" * 60)
@@ -84,10 +116,11 @@ def test_ipmd_baseline_vs_ppo():
 
     # Train IPMD (baseline mode)
     print("\n" + "=" * 60)
-    print("Training IPMD (baseline mode - no expert data)...")
+    print("Training IPMD (baseline mode)...")
     print("=" * 60)
     ipmd_env = make_parallel_env(ipmd_cfg)
     ipmd_agent = IPMD(ipmd_env, ipmd_cfg, logger=None)
+    _install_test_expert_sampler(ipmd_agent, ipmd_env)
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -149,10 +182,16 @@ def test_ipmd_baseline_smoke():
     cfg.logger.backend = ""
     cfg.ipmd.use_estimated_rewards_for_ppo = False
     cfg.ipmd.reward_num_cells = (32, 32)
+    cfg.ipmd.reward_loss_coeff = 0.0
+    cfg.ipmd.mi_loss_coeff = 0.0
+    cfg.ipmd.mi_reward_weight = 0.0
+    cfg.ipmd.diversity_bonus_coeff = 0.0
+    cfg.ipmd.latent_uniformity_coeff = 0.0
     _apply_obs_input_keys_to_ipmd(cfg)
 
     env = make_parallel_env(cfg)
     agent = IPMD(env, cfg, logger=None)
+    _install_test_expert_sampler(agent, env)
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",

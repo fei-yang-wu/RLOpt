@@ -11,6 +11,7 @@ from torchrl.envs import (
     RewardSum,
     StepCounter,
 )
+import torchrl.envs.libs.gym as torchrl_gym_lib
 from torchrl.envs.libs.gym import GymEnv, set_gym_backend
 
 from rlopt.config_base import RLOptConfig
@@ -20,12 +21,22 @@ def env_maker(cfg: RLOptConfig, device="cpu", from_pixels=False):
     lib = cfg.env.library
     if lib in ("gym", "gymnasium"):
         with set_gym_backend(lib):
-            env = GymEnv(
-                cfg.env.env_name,
-                device=device,
-                from_pixels=from_pixels,
-                pixels_only=False,
-            )
+            disable_isaaclab_probe = not str(cfg.env.env_name).startswith("Isaac")
+            original_has_isaaclab = getattr(torchrl_gym_lib, "_has_isaaclab", None)
+            if disable_isaaclab_probe and original_has_isaaclab is True:
+                # Plain Gym tasks should not import the full IsaacLab stack just to
+                # decide whether the env is vectorized.
+                torchrl_gym_lib._has_isaaclab = False
+            try:
+                env = GymEnv(
+                    cfg.env.env_name,
+                    device=device,
+                    from_pixels=from_pixels,
+                    pixels_only=False,
+                )
+            finally:
+                if disable_isaaclab_probe and original_has_isaaclab is not None:
+                    torchrl_gym_lib._has_isaaclab = original_has_isaaclab
             # Add dtype conversion transform (float64 -> float32) only if needed
             # Check if observations are float64
             obs_spec = env.observation_spec["observation"]

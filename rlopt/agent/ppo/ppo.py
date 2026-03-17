@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Generic, TypeVar, cast
 
 import numpy as np
 import torch
@@ -51,6 +51,9 @@ from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import as_float, get_activation_class, log_info
+
+
+PpoCfgT = TypeVar("PpoCfgT", bound="PPORLOptConfig")
 
 
 class CatInputs(torch.nn.Module):
@@ -162,11 +165,11 @@ class PPOIterationData(IterationData):
     """ Raw rollout TensorDict produced by the collector for this outer-metadata iteration. """
 
 
-class PPO(BaseAlgorithm):
+class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
     def __init__(
         self,
         env: TransformedEnv,
-        config: PPORLOptConfig,
+        config: PpoCfgT,
         policy_net: torch.nn.Module | None = None,
         value_net: torch.nn.Module | None = None,
         q_net: torch.nn.Module | None = None,
@@ -186,10 +189,6 @@ class PPO(BaseAlgorithm):
             feature_extractor_net=feature_extractor_net,
             **kwargs,
         )
-
-        # Narrow the type for static checkers
-        self.config = cast(PPORLOptConfig, self.config)
-        self.config: PPORLOptConfig
 
         # construct the advantage module
         self.adv_module = self._construct_adv_module()
@@ -418,6 +417,47 @@ class PPO(BaseAlgorithm):
             self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore
             self._components_compiled = True  # type: ignore[attr-defined]
 
+    @staticmethod
+    def _policy_action_from_dist(dist: Any) -> Tensor | None:
+        """Extract a deterministic action representative from a policy distribution."""
+        for attr_name in ("mean", "loc", "mode"):
+            try:
+                value = getattr(dist, attr_name, None)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    continue
+            if isinstance(value, Tensor):
+                return value
+        return None
+
+    def _clip_policy_action(self, action: Tensor) -> Tensor:
+        """Clamp deterministic actions to the action-spec bounds when available."""
+        action_spec = getattr(self.env, "action_spec_unbatched", self.env.action_spec)
+        if not isinstance(action_spec, Bounded):
+            return action
+        low = torch.as_tensor(
+            action_spec.space.low,
+            device=action.device,
+            dtype=action.dtype,
+        )
+        high = torch.as_tensor(
+            action_spec.space.high,
+            device=action.device,
+            dtype=action.dtype,
+        )
+        return torch.clamp(action, min=low, max=high)
+
+    def _extra_actor_loss(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
+        """Return actor-only auxiliary losses added on top of the PPO objective."""
+        del batch
+        return torch.zeros((), device=self.device), {}
+
     def update(
         self, batch: TensorDict, num_network_updates: int
     ) -> tuple[TensorDict, int]:
@@ -427,12 +467,20 @@ class PPO(BaseAlgorithm):
         # Forward pass PPO loss
         loss: TensorDict = self.loss_module(batch)
         critic_loss = loss["loss_critic"]
-        actor_loss = loss["loss_objective"] + loss["loss_entropy"]
+        extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
+        actor_loss = loss["loss_objective"] + loss["loss_entropy"] + extra_actor_loss
         total_loss = critic_loss + actor_loss
         # Backward pass
         total_loss.backward()  # type: ignore
 
         output_loss = loss.detach()  # type: ignore
+        for key, value in extra_actor_metrics.items():
+            metric = (
+                value
+                if isinstance(value, Tensor)
+                else torch.tensor(value, device=self.device, dtype=torch.float32)
+            )
+            output_loss.set(key, metric.detach())
 
         max_grad_norm = self.config.optim.max_grad_norm
         if max_grad_norm is not None and max_grad_norm > 0:

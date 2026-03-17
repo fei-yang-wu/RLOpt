@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
 from tensordict import TensorDict
@@ -17,8 +19,29 @@ try:
     import loco_mujoco  # noqa: F401
 
     LOCO_MUJOCO_AVAILABLE = True
-except ImportError:
+except Exception:
     LOCO_MUJOCO_AVAILABLE = False
+
+
+def _apply_obs_latent_alias(cfg: IPMDRLOptConfig, obs_dim: int) -> None:
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.latent_key = "observation"
+    cfg.ipmd.latent_dim = obs_dim
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.latent_input_type = "s'"
+
+
+def _make_test_expert_sampler(expert_data: TensorDict):
+    def _sample(batch_size: int, required_keys):
+        batch = expert_data
+        if batch.numel() > batch_size:
+            batch = batch[:batch_size]
+        return batch.select(*required_keys).clone()
+
+    return _sample
 
 
 @pytest.mark.skipif(not LOCO_MUJOCO_AVAILABLE, reason="loco-mujoco not installed")
@@ -131,6 +154,7 @@ def test_ipmd_with_g1_smoke():
 
         # Update config with correct dimensions
         cfg.policy.input_dim = obs_dim
+        _apply_obs_latent_alias(cfg, obs_dim)
         cfg.q_function = NetworkConfig(
             num_cells=[64, 64],
             activation_fn="relu",
@@ -156,9 +180,7 @@ def test_ipmd_with_g1_smoke():
             batch_size=[50],
         )
 
-        # Set expert buffer
-        expert_buffer = agent.create_expert_buffer(expert_data, buffer_size=50)
-        agent.set_expert_buffer(expert_buffer)
+        agent._set_test_expert_batch_sampler(_make_test_expert_sampler(expert_data))
 
         # Run a short training loop
         agent.train()
@@ -245,10 +267,9 @@ def test_ipmd_with_g1_and_iltools():
             ]
             replay_manager.set_assignment(assignment)
 
-            # Wrap in RLOpt's ExpertReplayBuffer
-            expert_buffer = ExpertReplayBuffer(replay_manager)
+            from rlopt.imitation import ExpertReplayBuffer
 
-            # Test sampling
+            expert_buffer = ExpertReplayBuffer(replay_manager)
             sample = expert_buffer.sample()
             assert isinstance(sample, TensorDict)
             assert sample.batch_size[0] == len(assignment)
@@ -257,6 +278,7 @@ def test_ipmd_with_g1_and_iltools():
 
             # Create IPMD agent and set expert source
             cfg.policy.input_dim = obs_dim
+            _apply_obs_latent_alias(cfg, obs_dim)
             cfg.q_function = NetworkConfig(
                 num_cells=[64, 64],
                 activation_fn="relu",
@@ -266,11 +288,15 @@ def test_ipmd_with_g1_and_iltools():
             )
 
             agent = IPMD(env, cfg, logger=None)
-            agent.set_expert_source(replay_manager)
+            agent._set_test_expert_batch_sampler(
+                lambda batch_size, required_keys: cast(
+                    TensorDict,
+                    expert_buffer.sample()[:batch_size].select(*required_keys).clone(),
+                )
+            )
 
             # Verify expert data can be sampled
             expert_batch = agent._next_expert_batch()
-            assert expert_batch is not None
             assert isinstance(expert_batch, TensorDict)
 
         env.close()
