@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -18,8 +18,6 @@ from tensordict.nn import (
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
-
-# Import missing modules
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
     Bounded,
@@ -44,11 +42,16 @@ from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
-from rlopt.base_class import BaseAlgorithm
+from rlopt.base_class import (
+    BaseAlgorithm,
+    IterationData,
+    TrainingMetadata,
+)
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import get_activation_class, log_info
+from rlopt.utils import as_float, get_activation_class, log_info
+
 
 class CatInputs(torch.nn.Module):
     """Concatenate multiple input tensors along the last dimension.
@@ -125,6 +128,40 @@ class PPORLOptConfig(RLOptConfig):
             )
 
 
+@dataclass(kw_only=True)
+class PPOTrainingMetadata(TrainingMetadata):
+    """PPO-specific extension of the generic train-metadata state."""
+
+    collector_iter: Iterator[TensorDict]
+    """ Iterator that yields collected rollouts from the TorchRL collector. """
+
+    policy_operator: TensorDictModule
+    """ Policy snapshot used for KL diagnostics around each policy update. """
+
+    updates_completed: int
+    """ Number of optimizer updates completed so far in this training metadata. """
+
+    minibatches_per_epoch: int
+    """ Number of replay-buffer minibatches consumed per PPO epoch. """
+
+    epochs_per_rollout: int
+    """ Number of PPO epochs to run for each collected rollout. """
+
+    anneal_clip_epsilon: bool
+    """ Whether clip epsilon is annealed by the loss module over training. """
+
+    base_clip_epsilon: float
+    """ Configured clip epsilon before any annealing is applied. """
+
+
+@dataclass(kw_only=True)
+class PPOIterationData(IterationData):
+    """One collected rollout flowing through the shared PPO phases."""
+
+    rollout: TensorDict
+    """ Raw rollout TensorDict produced by the collector for this outer-metadata iteration. """
+
+
 class PPO(BaseAlgorithm):
     def __init__(
         self,
@@ -158,7 +195,9 @@ class PPO(BaseAlgorithm):
         self.adv_module = self._construct_adv_module()
 
         # Cache optimizer parameters for compile-friendly grad clipping.
-        self._refresh_grad_clip_params()
+        self._grad_clip_params: list[Tensor] = [  # type: ignore[attr-defined]
+            param for group in self.optim.param_groups for param in group["params"]
+        ]
 
         # Compile if requested
         self._compile_components()
@@ -178,9 +217,10 @@ class PPO(BaseAlgorithm):
     ) -> TensorDictModule:
         """Construct policy"""
         # for PPO, we use a probabilistic actor
+        assert isinstance(self.config, PPORLOptConfig)
 
         action_spec = self.env.action_spec_unbatched  # type: ignore
-        action_dim = int(action_spec.shape[-1])
+        action_dim = int(action_spec.shape[-1])  # type: ignore[attr-defined]
         if isinstance(action_spec, Bounded):
             distribution_class = TanhNormal
             distribution_kwargs = {
@@ -333,18 +373,12 @@ class PPO(BaseAlgorithm):
             vectorized=False,
         )
 
-    def _set_optimizers(
+    def _set_optimizers(  # type: ignore[override]
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
         """Create optimizer for actor-critic parameters."""
         # For PPO, we use a single optimizer for both policy and value
         return [optimizer_cls(self.actor_critic.parameters(), **optimizer_kwargs)]
-
-    def _refresh_grad_clip_params(self) -> None:
-        """Cache optimizer parameters to avoid dynamic traversal in update."""
-        self._grad_clip_params: list[Tensor] = [
-            param for group in self.optim.param_groups for param in group["params"]
-        ]
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer"""
@@ -382,14 +416,13 @@ class PPO(BaseAlgorithm):
 
             self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore
             self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore
-            self._components_compiled = True
+            self._components_compiled = True  # type: ignore[attr-defined]
 
     def update(
         self, batch: TensorDict, num_network_updates: int
     ) -> tuple[TensorDict, int]:
         """Update function"""
         self.optim.zero_grad(set_to_none=True)
-        assert isinstance(self.config, PPORLOptConfig)
 
         # Forward pass PPO loss
         loss: TensorDict = self.loss_module(batch)
@@ -399,7 +432,7 @@ class PPO(BaseAlgorithm):
         # Backward pass
         total_loss.backward()  # type: ignore
 
-        output_loss = loss.detach()
+        output_loss = loss.detach()  # type: ignore
 
         max_grad_norm = self.config.optim.max_grad_norm
         if max_grad_norm is not None and max_grad_norm > 0:
@@ -411,34 +444,17 @@ class PPO(BaseAlgorithm):
 
         # Update the networks
         self.optim.step()
-        output_loss.set("alpha", torch.tensor(1.0, device=self.device))
-        output_loss.set("grad_norm", grad_norm_tensor.detach())
-        output_loss.set(
-            "lr",
-            torch.tensor(
-                self.config.optim.lr,
-                device=self.device,
-                dtype=torch.float32,
-            ),
-        )
-        output_loss.set("skipped_update", torch.tensor(False, device=self.device))
-        return output_loss, num_network_updates + 1
+        output_loss.set("alpha", torch.tensor(1.0, device=self.device))  # type: ignore
+        output_loss.set("grad_norm", grad_norm_tensor.detach())  # type: ignore
+        return output_loss, num_network_updates + 1  # type: ignore
 
     def _collector_iter(self) -> Iterator[TensorDict]:
         """Yield data from the collector while enforcing NaN guards per batch."""
+        yield from self.collector
 
-        for step_idx, tensordict in enumerate(self.collector):
-            yield tensordict
-
-    def train(self) -> None:  # type: ignore
-        """Train the agent"""
+    def init_metadata(self) -> PPOTrainingMetadata:
+        """Build the stable state shared across the full on-policy train metadata."""
         cfg = self.config
-        assert isinstance(self.config, PPORLOptConfig)
-
-        # Main loop
-        collected_frames = 0
-        num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
-        pbar = tqdm.tqdm(total=self.config.collector.total_frames)
 
         num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
         if cfg.collector.frames_per_batch % cfg.loss.mini_batch_size != 0:
@@ -450,175 +466,273 @@ class PPO(BaseAlgorithm):
             * num_mini_batches
         )
 
-        # extract cfg variables
-        cfg_loss_ppo_epochs: int = self.config.loss.epochs
-        cfg_loss_anneal_clip_eps: bool = self.config.ppo.anneal_clip_epsilon
-        cfg_loss_clip_epsilon: float = self.config.ppo.clip_epsilon
+        trainer_cfg = getattr(cfg, "trainer", None)
+        progress_bar_enabled = (
+            True if trainer_cfg is None else bool(trainer_cfg.progress_bar)
+        )
+        log_interval_frames = (
+            1000 if trainer_cfg is None else max(1, int(trainer_cfg.log_interval))
+        )
 
-        losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])  # type: ignore
+        self.collector = cast(SyncDataCollector, self.collector)
+        return PPOTrainingMetadata(
+            collector_iter=iter(self._collector_iter()),
+            total_iterations=len(self.collector),
+            policy_operator=self.actor_critic.get_policy_operator(),
+            progress_bar=tqdm.tqdm(
+                total=cfg.collector.total_frames, disable=not progress_bar_enabled
+            ),
+            progress_bar_enabled=progress_bar_enabled,
+            log_interval_frames=log_interval_frames,
+            next_log_frame=log_interval_frames,
+            frames_processed=0,
+            updates_completed=torch.zeros((), dtype=torch.int64, device=self.device),
+            minibatches_per_epoch=num_mini_batches,
+            epochs_per_rollout=cfg.loss.epochs,
+            anneal_clip_epsilon=cfg.ppo.anneal_clip_epsilon,
+            base_clip_epsilon=cfg.ppo.clip_epsilon,
+        )
 
-        self.collector: SyncDataCollector
-        collector_iter = iter(self.collector)
-        total_iter = len(self.collector)
-        policy_op = self.actor_critic.get_policy_operator()
-        for _i in range(total_iter):
-            # timeit.printevery(1000, total_iter, erase=True)
-            self.actor_critic.eval()
-            self.adv_module.eval()
-            with timeit("collecting"):
-                data = next(collector_iter)
+    def validate_training(self) -> None:
+        """Validate algorithm-specific prerequisites before the first rollout."""
+        return
 
-            metrics_to_log: dict[str, Any] = {}
-            frames_in_batch = data.numel()
-            collected_frames += frames_in_batch
-            pbar.update(frames_in_batch)
+    def collect(self, run: PPOTrainingMetadata, iteration_idx: int) -> PPOIterationData:
+        """Collect one rollout and package it into the per-iteration state object."""
+        self.actor_critic.eval()
+        self.adv_module.eval()
 
-            # Get training rewards and episode lengths (if available)
-            if ("next", "reward") in data.keys(True):
-                step_rewards = data["next", "reward"]
-                metrics_to_log.update(
-                    {
-                        "train/step_reward_mean": step_rewards.mean().item(),
-                        "train/step_reward_std": step_rewards.std().item(),
-                        "train/step_reward_max": step_rewards.max().item(),
-                        "train/step_reward_min": step_rewards.min().item(),
-                    }
-                )
-            if ("next", "episode_reward") in data.keys(True):
-                episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-                if len(episode_rewards) > 0:
-                    episode_length = data["next", "step_count"][data["next", "done"]]
-                    self.episode_lengths.extend(episode_length.cpu().tolist())
-                    self.episode_rewards.extend(episode_rewards.cpu().tolist())
-                    episode_rewards_mean = np.mean(episode_rewards.cpu().tolist())
-                    metrics_to_log.update(
-                        {
-                            "episode/length": np.mean(self.episode_lengths),
-                            "episode/return": np.mean(self.episode_rewards),
-                            "train/reward": episode_rewards_mean,
-                        }
+        collect_start = time.perf_counter()
+        with timeit("collecting"):
+            rollout = next(run.collector_iter)
+        collect_time = time.perf_counter() - collect_start
+
+        rollout_frames = rollout.numel()
+        run.frames_processed += rollout_frames
+        if run.progress_bar_enabled:
+            run.progress_bar.update(rollout_frames)  # type: ignore[attr-defined]
+        return PPOIterationData(
+            iteration_idx=iteration_idx,
+            rollout=rollout,
+            frames=rollout_frames,
+            collect_time=collect_time,
+        )
+
+    def prepare(
+        self,
+        _iteration: PPOIterationData,
+        _metadata: PPOTrainingMetadata,
+    ) -> None:
+        """Mutate the collected rollout before the shared learning phase begins."""
+        return
+
+    def pre_iteration_compute(self, rollout: TensorDict) -> TensorDict:
+        """Turn one rollout into the replay-buffer view consumed by minibatch updates."""
+        with torch.no_grad():
+            rollout = self.adv_module(rollout)
+            if getattr(self.config.compile, "compile_mode", None):
+                rollout = rollout.clone()
+
+        self.data_buffer.extend(rollout.reshape(-1))
+        return rollout
+
+    @property
+    def _required_loss_metrics(self) -> list[str]:
+        """Return the always-recorded loss keys for one PPO minibatch update."""
+        return ["loss_critic", "loss_entropy", "loss_objective"]
+
+    @property
+    def _optional_loss_metrics(self) -> list[str]:
+        """Return optional loss keys recorded when the update produced them."""
+        return [
+            "entropy",
+            "explained_variance",
+            "clip_fraction",
+            "value_clip_fraction",
+            "ESS",
+            "kl_approx",
+            "grad_norm",
+        ]
+
+    def _select_reported_loss_metrics(self, loss: TensorDict) -> TensorDict:
+        """Select the subset of update outputs that should be aggregated and logged."""
+        loss_keys = [key for key in self._required_loss_metrics if key in loss]
+        for key in self._optional_loss_metrics:
+            loss_keys.append(key)
+        return loss.select(*loss_keys)
+
+    def iterate(
+        self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
+    ) -> None:
+        """Run update epochs over the current rollout and aggregate minibatch metrics."""
+        losses = TensorDict(
+            batch_size=[metadata.epochs_per_rollout, metadata.minibatches_per_epoch]
+        )
+        learn_start = time.perf_counter()
+
+        self.data_buffer.empty()
+        self.actor_critic.train()
+        self.adv_module.train()
+
+        with timeit("training"):
+            # Pre-iteration compute GAE, once per rollout
+            iteration.rollout = self.pre_iteration_compute(iteration.rollout)
+
+            # Run PPO epochs over the rollout
+            for epoch_idx in range(metadata.epochs_per_rollout):
+                # Run PPO epochs over the rollout
+                for batch_idx, batch in enumerate(self.data_buffer):
+                    kl_context = None
+                    if (self.config.optim.scheduler or "").lower() == "adaptive":
+                        kl_context = self._prepare_kl_context(
+                            batch, metadata.policy_operator
+                        )
+
+                    loss, metadata.updates_completed = self.update(
+                        batch, metadata.updates_completed
                     )
-            self.data_buffer.empty()
+                    loss = loss.clone()
 
-            self.actor_critic.train()
-            self.adv_module.train()
-            with timeit("training"):
-                for j in range(cfg_loss_ppo_epochs):
-                    # Check for NaNs in data_reshape tensordict
-                    for key in data.keys(include_nested=True):
-                        value = data.get(key)
-                        if isinstance(value, Tensor):
-                            if torch.isnan(value).any():
-                                print("Before GAE")
-                                print(f"[WARNING] NaNs detected in data at key: {key}")
-
-                    # Compute GAE
-                    with torch.no_grad(), timeit("adv"):
-                        # torch.compiler.cudagraph_mark_step_begin()
-                        data = self.adv_module(data)
-                        if self.config.compile.compile_mode:
-                            data = data.clone()
-
-                    with timeit("rb - extend"):
-                        # Update the data buffer
-                        data_reshape = data.reshape(-1)
-                        self.data_buffer.extend(data_reshape)
-
-                    # Check for NaNs in data_reshape tensordict
-                    for key in data_reshape.keys(include_nested=True):
-                        value = data_reshape.get(key)
-                        if isinstance(value, Tensor):
-                            if torch.isnan(value).any():
-                                print("after GAE")
-                                print(
-                                    f"[WARNING] NaNs detected in data_reshape at key: {key}"
-                                )
-
-                    for k, batch in enumerate(self.data_buffer):
-                        kl_context = None
-                        if (self.config.optim.scheduler or "").lower() == "adaptive":
-                            kl_context = self._prepare_kl_context(batch, policy_op)
-                        with timeit("update"):
-                            # torch.compiler.cudagraph_mark_step_begin()
-                            loss, num_network_updates = self.update(  # type: ignore
-                                batch, num_network_updates=num_network_updates
-                            )
-                            loss = loss.clone()
-                        if self.lr_scheduler and self.lr_scheduler_step == "update":
-                            self.lr_scheduler.step()
-                        if kl_context is not None:
-                            kl_approx = self._compute_kl_after_update(
-                                kl_context, policy_op
-                            )
-                            if kl_approx is not None:
-                                loss.set("kl_approx", kl_approx.detach())
-                                self._maybe_adjust_lr(kl_approx, self.config.optim)
-                        num_network_updates = num_network_updates.clone()  # type: ignore
-                        loss_keys = ["loss_critic", "loss_entropy", "loss_objective"]
-                        optional_keys = [
-                            "entropy",
-                            "explained_variance",
-                            "clip_fraction",
-                            "value_clip_fraction",
-                            "ESS",
-                            "kl_approx",
-                            "grad_norm",
-                        ]
-                        for key in optional_keys:
-                            if key in loss.keys():
-                                loss_keys.append(key)
-                        losses[j, k] = loss.select(*loss_keys)
-
-                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
+                    if self.lr_scheduler and self.lr_scheduler_step == "update":
                         self.lr_scheduler.step()
+                    if kl_context is not None:
+                        kl_approx = self._compute_kl_after_update(
+                            kl_context, metadata.policy_operator
+                        )
+                        if kl_approx is not None:
+                            loss.set("kl_approx", kl_approx.detach())
+                            self._maybe_adjust_lr(kl_approx, self.config.optim)
 
-            # Get training losses and times
-            losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
-            for key, value in losses_mean.items():  # type: ignore
-                metrics_to_log.update({f"train/{key}": value.item()})  # type: ignore
-            metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
-            clip_attr = getattr(self.loss_module, "clip_epsilon", None)
-            if cfg_loss_anneal_clip_eps and isinstance(clip_attr, torch.Tensor):
-                clip_epsilon_value = clip_attr.detach()
-            else:
-                clip_epsilon_value = torch.tensor(
-                    cfg_loss_clip_epsilon,
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-            metrics_to_log.update(  # type: ignore
+                    losses[epoch_idx, batch_idx] = self._select_reported_loss_metrics(
+                        loss
+                    )
+
+                if self.lr_scheduler and self.lr_scheduler_step == "epoch":
+                    self.lr_scheduler.step()
+
+        iteration.learn_time = time.perf_counter() - learn_start
+        losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
+        for key, value in losses_mean.items():  # type: ignore[attr-defined]
+            iteration.metrics[f"train/{key}"] = value.item()  # type: ignore[attr-defined]
+
+    def _build_control_metrics(self, metadata: PPOTrainingMetadata) -> dict[str, Any]:
+        """Report optimizer and scheduler-controlled scalars for the current run."""
+        clip_attr = getattr(self.loss_module, "clip_epsilon", None)
+        if metadata.anneal_clip_epsilon and isinstance(clip_attr, torch.Tensor):
+            clip_epsilon = float(clip_attr.detach().item())
+        else:
+            clip_epsilon = float(metadata.base_clip_epsilon)
+        return {
+            "train/lr": self.optim.param_groups[0]["lr"],
+            "train/clip_epsilon": clip_epsilon,
+        }
+
+    def _build_timing_metrics(
+        self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
+    ) -> dict[str, float]:
+        """Return timing metrics for one rollout iteration."""
+        rate = (
+            metadata.progress_bar.format_dict.get("rate")  # type: ignore[attr-defined]
+            if metadata.progress_bar_enabled
+            else None
+        )
+        if rate is not None:
+            return {"time/speed": float(rate)}
+        iter_time = iteration.collect_time + iteration.learn_time
+        speed = float(iteration.frames) / iter_time if iter_time > 0.0 else 0.0
+        return {"time/speed": speed}
+
+    def _record_env_metrics(self, iteration: PPOIterationData) -> None:
+        """Add environment-side scalar metrics when the env exposes them."""
+        if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
+            log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+            log_info(log_info_dict, iteration.metrics)
+
+    def _build_progress_postfix(self, iteration: IterationData) -> dict[str, str]:
+        """Build the compact tqdm postfix displayed while training."""
+        return {}
+
+    def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
+        """Return the metrics printed for non-progress-bar training runs."""
+        return (
+            ("train/step_reward_mean", "r_step"),
+            ("episode/length", "ep_len"),
+            ("episode/return", "r_ep"),
+            ("train/loss_objective", "pi_loss"),
+            ("time/speed", "fps"),
+        )
+
+    def record(
+        self,
+        iteration: PPOIterationData,
+        metadata: PPOTrainingMetadata,
+    ) -> None:
+        """Flush metrics, refresh progress, and handle checkpoint cadence."""
+        rollout = iteration.rollout
+
+        step_rewards = rollout["next", "reward"]
+        iteration.metrics.update(
+            {
+                "train/step_reward_mean": step_rewards.mean().item(),  # type: ignore
+                "train/step_reward_std": step_rewards.std().item(),  # type: ignore
+                "train/step_reward_max": step_rewards.max().item(),  # type: ignore
+                "train/step_reward_min": step_rewards.min().item(),  # type: ignore
+            }
+        )
+
+        episode_rewards = rollout["next", "episode_reward"][rollout["next", "done"]]
+        if len(episode_rewards) > 0:
+            episode_length = rollout["next", "step_count"][rollout["next", "done"]]
+            episode_lengths = episode_length.cpu().tolist()
+            episode_reward_values = episode_rewards.cpu().tolist()
+            self.episode_lengths.extend(episode_lengths)
+            self.episode_rewards.extend(episode_reward_values)
+            iteration.metrics.update(
                 {
-                    # "train/lr": current_lr_tensor,
-                    "train/clip_epsilon": clip_epsilon_value,
+                    "episode/length": float(np.mean(self.episode_lengths)),
+                    "episode/return": float(np.mean(self.episode_rewards)),
+                    "train/reward": float(np.mean(episode_reward_values)),
                 }
             )
 
-            # for IsaacLab, we need to log the metrics from the environment
-            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                log_info(log_info_dict, metrics_to_log)
+        iteration.metrics.update(self._build_control_metrics(metadata))
+        iteration.metrics.update(self._build_timing_metrics(iteration, metadata))
+        self._record_env_metrics(iteration)
+        iteration.metrics.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
+        self.log_metrics(iteration.metrics, step=metadata.frames_processed)
+        self.collector.update_policy_weights_()
+        self._refresh_progress_display(metadata, iteration)
 
-            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-            rate = pbar.format_dict.get("rate")
-            if rate is not None:
-                metrics_to_log["time/speed"] = rate
+        if (
+            self.config.save_interval > 0
+            and metadata.updates_completed % self.config.save_interval == 0
+        ):
+            self.save_model(
+                path=self.log_dir / self.config.logger.save_path,
+                step=metadata.frames_processed,
+            )
 
-            # Stream metrics to both TorchRL backends and python logs via the base helper
-            self.log_metrics(metrics_to_log, step=collected_frames)
+    def train(self) -> None:  # type: ignore
+        """Train the agent with the shared on-policy rollout-to-update workflow."""
+        self.validate_training()
+        metadata = self.init_metadata()
 
-            self.collector.update_policy_weights_()
+        try:
+            for iteration_idx in range(metadata.total_iterations):
+                # 1) Collect a rollout and create the iteration state.
+                iteration = self.collect(metadata, iteration_idx)
 
-            # Save model periodically
-            if (
-                self.config.save_interval > 0
-                and num_network_updates % self.config.save_interval == 0
-            ):
-                self.save_model(
-                    path=self.log_dir / self.config.logger.save_path,
-                    step=collected_frames,
-                )
+                # 2) Let the algorithm reshape rewards or attach extra data.
+                self.prepare(iteration, metadata)
 
-        self.collector.shutdown()
+                # 3) Run the shared learning phase over the prepared rollout.
+                self.iterate(iteration, metadata)
+
+                # 4) Log, refresh collector weights, and checkpoint if needed.
+                self.record(iteration, metadata)
+        finally:
+            metadata.progress_bar.close()  # type: ignore[attr-defined]
+            self.collector.shutdown()
 
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
         """Predict action given observation."""

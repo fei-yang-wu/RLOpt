@@ -7,7 +7,7 @@ from typing import Any
 
 import gymnasium as gym
 import numpy as np
-import torch as th
+import torch
 from stable_baselines3.common.callbacks import (
     CheckpointCallback,
 )
@@ -19,8 +19,8 @@ from torch import Tensor, nn
 
 
 def obs_as_tensor(
-    obs: th.Tensor | np.ndarray | dict[str, np.ndarray] | Any, device: th.device
-) -> th.Tensor | TensorDict:
+    obs: torch.Tensor | np.ndarray | dict[str, np.ndarray] | Any, device: torch.device
+) -> torch.Tensor | TensorDict:
     """
     Moves the observation to the given device.
 
@@ -28,17 +28,28 @@ def obs_as_tensor(
     :param device: PyTorch device
     :return: PyTorch tensor of the observation on a desired device.
     """
-    if isinstance(obs, np.ndarray) or isinstance(obs, th.Tensor):
-        return th.as_tensor(obs, device=device)
+    if isinstance(obs, np.ndarray) or isinstance(obs, torch.Tensor):
+        return torch.as_tensor(obs, device=device)
     if isinstance(obs, dict):
-        return {key: th.as_tensor(_obs, device=device) for (key, _obs) in obs.items()}
+        return {
+            key: torch.as_tensor(_obs, device=device) for (key, _obs) in obs.items()
+        }
     raise Exception(f"Unrecognized type of observation {type(obs)}")
+
+
+def as_float(value: Any) -> float | None:
+    """Convert scalar metric values into floats for status-line logging."""
+    if isinstance(value, int | float | np.floating):
+        return float(value)
+    if isinstance(value, Tensor) and value.ndim == 0:
+        return float(value.detach().item())
+    return None
 
 
 # From stable baselines
 def explained_variance(
-    y_pred: np.ndarray | th.Tensor, y_true: np.ndarray | th.Tensor
-) -> float | np.ndarray | th.Tensor:
+    y_pred: np.ndarray | torch.Tensor, y_true: np.ndarray | torch.Tensor
+) -> float | np.ndarray | torch.Tensor:
     """
     Computes fraction of variance that ypred explains about y.
     Returns 1 - Var[y-ypred] / Var[y]
@@ -56,11 +67,11 @@ def explained_variance(
     if isinstance(y_pred, np.ndarray):
         var_y = np.var(y_true)
         return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y  # type: ignore
-    if isinstance(y_pred, th.Tensor) and isinstance(y_true, th.Tensor):
-        var_y = th.var(y_true).item()
-        return np.nan if var_y == 0 else 1 - th.var(y_true - y_pred).item() / var_y
+    if isinstance(y_pred, torch.Tensor) and isinstance(y_true, torch.Tensor):
+        var_y = torch.var(y_true).item()
+        return np.nan if var_y == 0 else 1 - torch.var(y_true - y_pred).item() / var_y
     raise ValueError(
-        "y_pred and y_true must be of the same type (np.ndarray or th.Tensor)"
+        "y_pred and y_true must be of the same type (np.ndarray or torch.Tensor)"
     )
 
 
@@ -86,7 +97,7 @@ def linear_schedule(initial_value: float) -> Callable[[float], float]:
 
 
 # from rsl_rl
-# @th.compile
+# @torch.compile
 def split_and_pad_trajectories(tensor, dones):
     """Splits trajectories at done indices. Then concatenates them and pads with zeros up to the length og the longest trajectory.
     Returns masks corresponding to valid parts of the trajectories
@@ -111,25 +122,25 @@ def split_and_pad_trajectories(tensor, dones):
     flat_dones = dones.transpose(1, 0).reshape(-1, 1)
 
     # Get length of trajectory by counting the number of successive not done elements
-    done_indices = th.cat(
-        (flat_dones.new_tensor([-1], dtype=th.int64), flat_dones.nonzero()[:, 0])
+    done_indices = torch.cat(
+        (flat_dones.new_tensor([-1], dtype=torch.int64), flat_dones.nonzero()[:, 0])
     )
     trajectory_lengths = done_indices[1:] - done_indices[:-1]
     trajectory_lengths_list = trajectory_lengths.tolist()
     # Extract the individual trajectories
-    trajectories = th.split(
+    trajectories = torch.split(
         tensor.transpose(1, 0).flatten(0, 1), trajectory_lengths_list
     )
     # add at least one full length trajectory
     trajectories = trajectories + (
-        th.zeros(tensor.shape[0], tensor.shape[-1], device=tensor.device),
+        torch.zeros(tensor.shape[0], tensor.shape[-1], device=tensor.device),
     )
     # pad the trajectories to the length of the longest trajectory
-    padded_trajectories = th.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
+    padded_trajectories = torch.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
     # remove the added tensor
     padded_trajectories = padded_trajectories[:, :-1]
 
-    trajectory_masks = trajectory_lengths > th.arange(
+    trajectory_masks = trajectory_lengths > torch.arange(
         0, tensor.shape[0], device=tensor.device
     ).unsqueeze(1)
     return padded_trajectories, trajectory_masks
@@ -145,7 +156,7 @@ def unpad_trajectories(trajectories, masks):
     )
 
 
-def swap_and_flatten(arr: th.Tensor) -> th.Tensor:
+def swap_and_flatten(arr: torch.Tensor) -> torch.Tensor:
     """
     Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
     to convert shape from [n_steps, n_envs, ...] (when ... is the shape of the features)
@@ -170,17 +181,19 @@ class ParallelEnvFlattenExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, get_flattened_obs_dim(observation_space))
         self.flatten = nn.Flatten(start_dim=2, end_dim=-1)
 
-    def forward(self, observations: th.Tensor) -> th.Tensor:
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
         # return self.flatten(observations)
         return observations
 
 
-class OnnxableOnPolicy(th.nn.Module):
+class OnnxableOnPolicy(torch.nn.Module):
     def __init__(self, policy: BasePolicy):
         super().__init__()
         self.policy = policy
 
-    def forward(self, observation: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def forward(
+        self, observation: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # NOTE: Preprocessing is included, but postprocessing
         # (clipping/inscaling actions) is not,
         # If needed, you also need to transpose the images so that they are channel first
@@ -189,19 +202,19 @@ class OnnxableOnPolicy(th.nn.Module):
         return self.policy(observation, deterministic=True)
 
 
-class OnnxableOffPolicy(th.nn.Module):
-    def __init__(self, actor: th.nn.Module):
+class OnnxableOffPolicy(torch.nn.Module):
+    def __init__(self, actor: torch.nn.Module):
         super().__init__()
         self.actor = actor
 
-    def forward(self, observation: th.Tensor) -> th.Tensor:
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
         # NOTE: You may have to postprocess (unnormalize) actions
         # to the correct bounds (see commented code below)
         return self.actor(observation, deterministic=True)
 
 
 def export_to_onnx(
-    model: BasePolicy | th.nn.Module,
+    model: BasePolicy | torch.nn.Module,
     onnx_filename: str,
     input_shape: tuple[int, ...] | None = None,
     export_params: bool = True,
@@ -221,17 +234,17 @@ def export_to_onnx(
     """
     if isinstance(model, BasePolicy):
         model = OnnxableOnPolicy(model)
-    elif isinstance(model, th.nn.Module):
+    elif isinstance(model, torch.nn.Module):
         model = OnnxableOffPolicy(model)
     else:
-        raise ValueError("model must be an instance of BasePolicy or th.nn.Module")
+        raise ValueError("model must be an instance of BasePolicy or torch.nn.Module")
 
     if input_shape is None:
         raise ValueError("input_shape must be provided")
-    input_tensor = th.zeros(1, *input_shape, dtype=th.float32)  # type: ignore
+    input_tensor = torch.zeros(1, *input_shape, dtype=torch.float32)  # type: ignore
 
     # Export the model
-    th.onnx.export(
+    torch.onnx.export(
         model,
         (input_tensor,),
         f=onnx_filename,
@@ -565,22 +578,103 @@ def log_agent_overview(
     )
 
 
-def get_activation_class(activation_name: str) -> type[th.nn.Module]:
+def get_activation_class(activation_name: str) -> type[torch.nn.Module]:
     """Get activation class from activation name across agents."""
     activation_map = {
-        "relu": th.nn.ReLU,
-        "elu": th.nn.ELU,
-        "tanh": th.nn.Tanh,
-        "gelu": th.nn.GELU,
+        "relu": torch.nn.ReLU,
+        "elu": torch.nn.ELU,
+        "tanh": torch.nn.Tanh,
+        "gelu": torch.nn.GELU,
     }
-    return activation_map.get(activation_name, th.nn.ELU)
+    return activation_map.get(activation_name, torch.nn.ELU)
+
 
 @torch.compile
-def gaussian_log_prob(action: th.Tensor, loc: th.Tensor, scale: th.Tensor) -> th.Tensor:
+def gaussian_log_prob(
+    action: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
     """Diagonal-Gaussian log probability, summed over action dims.
 
     Returns shape ``[batch]``.
     """
     return -0.5 * (
-        ((action - loc) / scale).pow(2) + 2.0 * scale.log() + math.log(2.0 * math.pi)
+        ((action - loc) / scale).pow(2)
+        + 2.0 * scale.log()
+        + matorch.log(2.0 * matorch.pi)
     ).sum(dim=-1)
+
+
+def discover_env_method(env: object, method_name: str) -> Callable | None:
+    """Discover a callable by walking common wrapper attributes."""
+    stack: list[object] = [env]
+    visited: set[int] = set()
+
+    while len(stack) > 0:
+        current = stack.pop()
+        obj_id = id(current)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+
+        method = getattr(current, method_name, None)
+        if callable(method):
+            return method
+
+        for attr_name in ("base_env", "env", "_env", "unwrapped"):
+            try:
+                next_obj = getattr(current, attr_name, None)
+            except Exception:
+                continue
+            if next_obj is None:
+                continue
+            if isinstance(next_obj, (list, tuple)):
+                stack.extend(next_obj)
+            else:
+                stack.append(next_obj)
+    return None
+
+
+def grad_penalty(
+    output: Tensor,
+    input: Tensor,
+    output_reduction: str = "mean",
+    grad_reduction: str = "mean",
+) -> Tensor:
+    """Squared gradient norm of reward with respect to its input features.
+    arguments:
+        output: reward output tensor, shape [batch]
+        input: input features tensor, shape [batch, feature_dim]
+        output_reduction: reduction method for output (mean or sum)
+        grad_reduction: reduction method for gradient (mean or sum)
+    returns:
+        reward_grad_penalty: scalar tensor of the gradient penalty
+    """
+    if output_reduction == "mean":
+        output = output.mean()
+    elif output_reduction == "sum":
+        output = output.sum()
+    reward_grad = torch.autograd.grad(
+        outputs=output,
+        inputs=input,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    if grad_reduction == "mean":
+        return reward_grad.pow(2).mean()
+    return reward_grad.pow(2).sum()
+
+
+def transition_action_from_batch(td: TensorDict | Mapping[str, Any]) -> Tensor:
+    """Return the action tensor stored in a transition batch.
+
+    Expert datasets may expose actions as ``expert_action`` while rollout data uses
+    ``action``. This helper keeps that mapping logic out of algorithm classes and
+    raises immediately when neither key is present.
+    """
+    if "expert_action" in td:
+        return td["expert_action"]
+    if "action" in td:
+        return td["action"]
+    msg = "Transition batch must contain 'expert_action' or 'action'."
+    raise KeyError(msg)

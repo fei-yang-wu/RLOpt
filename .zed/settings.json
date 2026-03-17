@@ -1,0 +1,26 @@
+{
+  "languages": {
+    "Python": {
+      "language_servers": ["pyrefly", "!pyright", "!pylsp"],
+    },
+  },
+  "lsp": {
+    "pyrefly": {
+      "binary": {
+        "path": "/home/fwu/miniforge3/envs/SkillLearning/bin/pyrefly",
+        "arguments": ["lsp"],
+      },
+      "settings": {
+        "python": {
+          "pythonPath": "/home/fwu/miniforge3/envs/SkillLearning/bin/python",
+        },
+        "pyrefly": {
+          "project_includes": ["src/**/*.py", "tests/**/*.py"],
+          "project_excludes": ["**/.[!/.]*", "**/*venv/**"],
+          "search_path": ["rlopt"],
+          "ignore_errors_in_generated_code": true,
+        },
+      },
+    },
+  },
+}

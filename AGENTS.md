@@ -50,6 +50,15 @@ conda run -n SkillLearning ...
 - Do not introduce IsaacLab assumptions based only on env name strings if a capability-based check is possible.
 - Avoid notebook-only workflows; command-line tests and scripts are the source of truth.
 
+## Training Loop Structure
+
+- Prefer the shared phased training lifecycle for algorithm implementations.
+- New or refactored agents should split training into `validate_training()`, `init_metadata()`, `collect()`, `prepare()`, `iterate()`, and `record()`.
+- Keep `train()` as thin orchestration only. Reuse a family-level implementation such as PPO's shared loop when possible instead of re-embedding a monolithic train loop inside each agent.
+- Use run-level metadata dataclasses for state that spans the full training call, and iteration-level dataclasses for state tied to one collected rollout or optimization cycle.
+- Put rollout mutation and auxiliary data attachment in `prepare()`, gradient updates in `iterate()`, and logging/progress/checkpoint behavior in `record()`.
+- When an algorithm needs custom metrics or progress output, prefer overriding the phase hooks and progress helpers rather than copying the whole outer loop.
+
 ## Performance Guidance
 
 - Treat the training loop, replay pipeline, and model forward passes as performance-sensitive code.

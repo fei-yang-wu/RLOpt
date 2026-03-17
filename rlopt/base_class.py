@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,10 +16,9 @@ import torch.nn
 import torch.optim
 from tensordict import TensorDict
 from tensordict.base import TensorDictBase
-from tensordict.nn import CudaGraphModule, TensorDictModule
+from tensordict.nn import TensorDictModule
 from torch import Tensor
 from torch.optim import lr_scheduler
-from torchrl._utils import compile_with_warmup
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
     ReplayBuffer,
@@ -29,8 +30,49 @@ from torchrl.record.loggers.common import Logger
 from rlopt.config_base import (
     RLOptConfig,
 )
+from rlopt.config_utils import ObsKey
 from rlopt.logging_utils import ROOT_LOGGER_NAME, LoggingManager, MetricReporter
 from rlopt.type_aliases import OptimizerClass, SchedulerClass
+from rlopt.utils import as_float
+
+
+@dataclass(kw_only=True)
+class TrainingMetadata:
+    """Generic metadata shared across the outer training loop.
+
+    The goal is to keep only algorithm-agnostic terms here so every training loop
+    can reuse the same vocabulary without inheriting family-specific details such
+    as replay sampling, GAE, or discriminator updates.
+    """
+
+    # Total number of outer-loop cycles expected for this train() call.
+    total_iterations: int
+    # Total environment frames consumed so far across the full outer-loop.
+    frames_processed: int = 0
+    # Optional UI handle used by algorithms that render a live progress bar.
+    progress_bar: Any | None = None
+    # Whether loop progress is shown via the progress bar instead of periodic logs.
+    progress_bar_enabled: bool = False
+    # Frame cadence for periodic text logging when no live progress bar is shown.
+    log_interval_frames: int = 1000
+    # Absolute frame count threshold for the next periodic text log.
+    next_log_frame: int = 1000
+
+
+@dataclass(kw_only=True)
+class IterationData:
+    """Generic per-iteration data accumulated while processing one outer-loop iteration."""
+
+    # Zero-based index of the current outer-loop iteration.
+    iteration_idx: int
+    # Number of environment frames represented by this iteration.
+    frames: int
+    # Time spent collecting fresh environment data for this iteration.
+    collect_time: float = 0.0
+    # Time spent learning/logging after collection for this iteration.
+    learn_time: float = 0.0
+    # Scalar metrics accumulated while handling this iteration.
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseAlgorithm(ABC):
@@ -242,6 +284,40 @@ class BaseAlgorithm(ABC):
         """
         return 1
 
+    def observation_feature_shape(self, key: ObsKey) -> tuple[int, ...]:
+        """Return the unbatched feature shape registered for one observation key.
+
+        TorchRL specs may include the environment batch prefix. This strips that
+        prefix so downstream code can reason about the per-sample feature layout.
+        """
+        shape = tuple(int(dim) for dim in self.env.observation_spec[key].shape)
+        batch_prefix = tuple(int(dim) for dim in self.env.batch_size)
+        if batch_prefix and shape[: len(batch_prefix)] == batch_prefix:
+            return shape[len(batch_prefix) :]
+        return shape
+
+    def observation_feature_rank(self, key: ObsKey) -> int:
+        """Return how many trailing dimensions belong to one observation sample."""
+        return len(self.observation_feature_shape(key))
+
+    def observation_feature_size(self, key: ObsKey) -> int:
+        """Return the flattened feature size for one observation sample."""
+        shape = self.observation_feature_shape(key)
+        return int(math.prod(shape)) if shape else 1
+
+    def action_feature_shape(self) -> tuple[int, ...]:
+        """Return the unbatched action shape used by the algorithm."""
+        return tuple(int(dim) for dim in self.env.action_spec_unbatched.shape)  # type: ignore[attr-defined]
+
+    def action_feature_rank(self) -> int:
+        """Return how many trailing dimensions belong to one action sample."""
+        return len(self.action_feature_shape())
+
+    def action_feature_size(self) -> int:
+        """Return the flattened action size for one action sample."""
+        shape = self.action_feature_shape()
+        return int(math.prod(shape)) if shape else 1
+
     @property
     def device(self) -> torch.device:
         """Return the PyTorch device used for training computations.
@@ -291,7 +367,7 @@ class BaseAlgorithm(ABC):
                     continue
                 if next_obj is None:
                     continue
-                if isinstance(next_obj, (list, tuple)):
+                if isinstance(next_obj, list | tuple):
                     stack.extend(next_obj)
                 else:
                     stack.append(next_obj)
@@ -519,7 +595,7 @@ class BaseAlgorithm(ABC):
             while off-policy methods may use larger buffers with prioritization.
         """
 
-    def _compile_components(self) -> None:  # noqa: B027
+    def _compile_components(self) -> None:
         """Compile performance-critical methods using torch.compile for acceleration.
 
         Override this method in subclasses to apply torch.compile to hot paths
@@ -630,7 +706,7 @@ class BaseAlgorithm(ABC):
         return optim
 
     def _set_optimizers(
-        self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
+        self, _optimizer_cls: OptimizerClass, _optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
         """Create optimizers for algorithm-specific trainable components.
 
@@ -689,7 +765,7 @@ class BaseAlgorithm(ABC):
 
         Args:
             metrics: Dictionary mapping metric names to scalar values.
-            step: Training step/iteration number for x-axis alignment.
+            step: Training step or outer-loop cycle number for x-axis alignment.
             log_python: Whether to also log to Python logger. If None, uses
                 config.logger.log_to_console setting.
             python_level: Logging level for Python logger output (default: INFO).
@@ -1151,3 +1227,40 @@ class BaseAlgorithm(ABC):
 
         for group in self.optim.param_groups:
             group["lr"] = lr
+
+    @abstractmethod
+    def _build_progress_postfix(self, iteration: IterationData) -> dict[str, str]:
+        pass
+
+    @abstractmethod
+    def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
+        pass
+
+    def _refresh_progress_display(
+        self, metadata: TrainingMetadata, iteration: IterationData
+    ) -> None:
+        """Refresh tqdm or emit periodic text summaries for headless runs."""
+        postfix = self._build_progress_postfix(iteration)
+        if metadata.progress_bar_enabled:
+            if postfix:
+                metadata.progress_bar.set_postfix(postfix)  # type: ignore[attr-defined]
+            return
+
+        if (
+            metadata.frames_processed < metadata.next_log_frame
+            and (iteration.iteration_idx + 1) != metadata.total_iterations
+        ):
+            return
+
+        status_parts = [
+            f"iter={iteration.iteration_idx + 1}/{metadata.total_iterations}",
+            f"frames={metadata.frames_processed}/{self.config.collector.total_frames}",
+        ]
+        for metric_key, alias in self._progress_summary_fields():
+            metric_value = as_float(iteration.metrics.get(metric_key))
+            if metric_value is not None:
+                status_parts.append(f"{alias}={metric_value:.4f}")
+        self.log.info(" | ".join(status_parts))
+
+        while metadata.frames_processed >= metadata.next_log_frame:
+            metadata.next_log_frame += metadata.log_interval_frames
