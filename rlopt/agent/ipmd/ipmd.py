@@ -48,19 +48,43 @@ class IPMDConfig(PPOConfig):
     """IPMD-specific configuration (PPO-based)."""
 
     latent_dim: int = 16
+    """Dimension of the latent skill space."""
+
     latent_key: ObsKey = "latent_command"
+    """Key for the latent skill."""
+
     latent_steps_min: int = 30
+    """Minimum steps before resampling latent."""
+
     latent_steps_max: int = 120
+    """Maximum steps before resampling latent."""
 
     latent_vmf_kappa: float = 1.0
+    """VMF parameter for the latent skill distribution."""
+
     mi_reward_weight: float = 0.25
+    """Weight for the mutual information reward."""
+
     mi_loss_coeff: float = 1.0
+    """Coefficient for the mutual information loss."""
+
     mi_encoder_hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    """Hidden dimensions for the mutual information encoder."""
+
     mi_encoder_activation: str = "elu"
+    """Activation function for the mutual information encoder."""
+
     mi_encoder_lr: float = 3e-4
+    """Learning rate for the mutual information encoder."""
+
     mi_grad_clip_norm: float = 1.0
+    """Gradient clipping norm for the mutual information encoder."""
+
     mi_weight_decay_coeff: float = 0.0
+    """Weight decay coefficient for the mutual information encoder."""
+
     mi_grad_penalty_coeff: float = 0.0
+    """Gradient penalty coefficient for the mutual information encoder."""
 
     latent_input_type: str = "s'"
     """Input type for the latent encoder / MI posterior.
@@ -73,9 +97,16 @@ class IPMDConfig(PPOConfig):
     """
 
     diversity_bonus_coeff: float = 0.05
+    """Coefficient for the diversity bonus."""
+
     diversity_target: float = 1.0
+    """Target diversity level."""
+
     latent_uniformity_coeff: float = 0.0
+    """Coefficient for the latent uniformity loss."""
+
     latent_uniformity_temperature: float = 2.0
+    """Temperature for the latent uniformity loss."""
 
     # Reward estimator network and loss settings
     reward_input_type: str = "sas"
@@ -135,30 +166,24 @@ class IPMDConfig(PPOConfig):
     Default is False. Set to True to train PPO on estimated rewards.
     """
 
-    estimated_reward_clamp_min: float | None = 0.0
+    estimated_reward_clamp_min: float | None = -np.inf
     """Optional lower bound applied to estimated rewards before PPO reward mixing.
 
     Set to ``None`` to disable lower clipping.
     """
 
-    estimated_reward_clamp_max: float | None = 0.25
+    estimated_reward_clamp_max: float | None = np.inf
     """Optional upper bound applied to estimated rewards before PPO reward mixing.
 
     Set to ``None`` to disable upper clipping.
     """
 
-    task_reward_weight: float = 0.3
+    est_reward_weight: float = 0.3
     """Linear mixing coefficient for estimated rewards in PPO.
-
-    Mixed reward is computed as:
-    ``reward = task_reward_weight * est_rew + (1 - task_reward_weight) * env_reward``.
     """
 
-    task_reward_weight: float = 1.0
-    """Weight for task reward in PPO.
-
-    Mixed reward is computed as:
-    ``reward = task_reward_weight * env_reward + task_reward_weight * est_rew ``.
+    env_reward_weight: float = 1.0
+    """Linear mixing coefficient for environment rewards in PPO.
     """
 
     estimated_reward_done_penalty: float = 0.0
@@ -1010,113 +1035,50 @@ class IPMD(LatentSkillMixin, PPO):
         """Attach reward-model diagnostics and PPO reward mixing to one rollout."""
         metrics: dict[str, float] = {}
         reward_key = ("next", "reward")
-        if reward_key not in rollout.keys(True):
-            return metrics
 
         with torch.no_grad():
             env_reward = rollout.get(reward_key)
-            imitation_rew_raw = self._reward_from_batch(
-                rollout,
-                batch_role="rollout",
-            ).detach()  # type: ignore[attr-defined]
+            assert env_reward is not None
+            est_reward = (
+                self._reward_from_batch(
+                    rollout,
+                    batch_role="rollout",
+                )
+                .detach()  # type: ignore[attr-defined]
+                .clamp(
+                    min=self.config.ipmd.estimated_reward_clamp_min,
+                    max=self.config.ipmd.estimated_reward_clamp_max,
+                )
+            )  # type: ignore[attr-defined]
             mi_obs = self._latent_encoder_features_from_td(
                 rollout,
                 detach=True,
                 context="rollout latent batch",
             ).to(self.device)
             latents = self._rollout_latents_from_td(rollout, detach=True)
-            mi_rew = self._mi_reward(mi_obs, latents)
-            est_rew_raw = imitation_rew_raw
-
-            clamp_min = self.config.ipmd.estimated_reward_clamp_min
-            clamp_max = self.config.ipmd.estimated_reward_clamp_max
-            done_penalty = float(self.config.ipmd.estimated_reward_done_penalty)
-            mix_coeff = (
-                float(self.config.ipmd.task_reward_weight)
-                if self.config.ipmd.use_estimated_rewards_for_ppo
-                else 0.0
-            )
-
-            est_rew = est_rew_raw
-            if clamp_min is not None or clamp_max is not None:
-                est_rew = torch.clamp(est_rew_raw, min=clamp_min, max=clamp_max)
-
-            terminal_penalty_mask = None
-            if done_penalty != 0.0 and ("next", "done") in rollout.keys(True):
-                terminal_penalty_mask = rollout["next", "done"].bool()
-                if ("next", "truncated") in rollout.keys(True):
-                    terminal_penalty_mask = (
-                        terminal_penalty_mask & ~rollout["next", "truncated"].bool()
-                    )
-                est_rew = est_rew - done_penalty * terminal_penalty_mask.to(
-                    dtype=est_rew.dtype
-                )
+            mi_rewward = self._mi_reward(mi_obs, latents)
 
             mixed_reward = (
-                self.config.ipmd.task_reward_weight * est_rew
-                + env_reward
-                + self.config.ipmd.mi_reward_weight * mi_rew
+                self.config.ipmd.env_reward_weight * env_reward
+                + self.config.ipmd.est_reward_weight * est_reward
+                + self.config.ipmd.mi_reward_weight * mi_rewward
             )
 
         rollout.set(("next", "env_reward"), env_reward)
-        rollout.set(("next", "estimated_reward_raw"), est_rew_raw)
-        rollout.set(("next", "estimated_reward_clamped"), est_rew)
+        rollout.set(("next", "est_reward"), est_reward)
+        rollout.set(("next", "mi_reward"), mi_rewward)
         rollout.set(reward_key, mixed_reward)
 
         metrics.update(
             {
-                "train/step_reward_mean": env_reward.mean().item(),
-                "train/step_reward_std": env_reward.std().item(),
-                "train/step_reward_max": env_reward.max().item(),
-                "train/step_reward_min": env_reward.min().item(),
-                "train/task_reward_weight": mix_coeff,
-                "train/estimated_reward_done_penalty": done_penalty,
-                "train/mi_reward_mean": float(mi_rew.mean().item()),
+                "train/env_reward_mean": env_reward.mean().item(),
+                "train/est_reward_mean": est_reward.mean().item(),
+                "train/mi_reward_mean": mi_rewward.mean().item(),
             }
         )
-        metrics.update(self._reward_tensor_stats("train/env_reward", env_reward))
         metrics.update(
-            self._reward_tensor_stats("train/imitation_reward_raw", imitation_rew_raw)
+            self._reward_alignment_metrics("reward/env_vs_est", env_reward, est_reward)
         )
-        metrics.update(
-            self._reward_tensor_stats("train/estimated_reward_raw", est_rew_raw)
-        )
-        metrics.update(
-            self._reward_tensor_stats("train/estimated_reward_clamped", est_rew)
-        )
-        metrics.update(self._reward_tensor_stats("train/ppo_reward", mixed_reward))
-        metrics.update(
-            self._reward_alignment_metrics("reward/raw_vs_env", est_rew_raw, env_reward)
-        )
-        metrics.update(
-            self._reward_alignment_metrics(
-                "reward/clamped_vs_env",
-                est_rew,
-                env_reward,
-            )
-        )
-        metrics.update(
-            self._reward_alignment_metrics(
-                "reward/mixed_vs_env",
-                mixed_reward,
-                env_reward,
-            )
-        )
-
-        if terminal_penalty_mask is not None:
-            metrics["reward/done_penalty_frac"] = (
-                terminal_penalty_mask.float().mean().item()
-            )
-        if clamp_min is not None:
-            metrics["reward/clip_low_frac"] = (
-                (est_rew_raw <= clamp_min).float().mean().item()
-            )
-            metrics["reward/clamp_min"] = float(clamp_min)
-        if clamp_max is not None:
-            metrics["reward/clip_high_frac"] = (
-                (est_rew_raw >= clamp_max).float().mean().item()
-            )
-            metrics["reward/clamp_max"] = float(clamp_max)
 
         return metrics
 
@@ -1237,56 +1199,14 @@ class IPMD(LatentSkillMixin, PPO):
         output_loss.set("loss_reward_diff", diff.detach())
         output_loss.set("loss_reward_l2", l2.detach())
         output_loss.set("loss_reward_grad_penalty", reward_grad_penalty.detach())
-        output_loss.set(
-            "loss_reward_grad_penalty_batch", reward_grad_penalty_batch.detach()
-        )
-        output_loss.set(
-            "loss_reward_grad_penalty_expert", reward_grad_penalty_expert.detach()
-        )
+
         if self._bc_coeff > 0.0:
             output_loss.set("loss_bc", bc_loss.detach())
             output_loss.set("bc_nll", bc_nll.detach())
-            output_loss.set("bc_has_expert", has_expert_float.detach())
-            output_loss.set("bc_log_prob_mean", log_prob_f.mean())
-            output_loss.set(
-                "bc_log_prob_nan_frac", torch.isnan(log_prob_f).float().mean()
-            )
-            output_loss.set("bc_expert_action_abs_mean", expert_action_f.abs().mean())
-            output_loss.set(
-                "bc_expert_action_zero_frac",
-                expert_action_f.abs().lt(1e-6).float().mean(),
-            )
-            output_loss.set(
-                "bc_expert_action_nan_frac", torch.isnan(expert_action_f).float().mean()
-            )
-            output_loss.set("bc_policy_action_abs_mean", policy_action_f.abs().mean())
-            output_loss.set("bc_policy_action_mae", action_delta.abs().mean())
-            output_loss.set("bc_policy_action_rmse", action_delta.pow(2).mean().sqrt())
-            output_loss.set("bc_actor_grad_norm", actor_grad_norm.detach())
+
         output_loss.set("grad_norm", grad_norm_tensor.detach())
-        output_loss.set(
-            "lr",
-            torch.tensor(
-                self.optim.param_groups[0]["lr"],
-                device=self.device,
-                dtype=torch.float32,
-            ),
-        )
-        with torch.no_grad():
-            output_loss.set("estimated_reward_mean", r_pi.mean().detach())
-            output_loss.set("estimated_reward_std", r_pi.std().detach())
-            output_loss.set("expert_reward_mean", r_exp.mean().detach().nan_to_num(0.0))
-            output_loss.set("expert_reward_std", r_exp.std().detach().nan_to_num(0.0))
 
         return output_loss, num_network_updates + 1
-
-    def validate_training(self) -> None:
-        super().validate_training()
-        if self._expert_batch_sampler is None:
-            raise RuntimeError(
-                "IPMD training requires env.sample_expert_batch(...). "
-                "Tests may install a private expert sampler override."
-            )
 
     def prepare(
         self,
@@ -1307,7 +1227,6 @@ class IPMD(LatentSkillMixin, PPO):
             self._rollout_required_keys(),
             context="rollout batch",
         )
-        self.reward_estimator.eval()
         iteration.metrics.update(
             {
                 f"train/{key}": value
@@ -1386,21 +1305,6 @@ class IPMD(LatentSkillMixin, PPO):
             log_info_dict: dict[str, Tensor] = self.env.log_infos.pop()
             self.env.log_infos.clear()
             log_info(log_info_dict, iteration.metrics)
-
-    def _build_progress_postfix(self, iteration: PPOIterationData) -> dict[str, str]:
-        return {}
-        postfix: dict[str, str] = {}
-        if "train/step_reward_mean" in iteration.metrics:
-            postfix["r_step"] = f"{iteration.metrics['train/step_reward_mean']:.2f}"
-        if "episode/return" in iteration.metrics:
-            postfix["r_ep"] = f"{iteration.metrics['episode/return']:.1f}"
-        if "train/loss_objective" in iteration.metrics:
-            postfix["pi_loss"] = f"{iteration.metrics['train/loss_objective']:.3f}"
-        if "train/loss_reward_diff" in iteration.metrics:
-            postfix["reward_diff"] = (
-                f"{iteration.metrics['train/loss_reward_diff']:.3f}"
-            )
-        return postfix
 
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         return (

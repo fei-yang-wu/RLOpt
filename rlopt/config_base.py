@@ -391,7 +391,7 @@ class RLOptConfig:
     seed: int = 42
     """Random seed."""
 
-    log_level: str = "warning"
+    log_level: str = "info"
     """Verbosity for internal debug logging (e.g. ``"debug"``, ``"info"``)."""
 
     save_interval: int = 10

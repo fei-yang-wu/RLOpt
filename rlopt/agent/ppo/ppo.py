@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -9,7 +10,6 @@ import numpy as np
 import torch
 import torch.nn
 import torch.optim
-import tqdm
 from tensordict import TensorDict
 from tensordict.nn import (
     InteractionType,
@@ -41,6 +41,7 @@ from torchrl.modules import (
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
+from tqdm.rich import tqdm
 
 from rlopt.base_class import (
     BaseAlgorithm,
@@ -51,7 +52,6 @@ from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import as_float, get_activation_class, log_info
-
 
 PpoCfgT = TypeVar("PpoCfgT", bound="PPORLOptConfig")
 
@@ -527,8 +527,10 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             collector_iter=iter(self._collector_iter()),
             total_iterations=len(self.collector),
             policy_operator=self.actor_critic.get_policy_operator(),
-            progress_bar=tqdm.tqdm(
-                total=cfg.collector.total_frames, disable=not progress_bar_enabled
+            progress_bar=tqdm(
+                total=cfg.collector.total_frames,
+                disable=not progress_bar_enabled or not sys.stdout.isatty(),
+                dynamic_ncols=True,
             ),
             progress_bar_enabled=progress_bar_enabled,
             log_interval_frames=log_interval_frames,
@@ -696,9 +698,6 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
             log_info(log_info_dict, iteration.metrics)
 
-    def _build_progress_postfix(self, iteration: IterationData) -> dict[str, str]:
-        """Build the compact tqdm postfix displayed while training."""
-        return {}
 
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         """Return the metrics printed for non-progress-bar training runs."""

@@ -1265,10 +1265,6 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             group["lr"] = lr
 
     @abstractmethod
-    def _build_progress_postfix(self, iteration: IterationData) -> dict[str, str]:
-        pass
-
-    @abstractmethod
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         pass
 
@@ -1276,12 +1272,6 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         self, metadata: TrainingMetadata, iteration: IterationData
     ) -> None:
         """Refresh tqdm or emit periodic text summaries for headless runs."""
-        postfix = self._build_progress_postfix(iteration)
-        if metadata.progress_bar_enabled:
-            if postfix:
-                metadata.progress_bar.set_postfix(postfix)  # type: ignore[attr-defined]
-            return
-
         if (
             metadata.frames_processed < metadata.next_log_frame
             and (iteration.iteration_idx + 1) != metadata.total_iterations
