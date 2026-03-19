@@ -58,6 +58,9 @@ class ASEConfig:
     mi_grad_clip_norm: float = 1.0
     mi_weight_decay_coeff: float = 0.0
     mi_grad_penalty_coeff: float = 0.0
+    # When True, shifts MI reward to [0, 1] via (dot + 1) / 2 (ProtoMotions style).
+    # When False, clamps negative dot products to 0.
+    mi_hypersphere_reward_shift: bool = True
 
     mi_critic_hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     mi_critic_activation: str = "elu"
@@ -241,8 +244,10 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             )[:1024]
             latent_pred = latent_pred[sample_idx]
         temperature = float(max(self.config.ase.latent_uniformity_temperature, 1.0e-6))
-        pairwise_sq = torch.pdist(latent_pred, p=2).pow(2)
-        return torch.log(torch.exp(-temperature * pairwise_sq).mean() + 1.0e-8)
+        # Use cdist (includes self-pairs, matching ProtoMotions compute_uniformity_loss).
+        pairwise_dist = torch.cdist(latent_pred, latent_pred, p=2)
+        kernel_values = torch.exp(-temperature * pairwise_dist.pow(2))
+        return torch.log(kernel_values.mean())
 
     def _update_mi_encoder(self, rollout_flat: TensorDict) -> dict[str, float]:
         if self.mi_encoder is None or self.mi_encoder_optim is None:
@@ -317,11 +322,15 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
         with torch.no_grad():
             latent_pred = self.mi_encoder(obs_features)
             score = (latent_pred * latents).sum(dim=-1)
-        return (
-            float(self.config.ase.mi_reward_weight)
-            * float(self.config.ase.latent_vmf_kappa)
-            * score
-        )
+
+        if self.config.ase.mi_hypersphere_reward_shift:
+            # ProtoMotions-style: shift dot product from [-1, 1] to [0, 1].
+            reward = (score + 1.0) / 2.0
+        else:
+            reward = score.clamp_min(0.0)
+        # Weight is applied at the advantage level in pre_iteration_compute,
+        # matching ProtoMotions which scales mi_advantages by mi_reward_w there.
+        return reward
 
     def _diversity_loss(self, batch: TensorDict) -> Tensor:
         """ProtoMotions-style diversity objective added directly to the actor loss."""
@@ -407,9 +416,10 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             style_reward = float(
                 self.config.gail.gail_reward_coeff
             ) * self._gail_reward(obs_disc, action_disc)
-            mi_reward = self._mi_reward(obs_features, latents)
 
-            adv_reward = style_reward + mi_reward
+            # MI reward is handled through a separate mi_critic path (added to
+            # main advantages in pre_iteration_compute), matching ProtoMotions.
+            adv_reward = style_reward
             adv_reward = self._apply_discriminator_reward_normalization(
                 adv_reward,
                 update_stats=True,
@@ -437,7 +447,6 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
 
         return {
             "ase/style_reward_mean": float(style_reward.mean().item()),
-            "ase/mi_reward_mean": float(mi_reward.mean().item()),
             "ase/reward_mean": float(adv_reward.mean().item()),
             "ase/reward_std": float(adv_reward.std().item()),
             "ase/reward_mix_alpha": float(alpha),
@@ -489,6 +498,15 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
         with torch.no_grad():
             rollout = self.adv_module(rollout)
             self._attach_mi_targets(rollout)
+
+            # Add MI advantages to main task advantages, matching ProtoMotions:
+            #   advantages += mi_advantages * mi_reward_w
+            mi_reward_w = float(self.config.ase.mi_reward_weight)
+            if mi_reward_w > 0.0 and "mi_advantage" in rollout.keys(True):
+                adv = cast(Tensor, rollout.get("advantage"))
+                mi_adv = cast(Tensor, rollout.get("mi_advantage"))
+                rollout.set("advantage", adv + mi_adv * mi_reward_w)
+
             if getattr(self.config.compile, "compile_mode", None):
                 rollout = rollout.clone()
 
@@ -565,6 +583,11 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
 
         with timeit("training"):
             iteration.rollout = self.pre_iteration_compute(iteration.rollout)
+
+            if "mi_reward" in iteration.rollout.keys(True):
+                iteration.metrics["train/ase/mi_reward_mean"] = float(
+                    cast(Tensor, iteration.rollout.get("mi_reward")).mean().item()
+                )
 
             for epoch_idx in range(metadata.epochs_per_rollout):
                 for batch_idx, batch in enumerate(self.data_buffer):

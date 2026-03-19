@@ -18,9 +18,12 @@ from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import MLP
 from torchrl.record.loggers import Logger
 
+import torch.nn.functional as F
+
 from rlopt.agent.imitation.latent_skill import (
     LatentEncoder,
     LatentSkillMixin,
+    generalized_advantage_estimate,
 )
 from rlopt.agent.ppo.ppo import (
     PPO,
@@ -86,7 +89,24 @@ class IPMDConfig(PPOConfig):
     mi_grad_penalty_coeff: float = 0.0
     """Gradient penalty coefficient for the mutual information encoder."""
 
-    latent_input_type: str = "s'"
+    # When True, shifts MI reward to [0, 1] via (dot + 1) / 2 (ProtoMotions / ASE style).
+    # When False, clamps negative dot products to 0.
+    mi_hypersphere_reward_shift: bool = True
+    """Shift MI reward to [0, 1] via (dot + 1) / 2, matching ASE / ProtoMotions."""
+
+    mi_critic_hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    """Hidden dimensions for the MI critic value network."""
+
+    mi_critic_activation: str = "elu"
+    """Activation function for the MI critic."""
+
+    mi_critic_lr: float = 3e-4
+    """Learning rate for the MI critic optimizer."""
+
+    mi_critic_grad_clip_norm: float = 1.0
+    """Gradient clip norm for the MI critic."""
+
+    latent_input_type: str = "s"
     """Input type for the latent encoder / MI posterior.
 
     Supported values:
@@ -281,6 +301,8 @@ class IPMD(LatentSkillMixin, PPO):
 
         self.mi_encoder: LatentEncoder | None = None
         self.mi_encoder_optim: torch.optim.Optimizer | None = None
+        self.mi_critic: torch.nn.Module | None = None
+        self.mi_critic_optim: torch.optim.Optimizer | None = None
 
         # Pre-cache compile-friendly scalars from config
         self._cache_ipmd_scalars()
@@ -583,6 +605,22 @@ class IPMD(LatentSkillMixin, PPO):
             lr=float(self.config.ipmd.mi_encoder_lr),
         )
 
+        if self.mi_critic is None:
+            obs_dim = sum(self._obs_feature_dims[key] for key in self._reward_obs_keys)
+            self.mi_critic = MLP(
+                in_features=obs_dim + self._latent_dim,
+                out_features=1,
+                num_cells=list(self.config.ipmd.mi_critic_hidden_dims),
+                activation_class=get_activation_class(
+                    self.config.ipmd.mi_critic_activation
+                ),
+                device=self.device,
+            )
+        self.mi_critic_optim = torch.optim.Adam(
+            self.mi_critic.parameters(),
+            lr=float(self.config.ipmd.mi_critic_lr),
+        )
+
         all_params = list(self.actor_critic.parameters()) + list(
             self.reward_estimator.parameters()
         )
@@ -772,8 +810,10 @@ class IPMD(LatentSkillMixin, PPO):
             )[:1024]
             latent_pred = latent_pred[sample_idx]
         temperature = float(max(self.config.ipmd.latent_uniformity_temperature, 1.0e-6))
-        pairwise_sq = torch.pdist(latent_pred, p=2).pow(2)
-        return torch.log(torch.exp(-temperature * pairwise_sq).mean() + 1.0e-8)
+        # Use cdist (includes self-pairs), matching ASE / ProtoMotions compute_uniformity_loss.
+        pairwise_dist = torch.cdist(latent_pred, latent_pred, p=2)
+        kernel_values = torch.exp(-temperature * pairwise_dist.pow(2))
+        return torch.log(kernel_values.mean())
 
     def _update_mi_encoder(self, rollout_flat: TensorDict) -> dict[str, float]:
         if self.mi_encoder is None or self.mi_encoder_optim is None:
@@ -838,11 +878,14 @@ class IPMD(LatentSkillMixin, PPO):
         with torch.no_grad():
             latent_pred = self.mi_encoder(obs_features)
             score = (latent_pred * latents).sum(dim=-1)
-        return (
-            float(self.config.ipmd.mi_reward_weight)
-            * float(self.config.ipmd.latent_vmf_kappa)
-            * score.unsqueeze(-1)
-        )
+        if self.config.ipmd.mi_hypersphere_reward_shift:
+            # ASE / ProtoMotions-style: shift dot product from [-1, 1] to [0, 1].
+            reward = (score + 1.0) / 2.0
+        else:
+            reward = score.clamp_min(0.0)
+        # Weight applied at advantage level in pre_iteration_compute,
+        # matching ASE which scales mi_advantages by mi_reward_weight there.
+        return reward
 
     def _diversity_loss(self, batch: TensorDict) -> Tensor:
         """ProtoMotions-style diversity objective added directly to the actor loss."""
@@ -1003,6 +1046,7 @@ class IPMD(LatentSkillMixin, PPO):
         return [
             *super()._optional_loss_metrics,
             "loss_diversity",
+            "mi_critic_loss",
             "loss_bc",
             "bc_nll",
             "bc_has_expert",
@@ -1050,30 +1094,22 @@ class IPMD(LatentSkillMixin, PPO):
                     max=self.config.ipmd.estimated_reward_clamp_max,
                 )
             )  # type: ignore[attr-defined]
-            mi_obs = self._latent_encoder_features_from_td(
-                rollout,
-                detach=True,
-                context="rollout latent batch",
-            ).to(self.device)
-            latents = self._rollout_latents_from_td(rollout, detach=True)
-            mi_rewward = self._mi_reward(mi_obs, latents)
-
+            # MI reward flows through the separate mi_critic path in
+            # pre_iteration_compute (mi_advantages added to main advantages),
+            # matching ASE. It is NOT mixed into the direct reward here.
             mixed_reward = (
                 self.config.ipmd.env_reward_weight * env_reward
                 + self.config.ipmd.est_reward_weight * est_reward
-                + self.config.ipmd.mi_reward_weight * mi_rewward
             )
 
         rollout.set(("next", "env_reward"), env_reward)
         rollout.set(("next", "est_reward"), est_reward)
-        rollout.set(("next", "mi_reward"), mi_rewward)
         rollout.set(reward_key, mixed_reward)
 
         metrics.update(
             {
                 "train/env_reward_mean": env_reward.mean().item(),
                 "train/est_reward_mean": est_reward.mean().item(),
-                "train/mi_reward_mean": mi_rewward.mean().item(),
             }
         )
         metrics.update(
@@ -1081,6 +1117,30 @@ class IPMD(LatentSkillMixin, PPO):
         )
 
         return metrics
+
+    def _update_mi_critic_batch(self, batch: TensorDict) -> dict[str, Tensor]:
+        """Train the MI critic on one minibatch of MI returns (like ASE)."""
+        if (
+            self.mi_critic is None
+            or self.mi_critic_optim is None
+            or "mi_returns" not in batch
+        ):
+            return {}
+
+        mi_input = self._mi_critic_input(batch, detach=True)
+        pred = self.mi_critic(mi_input).squeeze(-1)
+        target = cast(Tensor, batch.get("mi_returns")).to(self.device)
+        loss = F.mse_loss(pred, target)
+
+        self.mi_critic_optim.zero_grad(set_to_none=True)
+        loss.backward()
+        if float(self.config.ipmd.mi_critic_grad_clip_norm) > 0.0:
+            clip_grad_norm_(
+                self.mi_critic.parameters(),
+                float(self.config.ipmd.mi_critic_grad_clip_norm),
+            )
+        self.mi_critic_optim.step()
+        return {"mi_critic_loss": loss.detach()}
 
     def _expert_batch_for_update(self, batch: TensorDict) -> tuple[TensorDict, Tensor]:
         """Return an expert batch aligned with one PPO minibatch update."""
@@ -1091,9 +1151,74 @@ class IPMD(LatentSkillMixin, PPO):
             torch.ones((), device=self.device, dtype=torch.float32),
         )
 
+    def _mi_critic_input(self, td: TensorDict | Any, *, detach: bool) -> Tensor:
+        """Concatenate reward-obs features + latent as MI critic input."""
+        obs = self._obs_features_from_td(
+            td, self._reward_obs_keys, next_obs=False, detach=detach
+        ).to(self.device)
+        latents = self._rollout_latents_from_td(td, detach=detach)
+        return torch.cat([obs, latents], dim=-1)
+
+    def _attach_mi_targets(self, rollout: TensorDict) -> None:
+        """Compute MI value, advantage, and returns via a separate GAE pass (like ASE)."""
+        if self.mi_critic is None:
+            return
+
+        flat_rollout = rollout.reshape(-1)
+        next_td = cast(TensorDict, flat_rollout.get("next"))
+
+        with torch.no_grad():
+            mi_input = self._mi_critic_input(flat_rollout, detach=True)
+            mi_value = self.mi_critic(mi_input).squeeze(-1).reshape(*rollout.batch_size)
+
+            # Use next latent from the nested "next" tensordict (set by
+            # _prepare_latent_rollout_batch_for_training).
+            next_latent = self._latent_condition_from_td(next_td, detach=True)
+            if next_latent is None:
+                next_latent = self._rollout_latents_from_td(flat_rollout, detach=True)
+            next_obs = self._obs_features_from_td(
+                next_td, self._reward_obs_keys, next_obs=False, detach=True
+            ).to(self.device)
+            next_input = torch.cat([next_obs, next_latent.to(self.device)], dim=-1)
+            next_mi_value = self.mi_critic(next_input).squeeze(-1).reshape(
+                *rollout.batch_size
+            )
+
+            mi_obs = self._latent_encoder_features_from_td(
+                flat_rollout, detach=True, context="rollout latent batch"
+            ).to(self.device)
+            latents = self._rollout_latents_from_td(flat_rollout, detach=True)
+            mi_reward = self._mi_reward(mi_obs, latents).reshape(*rollout.batch_size)
+
+        done = cast(Tensor, rollout["next", "done"])
+        if done.ndim == mi_reward.ndim + 1 and done.shape[-1] == 1:
+            done = done.squeeze(-1)
+        mi_advantages, mi_returns = generalized_advantage_estimate(
+            mi_reward,
+            mi_value,
+            next_mi_value,
+            done,
+            gamma=float(self.config.loss.gamma),
+            gae_lambda=float(self.config.ppo.gae_lambda),
+        )
+        rollout.set("mi_reward", mi_reward)
+        rollout.set("mi_value", mi_value)
+        rollout.set("mi_advantage", mi_advantages)
+        rollout.set("mi_returns", mi_returns)
+
     def pre_iteration_compute(self, rollout: TensorDict) -> TensorDict:
         with torch.no_grad():
             rollout = self.adv_module(rollout)
+            self._attach_mi_targets(rollout)
+
+            # Add MI advantages to main task advantages, matching ASE / ProtoMotions:
+            #   advantages += mi_advantages * mi_reward_weight
+            mi_reward_w = float(self.config.ipmd.mi_reward_weight)
+            if mi_reward_w > 0.0 and "mi_advantage" in rollout.keys(True):
+                adv = cast(Tensor, rollout.get("advantage"))
+                mi_adv = cast(Tensor, rollout.get("mi_advantage"))
+                rollout.set("advantage", adv + mi_adv * mi_reward_w)
+
             if getattr(self.config.compile, "compile_mode", None):
                 rollout = rollout.clone()
 
@@ -1252,9 +1377,16 @@ class IPMD(LatentSkillMixin, PPO):
         self.actor_critic.train()
         self.adv_module.train()
         self.reward_estimator.train()
+        if self.mi_critic is not None:
+            self.mi_critic.train()
 
         with timeit("training"):
             iteration.rollout = self.pre_iteration_compute(iteration.rollout)
+
+            if "mi_reward" in iteration.rollout.keys(True):
+                iteration.metrics["train/mi_reward_mean"] = float(
+                    cast(Tensor, iteration.rollout.get("mi_reward")).mean().item()
+                )
 
             for epoch_idx in range(metadata.epochs_per_rollout):
                 for batch_idx, batch in enumerate(self.data_buffer):
@@ -1272,6 +1404,10 @@ class IPMD(LatentSkillMixin, PPO):
                             expert_batch,
                             has_expert,
                         )
+
+                    mi_critic_stats = self._update_mi_critic_batch(batch)
+                    for key, value in mi_critic_stats.items():
+                        loss.set(key, value)
 
                     if self.lr_scheduler and self.lr_scheduler_step == "update":
                         self.lr_scheduler.step()
