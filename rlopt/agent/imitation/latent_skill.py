@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import cast
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
-from torch import Tensor
+from torch import Tensor, nn
 
 from rlopt.config_utils import BatchKey, ObsKey, flatten_feature_tensor
 from rlopt.utils import get_activation_class
@@ -18,7 +17,7 @@ from rlopt.utils import get_activation_class
 class LatentSkillCollectorPolicy(nn.Module):
     """Collector wrapper that stamps the current latent command into rollouts."""
 
-    def __init__(self, agent: "LatentSkillMixin", policy_module: nn.Module):
+    def __init__(self, agent: LatentSkillMixin, policy_module: nn.Module):
         super().__init__()
         self.agent = agent
         self.policy_module = policy_module
@@ -120,9 +119,11 @@ class LatentSkillMixin:
 
         available_keys = set(env.observation_spec.keys(True))
         if self._latent_key not in available_keys:
-            raise KeyError(
-                f"Environment observation spec is missing latent key {self._latent_key!r}."
+            msg = (
+                "Environment observation spec is missing latent key "
+                f"{self._latent_key!r}."
             )
+            raise KeyError(msg)
 
         latent_shape = tuple(
             int(dim) for dim in env.observation_spec[self._latent_key].shape
@@ -135,10 +136,11 @@ class LatentSkillMixin:
         ):
             latent_shape = latent_shape[len(batch_prefix) :]
         if len(latent_shape) != 1 or int(latent_shape[0]) != self._latent_dim:
-            raise ValueError(
+            msg = (
                 f"Latent observation {self._latent_key!r} has shape {latent_shape}, "
                 f"expected ({self._latent_dim},)."
             )
+            raise ValueError(msg)
 
     @property
     def collector_policy(self):
@@ -258,26 +260,19 @@ class LatentSkillMixin:
     def _prepare_latent_rollout_batch_for_training(self, data: TensorDict) -> None:
         keys = data.keys(True)
         if self._latent_key not in keys:
-            latents = self._sample_unit_latents(
-                data.numel(),
-                device=self.device,
-                dtype=torch.float32,
-            ).reshape(*data.batch_size, self._latent_dim)
-            data.set(cast(BatchKey, self._latent_key), latents)
+            msg = (
+                "Collected rollout batch is missing latent key "
+                f"{self._latent_key!r}."
+            )
+            raise KeyError(msg)
 
         next_latent_key = cast(BatchKey, ("next", self._latent_key))
-        if next_latent_key in keys:
-            return
-
-        current_latents = cast(Tensor, data.get(cast(BatchKey, self._latent_key)))
-        if len(data.batch_size) >= 2:
-            time_steps = int(data.batch_size[0])
-            next_latents = current_latents.clone()
-            next_latents[:-1] = current_latents[1:]
-            next_latents[-1] = current_latents[-1]
-        else:
-            next_latents = current_latents.clone()
-        data.set(next_latent_key, next_latents)
+        if next_latent_key not in keys:
+            msg = (
+                "Collected rollout batch is missing next latent key "
+                f"{next_latent_key!r}."
+            )
+            raise KeyError(msg)
 
     def _latent_condition_from_td(
         self,
@@ -325,7 +320,9 @@ def infer_batch_shape_from_mapping(
         if batch_shape is None:
             batch_shape = current_batch_shape
         elif current_batch_shape != batch_shape:
-            raise ValueError(
-                f"Observation batch shape mismatch: {batch_shape} vs {current_batch_shape}."
+            msg = (
+                "Observation batch shape mismatch: "
+                f"{batch_shape} vs {current_batch_shape}."
             )
+            raise ValueError(msg)
     return batch_shape or (1,)

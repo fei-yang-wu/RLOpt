@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from rlopt.agent.ase.ase import ASEConfig
+from rlopt.agent.ase.model import ASEDiscriminatorEncoder
 from rlopt.agent.ase.multi_discriminator import MultiDiscriminator
 from rlopt.agent.gail.discriminator import Discriminator
 from rlopt.agent.gail.gail import GAILConfig
@@ -65,7 +67,7 @@ def test_multi_discriminator_batched_path() -> None:
 
 
 def test_config_aliases_map_to_new_fields() -> None:
-    with pytest.warns(UserWarning):
+    with pytest.warns(UserWarning, match="deprecated"):
         gail_cfg = GAILConfig(
             discriminator_input_key="invrwd",
             discriminator_hidden_dim=128,
@@ -76,7 +78,38 @@ def test_config_aliases_map_to_new_fields() -> None:
     assert gail_cfg.discriminator_hidden_dims == [128, 128, 128]
     assert gail_cfg.proportion_env_reward == 0.2
 
-    with pytest.warns(UserWarning):
-        ase_cfg = ASEConfig(num_skills=12, diversity_coeff=0.15)
+    ase_cfg = ASEConfig(latent_dim=12, diversity_bonus=0.15)
     assert ase_cfg.latent_dim == 12
-    assert ase_cfg.diversity_bonus_coeff == 0.15
+    assert ase_cfg.diversity_bonus == 0.15
+
+
+def test_ase_discriminator_encoder_helpers() -> None:
+    discriminator = ASEDiscriminatorEncoder(
+        observation_dim=10,
+        action_dim=3,
+        latent_dim=4,
+        hidden_dims=[16, 16],
+    )
+
+    obs_with_condition = torch.randn(32, 10)
+    action = torch.randn(32, 3)
+    latents = F.normalize(torch.randn(32, 4), dim=-1)
+
+    logits = discriminator.forward_logits(obs_with_condition, action)
+    enc = discriminator.mi_encode(obs_with_condition)
+    reward = discriminator.compute_mi_reward(
+        obs_with_condition[:, :6],
+        latents,
+        mi_hypersphere_reward_shift=True,
+    )
+
+    assert logits.shape == (32, 1)
+    assert enc.shape == (32, 4)
+    assert reward.shape == (32,)
+    assert torch.isfinite(logits).all()
+    assert torch.isfinite(enc).all()
+    assert torch.isfinite(reward).all()
+    assert len(discriminator.all_weights()) >= 4
+    assert len(discriminator.all_discriminator_weights()) >= 3
+    assert len(discriminator.logit_weights()) == 1
+    assert len(discriminator.enc_weights()) == 1

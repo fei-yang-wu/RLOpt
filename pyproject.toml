@@ -123,3 +123,6 @@ isort.required-imports = ["from __future__ import annotations"]
 
 [tool.pyrefly.errors]
 index-error = false
+
+[tool.pyrefly]
+disable-type-errors-in-ide = true

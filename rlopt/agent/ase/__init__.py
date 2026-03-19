@@ -2,7 +2,13 @@
 """ASE (Adversarial Skill Embeddings)."""
 
 from .ase import ASE, ASEConfig, ASERLOptConfig
+from .model import ASEDiscriminatorEncoder
 from .multi_discriminator import MultiDiscriminator
 
-__all__ = ["ASE", "ASEConfig", "ASERLOptConfig", "MultiDiscriminator"]
-
+__all__ = [
+    "ASE",
+    "ASEConfig",
+    "ASERLOptConfig",
+    "ASEDiscriminatorEncoder",
+    "MultiDiscriminator",
+]

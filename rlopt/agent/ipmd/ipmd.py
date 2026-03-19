@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 from tensordict.nn import InteractionType
 from torch import Tensor
@@ -17,8 +18,6 @@ from torchrl.data import ReplayBuffer
 from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import MLP
 from torchrl.record.loggers import Logger
-
-import torch.nn.functional as F
 
 from rlopt.agent.imitation.latent_skill import (
     LatentEncoder,
@@ -1180,8 +1179,8 @@ class IPMD(LatentSkillMixin, PPO):
                 next_td, self._reward_obs_keys, next_obs=False, detach=True
             ).to(self.device)
             next_input = torch.cat([next_obs, next_latent.to(self.device)], dim=-1)
-            next_mi_value = self.mi_critic(next_input).squeeze(-1).reshape(
-                *rollout.batch_size
+            next_mi_value = (
+                self.mi_critic(next_input).squeeze(-1).reshape(*rollout.batch_size)
             )
 
             mi_obs = self._latent_encoder_features_from_td(
