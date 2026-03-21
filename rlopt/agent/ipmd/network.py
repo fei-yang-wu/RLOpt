@@ -184,17 +184,16 @@ class DDPM(nn.Module):
             nn.Mish(),
             nn.Linear(256, 128),
         )
-        # phi takes (s_t, t) -> Jacobian (feature_dim x obs_dim)
         self.mlp_phi = ResidualMLP(
-            input_dim=obs_dim + 128,
-            output_dim=obs_dim * feature_dim,
+            input_dim=obs_dim + action_dim,
+            output_dim=feature_dim,
             hidden_dims=phi_hidden_dims,
             activation=nn.Mish(),
         )
-        # mu takes clean s' -> feature_dim
+
         self.mlp_mu = ResidualMLP(
-            input_dim=obs_dim,
-            output_dim=feature_dim,
+            input_dim=obs_dim + 128,
+            output_dim=obs_dim * feature_dim,
             hidden_dims=mu_hidden_dims,
             activation=nn.Mish(),
         )
@@ -216,38 +215,31 @@ class DDPM(nn.Module):
         xt = alphabars.sqrt() * x0 + (1 - alphabars).sqrt() * eps
         return xt, noise_idx, eps
 
-    def forward_phi(self, s_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """phi(s_t, t) -> Jacobian of shape (B, feature_dim, obs_dim)."""
-        t_ff = self.mlp_t(t)
-        x = torch.cat([s_t, t_ff], dim=-1)
-        out = self.mlp_phi(x)
-        return out.reshape(-1, self.feature_dim, self.obs_dim)
+    def forward_phi(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([s, a], dim=-1)
+        return self.mlp_phi(x)
 
-    def forward_mu(self, sp: torch.Tensor) -> torch.Tensor:
-        """mu(s') -> feature vector of shape (B, feature_dim)."""
-        return self.mlp_mu(sp)
+    def forward_mu(self, sp: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_ff = self.mlp_t(t)
+        all = torch.concat([sp, t_ff], dim=-1)
+        all = self.mlp_mu(all)
+        return all.reshape(-1, self.feature_dim, self.obs_dim)
 
     def forward_eps(
         self,
-        s_t: torch.Tensor | None = None,
-        t: torch.Tensor | None = None,
+        s: torch.Tensor | None = None,
+        a: torch.Tensor | None = None,
         sp: torch.Tensor | None = None,
+        t: torch.Tensor | None = None,
         z_phi: torch.Tensor | None = None,
         z_mu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if z_phi is None:
-            if s_t is None or t is None:
-                msg = "s_t and t must be provided when z_phi is None."
-                raise ValueError(msg)
-            z_phi = self.forward_phi(s_t=s_t, t=t)
+            z_phi = self.forward_phi(s=s, a=a)
         if z_mu is None:
-            if sp is None:
-                msg = "sp must be provided when z_mu is None."
-                raise ValueError(msg)
-            z_mu = self.forward_mu(sp=sp)
-        # z_mu: (B, feature_dim), z_phi: (B, feature_dim, obs_dim)
-        # eps_pred: (B, obs_dim)
-        return torch.bmm(z_mu.unsqueeze(1), z_phi).squeeze(1)
+            z_mu = self.forward_mu(sp=sp, t=t)
+        eps = torch.bmm(z_phi.unsqueeze(1), z_mu).squeeze(1)
+        return eps
 
     def compute_loss(
         self,
@@ -256,47 +248,43 @@ class DDPM(nn.Module):
         sp: torch.Tensor,
         r: torch.Tensor,
     ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
-        # Perturbation on s
-        x0 = s
-        s_t, t, eps = self.add_noise(x0)
+        x0 = sp
+        xt, t, eps = self.add_noise(x0)
 
-        z_phi = self.forward_phi(s_t=s_t.detach(), t=t.unsqueeze(-1))
-        z_mu = self.forward_mu(sp=sp)
+        z_phi = self.forward_phi(s=s, a=a)
+        z_mu = self.forward_mu(sp=xt.detach(), t=t.unsqueeze(-1))
         eps_pred = self.forward_eps(z_phi=z_phi, z_mu=z_mu)
         diffusion_loss = (eps_pred - eps).pow(2).sum(-1).mean()
 
-        if r.ndim == 1:
-            r = r.unsqueeze(-1)
-        reward_pred = self.reward_head(z_mu)
-        reward_loss = F.mse_loss(reward_pred, r)
+        reward_loss = F.mse_loss(self.reward_head(z_phi), r)
 
-        metrics = {
-            "info/eps_l1_norm": eps.abs().mean().item(),
-            "info/eps_pred_l1_norm": eps_pred.abs().mean().item(),
-            "info/x0_mean": x0.mean().item(),
-            "info/x0_std": x0.std(0).mean().item(),
-            "info/x0_l1_norm": x0.abs().mean().item(),
+        metrics = ({
+            "info/eps_l1_norm": eps.abs().mean(),
+            "info/eps_pred_l1_norm": eps_pred.abs().mean(),
+            "info/x0_mean": x0.mean(),
+            "info/x0_std": x0.std(0).mean(),
+            "info/x0_l1_norm": x0.abs().mean(),
             "loss/dynamics_loss": diffusion_loss.item(),
             "loss/reward_loss": reward_loss.item(),
-        }
+        })
         return metrics, diffusion_loss, reward_loss
 
     @torch.no_grad()
     def sample(
         self,
-        sp: torch.Tensor,
+        s: torch.Tensor,
+        a: torch.Tensor,
         preserve_history: bool = False,
     ) -> tuple[torch.Tensor, dict]:
-        """Sample (reconstruct) s given s' via reverse diffusion.
+        """Generate sp given (s, a) via reverse diffusion.
 
-        Since perturbation is on the s branch, the reverse process
-        denoises from x_T ~ N(0,I) to recover s, conditioned on s'
-        through mu(s').
+        The forward process noises sp; the reverse process denoises from
+        x_T ~ N(0,I) back to sp, conditioned on (s, a) through phi.
         """
         info = {}
-        shape = sp.shape
-        xt = torch.randn(shape, device=sp.device)
-        z_mu = self.forward_mu(sp)
+        shape = (s.shape[0], self.obs_dim)
+        xt = torch.randn(shape, device=s.device)
+        z_phi = self.forward_phi(s, a)  # (B, feature_dim) — constant across steps
 
         if preserve_history:
             info["sample_history"] = [xt.clone()]
@@ -304,10 +292,10 @@ class DDPM(nn.Module):
         for t in reversed(range(self.sample_steps)):
             z = torch.randn_like(xt)
             timestep = torch.full(
-                (xt.shape[0],), t, dtype=torch.int64, device=sp.device
+                (xt.shape[0],), t, dtype=torch.int64, device=s.device
             )
-            z_phi = self.forward_phi(s_t=xt, t=timestep.unsqueeze(-1))
-            eps_pred = torch.bmm(z_mu.unsqueeze(1), z_phi).squeeze(1)
+            z_mu = self.forward_mu(sp=xt, t=timestep.unsqueeze(-1))
+            eps_pred = torch.bmm(z_phi.unsqueeze(1), z_mu).squeeze(1)
 
             sigma_t = 0
             if t > 0:
@@ -330,9 +318,6 @@ class DDPM(nn.Module):
 
         return xt, info
 
-    def compute_feature(self, sp: torch.Tensor) -> torch.Tensor:
-        """Return the clean mu(s') representation for control."""
-        return self.forward_mu(sp)
 
 
 class FactorizedNCE(nn.Module):
@@ -393,9 +378,9 @@ class FactorizedNCE(nn.Module):
             dropout=None,
             device=device,
         )
-        # mu takes clean s' -> feature_dim
+        # mu takes (s'_t, t) -> feature_dim (perturbation on s')
         self.mlp_mu = ResidualMLP(
-            input_dim=obs_dim,
+            input_dim=obs_dim + (128 if self.use_noise_perturbation else 0),
             output_dim=feature_dim,
             hidden_dims=mu_hidden_dims,
             activation=nn.Mish(),
@@ -426,9 +411,15 @@ class FactorizedNCE(nn.Module):
         out = self.mlp_phi(s_flat)
         return torch.tanh(out).reshape(*leading, -1)
 
-    def forward_mu(self, sp: torch.Tensor) -> torch.Tensor:
-        """mu(s') -> feature_dim. Clean s'."""
+    def forward_mu(self, sp: torch.Tensor, t: torch.Tensor | None = None) -> torch.Tensor:
+        """mu(s'_t, t) -> feature_dim. Optionally with noise perturbation."""
         leading = sp.shape[:-1]
+        if self.use_noise_perturbation:
+            if t is None:
+                t = torch.zeros(*leading, 1, dtype=torch.int64, device=sp.device)
+            t_flat = t.reshape(-1, t.shape[-1])
+            t_ff = self.mlp_t(t_flat).reshape(*leading, -1)
+            sp = torch.cat([sp, t_ff], dim=-1)
         sp_flat = sp.reshape(-1, sp.shape[-1])
         out = self.mlp_mu(sp_flat)
         return torch.tanh(out).reshape(*leading, -1)
@@ -441,7 +432,7 @@ class FactorizedNCE(nn.Module):
         z_phi: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B = s.shape[0]
-        # Perturbation on s, not s'
+        # Perturbation on s and s'
         if self.use_noise_perturbation:
             s_expanded = s.unsqueeze(0).repeat(self.N, 1, 1)
             t = torch.arange(0, self.N, device=s.device)
@@ -449,9 +440,16 @@ class FactorizedNCE(nn.Module):
             alphabars = self.alphabars[t]
             eps = torch.randn_like(s_expanded)
             s_t = alphabars.sqrt() * s_expanded + (1 - alphabars).sqrt() * eps
+
+            # Noise on sp (same noise levels, independent noise)
+            sp_expanded = sp.unsqueeze(0).repeat(self.N, 1, 1)
+            eps_sp = torch.randn_like(sp_expanded)
+            sp_t = alphabars.sqrt() * sp_expanded + (1 - alphabars).sqrt() * eps_sp
+
             t = t.unsqueeze(-1)
         else:
             s_t = s.unsqueeze(0)
+            sp_t = sp.unsqueeze(0)
             t = None
 
         if z_phi is None:
@@ -459,8 +457,7 @@ class FactorizedNCE(nn.Module):
         else:
             z_phi = z_phi.unsqueeze(0).repeat(self.N, 1, 1)
 
-        z_mu = self.forward_mu(sp)  # (B, z_dim)
-        z_mu = z_mu.unsqueeze(0).repeat(self.N, 1, 1)  # (N, B, z_dim)
+        z_mu = self.forward_mu(sp_t, t)  # (N, B, z_dim)
         logits = torch.bmm(z_phi, z_mu.transpose(-1, -2))  # (N, LB, RB)
         return logits
 

@@ -179,17 +179,18 @@ class IPMDSR(IPMD):
 
     @torch.no_grad()
     def _sr_sample_eval(self, batch: TensorDict) -> dict[str, float]:
-        """Run diffusion sampling to reconstruct s from s', measure distance."""
+        """Run diffusion sampling to generate sp from (s, a), measure distance."""
         if not isinstance(self.sr_model, DDPM):
             return {}
         self.sr_model.eval()
         batch = batch.to(self.device)
         obs_key = self._sr_obs_key()
         obs = cast(Tensor, batch.get(obs_key))
+        action = cast(Tensor, batch.get("action"))
         next_obs = cast(Tensor, batch.get(("next", obs_key)))
-        s_recon, _ = self.sr_model.sample(sp=next_obs)
-        mse = (s_recon - obs).pow(2).sum(-1).mean()
-        l1 = (s_recon - obs).abs().sum(-1).mean()
+        sp_recon, _ = self.sr_model.sample(s=obs, a=action)
+        mse = (sp_recon - next_obs).pow(2).sum(-1).mean()
+        l1 = (sp_recon - next_obs).abs().sum(-1).mean()
         self.sr_model.train()
         return {
             "sample/recon_mse": mse.item(),
