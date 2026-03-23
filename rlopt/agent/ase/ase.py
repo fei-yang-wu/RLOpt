@@ -44,16 +44,19 @@ from rlopt.utils import get_activation_class
 class ASEConfig:
     """ASE-specific configuration with ProtoMotions-style naming."""
 
+    # Latent skill space config
     latent_dim: int = 64
     latent_key: ObsKey = "latent_command"
     latent_steps_min: int = 30
     latent_steps_max: int = 120
 
+    # Reward weights
     task_reward_w: float = 1.0
     discriminator_reward_w: float = 1.0
     mi_reward_w: float = 0.25
     mi_hypersphere_reward_shift: bool = True
 
+    # MI encoder configuration
     mi_enc_weight_decay: float = 0.0
     mi_enc_grad_penalty: float = 0.0
     diversity_bonus: float = 0.05
@@ -62,11 +65,13 @@ class ASEConfig:
     uniformity_kernel_scale: float = 2.0
     conditional_discriminator: bool = True
 
+    # MI critic configuration
     mi_critic_hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     mi_critic_activation: str = "elu"
     mi_critic_lr: float = 3e-4
     mi_critic_grad_clip_norm: float = 1.0
 
+    # Discriminator critic configuration
     discriminator_critic_hidden_dims: list[int] = field(
         default_factory=lambda: [256, 256]
     )
@@ -762,14 +767,12 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             advantage = cast(Tensor, rollout.get("advantage"))
             style_reward_w = float(self.config.ase.discriminator_reward_w)
             if style_reward_w > 0.0 and "style_advantage" in rollout.keys(True):
-                style_adv = cast(Tensor, rollout.get("style_advantage"))
-                style_adv = self._align_advantage_shape(advantage, style_adv)
+                style_adv = rollout.get("style_advantage").unsqueeze(-1)
                 advantage = advantage + style_adv * style_reward_w
 
             mi_reward_w = float(self.config.ase.mi_reward_w)
             if mi_reward_w > 0.0 and "mi_advantage" in rollout.keys(True):
-                mi_adv = cast(Tensor, rollout.get("mi_advantage"))
-                mi_adv = self._align_advantage_shape(advantage, mi_adv)
+                mi_adv = rollout.get("mi_advantage").unsqueeze(-1)
                 advantage = advantage + mi_adv * mi_reward_w
             rollout.set("advantage", advantage)
 
@@ -843,19 +846,9 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
     def prepare(
         self,
         iteration: PPOIterationData,
-        metadata: PPOTrainingMetadata,
+        metadata: PPOTrainingMetadata,  # noqa: ARG002
     ) -> None:
         self._prepare_latent_rollout_batch_for_training(iteration.rollout)
-        rollout_update_idx = self._counter_as_int(metadata.updates_completed)
-
-        discriminator_metrics = self._update_discriminator(
-            iteration.rollout.reshape(-1),
-            rollout_update_idx,
-        )
-        if discriminator_metrics:
-            iteration.metrics.update(
-                {f"train/{key}": value for key, value in discriminator_metrics.items()}
-            )
 
     def iterate(
         self,
@@ -877,6 +870,16 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
 
         with timeit("training"):
             iteration.rollout = self.pre_iteration_compute(iteration.rollout)
+
+            rollout_update_idx = self._counter_as_int(metadata.updates_completed)
+            discriminator_metrics = self._update_discriminator(
+                iteration.rollout.reshape(-1),
+                rollout_update_idx,
+            )
+            if discriminator_metrics:
+                iteration.metrics.update(
+                    {f"train/{key}": value for key, value in discriminator_metrics.items()}
+                )
 
             if "style_reward" in iteration.rollout.keys(True):
                 iteration.metrics["train/ase/style_reward_mean"] = float(
@@ -930,8 +933,27 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
         for key, value in losses_mean.items():  # type: ignore[attr-defined]
             iteration.metrics[f"train/{key}"] = value.item()  # type: ignore[attr-defined]
 
-    def train(self) -> None:  # type: ignore[override]
-        PPO.train(self)
+    def train(self) -> None:  # type: ignore
+        """Train the agent with the shared on-policy rollout-to-update workflow."""
+        self.validate_training()
+        metadata = self.init_metadata()
+
+        try:
+            for iteration_idx in range(metadata.total_iterations):
+                # 1) Collect a rollout and create the iteration state.
+                iteration = self.collect(metadata, iteration_idx)
+
+                # 2) Let the algorithm reshape rewards or attach extra data.
+                self.prepare(iteration, metadata)
+
+                # 3) Run the shared learning phase over the prepared rollout.
+                self.iterate(iteration, metadata)
+
+                # 4) Log, refresh collector weights, and checkpoint if needed.
+                self.record(iteration, metadata)
+        finally:
+            metadata.progress_bar.close()  # type: ignore[attr-defined]
+            self.collector.shutdown()
 
     def predict(self, obs: Tensor | np.ndarray | Mapping[Any, Any]) -> Tensor:  # type: ignore[override]
         policy_op = self.actor_critic.get_policy_operator()

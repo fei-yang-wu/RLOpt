@@ -303,28 +303,6 @@ class IPMD(LatentSkillMixin, PPO):
         self.mi_critic: torch.nn.Module | None = None
         self.mi_critic_optim: torch.optim.Optimizer | None = None
 
-        # Pre-cache compile-friendly scalars from config
-        self._cache_ipmd_scalars()
-
-        super().__init__(
-            env=env,
-            config=config,
-            policy_net=policy_net,
-            value_net=value_net,
-            q_net=q_net,
-            replay_buffer=replay_buffer,
-            logger=logger,
-            feature_extractor_net=feature_extractor_net,
-            **kwargs,
-        )
-
-        self._auto_attach_env_expert_sampler()
-        self._refresh_grad_clip_params()
-        self._policy_operator = self.actor_critic.get_policy_operator()
-        self._bc_debug_anomaly_prints = 0
-
-    def _cache_ipmd_scalars(self) -> None:
-        """Pre-cache config scalars and reward-input flags for compile-friendly hot paths."""
         cfg = self.config.ipmd
         rit = cfg.reward_input_type
         lit = cfg.latent_input_type
@@ -368,6 +346,23 @@ class IPMD(LatentSkillMixin, PPO):
             self._reward_out_fn = lambda r: torch.sigmoid(r) * scale
         else:
             self._reward_out_fn = lambda r: r
+
+        super().__init__(
+            env=env,
+            config=config,
+            policy_net=policy_net,
+            value_net=value_net,
+            q_net=q_net,
+            replay_buffer=replay_buffer,
+            logger=logger,
+            feature_extractor_net=feature_extractor_net,
+            **kwargs,
+        )
+
+        self._auto_attach_env_expert_sampler()
+        self._refresh_grad_clip_params()
+        self._policy_operator = self.actor_critic.get_policy_operator()
+        self._bc_debug_anomaly_prints = 0
 
     _REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
 
@@ -1214,8 +1209,8 @@ class IPMD(LatentSkillMixin, PPO):
             #   advantages += mi_advantages * mi_reward_weight
             mi_reward_w = float(self.config.ipmd.mi_reward_weight)
             if mi_reward_w > 0.0 and "mi_advantage" in rollout.keys(True):
-                adv = cast(Tensor, rollout.get("advantage"))
-                mi_adv = cast(Tensor, rollout.get("mi_advantage"))
+                adv = rollout.get("advantage")
+                mi_adv = rollout.get("mi_advantage").unsqueeze(-1)
                 rollout.set("advantage", adv + mi_adv * mi_reward_w)
 
             if getattr(self.config.compile, "compile_mode", None):
@@ -1335,10 +1330,9 @@ class IPMD(LatentSkillMixin, PPO):
     def prepare(
         self,
         iteration: PPOIterationData,
-        metadata: PPOTrainingMetadata,
+        metadata: PPOTrainingMetadata,  # noqa: ARG002
     ) -> None:
         """Attach reward-model diagnostics and replace the PPO reward for this rollout."""
-        del metadata
         self._prepare_latent_rollout_batch_for_training(iteration.rollout)
         self._log_batch_contract_once(
             flag_attr="_rollout_batch_contract_logged",
@@ -1350,14 +1344,6 @@ class IPMD(LatentSkillMixin, PPO):
             iteration.rollout,
             self._rollout_required_keys(),
             context="rollout batch",
-        )
-        iteration.metrics.update(
-            {
-                f"train/{key}": value
-                for key, value in self._update_mi_encoder(
-                    iteration.rollout.reshape(-1)
-                ).items()
-            }
         )
         iteration.metrics.update(self._prepare_rollout_rewards(iteration.rollout))
 
@@ -1380,6 +1366,14 @@ class IPMD(LatentSkillMixin, PPO):
             self.mi_critic.train()
 
         with timeit("training"):
+            # MI encoder trains once per rollout, before pre_iteration_compute which
+            # uses the encoder in _attach_mi_targets.
+            mi_encoder_metrics = self._update_mi_encoder(iteration.rollout.reshape(-1))
+            if mi_encoder_metrics:
+                iteration.metrics.update(
+                    {f"train/{key}": value for key, value in mi_encoder_metrics.items()}
+                )
+
             iteration.rollout = self.pre_iteration_compute(iteration.rollout)
 
             if "mi_reward" in iteration.rollout.keys(True):
