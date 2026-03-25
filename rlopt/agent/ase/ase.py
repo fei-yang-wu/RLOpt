@@ -764,15 +764,15 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             self._attach_style_targets(rollout)
             self._attach_mi_targets(rollout)
 
-            advantage = cast(Tensor, rollout.get("advantage"))
-            style_reward_w = float(self.config.ase.discriminator_reward_w)
+            advantage = rollout["advantage"]
+            style_reward_w = self.config.ase.discriminator_reward_w
             if style_reward_w > 0.0 and "style_advantage" in rollout.keys(True):
-                style_adv = rollout.get("style_advantage").unsqueeze(-1)
+                style_adv = rollout["style_advantage"].unsqueeze(-1)
                 advantage = advantage + style_adv * style_reward_w
 
-            mi_reward_w = float(self.config.ase.mi_reward_w)
+            mi_reward_w = self.config.ase.mi_reward_w
             if mi_reward_w > 0.0 and "mi_advantage" in rollout.keys(True):
-                mi_adv = rollout.get("mi_advantage").unsqueeze(-1)
+                mi_adv = rollout["mi_advantage"].unsqueeze(-1)
                 advantage = advantage + mi_adv * mi_reward_w
             rollout.set("advantage", advantage)
 
@@ -869,8 +869,10 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             self.mi_critic.train()
 
         with timeit("training"):
+            # Pre-iteration compute, attach style and MI targets, and compute advantages.
             iteration.rollout = self.pre_iteration_compute(iteration.rollout)
 
+            # Update discriminator and MI encoders
             rollout_update_idx = self._counter_as_int(metadata.updates_completed)
             discriminator_metrics = self._update_discriminator(
                 iteration.rollout.reshape(-1),
@@ -878,9 +880,13 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             )
             if discriminator_metrics:
                 iteration.metrics.update(
-                    {f"train/{key}": value for key, value in discriminator_metrics.items()}
+                    {
+                        f"train/{key}": value
+                        for key, value in discriminator_metrics.items()
+                    }
                 )
 
+            # Log style and MI rewards.
             if "style_reward" in iteration.rollout.keys(True):
                 iteration.metrics["train/ase/style_reward_mean"] = float(
                     cast(Tensor, iteration.rollout.get("style_reward")).mean().item()
@@ -890,6 +896,7 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
                     cast(Tensor, iteration.rollout.get("mi_reward")).mean().item()
                 )
 
+            # Run PPO epochs over the rollout and update additional critics.
             for epoch_idx in range(metadata.epochs_per_rollout):
                 for batch_idx, batch in enumerate(self.data_buffer):
                     kl_context = None
@@ -903,16 +910,21 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
                     )
                     loss = loss.clone()
 
+                    # Update discriminator critic.
                     disc_critic_stats = self._update_discriminator_critic_batch(batch)
                     for key, value in disc_critic_stats.items():
                         loss.set(key, value)
 
+                    # Update MI critic.
                     mi_critic_stats = self._update_mi_critic_batch(batch)
                     for key, value in mi_critic_stats.items():
                         loss.set(key, value)
 
+                    # Update learning rate scheduler.
                     if self.lr_scheduler and self.lr_scheduler_step == "update":
                         self.lr_scheduler.step()
+
+                    # Compute KL approximation.
                     if kl_context is not None:
                         kl_approx = self._compute_kl_after_update(
                             kl_context, metadata.policy_operator
@@ -921,10 +933,12 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
                             loss.set("kl_approx", kl_approx.detach())
                             self._maybe_adjust_lr(kl_approx, self.config.optim)
 
+                    # Select reported loss metrics.
                     losses[epoch_idx, batch_idx] = self._select_reported_loss_metrics(
                         loss
                     )
 
+                # Update learning rate scheduler.
                 if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                     self.lr_scheduler.step()
 

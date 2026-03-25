@@ -16,7 +16,7 @@ from torch import Tensor
 from torchrl._utils import timeit
 
 # Import missing modules
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import Collector
 from torchrl.data import LazyMemmapStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
@@ -882,7 +882,7 @@ class L2T(BaseAlgorithm[L2TRLOptConfig]):
 
         losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])  # type: ignore
 
-        self.collector: SyncDataCollector
+        self.collector: Collector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
         for _i in range(total_iter):

@@ -20,7 +20,7 @@ from tensordict.base import TensorDictBase
 from tensordict.nn import TensorDictModule
 from torch import Tensor
 from torch.optim import lr_scheduler
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import Collector
 from torchrl.data import (
     ReplayBuffer,
 )
@@ -107,7 +107,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         actor_critic: Combined actor-critic module for unified policy and value computation.
         loss_module: TorchRL loss module for computing training objectives.
         data_buffer: ReplayBuffer for storing and sampling experience.
-        collector: SyncDataCollector for environment interaction and data collection.
+        collector: Collector for environment interaction and data collection.
         optim: Grouped optimizer for all trainable parameters.
         lr_scheduler: Optional learning rate scheduler.
 
@@ -467,10 +467,10 @@ class BaseAlgorithm(Generic[CfgT], ABC):
 
     def _construct_collector(
         self, env: TransformedEnv, policy: TensorDictModule
-    ) -> SyncDataCollector:
+    ) -> Collector:
         """Create a synchronized data collector for environment interaction.
 
-        Configures a TorchRL SyncDataCollector with appropriate settings for
+        Configures a TorchRL Collector with appropriate settings for
         parallel data collection, initialization, and device placement.
 
         Args:
@@ -478,7 +478,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             policy: Policy module for action selection during collection.
 
         Returns:
-            Configured SyncDataCollector instance ready for use.
+            Configured Collector instance ready for use.
 
         Note:
             Uses fork context by default. Compilation is enabled if config.compile
@@ -486,7 +486,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         """
         # We can't use nested child processes with mp_start_method="fork"
 
-        collector = SyncDataCollector(
+        collector = Collector(
             env,
             policy=policy,
             init_random_frames=self.config.collector.init_random_frames,

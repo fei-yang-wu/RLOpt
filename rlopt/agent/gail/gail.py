@@ -16,7 +16,7 @@ from tensordict import TensorDict
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import RandomSampler
 
@@ -1042,7 +1042,7 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
         cfg_loss_clip_epsilon = cfg.ppo.clip_epsilon
         losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])
 
-        self.collector = cast(SyncDataCollector, self.collector)
+        self.collector = cast(Collector, self.collector)
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
         policy_op = self.actor_critic.get_policy_operator()
@@ -1278,8 +1278,14 @@ class AMP(GAIL[GailCfgT], Generic[GailCfgT]):
             "discriminator_loss": loss.detach(),
             "expert_loss": expert_loss.detach(),
             "policy_loss": policy_loss.detach(),
-            "expert_accuracy": (expert_logits.squeeze(-1) > 0.0).float().mean().detach(),
-            "policy_accuracy": (policy_logits.squeeze(-1) < 0.0).float().mean().detach(),
+            "expert_accuracy": (expert_logits.squeeze(-1) > 0.0)
+            .float()
+            .mean()
+            .detach(),
+            "policy_accuracy": (policy_logits.squeeze(-1) < 0.0)
+            .float()
+            .mean()
+            .detach(),
             "expert_d_mean": expert_logits.mean().detach(),
             "policy_d_mean": policy_logits.mean().detach(),
         }

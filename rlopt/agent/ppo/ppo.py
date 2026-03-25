@@ -18,7 +18,7 @@ from tensordict.nn import (
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import Collector
 from torchrl.data import (
     Bounded,
     LazyTensorStorage,
@@ -522,7 +522,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             1000 if trainer_cfg is None else max(1, int(trainer_cfg.log_interval))
         )
 
-        self.collector = cast(SyncDataCollector, self.collector)
+        self.collector = cast(Collector, self.collector)
         return PPOTrainingMetadata(
             collector_iter=iter(self._collector_iter()),
             total_iterations=len(self.collector),
@@ -697,7 +697,6 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
             log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
             log_info(log_info_dict, iteration.metrics)
-
 
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         """Return the metrics printed for non-progress-bar training runs."""
