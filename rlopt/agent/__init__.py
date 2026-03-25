@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from rlopt.agent.ppo import PPO, PPORLOptConfig
 from rlopt.agent.sac import SAC, SACRLOptConfig
-from rlopt.agent.ipmd import IPMD, IPMDRLOptConfig
+from rlopt.agent.ipmd import IPMD, IPMDSR, IPMDBilinear, IPMDRLOptConfig, IPMDSRRLOptConfig, IPMDBilinearRLOptConfig
 from rlopt.agent.fast_td3 import FastTD3, FastTD3RLOptConfig
 from rlopt.agent.gail import AMP, AMPRLOptConfig, GAIL, GAILRLOptConfig
 from rlopt.agent.ase import ASE, ASEConfig, ASERLOptConfig
@@ -16,7 +16,11 @@ __all__ = [
     "PPORLOptConfig",
     "SACRLOptConfig",
     "IPMD",
+    "IPMDSR",
+    "IPMDBilinear",
     "IPMDRLOptConfig",
+    "IPMDSRRLOptConfig",
+    "IPMDBilinearRLOptConfig",
     "FastTD3",
     "FastTD3RLOptConfig",
     "GAIL",

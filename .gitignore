@@ -178,3 +178,4 @@ MUJOCO_LOG.TXT
 # expert data
 expert_data/
 comparison_results/
+.omc/
