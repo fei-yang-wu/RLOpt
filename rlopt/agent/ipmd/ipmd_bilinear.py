@@ -25,7 +25,7 @@ from torchrl.envs.utils import ExplorationType
 from torchrl.modules import MLP, ProbabilisticActor, TanhNormal
 from torchrl.record.loggers import Logger
 
-from rlopt.agent.ipmd.ipmd_simple import IPMD, IPMDRLOptConfig
+from rlopt.agent.ipmd.ipmd import IPMD, IPMDRLOptConfig
 from rlopt.agent.ipmd.network import (
     PositionalFeature,
     ResidualMLP,
@@ -100,7 +100,6 @@ class IPMDBilinearRLOptConfig(IPMDRLOptConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +139,7 @@ class EmpiricalNormalization(nn.Module):
         if self.count < 2:
             return x
         return (x - self.mean) / (self.var.sqrt() + self.eps)
-    
+
     def inv_normalize(self, x: Tensor) -> Tensor:
         """Inverse normalize input using running statistics."""
         return x * (self.var.sqrt() + self.eps) + self.mean
@@ -188,7 +187,9 @@ class BilinearRepresentation(nn.Module):
         self.x_min, self.x_max = x_min, x_max
 
         # Empirical normalization for observations
-        self.obs_norm = EmpiricalNormalization(next_obs_dim) # normalize next obs for better noise mixing
+        self.obs_norm = EmpiricalNormalization(
+            next_obs_dim
+        )  # normalize next obs for better noise mixing
 
         # Noise schedule from the original DiffSR implementation (VP schedule)
         betas, alphas, alphabars = get_noise_schedule("vp", num_noises)
@@ -321,7 +322,7 @@ class BilinearRepresentation(nn.Module):
         r: Tensor,
     ) -> tuple[dict[str, float], Tensor, Tensor]:
         """Diffusion loss for bilinear spectral representation learning."""
-        s = s # no normalization for state
+        s = s  # no normalization for state
         x0 = self.obs_norm.normalize(sp)
         xt, t, eps = self.add_noise(x0)
 
@@ -360,9 +361,7 @@ class BilinearRepresentation(nn.Module):
 
         for t in reversed(range(self.num_noises)):
             z = torch.randn_like(xt)
-            timestep = torch.full(
-                (xt.shape[0],), t, dtype=torch.int64, device=s.device
-            )
+            timestep = torch.full((xt.shape[0],), t, dtype=torch.int64, device=s.device)
             z_mu = self.forward_mu(sp=xt, t=timestep.unsqueeze(-1))
             eps_pred = torch.bmm(z_phi.unsqueeze(1), z_mu).squeeze(1)
 
@@ -376,8 +375,14 @@ class BilinearRepresentation(nn.Module):
                 sigma_t = sigma_t_sq.clip(1e-20).sqrt()
 
             xt = (
-                1.0 / self.alphas[timestep].sqrt()
-                * (xt - self.betas[timestep] / (1 - self.alphabars[timestep]).sqrt() * eps_pred)
+                1.0
+                / self.alphas[timestep].sqrt()
+                * (
+                    xt
+                    - self.betas[timestep]
+                    / (1 - self.alphabars[timestep]).sqrt()
+                    * eps_pred
+                )
                 + sigma_t * z
             )
             xt = xt.clip(self.x_min, self.x_max)
@@ -444,7 +449,7 @@ class BilinearPolicyHead(GaussianPolicyHead):
         device: str | torch.device = "cpu",
     ) -> None:
         base_mlp = MLP(
-            in_features=None, # lazy initialization
+            in_features=None,  # lazy initialization
             out_features=action_dim,
             num_cells=num_cells,
             activation_class=get_activation_class(activation_fn),
@@ -466,7 +471,7 @@ class BilinearPolicyHead(GaussianPolicyHead):
         self.bilinear_rep = bilinear_rep
         self.detach_features = detach_features
 
-    def forward(self, *obs: Tensor, z: Tensor|None=None) -> tuple[Tensor, Tensor]:
+    def forward(self, *obs: Tensor, z: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Compute (loc, scale) from observations via bilinear representation.
 
         1. Concatenate multi-key observations.
@@ -521,9 +526,14 @@ class IPMDBilinear(IPMD):
         self.bilinear_rep.to(self.device)
 
         super().__init__(
-            env=env, config=config, policy_net=policy_net,
-            value_net=value_net, q_net=q_net, replay_buffer=replay_buffer,
-            logger=logger, feature_extractor_net=feature_extractor_net,
+            env=env,
+            config=config,
+            policy_net=policy_net,
+            value_net=value_net,
+            q_net=q_net,
+            replay_buffer=replay_buffer,
+            logger=logger,
+            feature_extractor_net=feature_extractor_net,
             **kwargs,
         )
 
@@ -546,31 +556,32 @@ class IPMDBilinear(IPMD):
 
     def _concat_obs_from_td(self, td: TensorDict) -> Tensor:
         """Concatenate all policy obs keys from a TensorDict."""
-        parts = [
-            td.get(k).flatten(-1)
-            for k in self._get_obs_keys()
-        ]
+        parts = [td.get(k).flatten(-1) for k in self._get_obs_keys()]
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-    
+
     def _concat_next_obs_from_td(self, td: TensorDict) -> Tensor:
         """Concatenate all next policy obs keys from a TensorDict."""
-        parts = [
-            td.get(("next", k)).flatten(-1)
-            for k in self._get_next_obs_keys()
-        ]
+        parts = [td.get(("next", k)).flatten(-1) for k in self._get_next_obs_keys()]
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
     def _get_obs_keys(self) -> list[str]:
         return list(self.config.policy.get_input_keys())
-    
+
     def _get_next_obs_keys(self) -> list[str]:
-        return list(self.config.policy.get_input_keys())[2:5] # only ["base_ang_vel", "joint_pos_rel", "joint_vel_rel"]
+        return list(self.config.policy.get_input_keys())[
+            2:5
+        ]  # only ["base_ang_vel", "joint_pos_rel", "joint_vel_rel"]
 
     def _construct_bilinear_model(self) -> BilinearRepresentation:
         cfg = self.config.bilinear
         action_spec = getattr(self.env, "action_spec_unbatched", self.env.action_spec)
-        obs_dim = sum(int(self.env.observation_spec[k].shape[-1]) for k in self._get_obs_keys())
-        next_obs_dim = sum(int(self.env.observation_spec[k].shape[-1]) for k in self._get_next_obs_keys())
+        obs_dim = sum(
+            int(self.env.observation_spec[k].shape[-1]) for k in self._get_obs_keys()
+        )
+        next_obs_dim = sum(
+            int(self.env.observation_spec[k].shape[-1])
+            for k in self._get_next_obs_keys()
+        )
         return BilinearRepresentation(
             obs_dim=obs_dim,
             next_obs_dim=next_obs_dim,
@@ -596,13 +607,17 @@ class IPMDBilinear(IPMD):
         action_dim = int(action_spec.shape[-1])
 
         if isinstance(action_spec, Bounded):
-            dist_cls, dist_kw = TanhNormal, {
-                "low": action_spec.space.low,
-                "high": action_spec.space.high,
-                "tanh_loc": False,
-            }
+            dist_cls, dist_kw = (
+                TanhNormal,
+                {
+                    "low": action_spec.space.low,
+                    "high": action_spec.space.high,
+                    "tanh_loc": False,
+                },
+            )
         else:
             from torchrl.modules import IndependentNormal
+
             dist_cls, dist_kw = IndependentNormal, {}
 
         policy_head = policy_net or BilinearPolicyHead(
@@ -706,8 +721,11 @@ class IPMDBilinear(IPMD):
     # -- Update / logging overrides --
 
     def update(
-        self, batch: TensorDict, num_network_updates: int,
-        expert_batch: TensorDict, has_expert: Tensor,
+        self,
+        batch: TensorDict,
+        num_network_updates: int,
+        expert_batch: TensorDict,
+        has_expert: Tensor,
     ) -> tuple[TensorDict, int]:
         self._store_transitions(batch)
 
@@ -744,7 +762,7 @@ class IPMDBilinear(IPMD):
 
         # f(s) from online state_net
         f_s = self.bilinear_rep.compute_policy_representation(obs)  # (N, embed_dim)
-        
+
         # Per-dimension std across the batch (low = collapse)
         f_std = f_s.std(dim=0)  # (embed_dim,)
 

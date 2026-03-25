@@ -11,7 +11,7 @@ from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.record.loggers import Logger
 
-from rlopt.agent.ipmd.ipmd_simple import IPMD, IPMDRLOptConfig
+from rlopt.agent.ipmd.ipmd import IPMD, IPMDRLOptConfig
 from rlopt.agent.ipmd.network import DDPM, FactorizedNCE
 
 
@@ -36,7 +36,9 @@ class SRConfig:
 
     # DiffSR-specific
     sample_steps: int = 16
-    sample_eval_interval: int = 50  # 0 = disabled; run sampling check every N SR updates
+    sample_eval_interval: int = (
+        50  # 0 = disabled; run sampling check every N SR updates
+    )
 
     # History buffer for learning from all past transitions
     history_buffer_size: int = 10_000_000
@@ -154,9 +156,7 @@ class IPMDSR(IPMD):
         """Return the primary observation key used for SR inputs."""
         return self.config.policy.get_input_keys()[0]
 
-    def _sr_loss_from_batch(
-        self, batch: TensorDict
-    ) -> tuple[dict[str, float], Tensor]:
+    def _sr_loss_from_batch(self, batch: TensorDict) -> tuple[dict[str, float], Tensor]:
         """Compute SR loss from a batch of transitions."""
         batch = batch.to(self.device)
         obs_key = self._sr_obs_key()
@@ -270,9 +270,7 @@ class IPMDSR(IPMD):
             float(len(self._sr_history_buffer))
         )
 
-        return super().update(
-            batch, num_network_updates, expert_batch, has_expert
-        )
+        return super().update(batch, num_network_updates, expert_batch, has_expert)
 
     def log_metrics(
         self,
