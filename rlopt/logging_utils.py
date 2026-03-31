@@ -139,6 +139,12 @@ def _coerce_metric_value(value: Any) -> float | int | None:
     return None
 
 
+def _format_metric_for_console(value: float | int) -> str:
+    """Render scalar metrics for console logs with 3 significant digits."""
+
+    return f"{float(value):.3g}"
+
+
 def _slugify(value: Any, fallback: str) -> str:
     text = str(value).strip() if value is not None else ""
     if not text:
@@ -306,7 +312,10 @@ class MetricReporter:
                 self._metrics_logger.log_scalar(key, value, record_step)
 
         if log_python and self._python_logger is not None:
-            message = ", ".join(f"{k}={v}" for k, v in sanitized.items())
+            message = " | ".join(
+                f"{k}={_format_metric_for_console(v)}"
+                for k, v in sanitized.items()
+            )
             if message:
                 if step is not None:
                     message = f"step={record_step} | {message}"

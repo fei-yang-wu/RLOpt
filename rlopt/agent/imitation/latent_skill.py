@@ -161,6 +161,17 @@ class LatentSkillMixin:
         latents = torch.randn(batch_size, self._latent_dim, device=device, dtype=dtype)
         return F.normalize(latents, dim=-1, eps=1.0e-6)
 
+    def _sample_collector_latents(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        env_ids: Tensor | None = None,
+    ) -> Tensor:
+        del env_ids
+        return self._sample_unit_latents(batch_size, device=device, dtype=dtype)
+
     def _sample_latent_steps(self, batch_size: int, *, device: torch.device) -> Tensor:
         if self._latent_steps_min == self._latent_steps_max:
             return torch.full(
@@ -212,10 +223,11 @@ class LatentSkillMixin:
             or self._collector_latents.device != device
             or self._collector_latents.dtype != dtype
         ):
-            self._collector_latents = self._sample_unit_latents(
+            self._collector_latents = self._sample_collector_latents(
                 batch_size,
                 device=device,
                 dtype=dtype,
+                env_ids=None,
             )
             self._collector_latent_steps = self._sample_latent_steps(
                 batch_size,
@@ -241,11 +253,13 @@ class LatentSkillMixin:
         done_mask = self._done_mask_from_td(td, batch_size=batch_size)
         renew_mask = done_mask | (self._collector_latent_steps <= 0)
         if bool(renew_mask.any()):
+            renew_env_ids = renew_mask.nonzero(as_tuple=False).squeeze(-1)
             renew_count = int(renew_mask.sum().item())
-            self._collector_latents[renew_mask] = self._sample_unit_latents(
+            self._collector_latents[renew_mask] = self._sample_collector_latents(
                 renew_count,
                 device=self.device,
                 dtype=dtype,
+                env_ids=renew_env_ids,
             )
             self._collector_latent_steps[renew_mask] = self._sample_latent_steps(
                 renew_count,

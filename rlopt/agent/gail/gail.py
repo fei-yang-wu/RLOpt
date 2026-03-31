@@ -1108,7 +1108,7 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
                 for j in range(cfg_loss_ppo_epochs):
                     with torch.no_grad(), timeit("adv"):
                         data = self.adv_module(data)
-                        if self.config.compile.compile_mode:
+                        if self.config.compile.compile:
                             data = data.clone()
 
                     with timeit("rb - extend"):
@@ -1225,6 +1225,16 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
             "config": self.config,
             "gail_state": self._gail_state_dict(),
         }
+        if self.optim is not None:
+            checkpoint["optimizer_state_dict"] = self.optim.state_dict()
+        if self.lr_scheduler is not None:
+            checkpoint["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        if (
+            hasattr(self.env, "is_closed")
+            and not self.env.is_closed
+            and hasattr(self.env, "normalize_obs")
+        ):
+            checkpoint["vec_norm_msg"] = self.env.state_dict()
         if self.discriminator_optim is not None:
             checkpoint["discriminator_optim"] = self.discriminator_optim.state_dict()
         torch.save(checkpoint, path)
@@ -1236,11 +1246,17 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
         self.actor_critic.load_state_dict(checkpoint["actor_critic"])
         if self.discriminator is not None and "discriminator" in checkpoint:
             self.discriminator.load_state_dict(checkpoint["discriminator"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optim.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self.lr_scheduler is not None and "lr_scheduler_state_dict" in checkpoint:
+            self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
         if self.discriminator_optim is not None and "discriminator_optim" in checkpoint:
             self.discriminator_optim.load_state_dict(checkpoint["discriminator_optim"])
         gail_state = checkpoint.get("gail_state")
         if isinstance(gail_state, dict):
             self._load_gail_state_dict(gail_state)
+        if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in checkpoint:
+            self.env.load_state_dict(checkpoint["vec_norm_msg"])
         self.log.info("Model loaded from %s", path)
 
 

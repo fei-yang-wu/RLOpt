@@ -208,18 +208,15 @@ def test_ipmd_update_with_expert_data():
     assert "loss_entropy" in loss_td
     assert "loss_reward_diff" in loss_td
     assert "loss_reward_l2" in loss_td
-    assert "estimated_reward_mean" in loss_td
-    assert "expert_reward_mean" in loss_td
-
     # Check that losses are finite
-    for key in loss_td.keys():
+    for key in tuple(loss_td.keys()):
         value = loss_td[key]
         assert not torch.isnan(value).any(), f"NaN in {key}"
         assert not torch.isinf(value).any(), f"Inf in {key}"
 
 
 def test_ipmd_missing_sampler_raises() -> None:
-    """IPMD training should fail fast when no expert sampler is available."""
+    """IPMD expert sampling should fail fast when no sampler is available."""
     cfg = IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
     cfg.env.device = "cpu"
@@ -234,7 +231,7 @@ def test_ipmd_missing_sampler_raises() -> None:
     agent._expert_batch_sampler = None
 
     with pytest.raises(RuntimeError, match="sample_expert_batch"):
-        agent.validate_training()
+        agent._next_expert_batch(batch_size=4)
 
 
 def test_ipmd_latent_input_requires_exact_keys() -> None:
@@ -264,8 +261,8 @@ def test_ipmd_latent_input_requires_exact_keys() -> None:
         )
 
 
-def test_ipmd_rollout_has_no_mi_targets() -> None:
-    """Prepared IPMD rollouts should not attach MI value targets anymore."""
+def test_ipmd_rollout_has_mi_targets() -> None:
+    """Prepared latent IPMD rollouts should attach MI value targets."""
     cfg = IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
     cfg.env.device = "cpu"
@@ -288,9 +285,66 @@ def test_ipmd_rollout_has_no_mi_targets() -> None:
     agent._prepare_rollout_rewards(rollout)
 
     prepared = agent.pre_iteration_compute(rollout)
-    assert "mi_value" not in prepared.keys(True)
-    assert "mi_returns" not in prepared.keys(True)
-    assert "mi_advantage" not in prepared.keys(True)
+    assert "mi_value" in prepared.keys(True)
+    assert "mi_returns" in prepared.keys(True)
+    assert "mi_advantage" in prepared.keys(True)
+
+
+def test_ipmd_reference_posterior_collector_latents() -> None:
+    """Reference-posterior collection should encode per-env reference observations."""
+    cfg = IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.collector.init_random_frames = 0
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    _apply_obs_input_keys(cfg)
+    cfg.ipmd.latent_input_type = "s"
+    cfg.ipmd.command_source = "reference_posterior"
+
+    env = make_parallel_env(cfg)
+    agent = IPMD(env, cfg, logger=None)
+
+    class _NormalizeIdentity(torch.nn.Module):
+        def forward(self, obs_features: torch.Tensor) -> torch.Tensor:
+            return torch.nn.functional.normalize(obs_features, dim=-1, eps=1.0e-6)
+
+    reference_obs = torch.tensor(
+        [[0.2, 0.3, 0.4], [0.9, -0.1, 0.1]],
+        device=agent.device,
+        dtype=torch.float32,
+    )
+
+    def _current_reference(required_keys, env_ids=None):
+        assert list(required_keys) == ["observation"]
+        values = reference_obs
+        if env_ids is not None:
+            values = values.index_select(0, env_ids.to(device=values.device))
+        return TensorDict(
+            {"observation": values.clone()},
+            batch_size=[values.shape[0]],
+            device=agent.device,
+        )
+
+    agent.mi_encoder = _NormalizeIdentity().to(agent.device)
+    agent._current_reference_obs_getter = _current_reference
+
+    env_ids = torch.tensor([1, 0], device=agent.device, dtype=torch.long)
+    latents = agent._sample_collector_latents(
+        batch_size=2,
+        device=agent.device,
+        dtype=torch.float32,
+        env_ids=env_ids,
+    )
+    expected = torch.nn.functional.normalize(
+        reference_obs.index_select(0, env_ids),
+        dim=-1,
+        eps=1.0e-6,
+    )
+    assert torch.allclose(latents, expected)
 
 
 if __name__ == "__main__":

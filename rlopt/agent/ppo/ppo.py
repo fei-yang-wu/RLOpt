@@ -580,7 +580,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         """Turn one rollout into the replay-buffer view consumed by minibatch updates."""
         with torch.no_grad():
             rollout = self.adv_module(rollout)
-            if getattr(self.config.compile, "compile_mode", None):
+            if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
         self.data_buffer.extend(rollout.reshape(-1))
@@ -753,10 +753,16 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             self.config.save_interval > 0
             and metadata.updates_completed % self.config.save_interval == 0
         ):
-            self.save_model(
-                path=self.log_dir / self.config.logger.save_path,
-                step=metadata.frames_processed,
-            )
+            checkpoint_dir = self.log_dir / self.config.logger.save_path
+            custom_save = getattr(self, "save", None)
+            if callable(custom_save):
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                custom_save(checkpoint_dir / f"model_step_{metadata.frames_processed}.pt")
+            else:
+                self.save_model(
+                    path=checkpoint_dir,
+                    step=metadata.frames_processed,
+                )
 
     def train(self) -> None:  # type: ignore
         """Train the agent with the shared on-policy rollout-to-update workflow."""
