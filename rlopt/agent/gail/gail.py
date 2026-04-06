@@ -1178,12 +1178,13 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
             if rate is not None:
                 metrics_to_log["time/speed"] = rate
 
-            self.log_metrics(metrics_to_log, step=collected_frames)
+            self.log_metrics(metrics_to_log, step=collected_frames, log_python=False)
             self.collector.update_policy_weights_()
 
             if (
                 self.config.save_interval > 0
-                and num_network_updates % self.config.save_interval == 0
+                and int(collected_frames) > 0
+                and int(collected_frames) % self.config.save_interval == 0
             ):
                 self.save_model(
                     path=self.log_dir / self.config.logger.save_path,

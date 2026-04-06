@@ -1737,13 +1737,19 @@ class IPMD(LatentSkillMixin, PPO):
         iteration.metrics.update(self._build_timing_metrics(iteration, metadata))
         self._record_env_metrics(iteration)
         iteration.metrics.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
-        self.log_metrics(iteration.metrics, step=metadata.frames_processed)
+        if self._should_log_iteration(metadata, iteration):
+            self.log_metrics(
+                iteration.metrics,
+                step=metadata.frames_processed,
+                log_python=False,
+            )
         self.collector.update_policy_weights_()
         self._refresh_progress_display(metadata, iteration)
 
         if (
             self.config.save_interval > 0
-            and metadata.updates_completed % self.config.save_interval == 0
+            and metadata.frames_processed > 0
+            and metadata.frames_processed % self.config.save_interval == 0
         ):
             self.save_model(
                 path=self.log_dir / self.config.logger.save_path,

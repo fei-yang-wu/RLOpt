@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -36,7 +37,7 @@ from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import SACLoss, compute_log_prob
 from torchrl.objectives.utils import ValueEstimators
 from torchrl.record.loggers import Logger
-from tqdm.std import tqdm as Tqdm
+from tqdm.rich import tqdm
 
 from rlopt.base_class import BaseAlgorithm
 from rlopt.config_base import NetworkConfig, RLOptConfig
@@ -187,10 +188,17 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
         """Construct policy network with learned log-std (same as PPO)."""
         action_spec = self.env.action_spec_unbatched  # type: ignore
         action_dim = int(action_spec.shape[-1])  # pyrefly: ignore
+        policy_input_dim = self.config.policy.input_dim
+        if policy_input_dim is None:
+            policy_input_dim = sum(
+                self.observation_feature_size(key)
+                for key in self.config.policy.get_input_keys()
+            )
+            self.config.policy.input_dim = policy_input_dim
 
         # Build the base MLP that outputs action means
         policy_mlp = MLP(
-            in_features=self.config.policy.input_dim,
+            in_features=policy_input_dim,
             activation_class=get_activation_class(self.config.policy.activation_fn),
             out_features=action_dim,
             num_cells=list(self.config.policy.num_cells),
@@ -252,9 +260,20 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
             msg = "SAC requires a Q-function configuration."
             raise ValueError(msg)
 
+        q_input_dim = self.config.q_function.input_dim
+        if q_input_dim is None:
+            q_input_dim = (
+                sum(
+                    self.observation_feature_size(key)
+                    for key in self.config.q_function.get_input_keys()
+                )
+                + self.action_feature_size()
+            )
+            self.config.q_function.input_dim = q_input_dim
+
         num_cells = list(self.config.q_function.num_cells)
         q_function = MLP(
-            in_features=self.config.q_function.input_dim,
+            in_features=q_input_dim,
             activation_class=get_activation_class(self.config.q_function.activation_fn),
             num_cells=num_cells,
             out_features=1,
@@ -274,9 +293,17 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
 
     def _construct_value_function(self) -> TensorDictModule:
         assert self.config.value_function is not None
+        value_input_dim = self.config.value_function.input_dim
+        if value_input_dim is None:
+            value_input_dim = sum(
+                self.observation_feature_size(key)
+                for key in self.config.value_function.get_input_keys()
+            )
+            self.config.value_function.input_dim = value_input_dim
+
         num_cells = list(self.config.value_function.num_cells)
         value_function = MLP(
-            in_features=123,
+            in_features=value_input_dim,
             activation_class=get_activation_class(
                 self.config.value_function.activation_fn
             ),
@@ -367,7 +394,7 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
             **extra_kwargs,
         )
         loss_module.make_value_estimator(
-            value_type=ValueEstimators.TD0,
+            value_type=ValueEstimators.TD1,
             gamma=self.config.loss.gamma,
             # lmbda=0.95,
             average_rewards=False,
@@ -521,149 +548,160 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
         total_frames = cfg.collector.total_frames
         utd_ratio = float(cfg.sac.utd_ratio)
         init_random_frames = int(self.config.collector.init_random_frames)
-        # Compute updates per collector iteration based on UTD ratio and batch sizes
-        num_updates = int(frames_per_batch * utd_ratio)
+        # Express UTD against rollout steps per env so it remains stable when
+        # the caller changes num_envs and train.py rescales frames_per_batch.
+        rollout_steps_per_env = max(1.0, float(frames_per_batch) / max(1, num_envs))
+        num_updates = max(1, int(round(rollout_steps_per_env * utd_ratio)))
 
         collected_frames = 0
         collector_iter = iter(self.collector)
-        pbar: Tqdm = Tqdm(total=total_frames)  # type: ignore[assignment]
+        trainer_cfg = getattr(cfg, "trainer", None)
+        progress_bar_enabled = (
+            True if trainer_cfg is None else bool(trainer_cfg.progress_bar)
+        )
+        pbar = tqdm(
+            total=total_frames,
+            disable=not progress_bar_enabled or not sys.stdout.isatty(),
+            dynamic_ncols=True,
+        )
 
-        while collected_frames < total_frames:
-            timeit.printevery(num_prints=1000, total_count=total_frames, erase=True)
+        try:
+            while collected_frames < total_frames:
+                timeit.printevery(num_prints=1000, total_count=total_frames, erase=True)
 
-            with timeit("collect"):
-                data = next(collector_iter)
+                with timeit("collect"):
+                    data = next(collector_iter)
 
-            metrics_to_log: dict[str, Any] = {}
-            frames_in_batch = data.numel()
-            collected_frames += frames_in_batch
-            pbar.update(frames_in_batch)
+                metrics_to_log: dict[str, Any] = {}
+                frames_in_batch = data.numel()
+                collected_frames += frames_in_batch
+                pbar.update(frames_in_batch)
 
-            self.collector.update_policy_weights_()
+                self.collector.update_policy_weights_()
 
-            # Log step rewards (always available)
-            if ("next", "reward") in data.keys(True):
-                step_rewards = data["next", "reward"]
-                metrics_to_log["train/step_reward_mean"] = (
-                    step_rewards.mean().item()  # pyrefly: ignore
-                )
-                metrics_to_log["train/step_reward_std"] = (
-                    step_rewards.std().item()  # pyrefly: ignore
-                )
-                metrics_to_log["train/step_reward_max"] = (
-                    step_rewards.max().item()  # pyrefly: ignore
-                )
-                metrics_to_log["train/step_reward_min"] = (
-                    step_rewards.min().item()  # pyrefly: ignore
-                )
-
-            # Get training rewards and episode lengths (if available)
-            if ("next", "episode_reward") in data.keys(True):
-                episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-                if len(episode_rewards) > 0:
-                    episode_length = data["next", "step_count"][data["next", "done"]]
-                    self.episode_lengths.extend(episode_length.cpu().tolist())
-                    self.episode_rewards.extend(episode_rewards.cpu().tolist())
-
-                    metrics_to_log.update(
-                        {
-                            "episode/length": np.mean(self.episode_lengths),
-                            "episode/return": np.mean(self.episode_rewards),
-                        }
+                # Log step rewards (always available)
+                if ("next", "reward") in data.keys(True):
+                    step_rewards = data["next", "reward"]
+                    metrics_to_log["train/step_reward_mean"] = (
+                        step_rewards.mean().item()  # pyrefly: ignore
+                    )
+                    metrics_to_log["train/step_reward_std"] = (
+                        step_rewards.std().item()  # pyrefly: ignore
+                    )
+                    metrics_to_log["train/step_reward_max"] = (
+                        step_rewards.max().item()  # pyrefly: ignore
+                    )
+                    metrics_to_log["train/step_reward_min"] = (
+                        step_rewards.min().item()  # pyrefly: ignore
                     )
 
-            # Don't empty the buffer in off-policy setting
-            with timeit("replay_extend"):
-                self.data_buffer.extend(data.reshape(-1))  # type: ignore[arg-type]
+                # Get training rewards and episode lengths (if available)
+                if ("next", "episode_reward") in data.keys(True):
+                    episode_rewards = data["next", "episode_reward"][
+                        data["next", "done"]
+                    ]
+                    if len(episode_rewards) > 0:
+                        episode_length = data["next", "step_count"][
+                            data["next", "done"]
+                        ]
+                        self.episode_lengths.extend(episode_length.cpu().tolist())
+                        self.episode_rewards.extend(episode_rewards.cpu().tolist())
 
-            losses = None
-            with timeit("train"):
-                if collected_frames >= init_random_frames:
-                    losses_list = []
-                    for _i in range(num_updates):
-                        with timeit("rb - sample"):
-                            # Sample from replay buffer
-                            sampled_tensordict = self.data_buffer.sample()
+                        metrics_to_log.update(
+                            {
+                                "episode/length": np.mean(self.episode_lengths),
+                                "episode/return": np.mean(self.episode_rewards),
+                            }
+                        )
 
-                        with timeit("update"):
-                            # Compute loss
-                            loss = self.update(sampled_tensordict).clone()
-                        loss_keys = ["loss_actor", "loss_qvalue", "loss_alpha"]
-                        if "kl_approx" in loss:
-                            loss_keys.append("kl_approx")
-                        losses_list.append(loss.select(*loss_keys))
-                        if self.config.replay_buffer.prb:
-                            self.data_buffer.update_tensordict_priority(  # pyrefly: ignore
-                                sampled_tensordict
-                            )
+                # Don't empty the buffer in off-policy setting
+                with timeit("replay_extend"):
+                    self.data_buffer.extend(data.reshape(-1))  # type: ignore[arg-type]
 
-                    # Stack collected losses into a TensorDict
-                    if len(losses_list) > 0:
-                        # gather keys and stack per-key tensors along new batch dim
-                        keys = list(losses_list[0].keys())
-                        stacked = {}
-                        for key in keys:
-                            stacked[key] = torch.stack(
-                                [ld.get(key) for ld in losses_list]
-                            )
-                        losses = TensorDict(stacked, batch_size=[num_updates])
+                losses = None
+                with timeit("train"):
+                    if collected_frames >= init_random_frames:
+                        losses_list = []
+                        for _i in range(num_updates):
+                            with timeit("rb - sample"):
+                                # Sample from replay buffer
+                                sampled_tensordict = self.data_buffer.sample()
 
-            # Get training losses and times
-            if losses is not None:
-                losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
-                for key, value in losses_mean.items():  # type: ignore
-                    try:
-                        scalar = float(value)  # type: ignore[arg-type]
-                    except Exception:
-                        scalar = value.detach().cpu().float().item()  # type: ignore[attr-defined]
-                    metrics_to_log.update({f"train/{key}": scalar})
-                metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
+                            with timeit("update"):
+                                # Compute loss
+                                loss = self.update(sampled_tensordict).clone()
+                            loss_keys = ["loss_actor", "loss_qvalue", "loss_alpha"]
+                            if "kl_approx" in loss:
+                                loss_keys.append("kl_approx")
+                            losses_list.append(loss.select(*loss_keys))
+                            if self.config.replay_buffer.prb:
+                                self.data_buffer.update_tensordict_priority(  # pyrefly: ignore
+                                    sampled_tensordict
+                                )
 
-                # Log SAC-specific metrics
-                if hasattr(self.loss_module, "log_alpha"):
-                    alpha = (
-                        self.loss_module.log_alpha.exp()  # pyrefly: ignore
-                        .detach()
-                        .cpu()
-                        .item()
+                        # Stack collected losses into a TensorDict
+                        if len(losses_list) > 0:
+                            # gather keys and stack per-key tensors along new batch dim
+                            keys = list(losses_list[0].keys())
+                            stacked = {}
+                            for key in keys:
+                                stacked[key] = torch.stack(
+                                    [ld.get(key) for ld in losses_list]
+                                )
+                            losses = TensorDict(stacked, batch_size=[num_updates])
+
+                # Get training losses and times
+                if losses is not None:
+                    losses_mean = losses.apply(
+                        lambda x: x.float().mean(), batch_size=[]
                     )
-                    metrics_to_log["train/alpha"] = alpha
+                    for key, value in losses_mean.items():  # type: ignore
+                        try:
+                            scalar = float(value)  # type: ignore[arg-type]
+                        except Exception:
+                            scalar = value.detach().cpu().float().item()  # type: ignore[attr-defined]
+                        metrics_to_log.update({f"train/{key}": scalar})
+                    metrics_to_log["train/lr"] = self.optim.param_groups[0]["lr"]
 
-            # for IsaacLab, we need to log the metrics from the environment
-            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                log_info(log_info_dict, metrics_to_log)
+                    # Log SAC-specific metrics
+                    if hasattr(self.loss_module, "log_alpha"):
+                        alpha = (
+                            self.loss_module.log_alpha.exp()  # pyrefly: ignore
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                        metrics_to_log["train/alpha"] = alpha
 
-            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
-            rate = pbar.format_dict.get("rate")
-            if rate is not None:
-                metrics_to_log["time/speed"] = rate
+                # for IsaacLab, we need to log the metrics from the environment
+                if "Isaac" in self.config.env.env_name and hasattr(
+                    self.env, "log_infos"
+                ):
+                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+                    log_info(log_info_dict, metrics_to_log)
 
-            if metrics_to_log:
-                # Use the shared base-class helper for consistent metrics emission
-                self.log_metrics(metrics_to_log, step=collected_frames)
+                metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
+                rate = pbar.format_dict.get("rate")
+                if rate is not None:
+                    metrics_to_log["time/speed"] = rate
 
-                # Update progress bar with latest metrics
-                postfix = {}
-                if "episode/return" in metrics_to_log:
-                    postfix["ep_ret"] = f"{metrics_to_log['episode/return']:.1f}"
-                if "episode/length" in metrics_to_log:
-                    postfix["ep_len"] = f"{metrics_to_log['episode/length']:.0f}"
-                if postfix:
-                    pbar.set_postfix(postfix)
+                if metrics_to_log:
+                    # Use the shared base-class helper for consistent metrics emission
+                    self.log_metrics(metrics_to_log, step=collected_frames, log_python=False)
 
-            # Save model periodically
-            if (
-                self.config.save_interval > 0
-                and collected_frames % (self.config.save_interval * num_envs) == 0
-            ):
-                self.save_model(
-                    path=self.log_dir / self.config.logger.save_path,
-                    step=collected_frames,
-                )
-
-        pbar.close()
-        self.collector.shutdown()
+                # Save model periodically (save_interval is in samples)
+                if (
+                    self.config.save_interval > 0
+                    and collected_frames > 0
+                    and collected_frames % self.config.save_interval == 0
+                ):
+                    self.save_model(
+                        path=self.log_dir / self.config.logger.save_path,
+                        step=collected_frames,
+                    )
+        finally:
+            pbar.close()
+            self.collector.shutdown()
 
     def predict(self, td: TensorDict) -> Tensor:  # type: ignore[override]
         policy_op = self.actor_critic.get_policy_operator()
@@ -671,6 +709,18 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
             td = policy_op(td)
             return td.get("action")
+
+    def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
+        """Return the metrics printed for non-progress-bar training runs."""
+        return (
+            ("train/step_reward_mean", "r_step"),
+            ("episode/length", "ep_len"),
+            ("episode/return", "r_ep"),
+            ("train/loss_actor", "pi_loss"),
+            ("train/loss_qvalue", "q_loss"),
+            ("train/alpha", "alpha"),
+            ("time/speed", "fps"),
+        )
 
 
 class ClippedSACLoss(SACLoss):

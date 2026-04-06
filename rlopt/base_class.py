@@ -19,6 +19,7 @@ from tensordict import TensorDict
 from tensordict.base import TensorDictBase
 from tensordict.nn import TensorDictModule
 from torch import Tensor
+from torch.nn.parameter import UninitializedParameter
 from torch.optim import lr_scheduler
 from torchrl.collectors import Collector
 from torchrl.data import (
@@ -1004,7 +1005,9 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             if module is None:
                 continue
             for name, param in module.named_parameters(recurse=True):
-                if param is None or not torch.is_floating_point(param):
+                if param is None or isinstance(param, UninitializedParameter):
+                    continue
+                if not torch.is_floating_point(param):
                     continue
                 param_id = id(param)
                 if param_id in seen:
@@ -1268,14 +1271,20 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         pass
 
+    def _should_log_iteration(
+        self, metadata: TrainingMetadata, iteration: IterationData
+    ) -> bool:
+        """Return whether this iteration should emit periodic logs."""
+        return (
+            metadata.frames_processed >= metadata.next_log_frame
+            or (iteration.iteration_idx + 1) == metadata.total_iterations
+        )
+
     def _refresh_progress_display(
         self, metadata: TrainingMetadata, iteration: IterationData
     ) -> None:
         """Refresh tqdm or emit periodic text summaries for headless runs."""
-        if (
-            metadata.frames_processed < metadata.next_log_frame
-            and (iteration.iteration_idx + 1) != metadata.total_iterations
-        ):
+        if not self._should_log_iteration(metadata, iteration):
             return
 
         status_parts = [
