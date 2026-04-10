@@ -115,11 +115,6 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
         self._command_source = self._normalize_command_source(
             self.config.ase.command_source
         )
-        self._current_reference_obs_getter = self._discover_env_method(
-            env,
-            "get_current_reference_observations",
-        )
-        self._reference_posterior_fallback_logged = False
 
         super().__init__(env, config)
 
@@ -141,12 +136,13 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
     @staticmethod
     def _normalize_command_source(command_source: str) -> str:
         normalized = str(command_source).strip().lower()
-        valid_sources = {"random", "reference_posterior"}
+        valid_sources = {"random"}
         if normalized not in valid_sources:
-            raise ValueError(
+            msg = (
                 f"Unsupported ASE command_source={command_source!r}. "
                 f"Expected one of {sorted(valid_sources)}."
             )
+            raise ValueError(msg)
         return normalized
 
     def _discriminator_condition_dim(self) -> int:
@@ -219,26 +215,7 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             self.mi_critic.parameters(),
             lr=float(self.config.ase.mi_critic_lr),
         )
-        self._refresh_collector_latents_from_reference_posterior()
         return optimizers
-
-    def _refresh_collector_latents_from_reference_posterior(self) -> None:
-        if self._command_source != "reference_posterior":
-            return
-        if self._collector_latents is None:
-            return
-        latents = self._reference_posterior_latents(
-            int(self._collector_latents.shape[0]),
-            device=self._collector_latents.device,
-            dtype=self._collector_latents.dtype,
-            env_ids=None,
-        )
-        if latents is None:
-            if self._collector_latent_steps is not None:
-                self._collector_latent_steps.zero_()
-            return
-        self._collector_latents.copy_(latents)
-        self._publish_latents_to_env(self._collector_latents)
 
     def _discriminator_condition_from_td(
         self, td: TensorDict, *, detach: bool
@@ -302,76 +279,6 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
         pairwise_dist = torch.cdist(encodings, encodings, p=2)
         kernel_values = torch.exp(-scale * pairwise_dist.pow(2))
         return torch.log(kernel_values.mean())
-
-    def _sample_collector_latents(
-        self,
-        batch_size: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        env_ids: Tensor | None = None,
-    ) -> Tensor:
-        if self._command_source != "reference_posterior":
-            return super()._sample_collector_latents(
-                batch_size,
-                device=device,
-                dtype=dtype,
-                env_ids=env_ids,
-            )
-
-        latents = self._reference_posterior_latents(
-            batch_size,
-            device=device,
-            dtype=dtype,
-            env_ids=env_ids,
-        )
-        if latents is not None:
-            return latents
-
-        if self.discriminator is None or self._current_reference_obs_getter is None:
-            return super()._sample_collector_latents(
-                batch_size,
-                device=device,
-                dtype=dtype,
-                env_ids=env_ids,
-            )
-
-        if not self._reference_posterior_fallback_logged:
-            self.log.warning(
-                "ASE command_source=reference_posterior fell back to random latents."
-            )
-            self._reference_posterior_fallback_logged = True
-        return super()._sample_collector_latents(
-            batch_size,
-            device=device,
-            dtype=dtype,
-            env_ids=env_ids,
-        )
-
-    def _reference_posterior_latents(
-        self,
-        batch_size: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        env_ids: Tensor | None = None,
-    ) -> Tensor | None:
-        if self.discriminator is None or self._current_reference_obs_getter is None:
-            return None
-
-        reference_obs = self._current_reference_obs_getter(
-            required_keys=self._disc_obs_keys,
-            env_ids=env_ids,
-        )
-        if reference_obs is None or reference_obs.numel() != batch_size:
-            return None
-
-        with torch.no_grad():
-            obs_features = self._obs_features_from_td(reference_obs, detach=True).to(
-                self.device
-            )
-            latents = self.discriminator.mi_encode_from_obs(obs_features)
-        return latents.to(device=device, dtype=dtype)
 
     def _sample_td_indices(self, td: TensorDict, batch_size: int) -> TensorDict:
         if td.numel() == batch_size:

@@ -168,8 +168,9 @@ class LatentSkillMixin:
         device: torch.device,
         dtype: torch.dtype,
         env_ids: Tensor | None = None,
+        td: TensorDict | None = None,
     ) -> Tensor:
-        del env_ids
+        del env_ids, td
         return self._sample_unit_latents(batch_size, device=device, dtype=dtype)
 
     def _sample_latent_steps(self, batch_size: int, *, device: torch.device) -> Tensor:
@@ -215,6 +216,7 @@ class LatentSkillMixin:
         *,
         device: torch.device,
         dtype: torch.dtype,
+        td: TensorDict | None = None,
     ) -> None:
         if (
             self._collector_latents is None
@@ -228,6 +230,7 @@ class LatentSkillMixin:
                 device=device,
                 dtype=dtype,
                 env_ids=None,
+                td=td,
             )
             self._collector_latent_steps = self._sample_latent_steps(
                 batch_size,
@@ -246,7 +249,12 @@ class LatentSkillMixin:
             return
 
         dtype = torch.float32
-        self._ensure_collector_latent_state(batch_size, device=self.device, dtype=dtype)
+        self._ensure_collector_latent_state(
+            batch_size,
+            device=self.device,
+            dtype=dtype,
+            td=td,
+        )
         assert self._collector_latents is not None
         assert self._collector_latent_steps is not None
 
@@ -255,11 +263,13 @@ class LatentSkillMixin:
         if bool(renew_mask.any()):
             renew_env_ids = renew_mask.nonzero(as_tuple=False).squeeze(-1)
             renew_count = int(renew_mask.sum().item())
+            renew_td = cast(TensorDict, td[renew_env_ids])
             self._collector_latents[renew_mask] = self._sample_collector_latents(
                 renew_count,
                 device=self.device,
                 dtype=dtype,
                 env_ids=renew_env_ids,
+                td=renew_td,
             )
             self._collector_latent_steps[renew_mask] = self._sample_latent_steps(
                 renew_count,

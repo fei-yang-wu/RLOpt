@@ -487,12 +487,28 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         """
         # We can't use nested child processes with mp_start_method="fork"
 
+        frames_per_batch = int(self.config.collector.frames_per_batch)
+        total_frames = int(self.config.collector.total_frames)
+        aligned_total_frames = total_frames
+        if frames_per_batch > 0 and total_frames % frames_per_batch != 0:
+            aligned_total_frames = max(
+                frames_per_batch,
+                (total_frames // frames_per_batch) * frames_per_batch,
+            )
+            self.log.warning(
+                "collector.total_frames (%d) is not divisible by frames_per_batch (%d); "
+                "using %d to avoid over-collection warnings.",
+                total_frames,
+                frames_per_batch,
+                aligned_total_frames,
+            )
+
         collector = Collector(
             env,
             policy=policy,
             init_random_frames=self.config.collector.init_random_frames,
-            frames_per_batch=self.config.collector.frames_per_batch,
-            total_frames=self.config.collector.total_frames,
+            frames_per_batch=frames_per_batch,
+            total_frames=aligned_total_frames,
             # this is the default behavior: the collector runs in ``"random"`` (or explorative) mode
             # exploration_type=ExplorationType.RANDOM,
             # We set the all the devices to be identical. Below is an example of
@@ -1275,6 +1291,10 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         self, metadata: TrainingMetadata, iteration: IterationData
     ) -> bool:
         """Return whether this iteration should emit periodic logs."""
+        if metadata.progress_bar_enabled:
+            # The progress bar already provides live progress updates; avoid
+            # duplicate periodic logs and only emit logs at the final iteration.
+            return (iteration.iteration_idx + 1) == metadata.total_iterations
         return (
             metadata.frames_processed >= metadata.next_log_frame
             or (iteration.iteration_idx + 1) == metadata.total_iterations

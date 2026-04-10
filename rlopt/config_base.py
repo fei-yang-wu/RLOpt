@@ -341,7 +341,7 @@ class TrainerConfig:
     progress_bar: bool = False
     """Whether to show progress bar."""
 
-    log_interval: int = 10000
+    log_interval: int = 10_000_000
     """Interval for logging."""
 
 
