@@ -33,6 +33,7 @@ def _rlopt() -> SimpleNamespace:
 
 def _apply_obs_input_keys(cfg) -> None:
     """Force observation-based keys for smoke tests across torchrl versions."""
+    cfg.logger.backend = ""
     cfg.policy.input_keys = ["observation"]
     if cfg.value_function is not None:
         cfg.value_function.input_keys = ["observation"]
@@ -40,7 +41,7 @@ def _apply_obs_input_keys(cfg) -> None:
     cfg.ipmd.latent_key = "observation"
     cfg.ipmd.latent_dim = 3
     cfg.ipmd.bc_coef = 0.0
-    cfg.ipmd.latent_input_type = "s'"
+    cfg.ipmd.latent_learning.method = "patch_autoencoder"
     cfg.ipmd.diversity_bonus_coeff = 0.0
 
 
@@ -86,6 +87,7 @@ def _make_env_reward_only_ipmd_agent():
     cfg.replay_buffer.size = 64
     cfg.loss.mini_batch_size = 2
     cfg.compile.compile = False
+    cfg.logger.backend = ""
     cfg.policy.input_keys = ["observation"]
     if cfg.value_function is not None:
         cfg.value_function.input_keys = ["observation"]
@@ -95,8 +97,6 @@ def _make_env_reward_only_ipmd_agent():
     cfg.ipmd.reward_l2_coeff = 0.0
     cfg.ipmd.reward_grad_penalty_coeff = 0.0
     cfg.ipmd.bc_coef = 0.0
-    cfg.ipmd.mi_loss_coeff = 0.0
-    cfg.ipmd.mi_reward_weight = 0.0
     cfg.ipmd.diversity_bonus_coeff = 0.0
 
     env = rlopt.make_parallel_env(cfg)
@@ -374,8 +374,8 @@ def test_ipmd_missing_sampler_raises() -> None:
         agent._next_expert_batch(batch_size=4)
 
 
-def test_ipmd_latent_input_requires_exact_keys() -> None:
-    """Latent encoder input selection must request the configured transition keys exactly."""
+def test_ipmd_posterior_keys_default_to_reward_inputs() -> None:
+    """Patch posterior inputs should default to the configured reward keys."""
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
@@ -388,22 +388,12 @@ def test_ipmd_latent_input_requires_exact_keys() -> None:
 
     env = rlopt.make_parallel_env(cfg)
     agent = rlopt.IPMD(env, cfg, logger=None)
-    obs_dim = env.observation_spec["observation"].shape[-1]
 
-    current_only = TensorDict(
-        {"observation": torch.randn(4, obs_dim)},
-        batch_size=[4],
-    )
-    with pytest.raises(KeyError, match="expert latent batch"):
-        agent._latent_encoder_features_from_td(
-            current_only,
-            detach=False,
-            context="expert latent batch",
-        )
+    assert agent._posterior_obs_keys == ["observation"]
 
 
-def test_ipmd_rollout_has_mi_targets() -> None:
-    """Prepared latent IPMD rollouts should attach MI value targets."""
+def test_ipmd_pre_iteration_compute_stays_mi_free() -> None:
+    """Prepared latent IPMD rollouts should not attach removed MI targets."""
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
@@ -423,17 +413,17 @@ def test_ipmd_rollout_has_mi_targets() -> None:
     )
 
     rollout = next(iter(agent.collector))
-    agent._prepare_latent_rollout_batch_for_training(rollout)
     agent._prepare_rollout_rewards(rollout)
 
     prepared = agent.pre_iteration_compute(rollout)
-    assert "mi_value" in prepared.keys(True)
-    assert "mi_returns" in prepared.keys(True)
-    assert "mi_advantage" in prepared.keys(True)
+    assert "mi_reward" not in prepared.keys(True)
+    assert "mi_value" not in prepared.keys(True)
+    assert "mi_returns" not in prepared.keys(True)
+    assert "mi_advantage" not in prepared.keys(True)
 
 
-def test_ipmd_rollout_posterior_collector_latents() -> None:
-    """Rollout-posterior collection should encode the current rollout batch."""
+def test_ipmd_posterior_collector_latents_are_recomputed_each_step() -> None:
+    """Posterior collection should publish the current batch latent each step."""
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
@@ -445,8 +435,9 @@ def test_ipmd_rollout_posterior_collector_latents() -> None:
     cfg.loss.mini_batch_size = 2
     cfg.compile.compile = False
     _apply_obs_input_keys(cfg)
-    cfg.ipmd.latent_input_type = "s"
-    cfg.ipmd.command_source = "rollout_posterior"
+    cfg.ipmd.command_source = "posterior"
+    cfg.ipmd.latent_steps_min = 10
+    cfg.ipmd.latent_steps_max = 10
     cfg.ipmd.latent_learning.posterior_input_keys = ["observation"]
 
     env = rlopt.make_parallel_env(cfg)
@@ -456,26 +447,40 @@ def test_ipmd_rollout_posterior_collector_latents() -> None:
         def forward(self, obs_features: torch.Tensor) -> torch.Tensor:
             return torch.nn.functional.normalize(obs_features, dim=-1, eps=1.0e-6)
 
-    agent.mi_encoder = _NormalizeIdentity().to(agent.device)
-    rollout_obs = torch.tensor(
+    normalize_identity = _NormalizeIdentity().to(agent.device)
+    assert agent._latent_learner is not None
+    agent._latent_learner.encoder = normalize_identity
+    rollout_obs_1 = torch.tensor(
         [[0.2, 0.3, 0.4], [0.9, -0.1, 0.1]],
         device=agent.device,
         dtype=torch.float32,
     )
-    rollout_td = TensorDict(
-        {"observation": rollout_obs.clone()},
-        batch_size=[rollout_obs.shape[0]],
-        device=agent.device,
-    )
-
-    latents = agent._sample_collector_latents(
-        batch_size=2,
+    rollout_obs_2 = torch.tensor(
+        [[-0.3, 0.1, 0.7], [0.4, 0.4, -0.2]],
         device=agent.device,
         dtype=torch.float32,
-        td=rollout_td,
     )
-    expected = torch.nn.functional.normalize(rollout_obs, dim=-1, eps=1.0e-6)
-    assert torch.allclose(latents, expected)
+    rollout_td_1 = TensorDict(
+        {"observation": rollout_obs_1.clone()},
+        batch_size=[rollout_obs_1.shape[0]],
+        device=agent.device,
+    )
+    rollout_td_2 = TensorDict(
+        {"observation": rollout_obs_2.clone()},
+        batch_size=[rollout_obs_2.shape[0]],
+        device=agent.device,
+    )
+    agent._inject_latent_command(rollout_td_1)
+    agent._inject_latent_command(rollout_td_2)
+
+    expected_1 = torch.nn.functional.normalize(rollout_obs_1, dim=-1, eps=1.0e-6)
+    expected_2 = torch.nn.functional.normalize(rollout_obs_2, dim=-1, eps=1.0e-6)
+    assert torch.allclose(rollout_td_1.get("observation"), expected_1)
+    assert torch.allclose(rollout_td_2.get("observation"), expected_2)
+    assert not torch.allclose(
+        rollout_td_1.get("observation"),
+        rollout_td_2.get("observation"),
+    )
 
 
 def test_ipmd_patch_autoencoder_uses_only_posterior_expert_keys() -> None:
@@ -494,8 +499,6 @@ def test_ipmd_patch_autoencoder_uses_only_posterior_expert_keys() -> None:
     cfg.ipmd.reward_loss_coeff = 0.0
     cfg.ipmd.reward_l2_coeff = 0.0
     cfg.ipmd.reward_grad_penalty_coeff = 0.0
-    cfg.ipmd.mi_loss_coeff = 0.0
-    cfg.ipmd.mi_reward_weight = 0.0
     cfg.ipmd.diversity_bonus_coeff = 0.0
     cfg.ipmd.latent_learning.method = "patch_autoencoder"
     cfg.ipmd.latent_learning.posterior_input_keys = ["observation"]
@@ -530,16 +533,19 @@ def test_ipmd_patch_autoencoder_uses_only_posterior_expert_keys() -> None:
     assert metrics["ipmd/latent_recon_loss"] >= 0.0
 
 
-def test_ipmd_rejects_env_sourced_expert_posterior_command_source() -> None:
-    """Collector latents must not bypass rollout observations via live env getters."""
+def test_ipmd_rejects_removed_posterior_command_source_aliases() -> None:
+    """Removed command-source aliases should now fail at construction-time validation."""
     rlopt = _rlopt()
 
+    assert rlopt.IPMD._normalize_command_source("posterior") == "posterior"
+    with pytest.raises(ValueError, match="Unsupported IPMD command_source"):
+        rlopt.IPMD._normalize_command_source("rollout_posterior")
     with pytest.raises(ValueError, match="Unsupported IPMD command_source"):
         rlopt.IPMD._normalize_command_source("expert_posterior")
 
 
-def test_ipmd_rejects_non_expert_group_posterior_keys() -> None:
-    """Grouped posterior keys must come from expert_state or expert_window."""
+def test_ipmd_accepts_configured_posterior_keys_present_in_obs_spec() -> None:
+    """Posterior keys only need to exist in the observation spec at construction time."""
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
@@ -558,8 +564,8 @@ def test_ipmd_rejects_non_expert_group_posterior_keys() -> None:
     spec.set(("policy", "observation"), spec["observation"].clone())
     env.observation_spec = spec
 
-    with pytest.raises(ValueError, match="expert_state or expert_window"):
-        rlopt.IPMD(env, cfg, logger=None)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+    assert agent._posterior_obs_keys == [("policy", "observation")]
 
 
 if __name__ == "__main__":

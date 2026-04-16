@@ -25,17 +25,19 @@ def _apply_obs_input_keys_to_ipmd(cfg: IPMDRLOptConfig) -> None:
     cfg.ipmd.latent_key = "observation"
     cfg.ipmd.latent_dim = 3
     cfg.ipmd.bc_coef = 0.0
-    cfg.ipmd.latent_input_type = "s'"
+    cfg.ipmd.latent_learning.method = "patch_autoencoder"
 
 
 def _install_test_expert_sampler(agent: IPMD, env, num_transitions: int = 256) -> None:
+    rng = np.random.default_rng(0)
     obs_dim = env.observation_spec["observation"].shape[-1]
     act_dim = env.action_spec.shape[-1]
     expert_data = {
-        "observation": np.random.randn(num_transitions, obs_dim).astype(np.float32),
-        "action": np.random.randn(num_transitions, act_dim).astype(np.float32),
-        ("next", "observation"): np.random.randn(num_transitions, obs_dim).astype(
-            np.float32
+        "observation": rng.standard_normal((num_transitions, obs_dim), dtype=np.float32),
+        "action": rng.standard_normal((num_transitions, act_dim), dtype=np.float32),
+        ("next", "observation"): rng.standard_normal(
+            (num_transitions, obs_dim),
+            dtype=np.float32,
         ),
     }
 
@@ -100,10 +102,7 @@ def test_ipmd_baseline_vs_ppo():
     ipmd_cfg.ipmd.use_estimated_rewards_for_ppo = False
     ipmd_cfg.ipmd.reward_num_cells = (64, 64)
     ipmd_cfg.ipmd.reward_loss_coeff = 0.0
-    ipmd_cfg.ipmd.mi_loss_coeff = 0.0
-    ipmd_cfg.ipmd.mi_reward_weight = 0.0
     ipmd_cfg.ipmd.diversity_bonus_coeff = 0.0
-    ipmd_cfg.ipmd.latent_uniformity_coeff = 0.0
 
     # Train PPO
     print("\n" + "=" * 60)
@@ -183,10 +182,7 @@ def test_ipmd_baseline_smoke():
     cfg.ipmd.use_estimated_rewards_for_ppo = False
     cfg.ipmd.reward_num_cells = (32, 32)
     cfg.ipmd.reward_loss_coeff = 0.0
-    cfg.ipmd.mi_loss_coeff = 0.0
-    cfg.ipmd.mi_reward_weight = 0.0
     cfg.ipmd.diversity_bonus_coeff = 0.0
-    cfg.ipmd.latent_uniformity_coeff = 0.0
     _apply_obs_input_keys_to_ipmd(cfg)
 
     env = make_parallel_env(cfg)

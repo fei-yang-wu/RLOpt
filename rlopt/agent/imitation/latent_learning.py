@@ -182,6 +182,16 @@ class BaseLatentLearner:
         del batch, detach, context
         return None
 
+    def reconstruct_batch_features(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+        context: str,
+    ) -> Tensor | None:
+        del batch, detach, context
+        return None
+
     def sample_expert_prior_latents(
         self,
         *,
@@ -203,252 +213,6 @@ class BaseLatentLearner:
     def aux_reward_from_rollout(self, rollout_flat: TensorDict) -> Tensor | None:
         del rollout_flat
         return None
-
-
-class ExpertMLEPosteriorLatentLearner(BaseLatentLearner):
-    """Legacy latent learner that fits q(z | transition) through expert-action MLE."""
-
-    uses_aux_reward = True
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.encoder: LatentEncoder | None = None
-        self.optimizer: torch.optim.Optimizer | None = None
-
-    def initialize(self, agent: IPMD) -> None:
-        super().initialize(agent)
-        self._ensure_encoder(int(agent._mi_obs_dim))
-
-    def _ensure_encoder(self, input_dim: int) -> None:
-        assert self.agent is not None
-        if self.encoder is None:
-            self.encoder = LatentEncoder(
-                input_dim=input_dim,
-                latent_dim=self.agent._latent_dim,
-                hidden_dims=list(self.agent.config.ipmd.mi_encoder_hidden_dims),
-                activation=self.agent.config.ipmd.mi_encoder_activation,
-            ).to(self.agent.device)
-        if self.optimizer is None:
-            self.optimizer = torch.optim.Adam(
-                self.encoder.parameters(),
-                lr=float(self.agent.config.ipmd.mi_encoder_lr),
-            )
-        self.agent.mi_encoder = self.encoder
-        self.agent.mi_encoder_optim = self.optimizer
-
-    def _reference_obs_keys(self) -> list[BatchKey]:
-        assert self.agent is not None
-        if not self.agent._lit_use_s or self.agent._lit_use_a or self.agent._lit_use_sn:
-            return []
-        return list(self.agent._reward_obs_keys)
-
-    def _inference_encoder(self) -> nn.Module:
-        assert self.agent is not None
-        if self.agent.mi_encoder is not None:
-            return self.agent.mi_encoder
-        if self.encoder is None:
-            msg = "Legacy latent learner encoder has not been initialized."
-            raise RuntimeError(msg)
-        return self.encoder
-
-    def required_expert_batch_keys(self) -> list[BatchKey]:
-        assert self.agent is not None
-        required: list[BatchKey] = []
-        required.extend(self.agent._latent_encoder_required_keys())
-        required.extend(self.agent._policy_obs_keys_without_latent)
-        required.append("action")
-        return dedupe_keys(required)
-
-    def infer_current_reference_latents(
-        self,
-        *,
-        env_ids: Tensor | None = None,
-    ) -> Tensor | None:
-        assert self.agent is not None
-        obs_keys = self._reference_obs_keys()
-        if len(obs_keys) == 0 or self.agent._current_reference_obs_getter is None:
-            return None
-        reference_obs = self.agent._current_reference_obs_getter(
-            required_keys=obs_keys,
-            env_ids=env_ids,
-        )
-        if reference_obs is None or reference_obs.numel() == 0:
-            return None
-        obs_features = self.agent._obs_features_from_td(
-            reference_obs,
-            cast(list, obs_keys),
-            next_obs=False,
-            detach=True,
-        ).to(self.agent.device)
-        self._ensure_encoder(int(obs_features.shape[-1]))
-        with torch.no_grad():
-            return self._inference_encoder()(obs_features)
-
-    def infer_expert_latents(
-        self,
-        expert_batch: TensorDict,
-        *,
-        detach: bool,
-    ) -> Tensor:
-        assert self.agent is not None
-        latent = self.agent._latent_condition_from_td(expert_batch, detach=detach)
-        if latent is not None:
-            return latent.to(self.agent.device)
-        obs_features = self.agent._latent_encoder_features_from_td(
-            expert_batch,
-            detach=False,
-            context="expert latent batch",
-        ).to(self.agent.device)
-        self._ensure_encoder(int(obs_features.shape[-1]))
-        latent = self._inference_encoder()(obs_features)
-        return latent.detach() if detach else latent
-
-    def infer_batch_latents(
-        self,
-        batch: TensorDict,
-        *,
-        detach: bool,
-        context: str,
-    ) -> Tensor | None:
-        assert self.agent is not None
-        obs_features = self.agent._latent_encoder_features_from_td(
-            batch,
-            detach=detach,
-            context=context,
-        ).to(self.agent.device)
-        if self.encoder is None and self.agent.mi_encoder is None:
-            self._ensure_encoder(int(obs_features.shape[-1]))
-        encoder = self._inference_encoder()
-        if detach:
-            with torch.no_grad():
-                return encoder(obs_features)
-        return encoder(obs_features)
-
-    def sample_expert_prior_latents(
-        self,
-        *,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tensor | None:
-        assert self.agent is not None
-        obs_keys = self._reference_obs_keys()
-        if len(obs_keys) == 0:
-            return None
-        expert_batch = self.agent._next_expert_batch(
-            batch_size,
-            required_keys=obs_keys,
-        )
-        obs_features = self.agent._obs_features_from_td(
-            expert_batch,
-            cast(list, obs_keys),
-            next_obs=False,
-            detach=True,
-        ).to(self.agent.device)
-        self._ensure_encoder(int(obs_features.shape[-1]))
-        with torch.no_grad():
-            latents = self._inference_encoder()(obs_features)
-        return latents.to(device=device, dtype=dtype)
-
-    def update(self, rollout_flat: TensorDict) -> dict[str, float]:
-        del rollout_flat
-        assert self.agent is not None
-        if float(self.agent.config.ipmd.mi_loss_coeff) <= 0.0:
-            return {}
-        expert_td = self.agent._next_expert_batch(
-            required_keys=self.required_expert_batch_keys()
-        )
-        expert_obs = self.agent._latent_encoder_features_from_td(
-            expert_td,
-            detach=False,
-            context="expert latent mle",
-        ).to(self.agent.device)
-        if expert_obs.shape[0] == 0:
-            return {}
-        self._ensure_encoder(int(expert_obs.shape[-1]))
-        assert self.encoder is not None
-        assert self.optimizer is not None
-
-        expert_action = self.agent._expert_action_from_td(expert_td)
-        if expert_action is None:
-            msg = "Expert batch is missing expert actions required for latent MLE."
-            raise RuntimeError(msg)
-        expert_action = expert_action.to(self.agent.device)
-
-        latent_pred = self.encoder(expert_obs)
-        policy_td = self.agent._expert_policy_td_with_latents(expert_td, latent_pred)
-        dist = self.agent._policy_operator.get_dist(policy_td)
-        log_prob = dist.log_prob(expert_action)
-        log_prob = self.agent._reduce_log_prob(log_prob, expert_action)
-        mle_loss = -log_prob.mean()
-
-        grad_penalty = torch.zeros((), device=self.agent.device)
-        if float(self.agent.config.ipmd.mi_grad_penalty_coeff) > 0.0:
-            obs_req = expert_obs.detach().requires_grad_(True)
-            latent_req = self.encoder(obs_req)
-            policy_td = self.agent._expert_policy_td_with_latents(expert_td, latent_req)
-            dist = self.agent._policy_operator.get_dist(policy_td)
-            log_prob_req = dist.log_prob(expert_action)
-            log_prob_req = self.agent._reduce_log_prob(log_prob_req, expert_action)
-            grads = torch.autograd.grad(
-                outputs=log_prob_req.sum(),
-                inputs=obs_req,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True,
-            )[0]
-            grad_penalty = grads.pow(2).sum(dim=-1).mean()
-
-        weight_decay = torch.zeros((), device=self.agent.device)
-        if float(self.agent.config.ipmd.mi_weight_decay_coeff) > 0.0:
-            for param in self.encoder.parameters():
-                if param.ndim >= 2:
-                    weight_decay = weight_decay + param.pow(2).mean()
-
-        uniformity = self.agent._latent_uniformity(latent_pred)
-        total_loss = (
-            float(self.agent.config.ipmd.mi_loss_coeff) * mle_loss
-            + float(self.agent.config.ipmd.mi_grad_penalty_coeff) * grad_penalty
-            + float(self.agent.config.ipmd.mi_weight_decay_coeff) * weight_decay
-            + float(self.agent.config.ipmd.latent_uniformity_coeff) * uniformity
-        )
-
-        self.optimizer.zero_grad(set_to_none=True)
-        self.agent.optim.zero_grad(set_to_none=True)
-        total_loss.backward()
-        if float(self.agent.config.ipmd.mi_grad_clip_norm) > 0.0:
-            clip_grad_norm_(
-                self.encoder.parameters(),
-                float(self.agent.config.ipmd.mi_grad_clip_norm),
-            )
-        self.optimizer.step()
-        self.agent.optim.zero_grad(set_to_none=True)
-
-        return {
-            "ipmd/mi_total_loss": float(total_loss.detach().item()),
-            "ipmd/mi_loss": float(mle_loss.detach().item()),
-            "ipmd/mi_expert_log_prob_mean": float(log_prob.detach().mean().item()),
-            "ipmd/mi_grad_penalty": float(grad_penalty.detach().item()),
-            "ipmd/mi_weight_decay": float(weight_decay.detach().item()),
-            "ipmd/latent_uniformity": float(uniformity.detach().item()),
-        }
-
-    def aux_reward_from_rollout(self, rollout_flat: TensorDict) -> Tensor | None:
-        assert self.agent is not None
-        if self.encoder is None and self.agent.mi_encoder is None:
-            return None
-        obs_features = self.agent._latent_encoder_features_from_td(
-            rollout_flat,
-            detach=True,
-            context="rollout latent batch",
-        ).to(self.agent.device)
-        latents = self.agent._rollout_latents_from_td(rollout_flat, detach=True)
-        with torch.no_grad():
-            latent_pred = self._inference_encoder()(obs_features)
-            score = (latent_pred * latents).sum(dim=-1)
-        if self.agent.config.ipmd.mi_hypersphere_reward_shift:
-            return (score + 1.0) / 2.0
-        return score.clamp_min(0.0)
 
 
 class PatchAutoencoderLatentLearner(BaseLatentLearner):
@@ -473,16 +237,21 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
     def required_expert_batch_keys(self) -> list[BatchKey]:
         return self._posterior_input_keys()
 
+    def initialize(self, agent: IPMD) -> None:
+        super().initialize(agent)
+        input_dim = sum(
+            agent._obs_feature_dims[key] for key in agent._posterior_obs_keys
+        )
+        self._ensure_modules(int(input_dim))
+
     def _patch_features_from_td(
         self,
         td: TensorDict,
         *,
         detach: bool,
-        context: str,
     ) -> Tensor:
         assert self.agent is not None
         required_keys = self._posterior_input_keys()
-        self.agent._require_batch_keys(td, required_keys, context=context)
         parts: list[Tensor] = []
         for key in required_keys:
             value = cast(Tensor, td.get(key)).to(self.agent.device)
@@ -510,8 +279,6 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         if self.optimizer is None:
             params = list(self.encoder.parameters()) + list(self.decoder.parameters())
             self.optimizer = torch.optim.Adam(params, lr=float(cfg.lr))
-        self.agent.mi_encoder = self.encoder
-        self.agent.mi_encoder_optim = self.optimizer
 
     def infer_batch_latents(
         self,
@@ -520,10 +287,10 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         detach: bool,
         context: str,
     ) -> Tensor | None:
+        del context
         patch_features = self._patch_features_from_td(
             batch,
             detach=detach,
-            context=context,
         )
         self._ensure_modules(int(patch_features.shape[-1]))
         assert self.encoder is not None
@@ -532,20 +299,46 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
                 return self.encoder(patch_features)
         return self.encoder(patch_features)
 
+    def reconstruct_batch_features(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+        context: str,
+    ) -> Tensor | None:
+        del context
+        patch_features = self._patch_features_from_td(
+            batch,
+            detach=detach,
+        )
+        self._ensure_modules(int(patch_features.shape[-1]))
+        assert self.encoder is not None
+        assert self.decoder is not None
+        if detach:
+            with torch.no_grad():
+                return self.decoder(self.encoder(patch_features))
+        return self.decoder(self.encoder(patch_features))
+
     def infer_expert_latents(
         self,
         expert_batch: TensorDict,
         *,
         detach: bool,
     ) -> Tensor:
+        """Sample latent from the posterior distribution z \sim p(\cdot|s').
+            Patch here means a windows of expert transitions that centered at the current timestep.
+
+        Args:
+            expert_batch (TensorDict): Batch of expert transitions containing the required observation keys for posterior inference.
+            detach (bool): Whether to detach the inferred latents.
+
+        Returns:
+            Tensor: Inferred latent tensor of shape (batch_size, latent_dim).
+        """
         assert self.agent is not None
-        latent = self.agent._latent_condition_from_td(expert_batch, detach=detach)
-        if latent is not None:
-            return latent.to(self.agent.device)
         patch_features = self._patch_features_from_td(
             expert_batch,
             detach=False,
-            context="expert patch batch",
         )
         self._ensure_modules(int(patch_features.shape[-1]))
         assert self.encoder is not None
@@ -567,7 +360,6 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         patch_features = self._patch_features_from_td(
             expert_batch,
             detach=True,
-            context="expert patch prior",
         )
         self._ensure_modules(int(patch_features.shape[-1]))
         assert self.encoder is not None
@@ -587,7 +379,6 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         patch_features = self._patch_features_from_td(
             expert_td,
             detach=False,
-            context="expert patch autoencoder",
         )
         if patch_features.shape[0] == 0:
             return {}
@@ -598,11 +389,10 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
 
         latent_pred = self.encoder(patch_features)
         patch_recon = self.decoder(latent_pred)
+        recon_error = patch_recon - patch_features
         recon_loss = F.mse_loss(patch_recon, patch_features)
-
-        uniformity = torch.zeros((), device=self.agent.device)
-        if float(cfg.uniformity_coeff) > 0.0:
-            uniformity = self.agent._latent_uniformity(latent_pred)
+        recon_mae = recon_error.abs().mean()
+        recon_max_abs = recon_error.abs().max()
 
         weight_decay = torch.zeros((), device=self.agent.device)
         if float(cfg.weight_decay_coeff) > 0.0:
@@ -613,7 +403,6 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
 
         total_loss = (
             float(cfg.recon_coeff) * recon_loss
-            + float(cfg.uniformity_coeff) * uniformity
             + float(cfg.weight_decay_coeff) * weight_decay
         )
 
@@ -629,7 +418,9 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         return {
             "ipmd/latent_total_loss": float(total_loss.detach().item()),
             "ipmd/latent_recon_loss": float(recon_loss.detach().item()),
-            "ipmd/latent_uniformity": float(uniformity.detach().item()),
+            "ipmd/latent_posterior_recon_mse": float(recon_loss.detach().item()),
+            "ipmd/latent_posterior_recon_mae": float(recon_mae.detach().item()),
+            "ipmd/latent_posterior_recon_max_abs": float(recon_max_abs.detach().item()),
             "ipmd/latent_weight_decay": float(weight_decay.detach().item()),
         }
 
@@ -658,6 +449,9 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
         return dedupe_keys(
             [*self.agent._policy_obs_keys_without_latent, *self.agent._reward_obs_keys]
         )
+
+    def required_expert_batch_keys(self) -> list[BatchKey]:
+        return self._posterior_input_keys()
 
     def _prior_input_keys(self) -> list[BatchKey]:
         assert self.agent is not None
@@ -709,10 +503,8 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
         keys: list[BatchKey],
         *,
         detach: bool,
-        context: str,
     ) -> Tensor:
         assert self.agent is not None
-        self.agent._require_batch_keys(td, keys, context=context)
         return self.agent._obs_features_from_td(
             td,
             cast(list, keys),
@@ -769,12 +561,12 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
         detach: bool,
         context: str,
     ) -> Tensor | None:
+        del context
         self._ensure_modules()
         posterior_input = self._features_from_td(
             batch,
             self._posterior_input_keys(),
             detach=detach,
-            context=context,
         )
         assert self.posterior is not None
         latent_mean, _ = self.posterior(posterior_input)
@@ -804,13 +596,11 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
             batch,
             self._posterior_input_keys(),
             detach=False,
-            context="policy latent posterior batch",
         )
         prior_input = self._features_from_td(
             batch,
             self._prior_input_keys(),
             detach=False,
-            context="policy latent prior batch",
         )
         assert self.posterior is not None
         assert self.prior is not None
@@ -859,7 +649,7 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
             latents = self.infer_batch_latents(
                 probe_batch,
                 detach=True,
-                context="latent probe batch",
+                context="",
             )
         if latents is None:
             return {}
@@ -872,7 +662,6 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
                     probe_batch,
                     probe_state_keys,
                     detach=True,
-                    context="latent probe state batch",
                 )
             )
         probe_input = (
@@ -884,7 +673,6 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
             probe_batch,
             self._probe_target_keys(),
             detach=True,
-            context="latent probe target batch",
         )
 
         pred = self.probe(probe_input)
@@ -973,23 +761,47 @@ class PolicyMLPEmbeddingLatentLearner(PolicyKLBottleneckLatentLearner):
         detach: bool,
         context: str,
     ) -> Tensor | None:
+        del context
         self._ensure_modules()
         encoder_input = self._features_from_td(
             batch,
             self._posterior_input_keys(),
             detach=detach,
-            context=context,
         )
         assert self.encoder is not None
         latents = F.normalize(self.encoder(encoder_input), dim=-1, eps=1.0e-6)
         return latents.detach() if detach else latents
+
+    def reconstruct_batch_features(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+        context: str,
+    ) -> Tensor | None:
+        del context
+        self._ensure_modules()
+        if self.decoder is None:
+            return None
+        encoder_input = self._features_from_td(
+            batch,
+            self._posterior_input_keys(),
+            detach=detach,
+        )
+        assert self.encoder is not None
+        if detach:
+            with torch.no_grad():
+                latents = F.normalize(self.encoder(encoder_input), dim=-1, eps=1.0e-6)
+                return self.decoder(latents)
+        latents = F.normalize(self.encoder(encoder_input), dim=-1, eps=1.0e-6)
+        return self.decoder(latents)
 
     def joint_loss(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
         assert self.agent is not None
         latents = self.infer_batch_latents(
             batch,
             detach=False,
-            context="policy latent embedding batch",
+            context="",
         )
         if latents is None:
             msg = (
@@ -1022,7 +834,6 @@ class PolicyMLPEmbeddingLatentLearner(PolicyKLBottleneckLatentLearner):
             rollout_flat,
             self._posterior_input_keys(),
             detach=True,
-            context="recon update batch",
         )
         if features.shape[0] == 0:
             return probe_metrics
@@ -1091,16 +902,17 @@ class FixedProjectionLatentLearner(BaseLatentLearner):
             [*self.agent._policy_obs_keys_without_latent, *self.agent._reward_obs_keys]
         )
 
+    def required_expert_batch_keys(self) -> list[BatchKey]:
+        return self._posterior_input_keys()
+
     def _features_from_td(
         self,
         td: TensorDict,
         *,
         detach: bool,
-        context: str,
     ) -> Tensor:
         assert self.agent is not None
         keys = self._posterior_input_keys()
-        self.agent._require_batch_keys(td, keys, context=context)
         return self.agent._obs_features_from_td(
             td,
             cast(list, keys),
@@ -1160,7 +972,8 @@ class FixedProjectionLatentLearner(BaseLatentLearner):
         context: str,
     ) -> Tensor | None:
         del detach
-        features = self._features_from_td(batch, detach=True, context=context)
+        del context
+        features = self._features_from_td(batch, detach=True)
         self._ensure_projection(int(features.shape[-1]))
         with torch.no_grad():
             return self._project(features)
@@ -1194,11 +1007,7 @@ class FixedProjectionLatentLearner(BaseLatentLearner):
             batch_size,
             required_keys=list(self._posterior_input_keys()),
         )
-        features = self._features_from_td(
-            expert_batch,
-            detach=True,
-            context="expert fixed projection prior",
-        )
+        features = self._features_from_td(expert_batch, detach=True)
         self._ensure_projection(int(features.shape[-1]))
         with torch.no_grad():
             latents = self._project(features)
@@ -1207,8 +1016,6 @@ class FixedProjectionLatentLearner(BaseLatentLearner):
 
 def _build_registry() -> dict[str, Callable[[], BaseLatentLearner]]:
     return {
-        "expert_mle_posterior": ExpertMLEPosteriorLatentLearner,
-        "legacy_mi_encoder": ExpertMLEPosteriorLatentLearner,
         "patch_autoencoder": PatchAutoencoderLatentLearner,
         "policy_kl_bottleneck": PolicyKLBottleneckLatentLearner,
         "policy_mlp_embedding": PolicyMLPEmbeddingLatentLearner,

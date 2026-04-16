@@ -23,7 +23,7 @@ class LatentSkillCollectorPolicy(nn.Module):
         self.policy_module = policy_module
 
     def forward(self, tensordict: TensorDict) -> TensorDict:
-        self.agent._inject_collector_latents(tensordict)
+        self.agent._inject_latent_command(tensordict)
         return self.policy_module(tensordict)
 
 
@@ -87,14 +87,124 @@ def generalized_advantage_estimate(
     return advantages.reshape_as(rewards), returns.reshape_as(values)
 
 
+class RandomLatentSampler:
+    """Stateful random latent sampler used by collector-time latent commands."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        *,
+        latent_steps_min: int,
+        latent_steps_max: int,
+    ) -> None:
+        self.latent_dim = int(latent_dim)
+        self.latent_steps_min = max(1, int(latent_steps_min))
+        self.latent_steps_max = max(self.latent_steps_min, int(latent_steps_max))
+        self._latents: Tensor | None = None
+        self._latent_steps: Tensor | None = None
+
+    def _sample_latents(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        latents = torch.randn(batch_size, self.latent_dim, device=device, dtype=dtype)
+        return F.normalize(latents, dim=-1, eps=1.0e-6)
+
+    def _sample_steps(self, batch_size: int, *, device: torch.device) -> Tensor:
+        if self.latent_steps_min == self.latent_steps_max:
+            return torch.full(
+                (batch_size,),
+                self.latent_steps_min,
+                device=device,
+                dtype=torch.long,
+            )
+        return torch.randint(
+            self.latent_steps_min,
+            self.latent_steps_max + 1,
+            (batch_size,),
+            device=device,
+        )
+
+    @staticmethod
+    def _done_mask(td: TensorDict, *, batch_size: int, device: torch.device) -> Tensor:
+        done_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        candidate_keys: list[BatchKey] = [
+            cast(BatchKey, "done"),
+            cast(BatchKey, "terminated"),
+            cast(BatchKey, "truncated"),
+            cast(BatchKey, "is_init"),
+            cast(BatchKey, ("next", "done")),
+            cast(BatchKey, ("next", "terminated")),
+            cast(BatchKey, ("next", "truncated")),
+            cast(BatchKey, ("next", "is_init")),
+        ]
+        available_keys = td.keys(True)
+
+        for key in candidate_keys:
+            if key not in available_keys:
+                continue
+            value = cast(Tensor, td.get(key)).reshape(-1).to(device=device).bool()
+            if value.numel() == batch_size:
+                done_mask |= value
+        return done_mask
+
+    def sample_for_step(
+        self,
+        td: TensorDict,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        batch_size = int(td.numel())
+        if batch_size <= 0:
+            return torch.empty(0, self.latent_dim, device=device, dtype=dtype)
+
+        if (
+            self._latents is None
+            or self._latent_steps is None
+            or self._latents.shape[0] != batch_size
+            or self._latents.device != device
+            or self._latents.dtype != dtype
+        ):
+            self._latents = self._sample_latents(
+                batch_size,
+                device=device,
+                dtype=dtype,
+            )
+            self._latent_steps = self._sample_steps(batch_size, device=device)
+
+        renew_mask = self._done_mask(
+            td,
+            batch_size=batch_size,
+            device=device,
+        ) | (self._latent_steps <= 0)
+        if bool(renew_mask.any()):
+            renew_count = int(renew_mask.sum().item())
+            self._latents[renew_mask] = self._sample_latents(
+                renew_count,
+                device=device,
+                dtype=dtype,
+            )
+            self._latent_steps[renew_mask] = self._sample_steps(
+                renew_count,
+                device=device,
+            )
+
+        latents = self._latents
+        self._latent_steps = self._latent_steps - 1
+        return latents
+
+
 class LatentSkillMixin:
     """Mixin that manages per-env latent commands and rollout stamping."""
 
     _latent_key: ObsKey
     _latent_dim: int
     _collector_policy_wrapper: LatentSkillCollectorPolicy | None
-    _collector_latents: Tensor | None
-    _collector_latent_steps: Tensor | None
+    _random_latent_sampler: RandomLatentSampler | None
 
     def _init_latent_skills(
         self,
@@ -107,12 +217,13 @@ class LatentSkillMixin:
     ) -> None:
         self._latent_key = latent_key
         self._latent_dim = int(latent_dim)
-        self._latent_steps_min = max(1, int(latent_steps_min))
-        self._latent_steps_max = max(self._latent_steps_min, int(latent_steps_max))
 
         self._collector_policy_wrapper = None
-        self._collector_latents = None
-        self._collector_latent_steps = None
+        self._random_latent_sampler = RandomLatentSampler(
+            self._latent_dim,
+            latent_steps_min=latent_steps_min,
+            latent_steps_max=latent_steps_max,
+        )
         self._env_latent_setter = self._discover_env_method(
             env, "set_agent_latent_command"
         )
@@ -161,142 +272,30 @@ class LatentSkillMixin:
         latents = torch.randn(batch_size, self._latent_dim, device=device, dtype=dtype)
         return F.normalize(latents, dim=-1, eps=1.0e-6)
 
-    def _sample_collector_latents(
-        self,
-        batch_size: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        env_ids: Tensor | None = None,
-        td: TensorDict | None = None,
-    ) -> Tensor:
-        del env_ids, td
-        return self._sample_unit_latents(batch_size, device=device, dtype=dtype)
-
-    def _sample_latent_steps(self, batch_size: int, *, device: torch.device) -> Tensor:
-        if self._latent_steps_min == self._latent_steps_max:
-            return torch.full(
-                (batch_size,),
-                self._latent_steps_min,
-                device=device,
-                dtype=torch.long,
-            )
-        return torch.randint(
-            self._latent_steps_min,
-            self._latent_steps_max + 1,
-            (batch_size,),
-            device=device,
-        )
-
-    def _done_mask_from_td(self, td: TensorDict, *, batch_size: int) -> Tensor:
-        keys = td.keys(True)
-        done_mask = torch.zeros(batch_size, device=self.device, dtype=torch.bool)
-        candidate_keys: list[BatchKey] = [
-            cast(BatchKey, "done"),
-            cast(BatchKey, "terminated"),
-            cast(BatchKey, "truncated"),
-            cast(BatchKey, "is_init"),
-            cast(BatchKey, ("next", "done")),
-            cast(BatchKey, ("next", "terminated")),
-            cast(BatchKey, ("next", "truncated")),
-            cast(BatchKey, ("next", "is_init")),
-        ]
-
-        for key in candidate_keys:
-            if key not in keys:
-                continue
-            value = cast(Tensor, td.get(key)).reshape(-1).to(self.device).bool()
-            if value.numel() == batch_size:
-                done_mask = done_mask | value
-        return done_mask
-
-    def _ensure_collector_latent_state(
-        self,
-        batch_size: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        td: TensorDict | None = None,
-    ) -> None:
-        if (
-            self._collector_latents is None
-            or self._collector_latent_steps is None
-            or self._collector_latents.shape[0] != batch_size
-            or self._collector_latents.device != device
-            or self._collector_latents.dtype != dtype
-        ):
-            self._collector_latents = self._sample_collector_latents(
-                batch_size,
-                device=device,
-                dtype=dtype,
-                env_ids=None,
-                td=td,
-            )
-            self._collector_latent_steps = self._sample_latent_steps(
-                batch_size,
-                device=device,
-            )
-            self._publish_latents_to_env(self._collector_latents)
-
     def _publish_latents_to_env(self, latents: Tensor) -> None:
-        if self._env_latent_setter is None:
-            return
         self._env_latent_setter(latents)
 
-    def _inject_collector_latents(self, td: TensorDict) -> None:
-        batch_size = int(td.numel())
-        if batch_size <= 0:
+    def _inject_latent_command(
+        self,
+        td: TensorDict,
+    ) -> None:
+        if td.numel() <= 0:
             return
 
-        dtype = torch.float32
-        self._ensure_collector_latent_state(
-            batch_size,
+        assert self._random_latent_sampler is not None
+        latents = self._random_latent_sampler.sample_for_step(
+            td,
             device=self.device,
-            dtype=dtype,
-            td=td,
+            dtype=torch.float32,
         )
-        assert self._collector_latents is not None
-        assert self._collector_latent_steps is not None
-
-        done_mask = self._done_mask_from_td(td, batch_size=batch_size)
-        renew_mask = done_mask | (self._collector_latent_steps <= 0)
-        if bool(renew_mask.any()):
-            renew_env_ids = renew_mask.nonzero(as_tuple=False).squeeze(-1)
-            renew_count = int(renew_mask.sum().item())
-            renew_td = cast(TensorDict, td[renew_env_ids])
-            self._collector_latents[renew_mask] = self._sample_collector_latents(
-                renew_count,
-                device=self.device,
-                dtype=dtype,
-                env_ids=renew_env_ids,
-                td=renew_td,
-            )
-            self._collector_latent_steps[renew_mask] = self._sample_latent_steps(
-                renew_count,
-                device=self.device,
-            )
-
-        latents = self._collector_latents.reshape(*td.batch_size, self._latent_dim)
-        td.set(cast(BatchKey, self._latent_key), latents)
-        self._publish_latents_to_env(self._collector_latents)
-        self._collector_latent_steps = self._collector_latent_steps - 1
+        td.set(
+            cast(BatchKey, self._latent_key),
+            latents.reshape(*td.batch_size, self._latent_dim),
+        )
+        self._publish_latents_to_env(latents.reshape(-1, self._latent_dim))
 
     def _prepare_latent_rollout_batch_for_training(self, data: TensorDict) -> None:
-        keys = data.keys(True)
-        if self._latent_key not in keys:
-            msg = (
-                "Collected rollout batch is missing latent key "
-                f"{self._latent_key!r}."
-            )
-            raise KeyError(msg)
-
-        next_latent_key = cast(BatchKey, ("next", self._latent_key))
-        if next_latent_key not in keys:
-            msg = (
-                "Collected rollout batch is missing next latent key "
-                f"{next_latent_key!r}."
-            )
-            raise KeyError(msg)
+        del data
 
     def _latent_condition_from_td(
         self,
@@ -310,23 +309,6 @@ class LatentSkillMixin:
         latent = flatten_feature_tensor(latent, 1)
         return latent.detach() if detach else latent
 
-    def _inject_predict_latents(
-        self,
-        td_data: dict[BatchKey, Tensor],
-        batch_shape: tuple[int, ...],
-    ) -> None:
-        if cast(BatchKey, self._latent_key) in td_data:
-            return
-        batch_size = 1
-        for dim in batch_shape:
-            batch_size *= int(dim)
-        latents = self._sample_unit_latents(
-            batch_size,
-            device=self.device,
-            dtype=torch.float32,
-        ).reshape(*batch_shape, self._latent_dim)
-        td_data[cast(BatchKey, self._latent_key)] = latents
-        self._publish_latents_to_env(latents.reshape(batch_size, self._latent_dim))
 
 
 def infer_batch_shape_from_mapping(

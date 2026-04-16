@@ -1040,8 +1040,8 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
                 batch_shape = infer_batch_shape(value, feature_ndim)
 
             batch_shape = batch_shape or (1,)
-            self._inject_predict_latents(td_data, batch_shape)
             td = TensorDict(td_data, batch_size=list(batch_shape), device=self.device)
+            self._inject_latent_command(td)
             td = policy_op(td)
             return td.get("action")
 
