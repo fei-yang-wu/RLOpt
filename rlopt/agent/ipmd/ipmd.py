@@ -18,13 +18,25 @@ from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import MLP
 from torchrl.record.loggers import Logger
 
+from rlopt.agent.imitation.latent_commands import LatentCommandController
 from rlopt.agent.imitation.latent_learning import (
     BaseLatentLearner,
     build_latent_learner,
 )
-from rlopt.agent.imitation.latent_skill import (
-    LatentSkillCollectorPolicy,
-    LatentSkillMixin,
+from rlopt.agent.ipmd.utils import (
+    IPMD_COMMAND_SOURCES,
+    IPMD_REWARD_INPUT_TYPES,
+    IPMD_REWARD_OUTPUT_ACTIVATIONS,
+    RewardInputBlock,
+    build_reward_input_blocks,
+    normalize_ipmd_command_source,
+    normalize_ipmd_reward_input_type,
+    normalize_ipmd_reward_output_activation,
+    require_non_negative,
+    require_positive_int,
+    required_batch_keys_from_reward_blocks,
+    reward_alignment_metrics,
+    reward_grad_penalty_from_input,
 )
 from rlopt.agent.ppo.ppo import (
     PPO,
@@ -37,11 +49,12 @@ from rlopt.config_utils import (
     BatchKey,
     ObsKey,
     dedupe_keys,
-    epic_distance,
-    flatten_feature_tensor,
+    flatten_action_features_from_td,
+    flatten_obs_features_from_td,
     infer_batch_shape,
     mapping_get_obs_value,
-    next_obs_key,
+    obs_key_feature_dim,
+    obs_key_feature_ndim,
 )
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
@@ -246,6 +259,74 @@ class IPMDConfig(PPOConfig):
     during early training.  Set to 0 to disable (default).
     """
 
+    def validate(self) -> None:
+        self.command_source = normalize_ipmd_command_source(self.command_source)
+        self.reward_input_type = normalize_ipmd_reward_input_type(
+            self.reward_input_type
+        )
+        self.reward_output_activation = normalize_ipmd_reward_output_activation(
+            self.reward_output_activation
+        )
+        self.latent_dim = require_positive_int("ipmd.latent_dim", self.latent_dim)
+        self.latent_steps_min = require_positive_int(
+            "ipmd.latent_steps_min", self.latent_steps_min
+        )
+        self.latent_steps_max = require_positive_int(
+            "ipmd.latent_steps_max", self.latent_steps_max
+        )
+        if self.latent_steps_min > self.latent_steps_max:
+            msg = (
+                "ipmd.latent_steps_min must be <= ipmd.latent_steps_max, got "
+                f"{self.latent_steps_min} > {self.latent_steps_max}."
+            )
+            raise ValueError(msg)
+        require_non_negative("ipmd.diversity_bonus_coeff", self.diversity_bonus_coeff)
+        require_non_negative("ipmd.diversity_target", self.diversity_target)
+        if float(self.latent_uniformity_temperature) <= 0.0:
+            msg = (
+                "ipmd.latent_uniformity_temperature must be > 0, got "
+                f"{self.latent_uniformity_temperature!r}."
+            )
+            raise ValueError(msg)
+        if any(int(width) <= 0 for width in self.reward_num_cells):
+            msg = (
+                "ipmd.reward_num_cells must contain only positive widths, got "
+                f"{self.reward_num_cells!r}."
+            )
+            raise ValueError(msg)
+        if (
+            self.reward_output_activation != "none"
+            and float(self.reward_output_scale) <= 0.0
+        ):
+            msg = (
+                "ipmd.reward_output_scale must be > 0 when reward_output_activation "
+                f"is {self.reward_output_activation!r}, got {self.reward_output_scale!r}."
+            )
+            raise ValueError(msg)
+        require_non_negative("ipmd.reward_loss_coeff", self.reward_loss_coeff)
+        require_non_negative("ipmd.reward_l2_coeff", self.reward_l2_coeff)
+        require_non_negative(
+            "ipmd.reward_grad_penalty_coeff", self.reward_grad_penalty_coeff
+        )
+        require_non_negative("ipmd.est_reward_weight", self.est_reward_weight)
+        require_non_negative("ipmd.env_reward_weight", self.env_reward_weight)
+        require_non_negative("ipmd.bc_coef", self.bc_coef)
+        if self.expert_batch_size is not None:
+            self.expert_batch_size = require_positive_int(
+                "ipmd.expert_batch_size", self.expert_batch_size
+            )
+        clamp_min = self.estimated_reward_clamp_min
+        clamp_max = self.estimated_reward_clamp_max
+        if clamp_min is not None and clamp_max is not None and clamp_min > clamp_max:
+            msg = (
+                "ipmd.estimated_reward_clamp_min must be <= "
+                f"ipmd.estimated_reward_clamp_max, got {clamp_min!r} > {clamp_max!r}."
+            )
+            raise ValueError(msg)
+
+    def __post_init__(self) -> None:
+        self.validate()
+
 
 @dataclass
 class IPMDRLOptConfig(PPORLOptConfig):
@@ -255,7 +336,7 @@ class IPMDRLOptConfig(PPORLOptConfig):
     """IPMD configuration."""
 
 
-class IPMD(LatentSkillMixin, PPO):
+class IPMD(PPO):
     """IPMD algorithm with PPO as the base RL algorithm.
 
     Uses the same on-policy rollout + GAE + multiple epochs over mini-batches as PPO,
@@ -263,6 +344,14 @@ class IPMD(LatentSkillMixin, PPO):
     (policy estimated return - expert estimated return). Optionally uses estimated
     rewards for PPO updates.
     """
+
+    _REWARD_INPUT_TYPES = IPMD_REWARD_INPUT_TYPES
+    _REWARD_OUTPUT_ACTIVATIONS = IPMD_REWARD_OUTPUT_ACTIVATIONS
+    _COMMAND_SOURCES = IPMD_COMMAND_SOURCES
+
+    @staticmethod
+    def _normalize_command_source(command_source: str) -> str:
+        return normalize_ipmd_command_source(command_source)
 
     def __init__(
         self,
@@ -277,21 +366,25 @@ class IPMD(LatentSkillMixin, PPO):
         **kwargs,
     ):
         self.config: IPMDRLOptConfig = config
+        self.config.ipmd.validate()
         self.env = env
         self._use_latent_command = bool(self.config.ipmd.use_latent_command)
         self._latent_key = self.config.ipmd.latent_key
         self._latent_dim = int(self.config.ipmd.latent_dim)
         self._collector_policy_wrapper = None
-        self._env_latent_setter = None
-        self._command_source = self.config.ipmd.command_source
+        self._latent_command_controller: LatentCommandController | None = None
+        self._command_source = self._normalize_command_source(
+            self.config.ipmd.command_source
+        )
 
         if self._use_latent_command:
-            self._init_latent_skills(
-                env,
+            self._latent_command_controller = LatentCommandController(
+                env=env,
                 latent_key=self._latent_key,
                 latent_dim=self._latent_dim,
                 latent_steps_min=int(self.config.ipmd.latent_steps_min),
                 latent_steps_max=int(self.config.ipmd.latent_steps_max),
+                discover_env_method=self._discover_env_method,
             )
 
         # Observation key groups can differ across policy, value, and reward model.
@@ -368,15 +461,28 @@ class IPMD(LatentSkillMixin, PPO):
         for key in all_obs_keys:
             env.observation_spec[key]
         self._obs_feature_ndims: dict[ObsKey, int] = {
-            key: self._obs_key_feature_ndim(key) for key in all_obs_keys
+            key: obs_key_feature_ndim(self.env, key) for key in all_obs_keys
         }
         self._obs_feature_dims: dict[ObsKey, int] = {
-            key: self._obs_key_feature_dim(key) for key in all_obs_keys
+            key: obs_key_feature_dim(self.env, key) for key in all_obs_keys
         }
         action_spec = getattr(self.env, "action_spec_unbatched", self.env.action_spec)
         action_shape = tuple(int(dim) for dim in action_spec.shape)
         self._action_feature_ndim = len(action_shape)
         self._action_feature_dim = int(math.prod(action_shape)) if action_shape else 1
+        self._reward_input_blocks: tuple[RewardInputBlock, ...] = (
+            build_reward_input_blocks(
+                reward_input_type=self.config.ipmd.reward_input_type,
+                reward_obs_keys=self._reward_obs_keys,
+                obs_feature_dims=self._obs_feature_dims,
+                action_feature_dim=self._action_feature_dim,
+                use_latent_command=self._use_latent_command,
+                latent_dim=self._latent_dim,
+            )
+        )
+        self._reward_input_dim: int = sum(
+            block.dim for block in self._reward_input_blocks
+        )
 
         # Reward estimator: r(s, a, s') -> scalar
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
@@ -389,10 +495,6 @@ class IPMD(LatentSkillMixin, PPO):
         self._latent_learner: BaseLatentLearner | None = None
 
         cfg = self.config.ipmd
-        rit = cfg.reward_input_type
-        self._rit_use_s: bool = rit in ("s", "sa", "sas")
-        self._rit_use_a: bool = rit in ("sa", "sas")
-        self._rit_use_sn: bool = rit in ("s'", "sas")
         # Scalar caches
         self._reward_loss_coeff: float = float(cfg.reward_loss_coeff)
         self._reward_l2_coeff: float = float(cfg.reward_l2_coeff)
@@ -454,18 +556,23 @@ class IPMD(LatentSkillMixin, PPO):
         policy_operator = self.actor_critic.get_policy_operator()
         if not self._use_latent_command:
             return policy_operator
-        if self._collector_policy_wrapper is None:
-            self._collector_policy_wrapper = LatentSkillCollectorPolicy(
-                self, policy_operator
-            )
-        return self._collector_policy_wrapper
+        assert self._latent_command_controller is not None
+        return self._latent_command_controller.collector_policy(
+            inject_fn=self._inject_latent_command,
+            policy_module=policy_operator,
+        )
 
     def _inject_latent_command(
         self,
         td: TensorDict,
     ) -> None:
+        assert self._latent_command_controller is not None
         if self._command_source == "random":
-            super()._inject_latent_command(td)
+            self._latent_command_controller.inject_random_latent_command(
+                td,
+                device=self.device,
+                dtype=torch.float32,
+            )
             return
 
         assert self._latent_learner is not None
@@ -489,51 +596,7 @@ class IPMD(LatentSkillMixin, PPO):
             latents.reshape(*td.batch_size, self._latent_dim),
         )
         published_latents = latents.reshape(-1, self._latent_dim)
-        self._publish_latents_to_env(published_latents)
-
-
-    _REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
-
-    def _obs_key_feature_shape(self, key: ObsKey) -> tuple[int, ...]:
-        """Return unbatched feature shape for an observation key."""
-        shape = tuple(int(dim) for dim in self.env.observation_spec[key].shape)
-        batch_prefix = tuple(int(dim) for dim in getattr(self.env, "batch_size", ()))
-        if (
-            len(batch_prefix) > 0
-            and len(shape) >= len(batch_prefix)
-            and shape[: len(batch_prefix)] == batch_prefix
-        ):
-            return shape[len(batch_prefix) :]
-        return shape
-
-    def _obs_key_feature_ndim(self, key: ObsKey) -> int:
-        return len(self._obs_key_feature_shape(key))
-
-    def _obs_key_feature_dim(self, key: ObsKey) -> int:
-        shape = self._obs_key_feature_shape(key)
-        return int(math.prod(shape)) if shape else 1
-
-    def _obs_features_from_td(
-        self,
-        td: TensorDict,
-        keys: list[ObsKey],
-        *,
-        next_obs: bool,
-        detach: bool,
-    ) -> Tensor:
-        parts: list[Tensor] = []
-        for key in keys:
-            obs_key = next_obs_key(key) if next_obs else key
-            obs = flatten_feature_tensor(
-                td[obs_key],
-                self._obs_feature_ndims[key],
-            )
-            parts.append(obs.detach() if detach else obs)
-        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-
-    def _action_features_from_td(self, td: TensorDict, *, detach: bool) -> Tensor:
-        action = flatten_feature_tensor(td["action"], self._action_feature_ndim)
-        return action.detach() if detach else action
+        self._latent_command_controller.publish_latents_to_env(published_latents)
 
     def _expert_latents_from_td(
         self,
@@ -551,13 +614,7 @@ class IPMD(LatentSkillMixin, PPO):
         """Return expert-batch keys required by current IPMD settings."""
         bc_enabled = float(self.config.ipmd.bc_coef) > 0.0
 
-        required: list[BatchKey] = []
-        if self._rit_use_s:
-            required.extend(self._reward_obs_keys)
-        if self._rit_use_sn:
-            required.extend(next_obs_key(key) for key in self._reward_obs_keys)
-        if self._rit_use_a:
-            required.append("action")
+        required = self._reward_required_batch_keys()
         if self._use_latent_command:
             assert self._latent_learner is not None
             required.extend(self._latent_learner.required_expert_batch_keys())
@@ -573,33 +630,17 @@ class IPMD(LatentSkillMixin, PPO):
                 required.extend(self._latent_learner.required_expert_batch_keys())
         return dedupe_keys(required)
 
+    def _reward_required_batch_keys(self) -> list[BatchKey]:
+        """Return the batch keys needed to materialize reward-model inputs."""
+        return required_batch_keys_from_reward_blocks(self._reward_input_blocks)
+
     def _construct_reward_estimator(self) -> torch.nn.Module:
         """Create reward network whose input depends on ``reward_input_type``."""
         cfg = self.config
         assert isinstance(cfg, IPMDRLOptConfig)
-        rit = cfg.ipmd.reward_input_type
-        if rit not in self._REWARD_INPUT_TYPES:
-            msg = f"Unknown reward_input_type {rit!r}; expected one of {sorted(self._REWARD_INPUT_TYPES)}"
-            raise ValueError(msg)
-        out_act = cfg.ipmd.reward_output_activation
-        if out_act not in self._REWARD_OUTPUT_ACTIVATIONS:
-            msg = f"Unknown reward_output_activation {out_act!r}; expected one of {sorted(self._REWARD_OUTPUT_ACTIVATIONS)}"
-            raise ValueError(msg)
-
-        obs_dim = sum(self._obs_feature_dims[key] for key in self._reward_obs_keys)
-        act_dim = self._action_feature_dim
-
-        if rit in ("s", "s'"):
-            in_dim = obs_dim
-        elif rit == "sa":
-            in_dim = obs_dim + act_dim
-        else:  # "sas"
-            in_dim = obs_dim * 2 + act_dim
-        if self._use_latent_command:
-            in_dim += self._latent_dim
 
         net = MLP(
-            in_features=in_dim,
+            in_features=self._reward_input_dim,
             out_features=1,
             num_cells=list(cfg.ipmd.reward_num_cells),
             activation_class=get_activation_class(cfg.ipmd.reward_activation),
@@ -647,19 +688,24 @@ class IPMD(LatentSkillMixin, PPO):
         required_keys = (
             self._expert_required_keys() if required_keys is None else required_keys
         )
-        try:
-            expert_batch = self._expert_batch_sampler(
-                effective_batch_size,
-                required_keys,
-            )
-        except Exception as err:
-            msg = "Failed to sample expert batch from sampler."
-            raise RuntimeError(msg) from err
+        expert_batch = self._expert_batch_sampler(
+            effective_batch_size,
+            required_keys,
+        )
         if expert_batch is None:
             msg = "Expert sampler returned None."
             raise RuntimeError(msg)
-        if expert_batch.numel() > effective_batch_size:
-            expert_batch = expert_batch[:effective_batch_size]
+        available_keys = set(expert_batch.keys(True))
+        missing_keys = [key for key in required_keys if key not in available_keys]
+        if missing_keys:
+            msg = f"Expert sampler batch is missing required keys: {missing_keys!r}."
+            raise RuntimeError(msg)
+        if expert_batch.numel() != effective_batch_size:
+            msg = (
+                "Expert sampler must return exactly the requested batch size, got "
+                f"{expert_batch.numel()} for request {effective_batch_size}."
+            )
+            raise RuntimeError(msg)
         return expert_batch.to(self.device)
 
     def _apply_estimated_reward_done_penalty(
@@ -667,7 +713,7 @@ class IPMD(LatentSkillMixin, PPO):
         rollout: TensorDict,
         est_reward: Tensor,
     ) -> Tensor:
-        """ Not used. Add penalty to done state. """
+        """Subtract the configured penalty on terminal non-truncated transitions."""
         penalty = float(self.config.ipmd.estimated_reward_done_penalty)
         if penalty == 0.0:
             return est_reward
@@ -677,9 +723,7 @@ class IPMD(LatentSkillMixin, PPO):
         done = rollout[done_key]
         truncated_key: BatchKey = ("next", "truncated")
         truncated = (
-            rollout[truncated_key]
-            if truncated_key in rollout.keys(True)
-            else None
+            rollout[truncated_key] if truncated_key in rollout.keys(True) else None
         )
         done_mask = done.to(device=est_reward.device, dtype=torch.bool)
         if truncated is None:
@@ -691,7 +735,68 @@ class IPMD(LatentSkillMixin, PPO):
             terminal_mask = terminal_mask.unsqueeze(-1)
         return torch.where(terminal_mask, est_reward - penalty, est_reward)
 
-    _REWARD_OUTPUT_ACTIVATIONS = frozenset({"none", "tanh", "sigmoid"})
+    def _reward_input_from_td(
+        self,
+        td: TensorDict,
+        *,
+        batch_role: str,
+        detach: bool,
+        requires_grad: bool,
+    ) -> Tensor:
+        """Materialize the canonical reward-model input tensor for one batch."""
+        parts: list[Tensor] = []
+        for block in self._reward_input_blocks:
+            if block.kind == "obs":
+                parts.append(
+                    flatten_obs_features_from_td(
+                        td,
+                        list(block.obs_keys),
+                        self._obs_feature_ndims,
+                        next_obs=False,
+                        detach=detach,
+                    )
+                )
+            elif block.kind == "next_obs":
+                parts.append(
+                    flatten_obs_features_from_td(
+                        td,
+                        list(block.obs_keys),
+                        self._obs_feature_ndims,
+                        next_obs=True,
+                        detach=detach,
+                    )
+                )
+            elif block.kind == "action":
+                parts.append(
+                    flatten_action_features_from_td(
+                        td,
+                        self._action_feature_ndim,
+                        detach=detach,
+                    )
+                )
+            elif block.kind == "latent":
+                if batch_role == "rollout":
+                    assert self._latent_command_controller is not None
+                    rollout_latent = (
+                        self._latent_command_controller.latent_condition_from_td(
+                            td, detach=True
+                        )
+                    )
+                    assert rollout_latent is not None
+                    parts.append(rollout_latent.to(self.device))
+                else:
+                    parts.append(self._expert_latents_from_td(td, detach=True))
+            else:
+                msg = f"Unhandled reward input block kind {block.kind!r}."
+                raise RuntimeError(msg)
+
+        if not parts:
+            msg = "Reward input specification must contain at least one block."
+            raise RuntimeError(msg)
+        reward_input = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        if requires_grad:
+            reward_input = reward_input.detach().requires_grad_(True)
+        return reward_input
 
     def _reward_from_td(
         self,
@@ -705,35 +810,34 @@ class IPMD(LatentSkillMixin, PPO):
         """Compute estimated reward for a batch of transitions."""
         if detach is None:
             detach = self._reward_detach_features
-        parts: list[Tensor] = []
-        if self._rit_use_s:
-            parts.append(
-                self._obs_features_from_td(
-                    td, self._reward_obs_keys, next_obs=False, detach=detach
-                )
-            )
-        if self._rit_use_a:
-            parts.append(self._action_features_from_td(td, detach=detach))
-        if self._rit_use_sn:
-            parts.append(
-                self._obs_features_from_td(
-                    td, self._reward_obs_keys, next_obs=True, detach=detach
-                )
-            )
-        if self._use_latent_command:
-            if batch_role == "rollout":
-                rollout_latent = self._latent_condition_from_td(td, detach=True)
-                assert rollout_latent is not None
-                parts.append(rollout_latent.to(self.device))
-            else:
-                parts.append(self._expert_latents_from_td(td, detach=True))
-        x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-        if requires_grad:
-            x = x.detach().requires_grad_(True)
+        x = self._reward_input_from_td(
+            td,
+            batch_role=batch_role,
+            detach=detach,
+            requires_grad=requires_grad,
+        )
         reward = self._reward_out_fn(self.reward_estimator(x))
         if return_input:
             return reward, x
         return reward
+
+    def _reward_from_batch(
+        self,
+        td: TensorDict,
+        *,
+        batch_role: str,
+        detach: bool | None = None,
+        requires_grad: bool = False,
+        return_input: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Backward-compatible alias for reward evaluation on one batch."""
+        return self._reward_from_td(
+            td,
+            batch_role=batch_role,
+            detach=detach,
+            requires_grad=requires_grad,
+            return_input=return_input,
+        )
 
     def _latent_uniformity(self, latent_pred: Tensor) -> Tensor:
         """Not used. Placeholder."""
@@ -742,90 +846,6 @@ class IPMD(LatentSkillMixin, PPO):
     def _extra_actor_loss(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
         del batch
         return torch.zeros((), device=self.device), {}
-
-    @staticmethod
-    def _reward_grad_penalty_from_input(reward: Tensor, reward_input: Tensor) -> Tensor:
-        """Squared gradient norm of reward with respect to its input features."""
-        reward_grad = torch.autograd.grad(
-            outputs=reward.sum(),
-            inputs=reward_input,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        return reward_grad.pow(2).sum(dim=-1).mean()
-
-    @staticmethod
-    def _reward_tensor_stats(prefix: str, reward: Tensor) -> dict[str, float]:
-        reward_f = reward.detach().float()
-        return {
-            f"{prefix}_mean": reward_f.mean().item(),
-            f"{prefix}_std": reward_f.std().item(),
-            f"{prefix}_min": reward_f.min().item(),
-            f"{prefix}_max": reward_f.max().item(),
-        }
-
-    @staticmethod
-    def _reward_alignment_metrics(
-        prefix: str, reward_pred: Tensor, reward_true: Tensor
-    ) -> dict[str, float]:
-        pred = reward_pred.detach().float().flatten()
-        true = reward_true.detach().float().flatten()
-        diff = pred - true
-
-        pred_mean = pred.mean()
-        true_mean = true.mean()
-        pred_centered = pred - pred_mean
-        true_centered = true - true_mean
-
-        pred_var = pred_centered.pow(2).mean()
-        true_var = true_centered.pow(2).mean()
-        cov = (pred_centered * true_centered).mean()
-
-        pearson_corr, corr_distance = epic_distance(pred, true)
-
-        eps = 1e-8
-        if pred_var <= eps:
-            affine_scale = torch.zeros((), device=pred.device, dtype=pred.dtype)
-            affine_bias = true_mean
-            fitted = torch.full_like(true, true_mean)
-        else:
-            affine_scale = cov / pred_var
-            affine_bias = true_mean - affine_scale * pred_mean
-            fitted = affine_scale * pred + affine_bias
-
-        resid = true - fitted
-        ss_res = resid.pow(2).sum()
-        ss_tot = true_centered.pow(2).sum()
-        if ss_tot <= eps:
-            affine_r2 = torch.ones((), device=pred.device, dtype=pred.dtype)
-        else:
-            affine_r2 = 1.0 - ss_res / ss_tot
-
-        return {
-            f"{prefix}/pearson_corr": pearson_corr.item(),
-            f"{prefix}/corr_distance": corr_distance.item(),
-            f"{prefix}/mae": diff.abs().mean().item(),
-            f"{prefix}/rmse": diff.pow(2).mean().sqrt().item(),
-            f"{prefix}/affine_scale": affine_scale.item(),
-            f"{prefix}/affine_bias": affine_bias.item(),
-            f"{prefix}/affine_r2": affine_r2.item(),
-            f"{prefix}/target_std": true_var.sqrt().item(),
-            f"{prefix}/pred_std": pred_var.sqrt().item(),
-        }
-
-    def _param_grad_norm(self, params: Any) -> Tensor:
-        total_sq: Tensor | None = None
-        for param in params:
-            grad = getattr(param, "grad", None)
-            if grad is None:
-                continue
-            grad_tensor = grad.detach().float()
-            grad_sq = grad_tensor.pow(2).sum()
-            total_sq = grad_sq if total_sq is None else total_sq + grad_sq
-        if total_sq is None:
-            return torch.zeros((), device=self.device)
-        return total_sq.sqrt()
 
     def _refresh_grad_clip_params(self) -> None:
         """Refresh the cached optimizer parameter list used for grad clipping."""
@@ -897,6 +917,10 @@ class IPMD(LatentSkillMixin, PPO):
                         max=self.config.ipmd.estimated_reward_clamp_max,
                     )
                 )  # type: ignore[attr-defined]
+                est_reward = self._apply_estimated_reward_done_penalty(
+                    rollout,
+                    est_reward,
+                )
 
             if self._use_estimated_rewards_for_ppo:
                 assert est_reward is not None
@@ -919,7 +943,7 @@ class IPMD(LatentSkillMixin, PPO):
             rollout.set(("next", "est_reward"), est_reward)
             metrics["train/est_reward_mean"] = est_reward.mean().item()
             metrics.update(
-                self._reward_alignment_metrics(
+                reward_alignment_metrics(
                     "reward/env_vs_est",
                     env_reward,
                     est_reward,
@@ -936,6 +960,115 @@ class IPMD(LatentSkillMixin, PPO):
             expert_batch,
             torch.ones((), device=self.device, dtype=torch.float32),
         )
+
+    def _backward_ppo_terms(self, batch: TensorDict) -> TensorDict:
+        """Backpropagate the PPO objective and return detached update metrics."""
+        loss: TensorDict = self.loss_module(batch)
+        extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
+        (
+            loss["loss_critic"]
+            + loss["loss_objective"]
+            + loss["loss_entropy"]
+            + extra_actor_loss
+        ).backward()
+        output_loss = loss.clone().detach_()
+        for key, value in extra_actor_metrics.items():
+            output_loss.set(key, value.detach())
+        return output_loss
+
+    def _backward_bc_terms(
+        self,
+        expert_batch: TensorDict,
+        has_expert: Tensor,
+    ) -> dict[str, Tensor]:
+        """Backpropagate behavior-cloning terms when enabled."""
+        metrics: dict[str, Tensor] = {}
+        if self._bc_coeff <= 0.0:
+            return metrics
+
+        expert_action = expert_batch["expert_action"]
+        if not isinstance(expert_action, Tensor):
+            msg = "BC update requires expert_batch['expert_action'] to be a Tensor."
+            raise RuntimeError(msg)
+        expert_obs_td = expert_batch.clone(False)
+        if self._latent_key not in expert_obs_td.keys(True):
+            expert_latents = self._expert_latents_from_td(
+                expert_batch,
+                detach=True,
+            ).reshape(*expert_batch.batch_size, self._latent_dim)
+            expert_obs_td.set(self._latent_key, expert_latents)
+        expert_obs_td = expert_obs_td.select(*self._policy_obs_keys)
+        dist = self._policy_operator.get_dist(expert_obs_td)
+        log_prob = dist.log_prob(expert_action)
+        log_prob = self._reduce_log_prob(log_prob, expert_action)
+        has_expert_float = has_expert.to(dtype=log_prob.dtype)
+        bc_nll = -log_prob.mean() * has_expert_float
+        bc_loss = bc_nll * self._bc_coeff
+        bc_loss.backward()
+        metrics["loss_bc"] = bc_loss.detach()
+        metrics["bc_nll"] = bc_nll.detach()
+        return metrics
+
+    def _backward_reward_terms(
+        self,
+        batch: TensorDict,
+        expert_batch: TensorDict,
+    ) -> dict[str, Tensor]:
+        """Backpropagate the IPMD reward objective and return detached metrics."""
+        metrics = {
+            "loss_reward_diff": torch.zeros((), device=self.device),
+            "loss_reward_l2": torch.zeros((), device=self.device),
+            "loss_reward_grad_penalty": torch.zeros((), device=self.device),
+            "loss_reward_grad_penalty_batch": torch.zeros((), device=self.device),
+            "loss_reward_grad_penalty_expert": torch.zeros((), device=self.device),
+        }
+        if not self._reward_update_enabled:
+            return metrics
+
+        if self._reward_grad_penalty_coeff > 0.0:
+            r_pi_with_input = self._reward_from_td(
+                batch,
+                batch_role="rollout",
+                requires_grad=True,
+                return_input=True,
+            )
+            r_exp_with_input = self._reward_from_td(
+                expert_batch,
+                batch_role="expert",
+                requires_grad=True,
+                return_input=True,
+            )
+            assert isinstance(r_pi_with_input, tuple)
+            assert isinstance(r_exp_with_input, tuple)
+            r_pi, r_pi_input = r_pi_with_input
+            r_exp, r_exp_input = r_exp_with_input
+            reward_grad_penalty_batch = reward_grad_penalty_from_input(
+                r_pi, r_pi_input
+            )
+            reward_grad_penalty_expert = reward_grad_penalty_from_input(
+                r_exp, r_exp_input
+            )
+        else:
+            r_pi = self._reward_from_td(batch, batch_role="rollout")  # type: ignore[attr-defined]
+            r_exp = self._reward_from_td(expert_batch, batch_role="expert")  # type: ignore[attr-defined]
+            reward_grad_penalty_batch = torch.zeros((), device=self.device)
+            reward_grad_penalty_expert = torch.zeros((), device=self.device)
+
+        diff = r_pi.mean() - r_exp.mean()
+        l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
+        reward_grad_penalty = reward_grad_penalty_batch + reward_grad_penalty_expert
+        (
+            self._reward_loss_coeff * diff
+            + self._reward_l2_coeff * l2.pow(0.5)
+            + self._reward_grad_penalty_coeff * reward_grad_penalty
+        ).backward()
+
+        metrics["loss_reward_diff"] = diff.detach()
+        metrics["loss_reward_l2"] = l2.detach()
+        metrics["loss_reward_grad_penalty"] = reward_grad_penalty.detach()
+        metrics["loss_reward_grad_penalty_batch"] = reward_grad_penalty_batch.detach()
+        metrics["loss_reward_grad_penalty_expert"] = reward_grad_penalty_expert.detach()
+        return metrics
 
     def _record_env_metrics(self, iteration: PPOIterationData) -> None:
         """Record IsaacLab env metrics while draining the env log queue."""
@@ -1098,7 +1231,7 @@ class IPMD(LatentSkillMixin, PPO):
         return ""
 
     def pre_iteration_compute(self, rollout: TensorDict) -> TensorDict:
-        """ Compute advantages. """
+        """Compute advantages."""
         with torch.no_grad():
             rollout = self.adv_module(rollout)
 
@@ -1117,87 +1250,9 @@ class IPMD(LatentSkillMixin, PPO):
     ) -> tuple[TensorDict, int]:
         """PPO update plus optional BC loss and IPMD reward loss."""
         self.optim.zero_grad(set_to_none=True)
-
-        # 1) PPO loss
-        loss: TensorDict = self.loss_module(batch)
-        extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
-        (
-            loss["loss_critic"]
-            + loss["loss_objective"]
-            + loss["loss_entropy"]
-            + extra_actor_loss
-        ).backward()
-        output_loss = loss.clone().detach_()
-        for key, value in extra_actor_metrics.items():
-            output_loss.set(key, value.detach())
-
-        # 2) Behavior cloning on expert actions.
-        bc_loss = torch.zeros((), device=self.device)
-
-        if self._bc_coeff > 0.0:
-            expert_action = expert_batch["expert_action"]
-            if not isinstance(expert_action, Tensor):
-                msg = (
-                    "BC update requires expert_batch['expert_action'] to be a Tensor."
-                )
-                raise RuntimeError(msg)
-            expert_obs_td = expert_batch.clone(False)
-            if self._latent_key not in expert_obs_td.keys(True):
-                expert_latents = self._expert_latents_from_td(
-                    expert_batch,
-                    detach=True,
-                ).reshape(*expert_batch.batch_size, self._latent_dim)
-                expert_obs_td.set(self._latent_key, expert_latents)
-            expert_obs_td = expert_obs_td.select(*self._policy_obs_keys)
-            dist = self._policy_operator.get_dist(expert_obs_td)
-            log_prob = dist.log_prob(expert_action)
-            log_prob = self._reduce_log_prob(log_prob, expert_action)
-            has_expert_float = has_expert.to(dtype=log_prob.dtype)
-            bc_nll = -log_prob.mean() * has_expert_float
-            bc_loss = bc_nll * self._bc_coeff
-            bc_loss.backward()
-
-        # 3) IPMD reward loss
-        reward_grad_penalty_batch = torch.zeros((), device=self.device)
-        reward_grad_penalty_expert = torch.zeros((), device=self.device)
-        diff = torch.zeros((), device=self.device)
-        l2 = torch.zeros((), device=self.device)
-        reward_grad_penalty = reward_grad_penalty_batch + reward_grad_penalty_expert
-        if self._reward_update_enabled:
-            if self._reward_grad_penalty_coeff > 0.0:
-                r_pi_with_input = self._reward_from_td(
-                    batch,
-                    batch_role="rollout",
-                    requires_grad=True,
-                    return_input=True,
-                )
-                r_exp_with_input = self._reward_from_td(
-                    expert_batch,
-                    batch_role="expert",
-                    requires_grad=True,
-                    return_input=True,
-                )
-                assert isinstance(r_pi_with_input, tuple)
-                assert isinstance(r_exp_with_input, tuple)
-                r_pi, r_pi_input = r_pi_with_input
-                r_exp, r_exp_input = r_exp_with_input
-                reward_grad_penalty_batch = self._reward_grad_penalty_from_input(
-                    r_pi, r_pi_input
-                )
-                reward_grad_penalty_expert = self._reward_grad_penalty_from_input(
-                    r_exp, r_exp_input
-                )
-            else:
-                r_pi = self._reward_from_td(batch, batch_role="rollout")  # type: ignore[attr-defined]
-                r_exp = self._reward_from_td(expert_batch, batch_role="expert")  # type: ignore[attr-defined]
-            diff = r_pi.mean() - r_exp.mean()
-            l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
-            reward_grad_penalty = reward_grad_penalty_batch + reward_grad_penalty_expert
-            (
-                self._reward_loss_coeff * diff
-                + self._reward_l2_coeff * l2.pow(0.5)
-                + self._reward_grad_penalty_coeff * reward_grad_penalty
-            ).backward()
+        output_loss = self._backward_ppo_terms(batch)
+        bc_metrics = self._backward_bc_terms(expert_batch, has_expert)
+        reward_metrics = self._backward_reward_terms(batch, expert_batch)
 
         # Gradient clipping — always call for a fixed graph
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
@@ -1205,14 +1260,10 @@ class IPMD(LatentSkillMixin, PPO):
         self.optim.step()
 
         output_loss.set("alpha", torch.ones((), device=self.device))
-        output_loss.set("loss_reward_diff", diff.detach())
-        output_loss.set("loss_reward_l2", l2.detach())
-        output_loss.set("loss_reward_grad_penalty", reward_grad_penalty.detach())
-
-        if self._bc_coeff > 0.0:
-            output_loss.set("loss_bc", bc_loss.detach())
-            output_loss.set("bc_nll", bc_nll.detach())
-
+        for key, value in reward_metrics.items():
+            output_loss.set(key, value)
+        for key, value in bc_metrics.items():
+            output_loss.set(key, value)
         output_loss.set("grad_norm", grad_norm_tensor.detach())
 
         return output_loss, num_network_updates + 1

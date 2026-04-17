@@ -11,7 +11,7 @@ from tensordict import TensorDict
 from torch import Tensor, nn
 from torch.nn.utils import clip_grad_norm_
 
-from rlopt.agent.imitation.latent_skill import LatentEncoder
+from rlopt.agent.imitation.utils import LatentEncoder
 from rlopt.config_utils import BatchKey, dedupe_keys
 from rlopt.utils import get_activation_class
 

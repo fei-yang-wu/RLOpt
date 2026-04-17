@@ -21,11 +21,18 @@ from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import RandomSampler
 
 from rlopt.agent.ppo import PPO, PPOConfig, PPORLOptConfig
-from rlopt.config_utils import BatchKey, ObsKey, dedupe_keys, flatten_feature_tensor
+from rlopt.config_utils import (
+    BatchKey,
+    ObsKey,
+    dedupe_keys,
+    flatten_action_features_from_td,
+    flatten_obs_features_from_td,
+    obs_key_feature_dim,
+    obs_key_feature_ndim,
+)
 from rlopt.utils import log_info
 
 from .discriminator import Discriminator
-
 
 GailCfgT = TypeVar("GailCfgT", bound="GAILRLOptConfig")
 
@@ -155,10 +162,10 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
 
         self._disc_obs_keys = self._resolve_discriminator_obs_keys(env, self.config)
         self._disc_obs_feature_ndims = {
-            key: self._obs_key_feature_ndim(env, key) for key in self._disc_obs_keys
+            key: obs_key_feature_ndim(env, key) for key in self._disc_obs_keys
         }
         self._disc_obs_dim = sum(
-            self._obs_key_feature_dim(env, key) for key in self._disc_obs_keys
+            obs_key_feature_dim(env, key) for key in self._disc_obs_keys
         )
         self._disc_condition_dim = int(self._discriminator_condition_dim())
         self._disc_obs_total_dim = self._disc_obs_dim + self._disc_condition_dim
@@ -242,27 +249,6 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
             msg = f"Discriminator observation key '{key}' not found in env.observation_spec."
             raise KeyError(msg)
         return resolved
-
-    @staticmethod
-    def _obs_key_feature_shape(env, key: ObsKey) -> tuple[int, ...]:
-        shape = tuple(int(dim) for dim in env.observation_spec[key].shape)
-        batch_prefix = tuple(int(dim) for dim in getattr(env, "batch_size", ()))
-        if (
-            len(batch_prefix) > 0
-            and len(shape) >= len(batch_prefix)
-            and shape[: len(batch_prefix)] == batch_prefix
-        ):
-            return shape[len(batch_prefix) :]
-        return shape
-
-    @classmethod
-    def _obs_key_feature_ndim(cls, env, key: ObsKey) -> int:
-        return len(cls._obs_key_feature_shape(env, key))
-
-    @classmethod
-    def _obs_key_feature_dim(cls, env, key: ObsKey) -> int:
-        shape = cls._obs_key_feature_shape(env, key)
-        return int(np.prod(shape)) if shape else 1
 
     @staticmethod
     def _counter_as_int(value: int | Tensor) -> int:
@@ -479,21 +465,6 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
         )
         self._require_expert_batch_keys(sampled, required_keys)
         return sampled
-
-    def _obs_features_from_td(self, td: TensorDict, *, detach: bool) -> Tensor:
-        parts: list[Tensor] = []
-        for key in self._disc_obs_keys:
-            obs = cast(Tensor, td.get(key))
-            obs = flatten_feature_tensor(obs, self._disc_obs_feature_ndims[key])
-            parts.append(obs.detach() if detach else obs)
-        if len(parts) == 1:
-            return parts[0]
-        return torch.cat(parts, dim=-1)
-
-    def _action_features_from_td(self, td: TensorDict, *, detach: bool) -> Tensor:
-        action = cast(Tensor, td.get("action"))
-        action = flatten_feature_tensor(action, self._action_feature_ndim)
-        return action.detach() if detach else action
 
     def _compose_discriminator_inputs(
         self,
@@ -808,13 +779,21 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
         )
         self._store_discriminator_replay_samples(rollout_flat.reshape(-1))
 
-        policy_obs = self._obs_features_from_td(policy_batch, detach=False).to(
+        policy_obs = flatten_obs_features_from_td(
+            policy_batch,
+            self._disc_obs_keys,
+            self._disc_obs_feature_ndims,
+            next_obs=False,
+            detach=False,
+        ).to(
             self.device
         )
         policy_action: Tensor | None = None
         if self.config.gail.discriminator_use_action:
-            policy_action = self._action_features_from_td(
-                policy_batch, detach=False
+            policy_action = flatten_action_features_from_td(
+                policy_batch,
+                self._action_feature_ndim,
+                detach=False,
             ).to(self.device)
         policy_condition = self._discriminator_condition_from_td(
             policy_batch, detach=False
@@ -832,13 +811,21 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
                 batch_size=self.config.gail.expert_batch_size
             )
 
-            expert_obs = self._obs_features_from_td(expert_td, detach=False).to(
+            expert_obs = flatten_obs_features_from_td(
+                expert_td,
+                self._disc_obs_keys,
+                self._disc_obs_feature_ndims,
+                next_obs=False,
+                detach=False,
+            ).to(
                 self.device
             )
             expert_action: Tensor | None = None
             if self.config.gail.discriminator_use_action:
-                expert_action = self._action_features_from_td(
-                    expert_td, detach=False
+                expert_action = flatten_action_features_from_td(
+                    expert_td,
+                    self._action_feature_ndim,
+                    detach=False,
                 ).to(self.device)
             expert_condition = self._discriminator_condition_from_td(
                 expert_td, detach=False
@@ -960,12 +947,20 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
             return {}
 
         with torch.no_grad():
-            obs = self._obs_features_from_td(data, detach=True).to(self.device)
+            obs = flatten_obs_features_from_td(
+                data,
+                self._disc_obs_keys,
+                self._disc_obs_feature_ndims,
+                next_obs=False,
+                detach=True,
+            ).to(self.device)
             action: Tensor | None = None
             if self.config.gail.discriminator_use_action:
-                action = self._action_features_from_td(data, detach=True).to(
-                    self.device
-                )
+                action = flatten_action_features_from_td(
+                    data,
+                    self._action_feature_ndim,
+                    detach=True,
+                ).to(self.device)
             condition = self._discriminator_condition_from_td(data, detach=True)
             if condition is not None:
                 condition = condition.to(self.device)

@@ -21,10 +21,8 @@ from torchrl.modules import MLP
 
 from rlopt.agent.ase.model import ASEDiscriminatorEncoder
 from rlopt.agent.gail.gail import AMP, AMPRLOptConfig
-from rlopt.agent.imitation.latent_skill import (
-    LatentSkillMixin,
-    generalized_advantage_estimate,
-)
+from rlopt.agent.imitation.latent_commands import LatentCommandController
+from rlopt.agent.imitation.utils import generalized_advantage_estimate
 from rlopt.agent.ppo.ppo import (
     PPO,
     CatInputs,
@@ -88,21 +86,23 @@ class ASERLOptConfig(AMPRLOptConfig):
     ase: ASEConfig = field(default_factory=ASEConfig)
 
 
-class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
+class ASE(AMP[ASERLOptConfig]):
     """ASE built on top of AMP with explicit latent-command observations."""
 
     discriminator: ASEDiscriminatorEncoder | None
 
     def __init__(self, env, config: ASERLOptConfig):
         self.config: ASERLOptConfig = config
-
-        self._init_latent_skills(
-            env,
+        self._latent_command_controller = LatentCommandController(
+            env=env,
             latent_key=cast(ObsKey, self.config.ase.latent_key),
             latent_dim=int(self.config.ase.latent_dim),
             latent_steps_min=int(self.config.ase.latent_steps_min),
             latent_steps_max=int(self.config.ase.latent_steps_max),
+            discover_env_method=self._discover_env_method,
         )
+        self._latent_key = self._latent_command_controller.latent_key
+        self._latent_dim = self._latent_command_controller.latent_dim
 
         self.discriminator_critic: TensorDictModule | None = None
         self.discriminator_critic_optim: torch.optim.Optimizer | None = None
@@ -144,6 +144,19 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             )
             raise ValueError(msg)
         return normalized
+
+    def _sample_unit_latents(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        return self._latent_command_controller.sample_unit_latents(
+            batch_size,
+            device=device,
+            dtype=dtype,
+        )
 
     def _discriminator_condition_dim(self) -> int:
         return self._latent_dim
@@ -220,11 +233,14 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
     def _discriminator_condition_from_td(
         self, td: TensorDict, *, detach: bool
     ) -> Tensor | None:
-        latent = self._latent_condition_from_td(td, detach=detach)
+        latent = self._latent_command_controller.latent_condition_from_td(
+            td,
+            detach=detach,
+        )
         if latent is not None:
             return latent
         if self.discriminator is None:
-            return self._sample_unit_latents(
+            return self._latent_command_controller.sample_unit_latents(
                 td.numel(),
                 device=self.device,
                 dtype=torch.float32,
@@ -725,7 +741,10 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             msg = "ASE diversity loss requires PPO rollout loc/scale keys."
             raise KeyError(msg)
 
-        old_latents = self._latent_condition_from_td(batch, detach=True)
+        old_latents = self._latent_command_controller.latent_condition_from_td(
+            batch,
+            detach=True,
+        )
         if old_latents is None:
             msg = "ASE minibatch is missing latent commands."
             raise RuntimeError(msg)
@@ -741,7 +760,7 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
             raise RuntimeError(msg)
         old_mean_action = self._clip_policy_action(old_mean_action.detach())
 
-        new_latents = self._sample_unit_latents(
+        new_latents = self._latent_command_controller.sample_unit_latents(
             batch.numel(),
             device=self.device,
             dtype=old_latents.dtype,
@@ -865,7 +884,9 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
         iteration: PPOIterationData,
         metadata: PPOTrainingMetadata,  # noqa: ARG002
     ) -> None:
-        self._prepare_latent_rollout_batch_for_training(iteration.rollout)
+        self._latent_command_controller.prepare_rollout_batch_for_training(
+            iteration.rollout
+        )
 
     def iterate(
         self,
@@ -1041,9 +1062,28 @@ class ASE(LatentSkillMixin, AMP[ASERLOptConfig]):
 
             batch_shape = batch_shape or (1,)
             td = TensorDict(td_data, batch_size=list(batch_shape), device=self.device)
-            self._inject_latent_command(td)
+            self._latent_command_controller.inject_random_latent_command(
+                td,
+                device=self.device,
+                dtype=torch.float32,
+            )
             td = policy_op(td)
             return td.get("action")
+
+    @property
+    def collector_policy(self):
+        policy_operator = self.actor_critic.get_policy_operator()
+        return self._latent_command_controller.collector_policy(
+            inject_fn=self._inject_latent_command,
+            policy_module=policy_operator,
+        )
+
+    def _inject_latent_command(self, td: TensorDict) -> None:
+        self._latent_command_controller.inject_random_latent_command(
+            td,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
     def _gail_state_dict(self) -> dict[str, Any]:
         state = super()._gail_state_dict()

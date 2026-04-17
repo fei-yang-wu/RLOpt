@@ -45,6 +45,18 @@ def _apply_obs_input_keys(cfg) -> None:
     cfg.ipmd.diversity_bonus_coeff = 0.0
 
 
+def _apply_nonlatent_obs_input_keys(cfg) -> None:
+    """Configure observation-only IPMD tests that do not exercise latent commands."""
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.diversity_bonus_coeff = 0.0
+
+
 def _make_test_expert_sampler(expert_data: TensorDict):
     """Return a private expert sampler override matching the new agent contract."""
 
@@ -128,7 +140,7 @@ def test_ipmd_prepare_rollout_rewards_ignores_estimator_when_disabled():
         msg = "reward estimator should not run"
         raise AssertionError(msg)
 
-    agent._reward_from_batch = _unexpected_reward_forward
+    agent._reward_from_td = _unexpected_reward_forward
 
     metrics = agent._prepare_rollout_rewards(rollout)
 
@@ -137,17 +149,10 @@ def test_ipmd_prepare_rollout_rewards_ignores_estimator_when_disabled():
     assert "train/est_reward_mean" not in metrics
 
 
-def test_ipmd_disabled_reward_update_does_not_sample_expert_batch():
-    """Pure-PPO IPMD updates should not require expert data."""
+def test_ipmd_disabled_reward_update_disables_expert_minibatch_path():
+    """Pure-PPO IPMD configs should skip the expert minibatch path entirely."""
     agent, _ = _make_env_reward_only_ipmd_agent()
-    agent._expert_batch_sampler = None
-    batch = TensorDict({}, batch_size=[2], device=agent.device)
-
-    expert_batch, has_expert = agent._expert_batch_for_update(batch)
-
-    assert expert_batch.numel() == 2
-    assert len(expert_batch.keys(True)) == 0
-    assert has_expert.item() == 0.0
+    assert agent._expert_minibatch_update_enabled is False
 
 
 def test_ipmd_prepare_rollout_rewards_honors_estimated_reward_gate():
@@ -177,7 +182,7 @@ def test_ipmd_prepare_rollout_rewards_honors_estimated_reward_gate():
     def _fixed_reward_forward(*_args, **_kwargs):
         return torch.full((2, 1), 2.0, device=agent.device)
 
-    agent._reward_from_batch = _fixed_reward_forward
+    agent._reward_from_td = _fixed_reward_forward
 
     metrics = agent._prepare_rollout_rewards(rollout)
 
@@ -204,7 +209,7 @@ def test_ipmd_initialization():
     cfg.loss.mini_batch_size = 2
     cfg.compile.compile = False
     cfg.ipmd.reward_num_cells = (64, 64)
-    _apply_obs_input_keys(cfg)
+    _apply_nonlatent_obs_input_keys(cfg)
     cfg.q_function = rlopt.NetworkConfig(
         num_cells=[64, 64],
         activation_fn="relu",
@@ -235,7 +240,7 @@ def test_ipmd_reward_estimator():
     cfg.loss.mini_batch_size = 2
     cfg.compile.compile = False
     cfg.ipmd.reward_num_cells = (32, 32)
-    _apply_obs_input_keys(cfg)
+    _apply_nonlatent_obs_input_keys(cfg)
 
     env = rlopt.make_parallel_env(cfg)
     agent = rlopt.IPMD(env, cfg, logger=None)
@@ -255,10 +260,62 @@ def test_ipmd_reward_estimator():
     )
 
     # Compute estimated rewards
-    rewards = agent._reward_from_batch(td, batch_role="rollout")
+    rewards = agent._reward_from_td(td, batch_role="rollout")
     assert rewards.shape[0] == batch_size
     assert not torch.isnan(rewards).any()
     assert not torch.isinf(rewards).any()
+
+
+def test_ipmd_reward_input_spec_matches_reward_mode() -> None:
+    """Reward-network shape and required keys should come from one shared spec."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.reward_input_type = "sa"
+    cfg.ipmd.reward_loss_coeff = 0.0
+    cfg.ipmd.reward_l2_coeff = 0.0
+    cfg.ipmd.reward_grad_penalty_coeff = 0.0
+    cfg.ipmd.bc_coef = 0.0
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    assert [block.kind for block in agent._reward_input_blocks] == ["obs", "action"]
+    assert agent._reward_input_dim == obs_dim + act_dim
+    assert agent._reward_required_batch_keys() == ["observation", "action"]
+
+
+def test_ipmd_invalid_command_source_fails_at_agent_construction() -> None:
+    """Invalid post-construction config mutations should fail before training starts."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.compile.compile = False
+    _apply_obs_input_keys(cfg)
+    cfg.ipmd.command_source = "rollout_posterior"
+
+    env = rlopt.make_parallel_env(cfg)
+    with pytest.raises(ValueError, match="command_source"):
+        rlopt.IPMD(env, cfg, logger=None)
 
 
 def test_ipmd_private_expert_sampler_integration():
@@ -274,7 +331,7 @@ def test_ipmd_private_expert_sampler_integration():
     cfg.loss.mini_batch_size = 2
     cfg.compile.compile = False
     cfg.ipmd.expert_batch_size = 4
-    _apply_obs_input_keys(cfg)
+    _apply_nonlatent_obs_input_keys(cfg)
 
     env = rlopt.make_parallel_env(cfg)
     agent = rlopt.IPMD(env, cfg, logger=None)
@@ -303,7 +360,7 @@ def test_ipmd_update_with_expert_data():
     cfg.compile.compile = False
     cfg.ipmd.reward_num_cells = (32, 32)
     cfg.ipmd.expert_batch_size = 4
-    _apply_obs_input_keys(cfg)
+    _apply_nonlatent_obs_input_keys(cfg)
 
     env = rlopt.make_parallel_env(cfg)
     agent = rlopt.IPMD(env, cfg, logger=None)
@@ -364,7 +421,7 @@ def test_ipmd_missing_sampler_raises() -> None:
     cfg.compile.compile = False
     cfg.collector.frames_per_batch = 10
     cfg.collector.total_frames = 100  # Divisible by frames_per_batch
-    _apply_obs_input_keys(cfg)
+    _apply_nonlatent_obs_input_keys(cfg)
 
     env = rlopt.make_parallel_env(cfg)
     agent = rlopt.IPMD(env, cfg, logger=None)
@@ -372,6 +429,60 @@ def test_ipmd_missing_sampler_raises() -> None:
 
     with pytest.raises(RuntimeError, match="sample_expert_batch"):
         agent._next_expert_batch(batch_size=4)
+
+
+def test_ipmd_sampler_size_mismatch_raises() -> None:
+    """Expert sampler must return exactly the requested batch size."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.compile.compile = False
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    _apply_nonlatent_obs_input_keys(cfg)
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+    expert_data = create_synthetic_expert_data(env, num_transitions=8)
+
+    def _sample(_batch_size: int, required_keys):
+        return expert_data.select(*required_keys).clone()
+
+    agent._set_test_expert_batch_sampler(_sample)
+
+    with pytest.raises(RuntimeError, match="exactly the requested batch size"):
+        agent._next_expert_batch(batch_size=4)
+
+
+def test_ipmd_sampler_missing_required_keys_raises() -> None:
+    """Expert sampler should fail fast when required keys are absent."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.compile.compile = False
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    _apply_nonlatent_obs_input_keys(cfg)
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    expert_data = TensorDict(
+        {"observation": torch.randn(4, obs_dim)},
+        batch_size=[4],
+    )
+
+    def _sample(_batch_size: int, required_keys):
+        return expert_data.select(*(key for key in required_keys if key in expert_data.keys(True))).clone()
+
+    agent._set_test_expert_batch_sampler(_sample)
+
+    with pytest.raises(RuntimeError, match="missing required keys"):
+        agent._next_expert_batch(batch_size=4, required_keys=["action"])
 
 
 def test_ipmd_posterior_keys_default_to_reward_inputs() -> None:

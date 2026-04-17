@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import Any, TypeAlias, cast
 
+import numpy as np
+import torch
 import yaml
-
-if TYPE_CHECKING:
-    import numpy as np
-    from tensordict import TensorDict
-    from torch import Tensor
+from tensordict import TensorDict
+from torch import Tensor
 
 ObsKey: TypeAlias = str | tuple[str, ...]
 BatchKey: TypeAlias = str | tuple[str, ...]
@@ -259,11 +259,88 @@ def flatten_feature_tensor(tensor: Tensor, feature_ndim: int) -> Tensor:
     return tensor.flatten(start_dim=tensor.ndim - feature_ndim)
 
 
+def obs_key_feature_shape(env: Any, key: ObsKey) -> tuple[int, ...]:
+    """Return the unbatched feature shape registered for one observation key."""
+    shape = tuple(int(dim) for dim in env.observation_spec[key].shape)
+    batch_prefix = tuple(int(dim) for dim in getattr(env, "batch_size", ()))
+    if batch_prefix and shape[: len(batch_prefix)] == batch_prefix:
+        return shape[len(batch_prefix) :]
+    return shape
+
+
+def obs_key_feature_ndim(env: Any, key: ObsKey) -> int:
+    """Return how many trailing dims belong to one observation sample."""
+    return len(obs_key_feature_shape(env, key))
+
+
+def obs_key_feature_dim(env: Any, key: ObsKey) -> int:
+    """Return the flattened feature size for one observation sample."""
+    shape = obs_key_feature_shape(env, key)
+    return int(math.prod(shape)) if shape else 1
+
+
+def flatten_obs_features_from_td(
+    td: TensorDict,
+    keys: Sequence[ObsKey],
+    key_feature_ndims: Mapping[ObsKey, int],
+    *,
+    next_obs: bool,
+    detach: bool,
+) -> Tensor:
+    """Materialize flattened observation features for one or more keys."""
+    if len(keys) == 0:
+        raise ValueError("Observation feature extraction requires at least one key.")
+
+    parts: list[Tensor] = []
+    for key in keys:
+        obs_key = next_obs_key(key) if next_obs else key
+        obs = cast(Tensor, td.get(cast(BatchKey, obs_key)))
+        obs = flatten_feature_tensor(obs, int(key_feature_ndims[key]))
+        parts.append(obs.detach() if detach else obs)
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
+
+def flatten_action_features_from_td(
+    td: TensorDict,
+    action_feature_ndim: int,
+    *,
+    detach: bool,
+) -> Tensor:
+    """Materialize flattened action features from a batch."""
+    action = cast(Tensor, td.get("action"))
+    action = flatten_feature_tensor(action, action_feature_ndim)
+    return action.detach() if detach else action
+
+
 def infer_batch_shape(tensor: Tensor, feature_ndim: int) -> tuple[int, ...]:
     """Infer batch shape for a tensor with known feature rank."""
     if feature_ndim <= 0:
         return tuple(int(dim) for dim in tensor.shape)
     return tuple(int(dim) for dim in tensor.shape[:-feature_ndim])
+
+
+def infer_batch_shape_from_mapping(
+    values: Mapping[BatchKey, Tensor],
+    key_feature_ndims: Mapping[ObsKey, int],
+) -> tuple[int, ...]:
+    """Infer the common batch shape for a dict of observation tensors."""
+
+    batch_shape: tuple[int, ...] | None = None
+    for key, value in values.items():
+        feature_ndim = int(key_feature_ndims[cast(ObsKey, key)])
+        current_batch_shape = tuple(
+            value.shape[:-feature_ndim] if feature_ndim > 0 else value.shape
+        )
+        if batch_shape is None:
+            batch_shape = current_batch_shape
+            continue
+        if current_batch_shape != batch_shape:
+            msg = (
+                "Observation batch shape mismatch: "
+                f"{batch_shape} vs {current_batch_shape}."
+            )
+            raise ValueError(msg)
+    return batch_shape or (1,)
 
 
 def flatten_obs_group(td: TensorDict) -> TensorDict:
@@ -283,8 +360,6 @@ def flatten_obs_group(td: TensorDict) -> TensorDict:
 
 def epic_distance(r_est: Tensor, r_true: Tensor) -> tuple[Tensor, Tensor]:
     """Compute EPIC-style distance between estimated and true rewards."""
-    import torch
-
     r_est = r_est.detach().float().flatten()
     r_true = r_true.detach().float().flatten()
     est_c = r_est - r_est.mean()
