@@ -227,6 +227,33 @@ def test_ipmd_initialization():
     assert hasattr(agent, "loss_module")
 
 
+def test_ipmd_latent_mode_owns_controller_without_mixin_inheritance():
+    """Latent-enabled IPMD should own a controller instead of inheriting behavior."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.collector.init_random_frames = 0
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    _apply_obs_input_keys(cfg)
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    from rlopt.agent.imitation.latent_commands import (
+        LatentCommandController,
+        LatentCommandMixin,
+    )
+
+    assert isinstance(agent._latent_command_controller, LatentCommandController)
+    assert not isinstance(agent, LatentCommandMixin)
+
+
 def test_ipmd_reward_estimator():
     """Test IPMD reward estimator network."""
     rlopt = _rlopt()

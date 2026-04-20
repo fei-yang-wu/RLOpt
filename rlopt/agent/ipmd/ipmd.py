@@ -371,7 +371,6 @@ class IPMD(PPO):
         self._use_latent_command = bool(self.config.ipmd.use_latent_command)
         self._latent_key = self.config.ipmd.latent_key
         self._latent_dim = int(self.config.ipmd.latent_dim)
-        self._collector_policy_wrapper = None
         self._latent_command_controller: LatentCommandController | None = None
         self._command_source = self._normalize_command_source(
             self.config.ipmd.command_source
@@ -550,14 +549,24 @@ class IPMD(PPO):
         self._policy_operator = self.actor_critic.get_policy_operator()
         self._bc_debug_anomaly_prints = 0
 
+    def _require_latent_command_controller(self) -> LatentCommandController:
+        controller = self._latent_command_controller
+        if controller is None:
+            msg = (
+                "IPMD latent-command controller is unavailable. "
+                "Construct the agent with ipmd.use_latent_command=True."
+            )
+            raise RuntimeError(msg)
+        return controller
+
     @property
     def collector_policy(self):
         """Return the collector policy, optionally stamping latent commands."""
         policy_operator = self.actor_critic.get_policy_operator()
         if not self._use_latent_command:
             return policy_operator
-        assert self._latent_command_controller is not None
-        return self._latent_command_controller.collector_policy(
+        controller = self._require_latent_command_controller()
+        return controller.collector_policy(
             inject_fn=self._inject_latent_command,
             policy_module=policy_operator,
         )
@@ -566,9 +575,9 @@ class IPMD(PPO):
         self,
         td: TensorDict,
     ) -> None:
-        assert self._latent_command_controller is not None
+        controller = self._require_latent_command_controller()
         if self._command_source == "random":
-            self._latent_command_controller.inject_random_latent_command(
+            controller.inject_random_latent_command(
                 td,
                 device=self.device,
                 dtype=torch.float32,
@@ -596,7 +605,7 @@ class IPMD(PPO):
             latents.reshape(*td.batch_size, self._latent_dim),
         )
         published_latents = latents.reshape(-1, self._latent_dim)
-        self._latent_command_controller.publish_latents_to_env(published_latents)
+        controller.publish_latents_to_env(published_latents)
 
     def _expert_latents_from_td(
         self,
@@ -776,11 +785,9 @@ class IPMD(PPO):
                 )
             elif block.kind == "latent":
                 if batch_role == "rollout":
-                    assert self._latent_command_controller is not None
-                    rollout_latent = (
-                        self._latent_command_controller.latent_condition_from_td(
-                            td, detach=True
-                        )
+                    controller = self._require_latent_command_controller()
+                    rollout_latent = controller.latent_condition_from_td(
+                        td, detach=True
                     )
                     assert rollout_latent is not None
                     parts.append(rollout_latent.to(self.device))
@@ -1042,9 +1049,7 @@ class IPMD(PPO):
             assert isinstance(r_exp_with_input, tuple)
             r_pi, r_pi_input = r_pi_with_input
             r_exp, r_exp_input = r_exp_with_input
-            reward_grad_penalty_batch = reward_grad_penalty_from_input(
-                r_pi, r_pi_input
-            )
+            reward_grad_penalty_batch = reward_grad_penalty_from_input(r_pi, r_pi_input)
             reward_grad_penalty_expert = reward_grad_penalty_from_input(
                 r_exp, r_exp_input
             )
