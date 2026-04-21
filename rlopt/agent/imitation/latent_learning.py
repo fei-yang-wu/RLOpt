@@ -277,8 +277,20 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
                 activation=cfg.decoder_activation,
             ).to(self.agent.device)
         if self.optimizer is None:
-            params = list(self.encoder.parameters()) + list(self.decoder.parameters())
+            if bool(cfg.freeze_encoder):
+                params = list(self.decoder.parameters())
+            else:
+                params = list(self.encoder.parameters()) + list(
+                    self.decoder.parameters()
+                )
             self.optimizer = torch.optim.Adam(params, lr=float(cfg.lr))
+
+    def joint_parameters(self) -> list[nn.Parameter]:
+        assert self.agent is not None
+        cfg = self._config()
+        if not bool(cfg.train_posterior_through_policy) or self.encoder is None:
+            return []
+        return list(self.encoder.parameters())
 
     def infer_batch_latents(
         self,
@@ -387,7 +399,13 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         assert self.decoder is not None
         assert self.optimizer is not None
 
-        latent_pred = self.encoder(patch_features)
+        freeze_encoder = bool(cfg.freeze_encoder)
+        if freeze_encoder:
+            with torch.no_grad():
+                latent_pred = self.encoder(patch_features)
+            latent_pred = latent_pred.detach()
+        else:
+            latent_pred = self.encoder(patch_features)
         patch_recon = self.decoder(latent_pred)
         recon_error = patch_recon - patch_features
         recon_loss = F.mse_loss(patch_recon, patch_features)
@@ -396,10 +414,13 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
 
         weight_decay = torch.zeros((), device=self.agent.device)
         if float(cfg.weight_decay_coeff) > 0.0:
-            params = list(self.encoder.parameters()) + list(self.decoder.parameters())
-            for param in params:
-                if param.ndim >= 2:
-                    weight_decay = weight_decay + param.pow(2).mean()
+            wd_modules: list[nn.Module] = [self.decoder]
+            if not freeze_encoder:
+                wd_modules.append(self.encoder)
+            for module in wd_modules:
+                for param in module.parameters():
+                    if param.ndim >= 2:
+                        weight_decay = weight_decay + param.pow(2).mean()
 
         total_loss = (
             float(cfg.recon_coeff) * recon_loss
@@ -409,10 +430,10 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         if float(cfg.grad_clip_norm) > 0.0:
-            clip_grad_norm_(
-                list(self.encoder.parameters()) + list(self.decoder.parameters()),
-                float(cfg.grad_clip_norm),
-            )
+            clip_params = list(self.decoder.parameters())
+            if not freeze_encoder:
+                clip_params = list(self.encoder.parameters()) + clip_params
+            clip_grad_norm_(clip_params, float(cfg.grad_clip_norm))
         self.optimizer.step()
 
         return {

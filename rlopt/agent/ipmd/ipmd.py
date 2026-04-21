@@ -107,6 +107,18 @@ class IPMDLatentLearningConfig:
     weight_decay_coeff: float = 0.0
     """Weight decay coefficient for the latent learner parameters. """
 
+    train_posterior_through_policy: bool = False
+    """If True, recompute the latent via the encoder during the PPO policy loss so that
+    policy-improvement gradients update the posterior encoder. Encoder parameters are added
+    to the main PPO optimizer. Combining this with recon_coeff > 0 updates the encoder from
+    both PPO and reconstruction simultaneously."""
+
+    freeze_encoder: bool = False
+    """If True, the reconstruction update steps only the decoder. The encoder forward in the
+    reconstruction loss is detached and its parameters are excluded from the reconstruction
+    optimizer. Use for decoder-only diagnostics (probe whether a fixed encoder preserves the
+    information in posterior_input_keys)."""
+
     kl_coeff: float = 0.0
     """KL regularization penalty. """
 
@@ -669,10 +681,24 @@ class IPMD(PPO):
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
         """Create optimizers for PPO and the reward estimator."""
+        joint_params: list[torch.nn.Parameter] = []
+        if (
+            self._use_latent_command
+            and self._latent_learner is not None
+            and bool(self.config.ipmd.latent_learning.train_posterior_through_policy)
+        ):
+            joint_params = list(self._latent_learner.joint_parameters())
+
         if not hasattr(self, "reward_estimator"):
-            return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
-        all_params = list(self.actor_critic.parameters()) + list(
-            self.reward_estimator.parameters()
+            if not joint_params:
+                return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
+            all_params = list(self.actor_critic.parameters()) + joint_params
+            return [optimizer_cls(all_params, **optimizer_kwargs)]
+
+        all_params = (
+            list(self.actor_critic.parameters())
+            + list(self.reward_estimator.parameters())
+            + joint_params
         )
         return [optimizer_cls(all_params, **optimizer_kwargs)]
 
@@ -970,6 +996,21 @@ class IPMD(PPO):
 
     def _backward_ppo_terms(self, batch: TensorDict) -> TensorDict:
         """Backpropagate the PPO objective and return detached update metrics."""
+        if (
+            self._use_latent_command
+            and self._latent_learner is not None
+            and bool(self.config.ipmd.latent_learning.train_posterior_through_policy)
+        ):
+            latents = self._latent_learner.infer_batch_latents(
+                batch,
+                detach=False,
+                context="ppo posterior latent",
+            )
+            if latents is not None:
+                batch.set(
+                    self._latent_key,
+                    latents.reshape(*batch.batch_size, self._latent_dim),
+                )
         loss: TensorDict = self.loss_module(batch)
         extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
         (
