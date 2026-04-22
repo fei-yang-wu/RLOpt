@@ -51,7 +51,7 @@ from rlopt.base_class import (
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import as_float, get_activation_class, log_info
+from rlopt.utils import get_activation_class, log_info
 
 PpoCfgT = TypeVar("PpoCfgT", bound="PPORLOptConfig")
 
@@ -794,7 +794,16 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
         """Predict action given observation."""
-        obs = torch.as_tensor([obs], device=self.device)
++        obs = torch.as_tensor(obs, device=self.device)
++        input_keys = list(
++            getattr(self, "total_input_keys", self.config.policy.get_input_keys())
++        )
++        input_key = input_keys[0]
++        feature_shape = self.observation_feature_shape(input_key)
++        if tuple(obs.shape) == feature_shape:
++            obs = obs.unsqueeze(0)
++        batch_ndim = max(obs.ndim - len(feature_shape), 0)
++        batch_size = list(obs.shape[:batch_ndim])
         policy_op = self.actor_critic.get_policy_operator()
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
