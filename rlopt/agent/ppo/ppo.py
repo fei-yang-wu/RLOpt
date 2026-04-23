@@ -535,6 +535,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             progress_bar_enabled=progress_bar_enabled,
             log_interval_frames=log_interval_frames,
             next_log_frame=log_interval_frames,
+            next_file_log_frame=log_interval_frames,
             frames_processed=0,
             updates_completed=torch.zeros((), dtype=torch.int64, device=self.device),
             minibatches_per_epoch=num_mini_batches,
@@ -751,6 +752,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 step=metadata.frames_processed,
                 log_python=False,
             )
+        self._log_iteration_file_summary(metadata, iteration)
         self.collector.update_policy_weights_()
         self._refresh_progress_display(metadata, iteration)
 
@@ -763,7 +765,9 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             custom_save = getattr(self, "save", None)
             if callable(custom_save):
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                custom_save(checkpoint_dir / f"model_step_{metadata.frames_processed}.pt")
+                custom_save(
+                    checkpoint_dir / f"model_step_{metadata.frames_processed}.pt"
+                )
             else:
                 self.save_model(
                     path=checkpoint_dir,
@@ -794,22 +798,22 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
         """Predict action given observation."""
-+        obs = torch.as_tensor(obs, device=self.device)
-+        input_keys = list(
-+            getattr(self, "total_input_keys", self.config.policy.get_input_keys())
-+        )
-+        input_key = input_keys[0]
-+        feature_shape = self.observation_feature_shape(input_key)
-+        if tuple(obs.shape) == feature_shape:
-+            obs = obs.unsqueeze(0)
-+        batch_ndim = max(obs.ndim - len(feature_shape), 0)
-+        batch_size = list(obs.shape[:batch_ndim])
+        obs = torch.as_tensor(obs, device=self.device)
+        input_keys = list(
+            getattr(self, "total_input_keys", self.config.policy.get_input_keys())
+        )
+        input_key = input_keys[0]
+        feature_shape = self.observation_feature_shape(input_key)
+        if tuple(obs.shape) == feature_shape:
+            obs = obs.unsqueeze(0)
+        batch_ndim = max(obs.ndim - len(feature_shape), 0)
+        batch_size = list(obs.shape[:batch_ndim])
         policy_op = self.actor_critic.get_policy_operator()
         policy_op.eval()
         with torch.no_grad(), set_exploration_type(InteractionType.DETERMINISTIC):
             td = TensorDict(
                 dict.fromkeys(self.total_input_keys, obs),
-                batch_size=[1],
+                batch_size=batch_size,
                 device=self.device,
             )
             td = policy_op(td)

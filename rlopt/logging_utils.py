@@ -27,6 +27,7 @@ __all__ = [
     "ROOT_LOGGER_NAME",
     "LoggingManager",
     "MetricReporter",
+    "log_to_file_only",
     "resolve_log_level",
 ]
 
@@ -143,6 +144,31 @@ def _format_metric_for_console(value: float | int) -> str:
     """Render scalar metrics for console logs with 3 significant digits."""
 
     return f"{float(value):.3g}"
+
+
+def log_to_file_only(logger: PyLogger, level: int, message: str) -> None:
+    """Emit one log record only through RLOpt's file handler."""
+
+    record = logger.makeRecord(
+        logger.name,
+        level,
+        fn="",
+        lno=0,
+        msg=message,
+        args=(),
+        exc_info=None,
+    )
+    current: PyLogger | None = logger
+    while current is not None:
+        for handler in current.handlers:
+            if handler.get_name() != _FILE_HANDLER_NAME:
+                continue
+            if record.levelno >= handler.level:
+                handler.handle(record)
+        if not current.propagate:
+            break
+        parent = current.parent
+        current = parent if isinstance(parent, logging.Logger) else None
 
 
 def _slugify(value: Any, fallback: str) -> str:
@@ -313,8 +339,7 @@ class MetricReporter:
 
         if log_python and self._python_logger is not None:
             message = " | ".join(
-                f"{k}={_format_metric_for_console(v)}"
-                for k, v in sanitized.items()
+                f"{k}={_format_metric_for_console(v)}" for k, v in sanitized.items()
             )
             if message:
                 if step is not None:

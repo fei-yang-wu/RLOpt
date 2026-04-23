@@ -1138,6 +1138,21 @@ class IPMD(PPO):
             ("time/speed", "fps"),
         )
 
+    def _file_summary_fields(self) -> tuple[tuple[str, str], ...]:
+        return (
+            *super()._file_summary_fields(),
+            ("train/env_reward_mean", "env_r"),
+            ("train/estimated_reward_mean", "est_r"),
+            ("train/expert_reward_mean", "exp_r"),
+            ("train/expert_reward_std", "exp_r_std"),
+            ("train/loss_reward_l2", "reward_l2"),
+            ("train/loss_reward_grad_penalty", "reward_gp"),
+            ("train/loss_bc", "bc_loss"),
+            ("train/bc_policy_action_mae", "bc_act_mae"),
+            ("train/latent_posterior_recon_mae", "latent_recon_mae"),
+            ("train/latent_posterior_recon_max_abs", "latent_recon_max"),
+        )
+
     def record(
         self,
         iteration: PPOIterationData,
@@ -1187,6 +1202,7 @@ class IPMD(PPO):
             step=metadata.frames_processed,
             log_python=False,
         )
+        self._log_iteration_file_summary(metadata, iteration)
         self.collector.update_policy_weights_()
         self._refresh_progress_display(metadata, iteration)
 

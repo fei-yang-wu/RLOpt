@@ -33,10 +33,14 @@ from rlopt.config_base import (
     RLOptConfig,
 )
 from rlopt.config_utils import ObsKey
-from rlopt.logging_utils import ROOT_LOGGER_NAME, LoggingManager, MetricReporter
+from rlopt.logging_utils import (
+    ROOT_LOGGER_NAME,
+    LoggingManager,
+    MetricReporter,
+    log_to_file_only,
+)
 from rlopt.type_aliases import OptimizerClass, SchedulerClass
 from rlopt.utils import as_float
-
 
 CfgT = TypeVar("CfgT", bound=RLOptConfig)
 
@@ -62,6 +66,10 @@ class TrainingMetadata:
     log_interval_frames: int = 1000
     # Absolute frame count threshold for the next periodic text log.
     next_log_frame: int = 1000
+    # Absolute frame count threshold for the next periodic file-only summary.
+    next_file_log_frame: int = 1000
+    # Number of table rows already emitted to the file-only summary.
+    file_summary_rows: int = 0
 
 
 @dataclass(kw_only=True)
@@ -137,6 +145,8 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         >>> algorithm.train()
         >>> algorithm.save_model("checkpoints/model.pt")
     """
+
+    _FILE_SUMMARY_HEADER_INTERVAL = 20
 
     def __init__(
         self,
@@ -1300,6 +1310,118 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             or (iteration.iteration_idx + 1) == metadata.total_iterations
         )
 
+    def _should_log_iteration_to_file(
+        self, metadata: TrainingMetadata, iteration: IterationData
+    ) -> bool:
+        """Return whether this iteration should emit an rlopt.log summary."""
+        return (
+            metadata.frames_processed >= metadata.next_file_log_frame
+            or (iteration.iteration_idx + 1) == metadata.total_iterations
+        )
+
+    def _file_summary_fields(self) -> tuple[tuple[str, str], ...]:
+        """Return scalar metrics persisted in compact periodic file summaries."""
+        return (
+            *self._progress_summary_fields(),
+            ("train/step_reward_std", "r_step_std"),
+            ("train/step_reward_min", "r_step_min"),
+            ("train/step_reward_max", "r_step_max"),
+            ("train/loss_critic", "v_loss"),
+            ("train/loss_entropy", "entropy_loss"),
+            ("train/entropy", "entropy"),
+            ("train/explained_variance", "ev"),
+            ("train/grad_norm", "grad_norm"),
+            ("train/lr", "lr"),
+            ("train/clip_epsilon", "clip"),
+        )
+
+    def _format_iteration_summary(
+        self,
+        metadata: TrainingMetadata,
+        iteration: IterationData,
+        fields: tuple[tuple[str, str], ...],
+    ) -> str:
+        status_parts = [
+            f"iter={iteration.iteration_idx + 1}/{metadata.total_iterations}",
+            f"frames={metadata.frames_processed}/{self.config.collector.total_frames}",
+        ]
+        seen_aliases = set[str]()
+        for metric_key, alias in fields:
+            if alias in seen_aliases:
+                continue
+            seen_aliases.add(alias)
+            metric_value = as_float(iteration.metrics.get(metric_key))
+            if metric_value is not None:
+                status_parts.append(f"{alias}={metric_value:.4f}")
+        return " | ".join(status_parts)
+
+    @staticmethod
+    def _format_summary_count(value: int) -> str:
+        abs_value = abs(value)
+        if abs_value >= 1_000_000_000:
+            return f"{value / 1_000_000_000:.3f}B"
+        if abs_value >= 1_000_000:
+            return f"{value / 1_000_000:.3f}M"
+        if abs_value >= 1_000:
+            return f"{value / 1_000:.3f}K"
+        return str(value)
+
+    def _format_iteration_table_summary(
+        self,
+        metadata: TrainingMetadata,
+        iteration: IterationData,
+        fields: tuple[tuple[str, str], ...],
+    ) -> tuple[str, str]:
+        columns = [
+            (
+                "iter",
+                f"{iteration.iteration_idx + 1}/{metadata.total_iterations}",
+                12,
+            ),
+            (
+                "frames",
+                (
+                    f"{self._format_summary_count(metadata.frames_processed)}/"
+                    f"{self._format_summary_count(self.config.collector.total_frames)}"
+                ),
+                17,
+            ),
+        ]
+        seen_aliases = set[str]()
+        for metric_key, alias in fields:
+            if alias in seen_aliases:
+                continue
+            seen_aliases.add(alias)
+            metric_value = as_float(iteration.metrics.get(metric_key))
+            if metric_value is not None:
+                columns.append((alias, f"{metric_value:.4f}", max(10, len(alias))))
+
+        header = " ".join(f"{label:>{width}}" for label, _, width in columns)
+        row = " ".join(f"{value:>{width}}" for _, value, width in columns)
+        return header, row
+
+    def _log_iteration_file_summary(
+        self, metadata: TrainingMetadata, iteration: IterationData
+    ) -> None:
+        """Write compact periodic summaries to rlopt.log without touching tqdm."""
+        if not metadata.progress_bar_enabled:
+            return
+        if not self._should_log_iteration_to_file(metadata, iteration):
+            return
+
+        header, row = self._format_iteration_table_summary(
+            metadata,
+            iteration,
+            self._file_summary_fields(),
+        )
+        if metadata.file_summary_rows % self._FILE_SUMMARY_HEADER_INTERVAL == 0:
+            log_to_file_only(self.log, logging.INFO, header)
+        log_to_file_only(self.log, logging.INFO, row)
+        metadata.file_summary_rows += 1
+
+        while metadata.frames_processed >= metadata.next_file_log_frame:
+            metadata.next_file_log_frame += metadata.log_interval_frames
+
     def _refresh_progress_display(
         self, metadata: TrainingMetadata, iteration: IterationData
     ) -> None:
@@ -1307,15 +1429,13 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         if not self._should_log_iteration(metadata, iteration):
             return
 
-        status_parts = [
-            f"iter={iteration.iteration_idx + 1}/{metadata.total_iterations}",
-            f"frames={metadata.frames_processed}/{self.config.collector.total_frames}",
-        ]
-        for metric_key, alias in self._progress_summary_fields():
-            metric_value = as_float(iteration.metrics.get(metric_key))
-            if metric_value is not None:
-                status_parts.append(f"{alias}={metric_value:.4f}")
-        self.log.info(" | ".join(status_parts))
+        self.log.info(
+            self._format_iteration_summary(
+                metadata,
+                iteration,
+                self._progress_summary_fields(),
+            )
+        )
 
         while metadata.frames_processed >= metadata.next_log_frame:
             metadata.next_log_frame += metadata.log_interval_frames
