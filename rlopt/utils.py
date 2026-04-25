@@ -600,7 +600,7 @@ def gaussian_log_prob(
     return -0.5 * (
         ((action - loc) / scale).pow(2)
         + 2.0 * scale.log()
-        + matorch.log(2.0 * matorch.pi)
+        + math.log(2.0 * math.pi)
     ).sum(dim=-1)
 
 

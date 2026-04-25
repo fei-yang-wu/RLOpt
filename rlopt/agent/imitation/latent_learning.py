@@ -337,8 +337,8 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         *,
         detach: bool,
     ) -> Tensor:
-        """Sample latent from the posterior distribution z \sim p(\cdot|s').
-            Patch here means a windows of expert transitions that centered at the current timestep.
+        r"""Sample latent from the posterior distribution z \sim p(\cdot|s').
+        Patch here means a window of expert transitions centered at the current timestep.
 
         Args:
             expert_batch (TensorDict): Batch of expert transitions containing the required observation keys for posterior inference.

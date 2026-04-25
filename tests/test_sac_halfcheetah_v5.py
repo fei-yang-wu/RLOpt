@@ -7,6 +7,8 @@ from rlopt.config_base import NetworkConfig
 from rlopt.env_utils import make_parallel_env
 
 
+@pytest.mark.slow
+@pytest.mark.mujoco("HalfCheetah-v5")
 def test_sac_train_halfcheetah_v5_smoke():
     """Smoke test: construct SAC on HalfCheetah-v5 and run a tiny training loop.
 

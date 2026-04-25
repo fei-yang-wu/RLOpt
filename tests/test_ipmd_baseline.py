@@ -10,6 +10,8 @@ import pytest
 from rlopt.agent import IPMD, PPO, IPMDRLOptConfig, PPORLOptConfig
 from rlopt.env_utils import make_parallel_env
 
+pytestmark = pytest.mark.slow
+
 
 def _apply_obs_input_keys_to_ppo(cfg: PPORLOptConfig) -> None:
     cfg.policy.input_keys = ["observation"]

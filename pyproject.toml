@@ -70,6 +70,8 @@ addopts = [
 xfail_strict = true
 filterwarnings = [
     "error",
+    "ignore:Creating .* which inherits from WeightUpdaterBase is deprecated.*:DeprecationWarning",
+    "ignore:`torch.jit.script_method` is deprecated.*:DeprecationWarning",
     "ignore:(ast.Str|Attribute s|ast.NameConstant|ast.Num) is deprecated:DeprecationWarning:_pytest",
 ]
 testpaths = ["tests"]
