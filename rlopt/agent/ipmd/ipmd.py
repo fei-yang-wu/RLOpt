@@ -4,6 +4,7 @@ import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -26,11 +27,13 @@ from rlopt.agent.imitation.latent_learning import (
 from rlopt.agent.ipmd.utils import (
     IPMD_COMMAND_SOURCES,
     IPMD_REWARD_INPUT_TYPES,
+    IPMD_REWARD_MODEL_TYPES,
     IPMD_REWARD_OUTPUT_ACTIVATIONS,
     RewardInputBlock,
     build_reward_input_blocks,
     normalize_ipmd_command_source,
     normalize_ipmd_reward_input_type,
+    normalize_ipmd_reward_model_type,
     normalize_ipmd_reward_output_activation,
     require_non_negative,
     require_positive_int,
@@ -176,6 +179,14 @@ class IPMDConfig(PPOConfig):
     """Temperature for the latent uniformity loss."""
 
     # Reward estimator network and loss settings
+    reward_model_type: str = "mlp"
+    """Reward estimator parameterization.
+
+    Supported values:
+    - ``"mlp"``     - one monolithic MLP over ``reward_input_type`` features
+    - ``"grouped"`` - one small MLP per reward-state head, sharing goal context
+    """
+
     reward_input_type: str = "sas"
     """Input type for the reward estimator.
 
@@ -190,12 +201,31 @@ class IPMDConfig(PPOConfig):
     """Observation keys used for reward state inputs.
 
     If ``None`` (default), falls back to ``value_function.get_input_keys()``
-    (then ``policy.get_input_keys()``).  Set this to let the reward model
+    (then ``policy.get_input_keys()``). Set this to let the reward model
     consume a different subset of observation keys than policy / value.
     """
 
     reward_num_cells: tuple[int, ...] = (256, 256)
     """Hidden layer sizes for the reward estimator MLP."""
+
+    reward_group_num_cells: tuple[int, ...] = (128, 128)
+    """Hidden layer sizes for each grouped reward head."""
+
+    reward_group_context_keys: list[ObsKey] | None = None
+    """Shared observation keys concatenated into every grouped reward head.
+
+    If ``None``, grouped mode looks for a reward input key whose final component
+    is ``"reference_command"``.
+    """
+
+    reward_group_head_keys: list[ObsKey] | None = None
+    """Observation keys that receive separate grouped reward heads.
+
+    If ``None``, grouped mode uses all reward input keys except the context keys.
+    """
+
+    reward_group_head_weights: list[float] | None = None
+    """Optional scalar weights used when summing grouped reward heads."""
 
     reward_activation: str = "elu"
     """Activation for reward estimator MLP."""
@@ -226,6 +256,27 @@ class IPMDConfig(PPOConfig):
 
     reward_detach_features: bool = True
     """Detach features when computing reward loss (avoid leaking grads)."""
+
+    reward_lr: float | None = None
+    """Learning rate for the reward estimator optimizer.
+
+    If ``None``, reuses ``optim.lr``.
+    """
+
+    reward_updates_per_policy_update: int = 1
+    """Number of reward-estimator updates to run when a reward step is due."""
+
+    reward_update_interval: int = 1
+    """Run reward-estimator updates every N policy updates."""
+
+    reward_update_warmup_updates: int = 0
+    """Number of policy updates to complete before reward updates begin."""
+
+    reward_logit_reg_coeff: float = 0.0
+    """L2 penalty coefficient on reward logits before output activation."""
+
+    reward_param_weight_decay_coeff: float = 0.0
+    """Explicit L2 penalty coefficient on reward-estimator parameters."""
 
     use_estimated_rewards_for_ppo: bool = False
     """Whether to use estimated rewards instead of environment rewards for PPO (GAE + value target).
@@ -273,6 +324,9 @@ class IPMDConfig(PPOConfig):
 
     def validate(self) -> None:
         self.command_source = normalize_ipmd_command_source(self.command_source)
+        self.reward_model_type = normalize_ipmd_reward_model_type(
+            self.reward_model_type
+        )
         self.reward_input_type = normalize_ipmd_reward_input_type(
             self.reward_input_type
         )
@@ -306,6 +360,45 @@ class IPMDConfig(PPOConfig):
                 f"{self.reward_num_cells!r}."
             )
             raise ValueError(msg)
+        if any(int(width) <= 0 for width in self.reward_group_num_cells):
+            msg = (
+                "ipmd.reward_group_num_cells must contain only positive widths, got "
+                f"{self.reward_group_num_cells!r}."
+            )
+            raise ValueError(msg)
+        if self.reward_model_type == "grouped" and self.reward_input_type != "s":
+            msg = (
+                "ipmd.reward_model_type='grouped' requires "
+                "ipmd.reward_input_type='s' because grouped heads consume current "
+                "reward-state observation slices."
+            )
+            raise ValueError(msg)
+        if (
+            self.reward_group_context_keys is not None
+            and len(self.reward_group_context_keys) == 0
+        ):
+            msg = "ipmd.reward_group_context_keys cannot be empty when configured."
+            raise ValueError(msg)
+        if (
+            self.reward_group_head_keys is not None
+            and len(self.reward_group_head_keys) == 0
+        ):
+            msg = "ipmd.reward_group_head_keys cannot be empty when configured."
+            raise ValueError(msg)
+        if self.reward_group_head_weights is not None:
+            normalized_weights: list[float] = []
+            for weight in self.reward_group_head_weights:
+                normalized_weight = require_non_negative(
+                    "ipmd.reward_group_head_weights", weight
+                )
+                if not math.isfinite(normalized_weight):
+                    msg = (
+                        "ipmd.reward_group_head_weights must be finite, got "
+                        f"{weight!r}."
+                    )
+                    raise ValueError(msg)
+                normalized_weights.append(normalized_weight)
+            self.reward_group_head_weights = normalized_weights
         if (
             self.reward_output_activation != "none"
             and float(self.reward_output_scale) <= 0.0
@@ -319,6 +412,28 @@ class IPMDConfig(PPOConfig):
         require_non_negative("ipmd.reward_l2_coeff", self.reward_l2_coeff)
         require_non_negative(
             "ipmd.reward_grad_penalty_coeff", self.reward_grad_penalty_coeff
+        )
+        if self.reward_lr is not None and float(self.reward_lr) <= 0.0:
+            msg = f"ipmd.reward_lr must be > 0, got {self.reward_lr!r}."
+            raise ValueError(msg)
+        self.reward_updates_per_policy_update = require_positive_int(
+            "ipmd.reward_updates_per_policy_update",
+            self.reward_updates_per_policy_update,
+        )
+        self.reward_update_interval = require_positive_int(
+            "ipmd.reward_update_interval",
+            self.reward_update_interval,
+        )
+        if int(self.reward_update_warmup_updates) < 0:
+            msg = (
+                "ipmd.reward_update_warmup_updates must be >= 0, got "
+                f"{self.reward_update_warmup_updates!r}."
+            )
+            raise ValueError(msg)
+        require_non_negative("ipmd.reward_logit_reg_coeff", self.reward_logit_reg_coeff)
+        require_non_negative(
+            "ipmd.reward_param_weight_decay_coeff",
+            self.reward_param_weight_decay_coeff,
         )
         require_non_negative("ipmd.est_reward_weight", self.est_reward_weight)
         require_non_negative("ipmd.env_reward_weight", self.env_reward_weight)
@@ -348,6 +463,26 @@ class IPMDRLOptConfig(PPORLOptConfig):
     """IPMD configuration."""
 
 
+@dataclass(frozen=True)
+class GroupedRewardHeadSpec:
+    """One construction-time grouped reward-head specification."""
+
+    name: str
+    obs_key: ObsKey
+    input_dim: int
+    weight: float
+
+
+@dataclass(frozen=True)
+class GroupedRewardOutput:
+    """Grouped reward forward outputs used by reward losses and diagnostics."""
+
+    reward: Tensor
+    head_rewards: dict[str, Tensor]
+    head_logits: dict[str, Tensor]
+    head_inputs: dict[str, Tensor]
+
+
 class IPMD(PPO):
     """IPMD algorithm with PPO as the base RL algorithm.
 
@@ -358,6 +493,7 @@ class IPMD(PPO):
     """
 
     _REWARD_INPUT_TYPES = IPMD_REWARD_INPUT_TYPES
+    _REWARD_MODEL_TYPES = IPMD_REWARD_MODEL_TYPES
     _REWARD_OUTPUT_ACTIVATIONS = IPMD_REWARD_OUTPUT_ACTIVATIONS
     _COMMAND_SOURCES = IPMD_COMMAND_SOURCES
 
@@ -380,6 +516,7 @@ class IPMD(PPO):
         self.config: IPMDRLOptConfig = config
         self.config.ipmd.validate()
         self.env = env
+        self._reward_model_type = self.config.ipmd.reward_model_type
         self._use_latent_command = bool(self.config.ipmd.use_latent_command)
         self._latent_key = self.config.ipmd.latent_key
         self._latent_dim = int(self.config.ipmd.latent_dim)
@@ -406,9 +543,11 @@ class IPMD(PPO):
             if value_cfg is not None
             else list(self._policy_obs_keys)
         )
-        self._policy_obs_keys_without_latent: list[ObsKey] = [
-            key for key in self._policy_obs_keys if key != self._latent_key
-        ]
+        self._policy_obs_keys_without_latent: list[ObsKey] = (
+            [key for key in self._policy_obs_keys if key != self._latent_key]
+            if self._use_latent_command
+            else list(self._policy_obs_keys)
+        )
         reward_keys = self.config.ipmd.reward_input_keys
         if not reward_keys:
             reward_keys = (
@@ -426,41 +565,22 @@ class IPMD(PPO):
         self._current_reference_obs_getter = None
 
         available_keys = set(env.observation_spec.keys(True))
-        latent_present = self._latent_key in available_keys
-        if self._use_latent_command != latent_present:
-            if self._use_latent_command:
+        if self._use_latent_command:
+            latent_present = self._latent_key in available_keys
+            if not latent_present:
                 msg = (
                     "IPMD use_latent_command=True requires the environment to expose "
                     f"the latent observation key {self._latent_key!r}."
                 )
-            else:
+                msg += self._latent_mode_hint()
+                raise ValueError(msg)
+            if self._latent_key not in self._policy_obs_keys:
                 msg = (
-                    "IPMD use_latent_command=False requires the environment to omit "
-                    f"the latent observation key {self._latent_key!r}."
+                    "IPMD use_latent_command=True requires the policy input keys to "
+                    f"contain {self._latent_key!r}."
                 )
-            msg += self._latent_mode_hint()
-            raise ValueError(msg)
-        if self._use_latent_command and self._latent_key not in self._policy_obs_keys:
-            msg = (
-                "IPMD use_latent_command=True requires the policy input keys to "
-                f"contain {self._latent_key!r}."
-            )
-            msg += self._latent_mode_hint()
-            raise ValueError(msg)
-        if not self._use_latent_command and any(
-            self._latent_key in keys
-            for keys in (
-                self._policy_obs_keys,
-                self._value_obs_keys,
-                self._reward_obs_keys,
-            )
-        ):
-            msg = (
-                "IPMD use_latent_command=False requires policy/value/reward input "
-                "keys to exclude the latent command."
-            )
-            msg += self._latent_mode_hint()
-            raise ValueError(msg)
+                msg += self._latent_mode_hint()
+                raise ValueError(msg)
 
         all_obs_keys = dedupe_keys(
             self._policy_obs_keys
@@ -487,17 +607,23 @@ class IPMD(PPO):
                 reward_obs_keys=self._reward_obs_keys,
                 obs_feature_dims=self._obs_feature_dims,
                 action_feature_dim=self._action_feature_dim,
-                use_latent_command=self._use_latent_command,
-                latent_dim=self._latent_dim,
             )
         )
         self._reward_input_dim: int = sum(
             block.dim for block in self._reward_input_blocks
         )
+        self._reward_group_context_keys: tuple[ObsKey, ...] = ()
+        self._reward_group_head_specs: tuple[GroupedRewardHeadSpec, ...] = ()
+        if self._reward_model_type == "grouped":
+            (
+                self._reward_group_context_keys,
+                self._reward_group_head_specs,
+            ) = self._resolve_grouped_reward_head_specs()
 
         # Reward estimator: r(s, a, s') -> scalar
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
         self.reward_estimator.to(self.device)
+        self.reward_optim: torch.optim.Optimizer | None = None
 
         self._expert_batch_sampler: (
             Callable[[int, list[BatchKey]], TensorDict | None] | None
@@ -510,6 +636,18 @@ class IPMD(PPO):
         self._reward_loss_coeff: float = float(cfg.reward_loss_coeff)
         self._reward_l2_coeff: float = float(cfg.reward_l2_coeff)
         self._reward_grad_penalty_coeff: float = float(cfg.reward_grad_penalty_coeff)
+        self._reward_logit_reg_coeff: float = float(cfg.reward_logit_reg_coeff)
+        self._reward_param_weight_decay_coeff: float = float(
+            cfg.reward_param_weight_decay_coeff
+        )
+        self._reward_updates_per_policy_update: int = int(
+            cfg.reward_updates_per_policy_update
+        )
+        self._reward_update_interval: int = int(cfg.reward_update_interval)
+        self._reward_update_warmup_updates: int = int(cfg.reward_update_warmup_updates)
+        self._reward_lr: float | None = (
+            float(cfg.reward_lr) if cfg.reward_lr is not None else None
+        )
         self._use_estimated_rewards_for_ppo: bool = bool(
             cfg.use_estimated_rewards_for_ppo
         )
@@ -520,6 +658,8 @@ class IPMD(PPO):
                 self._reward_loss_coeff,
                 self._reward_l2_coeff,
                 self._reward_grad_penalty_coeff,
+                self._reward_logit_reg_coeff,
+                self._reward_param_weight_decay_coeff,
             )
         )
         self._expert_minibatch_update_enabled: bool = bool(
@@ -528,6 +668,10 @@ class IPMD(PPO):
         self._reward_detach_features: bool = bool(cfg.reward_detach_features)
         max_grad = getattr(self.config.optim, "max_grad_norm", None)
         self._max_grad_norm: float = float(max_grad) if max_grad else 1e10
+        self._reward_max_grad_norm: float = self._max_grad_norm
+        self._reward_grad_clip_params: list[torch.nn.Parameter] = list(
+            self.reward_estimator.parameters()
+        )
         # Output activation as a callable (eliminates string dispatch at call time)
         out_act = cfg.reward_output_activation
         scale = float(cfg.reward_output_scale)
@@ -557,7 +701,9 @@ class IPMD(PPO):
             **kwargs,
         )
         self._auto_attach_env_expert_sampler()
+        self._validate_expert_transition_alignment()
         self._refresh_grad_clip_params()
+        self._reward_grad_clip_params = list(self.reward_estimator.parameters())
         self._policy_operator = self.actor_critic.get_policy_operator()
         self._bc_debug_anomaly_prints = 0
 
@@ -651,14 +797,156 @@ class IPMD(PPO):
                 required.extend(self._latent_learner.required_expert_batch_keys())
         return dedupe_keys(required)
 
+    def _validate_expert_transition_alignment(self) -> None:
+        """Fail fast when expert next-state requests cannot be satisfied exactly."""
+        requires_next_obs = any(
+            isinstance(key, tuple) and len(key) > 0 and key[0] == "next"
+            for key in self._expert_required_keys()
+        )
+        if not requires_next_obs or self._expert_batch_sampler is None:
+            return
+
+        aligned_next = getattr(self.env, "_reference_has_aligned_next", None)
+        if aligned_next is None or bool(aligned_next):
+            return
+
+        msg = (
+            "IPMD expert inputs require transition-aligned next observations, but "
+            "the attached env.sample_expert_batch(...) does not expose aligned next "
+            "reference transitions. Disable next_obs reward inputs or provide "
+            "transition-aligned expert next state data."
+        )
+        raise ValueError(msg)
+
     def _reward_required_batch_keys(self) -> list[BatchKey]:
         """Return the batch keys needed to materialize reward-model inputs."""
         return required_batch_keys_from_reward_blocks(self._reward_input_blocks)
+
+    @staticmethod
+    def _obs_key_leaf_name(key: ObsKey) -> str:
+        if isinstance(key, tuple):
+            return str(key[-1])
+        return str(key)
+
+    @staticmethod
+    def _metric_safe_name(value: str) -> str:
+        safe = "".join(ch if ch.isalnum() else "_" for ch in value)
+        return safe.strip("_") or "head"
+
+    @classmethod
+    def _reward_head_names_for_keys(cls, keys: list[ObsKey]) -> list[str]:
+        leaf_names = [
+            cls._metric_safe_name(cls._obs_key_leaf_name(key)) for key in keys
+        ]
+        if len(set(leaf_names)) == len(leaf_names):
+            return leaf_names
+        names: list[str] = []
+        for key in keys:
+            parts = key if isinstance(key, tuple) else (key,)
+            names.append(cls._metric_safe_name("__".join(str(part) for part in parts)))
+        if len(set(names)) != len(names):
+            msg = (
+                "Grouped IPMD reward head metric names are not unique. Configure "
+                "reward_group_head_keys without duplicate names."
+            )
+            raise ValueError(msg)
+        return names
+
+    def _resolve_grouped_reward_head_specs(
+        self,
+    ) -> tuple[tuple[ObsKey, ...], tuple[GroupedRewardHeadSpec, ...]]:
+        """Resolve grouped reward context and head specs at construction time."""
+        cfg = self.config.ipmd
+        reward_keys = list(self._reward_obs_keys)
+
+        if cfg.reward_group_context_keys is None:
+            context_keys = [
+                key
+                for key in reward_keys
+                if self._obs_key_leaf_name(key) == "reference_command"
+            ]
+        else:
+            context_keys = list(cfg.reward_group_context_keys)
+        missing_context = [key for key in context_keys if key not in reward_keys]
+        if missing_context:
+            msg = (
+                "ipmd.reward_group_context_keys must be included in "
+                f"ipmd.reward_input_keys; missing {missing_context!r}."
+            )
+            raise ValueError(msg)
+        if not context_keys:
+            msg = (
+                "ipmd.reward_model_type='grouped' requires reward group context. "
+                "Include a reward_input key named 'reference_command' or configure "
+                "ipmd.reward_group_context_keys explicitly."
+            )
+            raise ValueError(msg)
+
+        if cfg.reward_group_head_keys is None:
+            head_keys = [key for key in reward_keys if key not in context_keys]
+        else:
+            head_keys = list(cfg.reward_group_head_keys)
+        missing_heads = [key for key in head_keys if key not in reward_keys]
+        if missing_heads:
+            msg = (
+                "ipmd.reward_group_head_keys must be included in "
+                f"ipmd.reward_input_keys; missing {missing_heads!r}."
+            )
+            raise ValueError(msg)
+        overlap = [key for key in head_keys if key in context_keys]
+        if overlap:
+            msg = (
+                "ipmd.reward_group_head_keys must not overlap "
+                f"ipmd.reward_group_context_keys; got {overlap!r}."
+            )
+            raise ValueError(msg)
+        if not head_keys:
+            msg = "ipmd.reward_model_type='grouped' requires at least one reward head."
+            raise ValueError(msg)
+
+        if cfg.reward_group_head_weights is None:
+            weights = [1.0 for _ in head_keys]
+        else:
+            weights = [float(weight) for weight in cfg.reward_group_head_weights]
+            if len(weights) != len(head_keys):
+                msg = (
+                    "ipmd.reward_group_head_weights must have one weight per grouped "
+                    f"reward head, got {len(weights)} weights for {len(head_keys)} "
+                    "heads."
+                )
+                raise ValueError(msg)
+
+        context_dim = sum(int(self._obs_feature_dims[key]) for key in context_keys)
+        names = self._reward_head_names_for_keys(head_keys)
+        specs = tuple(
+            GroupedRewardHeadSpec(
+                name=name,
+                obs_key=head_key,
+                input_dim=context_dim + int(self._obs_feature_dims[head_key]),
+                weight=weight,
+            )
+            for name, head_key, weight in zip(names, head_keys, weights, strict=True)
+        )
+        return tuple(context_keys), specs
 
     def _construct_reward_estimator(self) -> torch.nn.Module:
         """Create reward network whose input depends on ``reward_input_type``."""
         cfg = self.config
         assert isinstance(cfg, IPMDRLOptConfig)
+
+        if self._reward_model_type == "grouped":
+            heads = torch.nn.ModuleDict()
+            for spec in self._reward_group_head_specs:
+                head = MLP(
+                    in_features=spec.input_dim,
+                    out_features=1,
+                    num_cells=list(cfg.ipmd.reward_group_num_cells),
+                    activation_class=get_activation_class(cfg.ipmd.reward_activation),
+                    device=self.device,
+                )
+                self._initialize_weights(head, cfg.ipmd.reward_init)
+                heads[spec.name] = head
+            return heads
 
         net = MLP(
             in_features=self._reward_input_dim,
@@ -680,7 +968,7 @@ class IPMD(PPO):
     def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
-        """Create optimizers for PPO and the reward estimator."""
+        """Create the PPO optimizer and a dedicated reward-estimator optimizer."""
         joint_params: list[torch.nn.Parameter] = []
         if (
             self._use_latent_command
@@ -695,12 +983,19 @@ class IPMD(PPO):
             all_params = list(self.actor_critic.parameters()) + joint_params
             return [optimizer_cls(all_params, **optimizer_kwargs)]
 
-        all_params = (
-            list(self.actor_critic.parameters())
-            + list(self.reward_estimator.parameters())
-            + joint_params
+        policy_params = list(self.actor_critic.parameters()) + joint_params
+        reward_optimizer_kwargs = dict(optimizer_kwargs)
+        reward_optimizer_kwargs["lr"] = (
+            self._reward_lr
+            if self._reward_lr is not None
+            else float(reward_optimizer_kwargs["lr"])
         )
-        return [optimizer_cls(all_params, **optimizer_kwargs)]
+        reward_optimizer_kwargs["weight_decay"] = 0.0
+        self.reward_optim = optimizer_cls(
+            self.reward_estimator.parameters(),
+            **reward_optimizer_kwargs,
+        )
+        return [optimizer_cls(policy_params, **optimizer_kwargs)]
 
     def _next_expert_batch(
         self,
@@ -774,7 +1069,6 @@ class IPMD(PPO):
         self,
         td: TensorDict,
         *,
-        batch_role: str,
         detach: bool,
         requires_grad: bool,
     ) -> Tensor:
@@ -809,16 +1103,6 @@ class IPMD(PPO):
                         detach=detach,
                     )
                 )
-            elif block.kind == "latent":
-                if batch_role == "rollout":
-                    controller = self._require_latent_command_controller()
-                    rollout_latent = controller.latent_condition_from_td(
-                        td, detach=True
-                    )
-                    assert rollout_latent is not None
-                    parts.append(rollout_latent.to(self.device))
-                else:
-                    parts.append(self._expert_latents_from_td(td, detach=True))
             else:
                 msg = f"Unhandled reward input block kind {block.kind!r}."
                 raise RuntimeError(msg)
@@ -831,6 +1115,54 @@ class IPMD(PPO):
             reward_input = reward_input.detach().requires_grad_(True)
         return reward_input
 
+    def _grouped_reward_outputs_from_td(
+        self,
+        td: TensorDict,
+        *,
+        detach: bool,
+        requires_grad: bool,
+    ) -> GroupedRewardOutput:
+        """Evaluate grouped reward heads on one TensorDict batch."""
+        context = flatten_obs_features_from_td(
+            td,
+            list(self._reward_group_context_keys),
+            self._obs_feature_ndims,
+            next_obs=False,
+            detach=detach,
+        )
+        assert isinstance(self.reward_estimator, torch.nn.ModuleDict)
+        head_rewards: dict[str, Tensor] = {}
+        head_logits: dict[str, Tensor] = {}
+        head_inputs: dict[str, Tensor] = {}
+        weighted_rewards: list[Tensor] = []
+        for spec in self._reward_group_head_specs:
+            head_features = flatten_obs_features_from_td(
+                td,
+                [spec.obs_key],
+                self._obs_feature_ndims,
+                next_obs=False,
+                detach=detach,
+            )
+            head_input = torch.cat((context, head_features), dim=-1)
+            if requires_grad:
+                head_input = head_input.detach().requires_grad_(True)
+            logits = self.reward_estimator[spec.name](head_input)
+            reward = self._reward_out_fn(logits)
+            head_inputs[spec.name] = head_input
+            head_logits[spec.name] = logits
+            head_rewards[spec.name] = reward
+            weighted_rewards.append(reward * spec.weight)
+
+        total_reward = weighted_rewards[0]
+        for reward in weighted_rewards[1:]:
+            total_reward = total_reward + reward
+        return GroupedRewardOutput(
+            reward=total_reward,
+            head_rewards=head_rewards,
+            head_logits=head_logits,
+            head_inputs=head_inputs,
+        )
+
     def _reward_from_td(
         self,
         td: TensorDict,
@@ -841,11 +1173,27 @@ class IPMD(PPO):
         return_input: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Compute estimated reward for a batch of transitions."""
+        del batch_role
         if detach is None:
             detach = self._reward_detach_features
+        if self._reward_model_type == "grouped":
+            grouped = self._grouped_reward_outputs_from_td(
+                td,
+                detach=detach,
+                requires_grad=requires_grad,
+            )
+            if return_input:
+                grouped_input = torch.cat(
+                    [
+                        grouped.head_inputs[spec.name]
+                        for spec in self._reward_group_head_specs
+                    ],
+                    dim=-1,
+                )
+                return grouped.reward, grouped_input
+            return grouped.reward
         x = self._reward_input_from_td(
             td,
-            batch_role=batch_role,
             detach=detach,
             requires_grad=requires_grad,
         )
@@ -872,6 +1220,24 @@ class IPMD(PPO):
             return_input=return_input,
         )
 
+    def _reward_parameter_weight_decay(self) -> Tensor:
+        """Return the explicit L2 penalty term over reward-estimator parameters."""
+        if self._reward_param_weight_decay_coeff <= 0.0:
+            return torch.zeros((), device=self.device)
+        terms = [param.pow(2).sum() for param in self.reward_estimator.parameters()]
+        if len(terms) == 0:
+            return torch.zeros((), device=self.device)
+        return torch.stack(terms).sum()
+
+    def _reward_update_due(self, policy_update_idx: int) -> bool:
+        """Return whether the reward estimator should update on this policy step."""
+        if not self._reward_update_enabled:
+            return False
+        if policy_update_idx < self._reward_update_warmup_updates:
+            return False
+        relative_idx = policy_update_idx - self._reward_update_warmup_updates
+        return relative_idx % self._reward_update_interval == 0
+
     def _latent_uniformity(self, latent_pred: Tensor) -> Tensor:
         """Not used. Placeholder."""
         return torch.zeros((), device=latent_pred.device, dtype=latent_pred.dtype)
@@ -886,6 +1252,40 @@ class IPMD(PPO):
             param for group in self.optim.param_groups for param in group["params"]
         ]
 
+    def _empty_reward_metrics(self) -> dict[str, Tensor]:
+        metrics = {
+            "loss_reward_diff": torch.zeros((), device=self.device),
+            "loss_reward_l2": torch.zeros((), device=self.device),
+            "loss_reward_grad_penalty": torch.zeros((), device=self.device),
+            "loss_reward_grad_penalty_batch": torch.zeros((), device=self.device),
+            "loss_reward_grad_penalty_expert": torch.zeros((), device=self.device),
+            "loss_reward_logit_reg": torch.zeros((), device=self.device),
+            "loss_reward_param_weight_decay": torch.zeros((), device=self.device),
+            "estimated_reward_mean": torch.zeros((), device=self.device),
+            "estimated_reward_std": torch.zeros((), device=self.device),
+            "expert_reward_mean": torch.zeros((), device=self.device),
+            "expert_reward_std": torch.zeros((), device=self.device),
+        }
+        for key in self._grouped_reward_loss_metric_keys():
+            metrics[key] = torch.zeros((), device=self.device)
+        return metrics
+
+    def _grouped_reward_loss_metric_keys(self) -> list[str]:
+        keys: list[str] = []
+        for spec in self._reward_group_head_specs:
+            prefix = f"reward_head_{spec.name}"
+            keys.extend(
+                [
+                    f"{prefix}_policy_mean",
+                    f"{prefix}_expert_mean",
+                    f"{prefix}_diff",
+                    f"{prefix}_grad_penalty",
+                    f"{prefix}_l2",
+                    f"{prefix}_logit_reg",
+                ]
+            )
+        return keys
+
     @property
     def _required_loss_metrics(self) -> list[str]:
         return [
@@ -895,6 +1295,9 @@ class IPMD(PPO):
             "loss_reward_grad_penalty",
             "loss_reward_grad_penalty_batch",
             "loss_reward_grad_penalty_expert",
+            "loss_reward_logit_reg",
+            "loss_reward_param_weight_decay",
+            "reward_updates_applied",
         ]
 
     @property
@@ -919,6 +1322,8 @@ class IPMD(PPO):
             "estimated_reward_std",
             "expert_reward_mean",
             "expert_reward_std",
+            "reward_grad_norm",
+            *self._grouped_reward_loss_metric_keys(),
         ]
 
     def _select_reported_loss_metrics(self, loss: TensorDict) -> TensorDict:
@@ -1063,50 +1468,49 @@ class IPMD(PPO):
         expert_batch: TensorDict,
     ) -> dict[str, Tensor]:
         """Backpropagate the IPMD reward objective and return detached metrics."""
-        metrics = {
-            "loss_reward_diff": torch.zeros((), device=self.device),
-            "loss_reward_l2": torch.zeros((), device=self.device),
-            "loss_reward_grad_penalty": torch.zeros((), device=self.device),
-            "loss_reward_grad_penalty_batch": torch.zeros((), device=self.device),
-            "loss_reward_grad_penalty_expert": torch.zeros((), device=self.device),
-        }
+        if self._reward_model_type == "grouped":
+            return self._backward_grouped_reward_terms(batch, expert_batch)
+
+        metrics = self._empty_reward_metrics()
         if not self._reward_update_enabled:
             return metrics
 
-        if self._reward_grad_penalty_coeff > 0.0:
-            r_pi_with_input = self._reward_from_td(
-                batch,
-                batch_role="rollout",
-                requires_grad=True,
-                return_input=True,
-            )
-            r_exp_with_input = self._reward_from_td(
-                expert_batch,
-                batch_role="expert",
-                requires_grad=True,
-                return_input=True,
-            )
-            assert isinstance(r_pi_with_input, tuple)
-            assert isinstance(r_exp_with_input, tuple)
-            r_pi, r_pi_input = r_pi_with_input
-            r_exp, r_exp_input = r_exp_with_input
+        requires_grad = self._reward_grad_penalty_coeff > 0.0
+        r_pi_input = self._reward_input_from_td(
+            batch,
+            detach=self._reward_detach_features,
+            requires_grad=requires_grad,
+        )
+        r_exp_input = self._reward_input_from_td(
+            expert_batch,
+            detach=self._reward_detach_features,
+            requires_grad=requires_grad,
+        )
+        r_pi_logits = self.reward_estimator(r_pi_input)
+        r_exp_logits = self.reward_estimator(r_exp_input)
+        r_pi = self._reward_out_fn(r_pi_logits)
+        r_exp = self._reward_out_fn(r_exp_logits)
+
+        if requires_grad:
             reward_grad_penalty_batch = reward_grad_penalty_from_input(r_pi, r_pi_input)
             reward_grad_penalty_expert = reward_grad_penalty_from_input(
                 r_exp, r_exp_input
             )
         else:
-            r_pi = self._reward_from_td(batch, batch_role="rollout")  # type: ignore[attr-defined]
-            r_exp = self._reward_from_td(expert_batch, batch_role="expert")  # type: ignore[attr-defined]
             reward_grad_penalty_batch = torch.zeros((), device=self.device)
             reward_grad_penalty_expert = torch.zeros((), device=self.device)
 
         diff = r_pi.mean() - r_exp.mean()
         l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
         reward_grad_penalty = reward_grad_penalty_batch + reward_grad_penalty_expert
+        logit_reg = r_pi_logits.pow(2).mean() + r_exp_logits.pow(2).mean()
+        param_weight_decay = self._reward_parameter_weight_decay()
         (
             self._reward_loss_coeff * diff
             + self._reward_l2_coeff * l2.pow(0.5)
             + self._reward_grad_penalty_coeff * reward_grad_penalty
+            + self._reward_logit_reg_coeff * logit_reg
+            + self._reward_param_weight_decay_coeff * param_weight_decay
         ).backward()
 
         metrics["loss_reward_diff"] = diff.detach()
@@ -1114,6 +1518,144 @@ class IPMD(PPO):
         metrics["loss_reward_grad_penalty"] = reward_grad_penalty.detach()
         metrics["loss_reward_grad_penalty_batch"] = reward_grad_penalty_batch.detach()
         metrics["loss_reward_grad_penalty_expert"] = reward_grad_penalty_expert.detach()
+        metrics["loss_reward_logit_reg"] = logit_reg.detach()
+        metrics["loss_reward_param_weight_decay"] = param_weight_decay.detach()
+        metrics["estimated_reward_mean"] = r_pi.mean().detach()
+        metrics["estimated_reward_std"] = r_pi.std().detach()
+        metrics["expert_reward_mean"] = r_exp.mean().detach()
+        metrics["expert_reward_std"] = r_exp.std().detach()
+        return metrics
+
+    def _backward_grouped_reward_terms(
+        self,
+        batch: TensorDict,
+        expert_batch: TensorDict,
+    ) -> dict[str, Tensor]:
+        """Backpropagate grouped reward heads with per-head diagnostics."""
+        metrics = self._empty_reward_metrics()
+        if not self._reward_update_enabled:
+            return metrics
+
+        requires_grad = self._reward_grad_penalty_coeff > 0.0
+        pi = self._grouped_reward_outputs_from_td(
+            batch,
+            detach=self._reward_detach_features,
+            requires_grad=requires_grad,
+        )
+        exp = self._grouped_reward_outputs_from_td(
+            expert_batch,
+            detach=self._reward_detach_features,
+            requires_grad=requires_grad,
+        )
+
+        diff = pi.reward.mean() - exp.reward.mean()
+        head_l2_terms: list[Tensor] = []
+        head_logit_terms: list[Tensor] = []
+        head_gp_terms: list[Tensor] = []
+        head_gp_batch_terms: list[Tensor] = []
+        head_gp_expert_terms: list[Tensor] = []
+        for spec in self._reward_group_head_specs:
+            name = spec.name
+            pi_head = pi.head_rewards[name]
+            exp_head = exp.head_rewards[name]
+            pi_logits = pi.head_logits[name]
+            exp_logits = exp.head_logits[name]
+
+            head_l2 = pi_head.pow(2).mean() + exp_head.pow(2).mean()
+            head_logit_reg = pi_logits.pow(2).mean() + exp_logits.pow(2).mean()
+            if requires_grad:
+                head_gp_batch = reward_grad_penalty_from_input(
+                    pi_head,
+                    pi.head_inputs[name],
+                )
+                head_gp_expert = reward_grad_penalty_from_input(
+                    exp_head,
+                    exp.head_inputs[name],
+                )
+            else:
+                head_gp_batch = torch.zeros((), device=self.device)
+                head_gp_expert = torch.zeros((), device=self.device)
+            head_gp = head_gp_batch + head_gp_expert
+
+            head_l2_terms.append(head_l2)
+            head_logit_terms.append(head_logit_reg)
+            head_gp_terms.append(head_gp)
+            head_gp_batch_terms.append(head_gp_batch)
+            head_gp_expert_terms.append(head_gp_expert)
+
+            prefix = f"reward_head_{name}"
+            metrics[f"{prefix}_policy_mean"] = pi_head.mean().detach()
+            metrics[f"{prefix}_expert_mean"] = exp_head.mean().detach()
+            metrics[f"{prefix}_diff"] = (pi_head.mean() - exp_head.mean()).detach()
+            metrics[f"{prefix}_grad_penalty"] = head_gp.detach()
+            metrics[f"{prefix}_l2"] = head_l2.detach()
+            metrics[f"{prefix}_logit_reg"] = head_logit_reg.detach()
+
+        l2 = torch.stack(head_l2_terms).sum()
+        l2_loss = torch.stack([term.pow(0.5) for term in head_l2_terms]).sum()
+        reward_grad_penalty_batch = torch.stack(head_gp_batch_terms).sum()
+        reward_grad_penalty_expert = torch.stack(head_gp_expert_terms).sum()
+        reward_grad_penalty = torch.stack(head_gp_terms).sum()
+        logit_reg = torch.stack(head_logit_terms).sum()
+        param_weight_decay = self._reward_parameter_weight_decay()
+        (
+            self._reward_loss_coeff * diff
+            + self._reward_l2_coeff * l2_loss
+            + self._reward_grad_penalty_coeff * reward_grad_penalty
+            + self._reward_logit_reg_coeff * logit_reg
+            + self._reward_param_weight_decay_coeff * param_weight_decay
+        ).backward()
+
+        metrics["loss_reward_diff"] = diff.detach()
+        metrics["loss_reward_l2"] = l2.detach()
+        metrics["loss_reward_grad_penalty"] = reward_grad_penalty.detach()
+        metrics["loss_reward_grad_penalty_batch"] = reward_grad_penalty_batch.detach()
+        metrics["loss_reward_grad_penalty_expert"] = reward_grad_penalty_expert.detach()
+        metrics["loss_reward_logit_reg"] = logit_reg.detach()
+        metrics["loss_reward_param_weight_decay"] = param_weight_decay.detach()
+        metrics["estimated_reward_mean"] = pi.reward.mean().detach()
+        metrics["estimated_reward_std"] = pi.reward.std().detach()
+        metrics["expert_reward_mean"] = exp.reward.mean().detach()
+        metrics["expert_reward_std"] = exp.reward.std().detach()
+        return metrics
+
+    def _run_reward_updates(
+        self,
+        batch: TensorDict,
+        expert_batch: TensorDict,
+        *,
+        policy_update_idx: int,
+    ) -> dict[str, Tensor]:
+        """Run scheduled reward-estimator updates and return averaged metrics."""
+        metrics: dict[str, Tensor] = self._empty_reward_metrics()
+        metrics["reward_updates_applied"] = torch.zeros((), device=self.device)
+        metrics["reward_grad_norm"] = torch.zeros((), device=self.device)
+        if not self._reward_update_due(policy_update_idx):
+            return metrics
+        if self.reward_optim is None:
+            msg = "Reward update is enabled, but reward_optim was not initialized."
+            raise RuntimeError(msg)
+
+        for _ in range(self._reward_updates_per_policy_update):
+            self.reward_optim.zero_grad(set_to_none=True)
+            step_metrics = self._backward_reward_terms(batch, expert_batch)
+            reward_grad_norm = clip_grad_norm_(
+                self._reward_grad_clip_params,
+                self._reward_max_grad_norm,
+            )
+            self.reward_optim.step()
+            for key, value in step_metrics.items():
+                metrics[key] = metrics[key] + value
+            metrics["reward_grad_norm"] = (
+                metrics["reward_grad_norm"] + reward_grad_norm.detach()
+            )
+
+        steps = float(self._reward_updates_per_policy_update)
+        for key in tuple(metrics.keys()):
+            if key == "reward_updates_applied":
+                continue
+            metrics[key] = metrics[key] / steps
+        metrics["reward_updates_applied"] = torch.tensor(steps, device=self.device)
         return metrics
 
     def _record_env_metrics(self, iteration: PPOIterationData) -> None:
@@ -1139,7 +1681,7 @@ class IPMD(PPO):
         )
 
     def _file_summary_fields(self) -> tuple[tuple[str, str], ...]:
-        return (
+        fields = (
             *super()._file_summary_fields(),
             ("train/env_reward_mean", "env_r"),
             ("train/estimated_reward_mean", "est_r"),
@@ -1152,6 +1694,15 @@ class IPMD(PPO):
             ("train/latent_posterior_recon_mae", "latent_recon_mae"),
             ("train/latent_posterior_recon_max_abs", "latent_recon_max"),
         )
+        grouped_fields: list[tuple[str, str]] = []
+        for spec in self._reward_group_head_specs:
+            grouped_fields.append(
+                (f"train/reward_head_{spec.name}_diff", f"{spec.name}_diff")
+            )
+            grouped_fields.append(
+                (f"train/reward_head_{spec.name}_grad_penalty", f"{spec.name}_gp")
+            )
+        return (*fields, *grouped_fields)
 
     def record(
         self,
@@ -1215,6 +1766,83 @@ class IPMD(PPO):
                 path=self.log_dir / self.config.logger.save_path,
                 step=metadata.frames_processed,
             )
+
+    def save_model(
+        self, path: str | Path | None = None, step: int | None = None
+    ) -> None:
+        """Save PPO and reward-estimator state into one checkpoint."""
+        default_dir = self.log_dir
+        target_base = Path(path).expanduser() if path else default_dir
+        base_exists = target_base.exists()
+        base_is_file = base_exists and target_base.is_file()
+        has_suffix = bool(target_base.suffix)
+
+        if step:
+            if base_is_file or (has_suffix and not target_base.is_dir()):
+                suffix = target_base.suffix
+                stemmed = target_base.with_suffix("")
+                target_path = stemmed.with_name(stemmed.name + f"_step_{step}{suffix}")
+            else:
+                target_path = target_base / f"model_step_{step}.pt"
+        elif base_is_file or (has_suffix and not target_base.is_dir()):
+            target_path = target_base
+        else:
+            target_path = target_base / "model.pt"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        data_to_save: dict[str, torch.Tensor | dict] = {
+            "policy_state_dict": (self.policy.state_dict() if self.policy else {}),
+            "optimizer_state_dict": self.optim.state_dict(),
+            "reward_estimator_state_dict": self.reward_estimator.state_dict(),
+        }
+        if self.value_function:
+            data_to_save["value_state_dict"] = self.value_function.state_dict()
+        if self.q_function:
+            data_to_save["q_state_dict"] = self.q_function.state_dict()
+        if self.feature_extractor:
+            data_to_save["feature_extractor_state_dict"] = (
+                self.feature_extractor.state_dict()
+            )
+        if self.reward_optim is not None:
+            data_to_save["reward_optimizer_state_dict"] = self.reward_optim.state_dict()
+        if self.lr_scheduler is not None:
+            data_to_save["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        if (
+            hasattr(self.env, "is_closed")
+            and not self.env.is_closed
+            and hasattr(self.env, "normalize_obs")
+        ):
+            data_to_save["vec_norm_msg"] = self.env.state_dict()
+
+        torch.save(data_to_save, target_path)
+
+    def load_model(self, path: str) -> None:
+        """Load PPO and reward-estimator state from a checkpoint."""
+        data = torch.load(path, map_location=self.device)
+        if self.policy and "policy_state_dict" in data:
+            self.policy.load_state_dict(data["policy_state_dict"])  # type: ignore[arg-type]
+        if self.value_function and "value_state_dict" in data:
+            self.value_function.load_state_dict(data["value_state_dict"])  # type: ignore[arg-type]
+        if self.q_function and "q_state_dict" in data:
+            self.q_function.load_state_dict(data["q_state_dict"])  # type: ignore[arg-type]
+        if "optimizer_state_dict" in data:
+            self.optim.load_state_dict(data["optimizer_state_dict"])  # type: ignore[arg-type]
+        if "reward_estimator_state_dict" in data:
+            self.reward_estimator.load_state_dict(
+                data["reward_estimator_state_dict"]  # type: ignore[arg-type]
+            )
+        if self.reward_optim is not None and "reward_optimizer_state_dict" in data:
+            self.reward_optim.load_state_dict(
+                data["reward_optimizer_state_dict"]  # type: ignore[arg-type]
+            )
+        if self.lr_scheduler is not None and "lr_scheduler_state_dict" in data:
+            self.lr_scheduler.load_state_dict(data["lr_scheduler_state_dict"])
+        if self.config.feature_extractor and "feature_extractor_state_dict" in data:
+            self.feature_extractor.load_state_dict(
+                data["feature_extractor_state_dict"]  # type: ignore[arg-type]
+            )
+        if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
+            self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
 
     def predict(self, obs: Tensor | np.ndarray | Mapping[Any, Any]) -> Tensor:  # type: ignore[override]
         """Predict action given observation (deterministic)."""
@@ -1314,12 +1942,16 @@ class IPMD(PPO):
         self.optim.zero_grad(set_to_none=True)
         output_loss = self._backward_ppo_terms(batch)
         bc_metrics = self._backward_bc_terms(expert_batch, has_expert)
-        reward_metrics = self._backward_reward_terms(batch, expert_batch)
 
         # Gradient clipping — always call for a fixed graph
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
         self.optim.step()
+        reward_metrics = self._run_reward_updates(
+            batch,
+            expert_batch,
+            policy_update_idx=num_network_updates,
+        )
 
         output_loss.set("alpha", torch.ones((), device=self.device))
         for key, value in reward_metrics.items():
@@ -1373,7 +2005,11 @@ class IPMD(PPO):
                             batch, metadata.policy_operator
                         )
 
-                    if self._expert_minibatch_update_enabled:
+                    needs_expert_batch = bool(
+                        self._bc_coeff > 0.0
+                        or self._reward_update_due(metadata.updates_completed)
+                    )
+                    if needs_expert_batch:
                         expert_batch, has_expert = self._expert_batch_for_update(batch)
                     else:
                         expert_batch = TensorDict(

@@ -252,6 +252,7 @@ def test_ipmd_latent_mode_owns_controller_without_mixin_inheritance():
 
     assert isinstance(agent._latent_command_controller, LatentCommandController)
     assert not isinstance(agent, LatentCommandMixin)
+    assert all(block.kind != "latent" for block in agent._reward_input_blocks)
 
 
 def test_ipmd_reward_estimator():
@@ -327,6 +328,139 @@ def test_ipmd_reward_input_spec_matches_reward_mode() -> None:
     assert agent._reward_required_batch_keys() == ["observation", "action"]
 
 
+def test_ipmd_grouped_reward_model_builds_heads_from_reward_keys() -> None:
+    """Grouped mode should infer reference context and one head per remaining key."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_model_type = "grouped"
+    cfg.ipmd.reward_input_type = "s"
+    cfg.ipmd.reward_input_keys = [
+        ("reward_state", "reference_command"),
+        ("reward_state", "joint_pos"),
+        ("reward_state", "joint_vel"),
+    ]
+    cfg.ipmd.reward_group_head_weights = [1.0, 0.5]
+    cfg.ipmd.reward_loss_coeff = 0.0
+    cfg.ipmd.reward_l2_coeff = 0.0
+    cfg.ipmd.reward_grad_penalty_coeff = 0.0
+    cfg.ipmd.bc_coef = 0.0
+
+    env = rlopt.make_parallel_env(cfg)
+    spec = env.observation_spec.clone()
+    for key in cfg.ipmd.reward_input_keys:
+        spec.set(key, spec["observation"].clone())
+    env.observation_spec = spec
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    assert isinstance(agent.reward_estimator, torch.nn.ModuleDict)
+    assert agent._reward_group_context_keys == (("reward_state", "reference_command"),)
+    assert [spec.name for spec in agent._reward_group_head_specs] == [
+        "joint_pos",
+        "joint_vel",
+    ]
+    assert [spec.weight for spec in agent._reward_group_head_specs] == [1.0, 0.5]
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    batch_size = 5
+    td = TensorDict({}, batch_size=[batch_size], device=agent.device)
+    for key in cfg.ipmd.reward_input_keys:
+        td.set(key, torch.randn(batch_size, obs_dim, device=agent.device))
+
+    rewards = agent._reward_from_td(td, batch_role="rollout")
+    assert rewards.shape == (batch_size, 1)
+    assert not torch.isnan(rewards).any()
+
+
+def test_ipmd_grouped_reward_terms_emit_per_head_metrics() -> None:
+    """Grouped reward updates should expose policy/expert/diff/GP per head."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_model_type = "grouped"
+    cfg.ipmd.reward_input_type = "s"
+    cfg.ipmd.reward_input_keys = [
+        ("reward_state", "reference_command"),
+        ("reward_state", "joint_pos"),
+        ("reward_state", "root_quat"),
+    ]
+    cfg.ipmd.reward_loss_coeff = 1.0
+    cfg.ipmd.reward_l2_coeff = 0.5
+    cfg.ipmd.reward_grad_penalty_coeff = 1.0
+    cfg.ipmd.reward_logit_reg_coeff = 0.1
+    cfg.ipmd.bc_coef = 0.0
+
+    env = rlopt.make_parallel_env(cfg)
+    spec = env.observation_spec.clone()
+    for key in cfg.ipmd.reward_input_keys:
+        spec.set(key, spec["observation"].clone())
+    env.observation_spec = spec
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    batch_size = 4
+    batch = TensorDict({}, batch_size=[batch_size], device=agent.device)
+    expert_batch = TensorDict({}, batch_size=[batch_size], device=agent.device)
+    for key in cfg.ipmd.reward_input_keys:
+        batch.set(key, torch.randn(batch_size, obs_dim, device=agent.device))
+        expert_batch.set(key, torch.randn(batch_size, obs_dim, device=agent.device))
+
+    assert agent.reward_optim is not None
+    agent.reward_optim.zero_grad(set_to_none=True)
+    metrics = agent._backward_reward_terms(batch, expert_batch)
+
+    for head in ("joint_pos", "root_quat"):
+        for suffix in ("policy_mean", "expert_mean", "diff", "grad_penalty"):
+            key = f"reward_head_{head}_{suffix}"
+            assert key in metrics
+            assert torch.isfinite(metrics[key])
+    assert torch.isfinite(metrics["loss_reward_grad_penalty"])
+    assert torch.isfinite(metrics["loss_reward_logit_reg"])
+
+
+def test_ipmd_grouped_reward_model_requires_state_only_inputs() -> None:
+    """Grouped reward heads should fail fast for transition/action input modes."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.compile.compile = False
+    _apply_nonlatent_obs_input_keys(cfg)
+    cfg.ipmd.reward_model_type = "grouped"
+    cfg.ipmd.reward_input_type = "sas"
+
+    env = rlopt.make_parallel_env(cfg)
+    with pytest.raises(ValueError, match="requires .*reward_input_type='s'"):
+        rlopt.IPMD(env, cfg, logger=None)
+
+
 def test_ipmd_invalid_command_source_fails_at_agent_construction() -> None:
     """Invalid post-construction config mutations should fail before training starts."""
     rlopt = _rlopt()
@@ -342,6 +476,103 @@ def test_ipmd_invalid_command_source_fails_at_agent_construction() -> None:
 
     env = rlopt.make_parallel_env(cfg)
     with pytest.raises(ValueError, match="command_source"):
+        rlopt.IPMD(env, cfg, logger=None)
+
+
+def test_ipmd_reward_update_schedule_runs_separate_optimizer_steps() -> None:
+    """Reward updates should honor the configured cadence independently of PPO."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.reward_input_type = "s"
+    cfg.ipmd.reward_loss_coeff = 1.0
+    cfg.ipmd.reward_l2_coeff = 0.0
+    cfg.ipmd.reward_grad_penalty_coeff = 0.0
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.reward_updates_per_policy_update = 2
+    cfg.ipmd.reward_update_interval = 3
+    cfg.ipmd.diversity_bonus_coeff = 0.0
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+    assert agent.reward_optim is not None
+
+    batch = TensorDict({}, batch_size=[2], device=agent.device)
+    expert_batch = TensorDict({}, batch_size=[2], device=agent.device)
+    backward_calls: list[int] = []
+    step_calls: list[int] = []
+
+    def _fake_backward_reward_terms(_batch, _expert_batch):
+        backward_calls.append(1)
+        return {
+            "loss_reward_diff": torch.zeros((), device=agent.device),
+            "loss_reward_l2": torch.zeros((), device=agent.device),
+            "loss_reward_grad_penalty": torch.zeros((), device=agent.device),
+            "loss_reward_grad_penalty_batch": torch.zeros((), device=agent.device),
+            "loss_reward_grad_penalty_expert": torch.zeros((), device=agent.device),
+            "loss_reward_logit_reg": torch.zeros((), device=agent.device),
+            "loss_reward_param_weight_decay": torch.zeros((), device=agent.device),
+        }
+
+    def _fake_reward_step():
+        step_calls.append(1)
+
+    agent._backward_reward_terms = _fake_backward_reward_terms
+    agent.reward_optim.step = _fake_reward_step
+
+    skipped = agent._run_reward_updates(batch, expert_batch, policy_update_idx=1)
+    assert skipped["reward_updates_applied"].item() == pytest.approx(0.0)
+    assert len(backward_calls) == 0
+    assert len(step_calls) == 0
+
+    applied = agent._run_reward_updates(batch, expert_batch, policy_update_idx=3)
+    assert applied["reward_updates_applied"].item() == pytest.approx(2.0)
+    assert len(backward_calls) == 2
+    assert len(step_calls) == 2
+
+
+def test_ipmd_reward_next_obs_requires_aligned_expert_transitions() -> None:
+    """Reward next-state expert inputs should fail fast without aligned transitions."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.reward_input_type = "s'"
+    cfg.ipmd.bc_coef = 0.0
+
+    env = rlopt.make_parallel_env(cfg)
+    env._reference_has_aligned_next = False
+
+    def _sample_expert_batch(*, batch_size: int, required_keys):
+        del batch_size, required_keys
+        return TensorDict({}, batch_size=[0])
+
+    env.sample_expert_batch = _sample_expert_batch
+
+    with pytest.raises(ValueError, match="transition-aligned next observations"):
         rlopt.IPMD(env, cfg, logger=None)
 
 
@@ -504,7 +735,9 @@ def test_ipmd_sampler_missing_required_keys_raises() -> None:
     )
 
     def _sample(_batch_size: int, required_keys):
-        return expert_data.select(*(key for key in required_keys if key in expert_data.keys(True))).clone()
+        return expert_data.select(
+            *(key for key in required_keys if key in expert_data.keys(True))
+        ).clone()
 
     agent._set_test_expert_batch_sampler(_sample)
 
