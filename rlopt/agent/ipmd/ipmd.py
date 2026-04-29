@@ -56,6 +56,7 @@ from rlopt.config_utils import (
     flatten_obs_features_from_td,
     infer_batch_shape,
     mapping_get_obs_value,
+    normalize_batch_key,
     obs_key_feature_dim,
     obs_key_feature_ndim,
 )
@@ -518,7 +519,7 @@ class IPMD(PPO):
         self.env = env
         self._reward_model_type = self.config.ipmd.reward_model_type
         self._use_latent_command = bool(self.config.ipmd.use_latent_command)
-        self._latent_key = self.config.ipmd.latent_key
+        self._latent_key = normalize_batch_key(self.config.ipmd.latent_key)
         self._latent_dim = int(self.config.ipmd.latent_dim)
         self._latent_command_controller: LatentCommandController | None = None
         self._command_source = self._normalize_command_source(
@@ -536,10 +537,12 @@ class IPMD(PPO):
             )
 
         # Observation key groups can differ across policy, value, and reward model.
-        self._policy_obs_keys: list[ObsKey] = self.config.policy.get_input_keys()
+        self._policy_obs_keys: list[ObsKey] = [
+            normalize_batch_key(key) for key in self.config.policy.get_input_keys()
+        ]
         value_cfg = self.config.value_function
         self._value_obs_keys: list[ObsKey] = (
-            value_cfg.get_input_keys()
+            [normalize_batch_key(key) for key in value_cfg.get_input_keys()]
             if value_cfg is not None
             else list(self._policy_obs_keys)
         )
@@ -555,12 +558,16 @@ class IPMD(PPO):
                 if value_cfg is not None
                 else self._policy_obs_keys_without_latent
             )
-        self._reward_obs_keys: list[ObsKey] = dedupe_keys(list(reward_keys))
+        self._reward_obs_keys: list[ObsKey] = dedupe_keys(
+            [normalize_batch_key(key) for key in reward_keys]
+        )
         latent_cfg = self.config.ipmd.latent_learning
         posterior_keys = latent_cfg.posterior_input_keys or self._reward_obs_keys
-        self._posterior_obs_keys: list[ObsKey] = dedupe_keys(list(posterior_keys))
+        self._posterior_obs_keys: list[ObsKey] = dedupe_keys(
+            [normalize_batch_key(key) for key in posterior_keys]
+        )
         self._prior_obs_keys: list[ObsKey] = dedupe_keys(
-            list(latent_cfg.prior_input_keys)
+            [normalize_batch_key(key) for key in latent_cfg.prior_input_keys]
         )
         self._current_reference_obs_getter = None
 
@@ -619,6 +626,10 @@ class IPMD(PPO):
                 self._reward_group_context_keys,
                 self._reward_group_head_specs,
             ) = self._resolve_grouped_reward_head_specs()
+        self._reward_infers_latent_condition: bool = (
+            self._use_latent_command
+            and self._latent_key in self._reward_required_batch_keys()
+        )
 
         # Reward estimator: r(s, a, s') -> scalar
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
@@ -688,6 +699,7 @@ class IPMD(PPO):
             method = str(self.config.ipmd.latent_learning.method)
             self._latent_learner = build_latent_learner(method)
             self._latent_learner.initialize(self)
+        self._validate_latent_reward_conditioning()
 
         super().__init__(
             env=env,
@@ -777,12 +789,64 @@ class IPMD(PPO):
             detach=detach,
         ).to(self.device)
 
+    def _validate_latent_reward_conditioning(self) -> None:
+        """Validate reward-side latent conditioning at construction time."""
+        if not self._reward_infers_latent_condition:
+            return
+        if self._latent_learner is None:
+            msg = (
+                "IPMD reward inputs include the latent key "
+                f"{self._latent_key!r}, but no latent learner is active."
+            )
+            raise ValueError(msg)
+        if (
+            self._reward_model_type == "grouped"
+            and self._latent_key not in self._reward_group_context_keys
+        ):
+            msg = (
+                "Grouped IPMD reward inputs include the latent key "
+                f"{self._latent_key!r}; configure it as "
+                "ipmd.reward_group_context_keys so it is shared conditioning "
+                "instead of a grouped reward head."
+            )
+            raise ValueError(msg)
+        latent_head_keys = [
+            spec.obs_key
+            for spec in self._reward_group_head_specs
+            if spec.obs_key == self._latent_key
+        ]
+        if latent_head_keys:
+            msg = (
+                "Grouped IPMD reward heads must not include the latent key "
+                f"{self._latent_key!r}; use it only as reward group context."
+            )
+            raise ValueError(msg)
+
+        expert_keys = self._latent_learner.required_expert_batch_keys()
+        missing_expert_keys = [
+            key for key in self._posterior_obs_keys if key not in expert_keys
+        ]
+        if missing_expert_keys:
+            msg = (
+                "Latent-conditioned reward updates require expert posterior input "
+                f"keys {missing_expert_keys!r}, but the active latent learner does "
+                "not declare them in required_expert_batch_keys()."
+            )
+            raise ValueError(msg)
+
+    def _reward_sampler_required_keys(self) -> list[BatchKey]:
+        """Return reward keys that must come directly from the expert sampler."""
+        required = self._reward_required_batch_keys()
+        if self._reward_infers_latent_condition:
+            required = [key for key in required if key != self._latent_key]
+        return required
+
     def _expert_required_keys(self) -> list[BatchKey]:
         """Return expert-batch keys required by current IPMD settings."""
         bc_enabled = float(self.config.ipmd.bc_coef) > 0.0
 
-        required = self._reward_required_batch_keys()
-        if self._use_latent_command:
+        required = self._reward_sampler_required_keys()
+        if self._reward_infers_latent_condition:
             assert self._latent_learner is not None
             required.extend(self._latent_learner.required_expert_batch_keys())
         if bc_enabled:
@@ -866,7 +930,9 @@ class IPMD(PPO):
                 if self._obs_key_leaf_name(key) == "reference_command"
             ]
         else:
-            context_keys = list(cfg.reward_group_context_keys)
+            context_keys = [
+                normalize_batch_key(key) for key in cfg.reward_group_context_keys
+            ]
         missing_context = [key for key in context_keys if key not in reward_keys]
         if missing_context:
             msg = (
@@ -885,7 +951,7 @@ class IPMD(PPO):
         if cfg.reward_group_head_keys is None:
             head_keys = [key for key in reward_keys if key not in context_keys]
         else:
-            head_keys = list(cfg.reward_group_head_keys)
+            head_keys = [normalize_batch_key(key) for key in cfg.reward_group_head_keys]
         missing_heads = [key for key in head_keys if key not in reward_keys]
         if missing_heads:
             msg = (
@@ -1268,6 +1334,8 @@ class IPMD(PPO):
         }
         for key in self._grouped_reward_loss_metric_keys():
             metrics[key] = torch.zeros((), device=self.device)
+        for key in self._reward_condition_metric_keys():
+            metrics[key] = torch.zeros((), device=self.device)
         return metrics
 
     def _grouped_reward_loss_metric_keys(self) -> list[str]:
@@ -1285,6 +1353,16 @@ class IPMD(PPO):
                 ]
             )
         return keys
+
+    def _reward_condition_metric_keys(self) -> list[str]:
+        if not self._reward_infers_latent_condition:
+            return []
+        return [
+            "reward_condition_policy_norm",
+            "reward_condition_expert_norm",
+            "reward_condition_mean_distance",
+            "reward_condition_mean_cosine",
+        ]
 
     @property
     def _required_loss_metrics(self) -> list[str]:
@@ -1324,6 +1402,7 @@ class IPMD(PPO):
             "expert_reward_std",
             "reward_grad_norm",
             *self._grouped_reward_loss_metric_keys(),
+            *self._reward_condition_metric_keys(),
         ]
 
     def _select_reported_loss_metrics(self, loss: TensorDict) -> TensorDict:
@@ -1636,6 +1715,13 @@ class IPMD(PPO):
             msg = "Reward update is enabled, but reward_optim was not initialized."
             raise RuntimeError(msg)
 
+        policy_latents = self._set_reward_policy_condition_from_batch(batch)
+        expert_latents = self._set_reward_expert_condition_from_batch(expert_batch)
+        condition_metrics = self._reward_condition_metrics(
+            policy_latents,
+            expert_latents,
+        )
+
         for _ in range(self._reward_updates_per_policy_update):
             self.reward_optim.zero_grad(set_to_none=True)
             step_metrics = self._backward_reward_terms(batch, expert_batch)
@@ -1656,6 +1742,8 @@ class IPMD(PPO):
                 continue
             metrics[key] = metrics[key] / steps
         metrics["reward_updates_applied"] = torch.tensor(steps, device=self.device)
+        for key, value in condition_metrics.items():
+            metrics[key] = value
         return metrics
 
     def _record_env_metrics(self, iteration: PPOIterationData) -> None:
@@ -1931,6 +2019,138 @@ class IPMD(PPO):
         self.data_buffer.extend(rollout.reshape(-1))
         return rollout
 
+    def _set_reward_policy_condition_from_batch(
+        self,
+        batch: TensorDict,
+    ) -> Tensor | None:
+        """Infer and stamp reward-conditioning latents for a policy minibatch."""
+        if not self._reward_infers_latent_condition:
+            return None
+        assert self._latent_learner is not None
+        latents = self._latent_learner.infer_batch_latents(
+            batch,
+            detach=True,
+            context="reward policy latent",
+        )
+        if latents is None:
+            msg = (
+                "Active latent learner does not support policy-batch latent "
+                "inference for reward conditioning."
+            )
+            raise RuntimeError(msg)
+        latents = latents.to(device=self.device, dtype=torch.float32)
+        batch.set(
+            self._latent_key,
+            latents.reshape(*batch.batch_size, self._latent_dim),
+        )
+        return latents.reshape(-1, self._latent_dim)
+
+    def _set_reward_expert_condition_from_batch(
+        self,
+        expert_batch: TensorDict,
+    ) -> Tensor | None:
+        """Infer and stamp reward-conditioning latents for an expert minibatch."""
+        if not self._reward_infers_latent_condition:
+            return None
+        latents = self._expert_latents_from_td(
+            expert_batch,
+            detach=True,
+        ).to(device=self.device, dtype=torch.float32)
+        expert_batch.set(
+            self._latent_key,
+            latents.reshape(*expert_batch.batch_size, self._latent_dim),
+        )
+        return latents.reshape(-1, self._latent_dim)
+
+    def _reward_condition_metrics(
+        self,
+        policy_latents: Tensor | None,
+        expert_latents: Tensor | None,
+    ) -> dict[str, Tensor]:
+        """Build diagnostics for the latent context used by reward updates."""
+        metrics: dict[str, Tensor] = {}
+        if policy_latents is None or expert_latents is None:
+            return metrics
+
+        policy_flat = policy_latents.reshape(-1, self._latent_dim)
+        expert_flat = expert_latents.reshape(-1, self._latent_dim)
+        policy_mean = policy_flat.mean(dim=0)
+        expert_mean = expert_flat.mean(dim=0)
+        metrics["reward_condition_policy_norm"] = (
+            policy_flat.norm(dim=-1).mean().detach()
+        )
+        metrics["reward_condition_expert_norm"] = (
+            expert_flat.norm(dim=-1).mean().detach()
+        )
+        metrics["reward_condition_mean_distance"] = (
+            (policy_mean - expert_mean).norm().detach()
+        )
+        metrics["reward_condition_mean_cosine"] = (
+            torch.nn.functional.cosine_similarity(
+                policy_mean.unsqueeze(0),
+                expert_mean.unsqueeze(0),
+                dim=-1,
+                eps=1.0e-6,
+            )
+            .squeeze(0)
+            .detach()
+        )
+        return metrics
+
+    def _empty_reward_update_metrics(self) -> dict[str, Tensor]:
+        metrics = self._empty_reward_metrics()
+        metrics["reward_updates_applied"] = torch.zeros((), device=self.device)
+        metrics["reward_grad_norm"] = torch.zeros((), device=self.device)
+        return metrics
+
+    def _run_pre_policy_reward_updates(
+        self,
+        rollout_flat: TensorDict,
+        metadata: PPOTrainingMetadata,
+    ) -> dict[str, Tensor]:
+        """Update the reward estimator before PPO reward and advantage computation."""
+        if not self._reward_update_enabled:
+            return {}
+
+        metrics = self._empty_reward_update_metrics()
+        minibatch_slots = 0
+        updates_completed = metadata.updates_completed
+        start_update_idx = (
+            int(updates_completed.item())
+            if isinstance(updates_completed, Tensor)
+            else int(updates_completed)
+        )
+        self.data_buffer.empty()
+        self.data_buffer.extend(rollout_flat)
+        try:
+            for _epoch_idx in range(metadata.epochs_per_rollout):
+                for batch in self.data_buffer:
+                    policy_update_idx = start_update_idx + minibatch_slots
+                    if self._reward_update_due(policy_update_idx):
+                        reward_batch = batch.clone()
+                        expert_batch, _has_expert = self._expert_batch_for_update(
+                            reward_batch
+                        )
+                        step_metrics = self._run_reward_updates(
+                            reward_batch,
+                            expert_batch,
+                            policy_update_idx=policy_update_idx,
+                        )
+                    else:
+                        step_metrics = self._empty_reward_update_metrics()
+                    for key, value in step_metrics.items():
+                        metrics[key] = metrics[key] + value
+                    minibatch_slots += 1
+        finally:
+            self.data_buffer.empty()
+
+        if minibatch_slots == 0:
+            return metrics
+        scale = float(minibatch_slots)
+        for key in tuple(metrics.keys()):
+            metrics[key] = metrics[key] / scale
+        return metrics
+
     def update(
         self,
         batch: TensorDict,
@@ -1938,7 +2158,7 @@ class IPMD(PPO):
         expert_batch: TensorDict,
         has_expert: Tensor,
     ) -> tuple[TensorDict, int]:
-        """PPO update plus optional BC loss and IPMD reward loss."""
+        """PPO update plus optional BC loss."""
         self.optim.zero_grad(set_to_none=True)
         output_loss = self._backward_ppo_terms(batch)
         bc_metrics = self._backward_bc_terms(expert_batch, has_expert)
@@ -1947,15 +2167,8 @@ class IPMD(PPO):
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
         self.optim.step()
-        reward_metrics = self._run_reward_updates(
-            batch,
-            expert_batch,
-            policy_update_idx=num_network_updates,
-        )
 
         output_loss.set("alpha", torch.ones((), device=self.device))
-        for key, value in reward_metrics.items():
-            output_loss.set(key, value)
         for key, value in bc_metrics.items():
             output_loss.set(key, value)
         output_loss.set("grad_norm", grad_norm_tensor.detach())
@@ -1964,11 +2177,11 @@ class IPMD(PPO):
 
     def prepare(
         self,
-        iteration: PPOIterationData,
+        iteration: PPOIterationData,  # noqa: ARG002
         metadata: PPOTrainingMetadata,  # noqa: ARG002
     ) -> None:
-        """Attach reward-model diagnostics and replace the PPO reward for this rollout."""
-        iteration.metrics.update(self._prepare_rollout_rewards(iteration.rollout))
+        """Reward preparation runs in iterate() after pre-PPO reward updates."""
+        return
 
     def iterate(
         self,
@@ -1995,6 +2208,14 @@ class IPMD(PPO):
                         {f"train/{k}": v for k, v in learner_metrics.items()}
                     )
 
+            reward_metrics = self._run_pre_policy_reward_updates(
+                rollout_flat,
+                metadata,
+            )
+            iteration.metrics.update(
+                {f"train/{key}": value.item() for key, value in reward_metrics.items()}
+            )
+            iteration.metrics.update(self._prepare_rollout_rewards(iteration.rollout))
             iteration.rollout = self.pre_iteration_compute(iteration.rollout)
 
             for epoch_idx in range(metadata.epochs_per_rollout):
@@ -2005,10 +2226,7 @@ class IPMD(PPO):
                             batch, metadata.policy_operator
                         )
 
-                    needs_expert_batch = bool(
-                        self._bc_coeff > 0.0
-                        or self._reward_update_due(metadata.updates_completed)
-                    )
+                    needs_expert_batch = bool(self._bc_coeff > 0.0)
                     if needs_expert_batch:
                         expert_batch, has_expert = self._expert_batch_for_update(batch)
                     else:

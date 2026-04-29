@@ -384,6 +384,224 @@ def test_ipmd_grouped_reward_model_builds_heads_from_reward_keys() -> None:
     assert not torch.isnan(rewards).any()
 
 
+def _make_latent_grouped_reward_agent():
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = [("command", "policy_command")]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = True
+    cfg.ipmd.command_source = "posterior"
+    cfg.ipmd.latent_key = ("command", "policy_command")
+    cfg.ipmd.latent_dim = 3
+    cfg.ipmd.latent_learning.method = "patch_autoencoder"
+    cfg.ipmd.latent_learning.posterior_input_keys = ["observation"]
+    cfg.ipmd.latent_learning.recon_coeff = 0.0
+    cfg.ipmd.reward_model_type = "grouped"
+    cfg.ipmd.reward_input_type = "s"
+    cfg.ipmd.reward_input_keys = [
+        ("command", "policy_command"),
+        ("reward_state", "joint_pos"),
+    ]
+    cfg.ipmd.reward_group_context_keys = [("command", "policy_command")]
+    cfg.ipmd.reward_group_head_weights = [1.0]
+    cfg.ipmd.reward_loss_coeff = 1.0
+    cfg.ipmd.reward_l2_coeff = 0.0
+    cfg.ipmd.reward_grad_penalty_coeff = 0.0
+    cfg.ipmd.reward_logit_reg_coeff = 0.0
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.diversity_bonus_coeff = 0.0
+
+    env = rlopt.make_parallel_env(cfg)
+    spec = env.observation_spec.clone()
+    spec.set(("command", "policy_command"), spec["observation"].clone())
+    spec.set(("reward_state", "joint_pos"), spec["observation"].clone())
+    env.observation_spec = spec
+    return rlopt.IPMD(env, cfg, logger=None), env
+
+
+def test_ipmd_latent_grouped_reward_context_is_not_a_head() -> None:
+    """Latent reward context should resolve as shared grouped context only."""
+    agent, _env = _make_latent_grouped_reward_agent()
+
+    assert agent._reward_infers_latent_condition is True
+    assert agent._reward_group_context_keys == (("command", "policy_command"),)
+    assert [spec.obs_key for spec in agent._reward_group_head_specs] == [
+        ("reward_state", "joint_pos")
+    ]
+
+
+def test_ipmd_grouped_reward_context_normalizes_hydra_list_keys() -> None:
+    """Hydra list materialization should not break grouped context matching."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_model_type = "grouped"
+    cfg.ipmd.reward_input_type = "s"
+    cfg.ipmd.reward_input_keys = [
+        ("command", "policy_command"),
+        ("reward_state", "joint_pos"),
+    ]
+    cfg.ipmd.reward_group_context_keys = [["command", "policy_command"]]
+    cfg.ipmd.reward_group_head_weights = [1.0]
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.diversity_bonus_coeff = 0.0
+
+    env = rlopt.make_parallel_env(cfg)
+    spec = env.observation_spec.clone()
+    spec.set(("command", "policy_command"), spec["observation"].clone())
+    spec.set(("reward_state", "joint_pos"), spec["observation"].clone())
+    env.observation_spec = spec
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    assert agent._reward_group_context_keys == (("command", "policy_command"),)
+    assert [spec.obs_key for spec in agent._reward_group_head_specs] == [
+        ("reward_state", "joint_pos")
+    ]
+
+
+def test_ipmd_latent_reward_expert_sampler_uses_posterior_not_command() -> None:
+    """Expert reward batches should request posterior inputs and inject command latents."""
+    agent, env = _make_latent_grouped_reward_agent()
+
+    class _IdentityLatent(torch.nn.Module):
+        def forward(self, obs_features: torch.Tensor) -> torch.Tensor:
+            return obs_features
+
+    assert agent._latent_learner is not None
+    agent._latent_learner.encoder = _IdentityLatent().to(agent.device)
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    batch_size = 2
+    expert_obs = torch.randn(batch_size, obs_dim, device=agent.device)
+    expert_data = TensorDict(
+        {
+            "observation": expert_obs.clone(),
+            ("reward_state", "joint_pos"): torch.randn(
+                batch_size, obs_dim, device=agent.device
+            ),
+        },
+        batch_size=[batch_size],
+        device=agent.device,
+    )
+    requested_keys: list[list] = []
+
+    def _sample(sample_batch_size: int, required_keys):
+        requested_keys.append(list(required_keys))
+        batch = expert_data[:sample_batch_size]
+        return batch.select(*required_keys).clone()
+
+    agent._set_test_expert_batch_sampler(_sample)
+    policy_obs = torch.randn(batch_size, obs_dim, device=agent.device)
+    policy_batch = TensorDict(
+        {
+            "observation": policy_obs.clone(),
+            ("reward_state", "joint_pos"): torch.randn(
+                batch_size, obs_dim, device=agent.device
+            ),
+        },
+        batch_size=[batch_size],
+        device=agent.device,
+    )
+
+    expert_batch, _has_expert = agent._expert_batch_for_update(policy_batch)
+    assert requested_keys == [[("reward_state", "joint_pos"), "observation"]]
+    assert ("command", "policy_command") not in expert_batch.keys(True)
+
+    metrics = agent._run_reward_updates(
+        policy_batch,
+        expert_batch,
+        policy_update_idx=0,
+    )
+
+    assert torch.allclose(policy_batch.get(("command", "policy_command")), policy_obs)
+    assert torch.allclose(expert_batch.get(("command", "policy_command")), expert_obs)
+    assert torch.isfinite(metrics["reward_condition_policy_norm"])
+    assert torch.isfinite(metrics["reward_condition_expert_norm"])
+
+
+def test_ipmd_pre_policy_reward_updates_preserve_rollout_command() -> None:
+    """Reward-training latent recompute must not overwrite stored rollout commands."""
+    from rlopt.agent.ppo.ppo import PPOTrainingMetadata
+
+    agent, env = _make_latent_grouped_reward_agent()
+
+    class _IdentityLatent(torch.nn.Module):
+        def forward(self, obs_features: torch.Tensor) -> torch.Tensor:
+            return obs_features
+
+    assert agent._latent_learner is not None
+    agent._latent_learner.encoder = _IdentityLatent().to(agent.device)
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    batch_size = 2
+    expert_data = TensorDict(
+        {
+            "observation": torch.randn(batch_size, obs_dim, device=agent.device),
+            ("reward_state", "joint_pos"): torch.randn(
+                batch_size, obs_dim, device=agent.device
+            ),
+        },
+        batch_size=[batch_size],
+        device=agent.device,
+    )
+
+    def _sample(sample_batch_size: int, required_keys):
+        batch = expert_data[:sample_batch_size]
+        return batch.select(*required_keys).clone()
+
+    agent._set_test_expert_batch_sampler(_sample)
+    stored_command = torch.randn(batch_size, obs_dim, device=agent.device)
+    rollout_flat = TensorDict(
+        {
+            "observation": torch.randn(batch_size, obs_dim, device=agent.device),
+            ("command", "policy_command"): stored_command.clone(),
+            ("reward_state", "joint_pos"): torch.randn(
+                batch_size, obs_dim, device=agent.device
+            ),
+        },
+        batch_size=[batch_size],
+        device=agent.device,
+    )
+    metadata = PPOTrainingMetadata(
+        collector_iter=iter(()),
+        total_iterations=1,
+        policy_operator=agent.actor_critic.get_policy_operator(),
+        updates_completed=0,
+        minibatches_per_epoch=1,
+        epochs_per_rollout=1,
+        anneal_clip_epsilon=False,
+        base_clip_epsilon=agent.config.ppo.clip_epsilon,
+    )
+
+    metrics = agent._run_pre_policy_reward_updates(rollout_flat, metadata)
+
+    assert metrics["reward_updates_applied"].item() == pytest.approx(1.0)
+    assert torch.allclose(
+        rollout_flat.get(("command", "policy_command")),
+        stored_command,
+    )
+
+
 def test_ipmd_grouped_reward_terms_emit_per_head_metrics() -> None:
     """Grouped reward updates should expose policy/expert/diff/GP per head."""
     rlopt = _rlopt()
@@ -544,6 +762,62 @@ def test_ipmd_reward_update_schedule_runs_separate_optimizer_steps() -> None:
     assert len(step_calls) == 2
 
 
+def test_ipmd_iterate_updates_reward_before_reward_recompute_and_advantage() -> None:
+    """Pre-PPO reward updates should precede reward recompute and GAE."""
+    from rlopt.agent.ppo.ppo import PPOIterationData, PPOTrainingMetadata
+
+    agent, env = _make_env_reward_only_ipmd_agent()
+    order: list[str] = []
+
+    def _fake_reward_updates(_rollout_flat, _metadata):
+        order.append("reward_update")
+        return {}
+
+    def _fake_prepare_rollout_rewards(_rollout):
+        order.append("reward_recompute")
+        return {}
+
+    def _fake_pre_iteration_compute(_rollout):
+        order.append("advantage")
+        msg = "stop after advantage"
+        raise RuntimeError(msg)
+
+    agent._reward_update_enabled = True
+    agent._run_pre_policy_reward_updates = _fake_reward_updates
+    agent._prepare_rollout_rewards = _fake_prepare_rollout_rewards
+    agent.pre_iteration_compute = _fake_pre_iteration_compute
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    rollout = TensorDict(
+        {
+            "observation": torch.randn(2, obs_dim, device=agent.device),
+            ("next", "reward"): torch.ones(2, 1, device=agent.device),
+            ("next", "done"): torch.zeros(2, 1, dtype=torch.bool, device=agent.device),
+            ("next", "truncated"): torch.zeros(
+                2, 1, dtype=torch.bool, device=agent.device
+            ),
+        },
+        batch_size=[2],
+        device=agent.device,
+    )
+    iteration = PPOIterationData(iteration_idx=0, frames=2, rollout=rollout)
+    metadata = PPOTrainingMetadata(
+        collector_iter=iter(()),
+        total_iterations=1,
+        policy_operator=agent.actor_critic.get_policy_operator(),
+        updates_completed=0,
+        minibatches_per_epoch=1,
+        epochs_per_rollout=1,
+        anneal_clip_epsilon=False,
+        base_clip_epsilon=agent.config.ppo.clip_epsilon,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after advantage"):
+        agent.iterate(iteration, metadata)
+
+    assert order == ["reward_update", "reward_recompute", "advantage"]
+
+
 def test_ipmd_reward_next_obs_requires_aligned_expert_transitions() -> None:
     """Reward next-state expert inputs should fail fast without aligned transitions."""
     rlopt = _rlopt()
@@ -660,8 +934,8 @@ def test_ipmd_update_with_expert_data():
     assert "loss_critic" in loss_td
     assert "loss_objective" in loss_td
     assert "loss_entropy" in loss_td
-    assert "loss_reward_diff" in loss_td
-    assert "loss_reward_l2" in loss_td
+    assert "loss_reward_diff" not in loss_td
+    assert "loss_reward_l2" not in loss_td
     # Check that losses are finite
     for key in tuple(loss_td.keys()):
         value = loss_td[key]
