@@ -501,10 +501,10 @@ class IPMDDiffSR(IPMD):
                     pbar.set_postfix(postfix)
 
             if (
-                self.config.save_interval > 0
-                and collected_frames
-                % (self.config.save_interval * self.config.env.num_envs)
-                == 0
+                self._should_save_checkpoint(
+                    frames_processed=collected_frames,
+                    frames_in_iteration=frames_in_batch,
+                )
             ):
                 self.save_model(
                     path=self.log_dir / self.config.logger.save_path,

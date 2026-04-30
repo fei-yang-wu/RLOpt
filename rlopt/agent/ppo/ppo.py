@@ -757,9 +757,10 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self._refresh_progress_display(metadata, iteration)
 
         if (
-            self.config.save_interval > 0
-            and metadata.frames_processed > 0
-            and metadata.frames_processed % self.config.save_interval == 0
+            self._should_save_checkpoint(
+                frames_processed=metadata.frames_processed,
+                frames_in_iteration=iteration.frames,
+            )
         ):
             checkpoint_dir = self.log_dir / self.config.logger.save_path
             custom_save = getattr(self, "save", None)

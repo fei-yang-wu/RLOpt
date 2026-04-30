@@ -971,6 +971,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             and hasattr(self.env, "normalize_obs")
         ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
+        data_to_save.update(self._extra_model_state_dict())
 
         torch.save(data_to_save, target_path)
 
@@ -1006,6 +1007,31 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             self.feature_extractor.load_state_dict(data["feature_extractor_state_dict"])  # type: ignore[arg-type]
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
             self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
+        self._load_extra_model_state_dict(data)
+
+    def _extra_model_state_dict(self) -> dict[str, Any]:
+        """Algorithm-specific checkpoint payload, merged into ``save_model``."""
+        return {}
+
+    def _load_extra_model_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
+        del checkpoint
+
+    def _should_save_checkpoint(
+        self,
+        *,
+        frames_processed: int,
+        frames_in_iteration: int,
+    ) -> bool:
+        """Return true once when an iteration crosses a sample-count boundary."""
+        save_interval = int(self.config.save_interval)
+        if save_interval <= 0:
+            return False
+        current_frames = int(frames_processed)
+        previous_frames = current_frames - int(frames_in_iteration)
+        return (
+            current_frames >= save_interval
+            and current_frames // save_interval > previous_frames // save_interval
+        )
 
     def _refresh_parameter_monitor(self) -> None:
         """Build a registry of all trainable parameters for numerical stability monitoring.

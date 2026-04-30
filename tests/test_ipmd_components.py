@@ -254,6 +254,29 @@ def test_ipmd_latent_mode_owns_controller_without_mixin_inheritance():
     assert not isinstance(agent, LatentCommandMixin)
 
 
+def test_ipmd_checkpoint_cadence_crosses_sample_boundary_once() -> None:
+    """Checkpoint cadence should trigger when an iteration crosses save_interval."""
+    agent, _ = _make_env_reward_only_ipmd_agent()
+    agent.config.save_interval = 100
+
+    assert not agent._should_save_checkpoint(
+        frames_processed=99,
+        frames_in_iteration=4,
+    )
+    assert agent._should_save_checkpoint(
+        frames_processed=100,
+        frames_in_iteration=4,
+    )
+    assert not agent._should_save_checkpoint(
+        frames_processed=120,
+        frames_in_iteration=20,
+    )
+    assert agent._should_save_checkpoint(
+        frames_processed=205,
+        frames_in_iteration=90,
+    )
+
+
 def test_ipmd_reward_estimator():
     """Test IPMD reward estimator network."""
     rlopt = _rlopt()
@@ -504,7 +527,9 @@ def test_ipmd_sampler_missing_required_keys_raises() -> None:
     )
 
     def _sample(_batch_size: int, required_keys):
-        return expert_data.select(*(key for key in required_keys if key in expert_data.keys(True))).clone()
+        return expert_data.select(
+            *(key for key in required_keys if key in expert_data.keys(True))
+        ).clone()
 
     agent._set_test_expert_batch_sampler(_sample)
 
@@ -619,6 +644,100 @@ def test_ipmd_posterior_collector_latents_are_recomputed_each_step() -> None:
         rollout_td_1.get("observation"),
         rollout_td_2.get("observation"),
     )
+
+
+def test_ipmd_vqvae_phase_config_validates_command_width() -> None:
+    """VQVAE code width plus phase features should be validated up front."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 66
+    cfg.ipmd.latent_learning.command_phase_mode = "sin_cos"
+    cfg.ipmd.latent_learning.code_latent_dim = 64
+    cfg.ipmd.validate()
+
+    bad_cfg = rlopt.IPMDRLOptConfig()
+    bad_cfg.ipmd.latent_dim = 65
+    bad_cfg.ipmd.latent_learning.command_phase_mode = "sin_cos"
+    bad_cfg.ipmd.latent_learning.code_latent_dim = 64
+    with pytest.raises(ValueError, match="code_latent_dim plus phase"):
+        bad_cfg.ipmd.validate()
+
+    bad_quantizer = rlopt.IPMDRLOptConfig()
+    bad_quantizer.ipmd.latent_learning.quantizer = "not_a_quantizer"
+    with pytest.raises(ValueError, match="quantizer"):
+        bad_quantizer.ipmd.validate()
+
+
+def test_fsq_quantizer_uses_all_even_level_codes() -> None:
+    """Even FSQ levels should map to all integer bins without half-step collapse."""
+    from rlopt.agent.imitation.latent_learning import FSQQuantizer
+
+    quantizer = FSQQuantizer([8])
+    z_e = torch.linspace(-20.0, 20.0, steps=4096).unsqueeze(-1)
+    _, code, _ = quantizer(z_e)
+
+    assert torch.equal(torch.unique(code), torch.arange(8))
+
+
+def test_patch_vqvae_collector_holds_code_and_reports_phase() -> None:
+    """The collector hook should hold z_q while sin/cos phase advances."""
+    rlopt = _rlopt()
+    from rlopt.agent.imitation.latent_learning import PatchVQVAELatentLearner
+
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 5
+    cfg.ipmd.latent_learning.method = "patch_vqvae"
+    cfg.ipmd.latent_learning.quantizer = "identity"
+    cfg.ipmd.latent_learning.code_latent_dim = 3
+    cfg.ipmd.latent_learning.command_phase_mode = "sin_cos"
+    cfg.ipmd.latent_learning.code_period = 3
+    cfg.ipmd.latent_learning.posterior_input_keys = ["observation"]
+    cfg.ipmd.validate()
+
+    fake_agent = SimpleNamespace(
+        config=cfg,
+        device=torch.device("cpu"),
+        _latent_dim=5,
+        _obs_feature_dims={"observation": 3},
+        _posterior_obs_keys=["observation"],
+        _action_feature_dim=2,
+    )
+    learner = PatchVQVAELatentLearner()
+    learner.initialize(fake_agent)
+    learner.encoder = torch.nn.Identity()
+
+    td0 = TensorDict(
+        {"observation": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+        batch_size=[2],
+    )
+    td1 = TensorDict(
+        {"observation": torch.tensor([[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]])},
+        batch_size=[2],
+    )
+    td3 = TensorDict(
+        {"observation": torch.tensor([[7.0, 8.0, 9.0], [1.0, 3.0, 5.0]])},
+        batch_size=[2],
+    )
+
+    cmd0 = learner.infer_collector_latents(td0)
+    cmd1 = learner.infer_collector_latents(td1)
+    cmd2 = learner.infer_collector_latents(td1)
+    cmd3 = learner.infer_collector_latents(td3)
+
+    assert torch.allclose(cmd0[:, :3], td0["observation"])
+    assert torch.allclose(cmd1[:, :3], td0["observation"])
+    assert torch.allclose(cmd2[:, :3], td0["observation"])
+    assert torch.allclose(cmd3[:, :3], td3["observation"])
+
+    phase0 = torch.tensor([0.0, 1.0]).repeat(2, 1)
+    angle1 = torch.tensor(2.0 * torch.pi / 3.0)
+    phase1 = torch.stack((torch.sin(angle1), torch.cos(angle1))).repeat(2, 1)
+    angle2 = torch.tensor(4.0 * torch.pi / 3.0)
+    phase2 = torch.stack((torch.sin(angle2), torch.cos(angle2))).repeat(2, 1)
+    assert torch.allclose(cmd0[:, -2:], phase0)
+    assert torch.allclose(cmd1[:, -2:], phase1)
+    assert torch.allclose(cmd2[:, -2:], phase2)
+    assert torch.allclose(cmd3[:, -2:], phase0)
 
 
 def test_ipmd_patch_autoencoder_uses_only_posterior_expert_keys() -> None:
