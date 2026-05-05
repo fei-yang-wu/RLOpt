@@ -17,6 +17,7 @@ from rlopt.config_utils import (
 )
 
 IPMD_COMMAND_SOURCES = frozenset({"random", "posterior"})
+IPMD_REWARD_MODEL_TYPES = frozenset({"mlp", "grouped"})
 IPMD_REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
 IPMD_REWARD_OUTPUT_ACTIVATIONS = frozenset({"none", "tanh", "sigmoid"})
 IPMD_REWARD_BLOCK_ORDER: dict[str, tuple[str, ...]] = {
@@ -33,6 +34,17 @@ def normalize_ipmd_command_source(command_source: str) -> str:
         msg = (
             f"Unsupported IPMD command_source {command_source!r}; "
             f"expected one of {sorted(IPMD_COMMAND_SOURCES)}."
+        )
+        raise ValueError(msg)
+    return normalized
+
+
+def normalize_ipmd_reward_model_type(reward_model_type: str) -> str:
+    normalized = str(reward_model_type).strip().lower()
+    if normalized not in IPMD_REWARD_MODEL_TYPES:
+        msg = (
+            f"Unsupported IPMD reward_model_type {reward_model_type!r}; "
+            f"expected one of {sorted(IPMD_REWARD_MODEL_TYPES)}."
         )
         raise ValueError(msg)
     return normalized
@@ -92,8 +104,6 @@ def build_reward_input_blocks(
     reward_obs_keys: Sequence[ObsKey],
     obs_feature_dims: Mapping[ObsKey, int],
     action_feature_dim: int,
-    use_latent_command: bool,
-    latent_dim: int,
 ) -> tuple[RewardInputBlock, ...]:
     """Construct one canonical reward-input specification."""
     obs_dim = sum(int(obs_feature_dims[key]) for key in reward_obs_keys)
@@ -116,15 +126,11 @@ def build_reward_input_blocks(
             )
             continue
         if kind == "action":
-            blocks.append(
-                RewardInputBlock(kind="action", dim=int(action_feature_dim))
-            )
+            blocks.append(RewardInputBlock(kind="action", dim=int(action_feature_dim)))
             continue
         msg = f"Unhandled reward input block kind {kind!r}."
         raise RuntimeError(msg)
 
-    if use_latent_command:
-        blocks.append(RewardInputBlock(kind="latent", dim=int(latent_dim)))
     return tuple(blocks)
 
 
@@ -142,8 +148,6 @@ def required_batch_keys_from_reward_blocks(
             continue
         if block.kind == "action":
             required.append("action")
-            continue
-        if block.kind == "latent":
             continue
         msg = f"Unhandled reward input block kind {block.kind!r}."
         raise RuntimeError(msg)
