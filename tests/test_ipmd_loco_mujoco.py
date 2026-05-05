@@ -13,6 +13,8 @@ from torchrl.envs.transforms import DoubleToFloat, StepCounter
 from rlopt.agent import IPMD, IPMDRLOptConfig
 from rlopt.config_base import NetworkConfig
 
+pytestmark = pytest.mark.slow
+
 # Check if loco-mujoco is available
 try:
     import gymnasium as gym

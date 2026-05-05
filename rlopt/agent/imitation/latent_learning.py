@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -154,6 +154,14 @@ class BaseLatentLearner:
     def joint_parameters(self) -> list[nn.Parameter]:
         return []
 
+    def state_dict(self) -> dict[str, Any]:
+        return {}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if state:
+            msg = f"{self.__class__.__name__} does not define checkpoint state."
+            raise RuntimeError(msg)
+
     def infer_current_reference_latents(
         self,
         *,
@@ -291,6 +299,24 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         if not bool(cfg.train_posterior_through_policy) or self.encoder is None:
             return []
         return list(self.encoder.parameters())
+
+    def state_dict(self) -> dict[str, Any]:
+        assert self.encoder is not None
+        assert self.decoder is not None
+        assert self.optimizer is not None
+        return {
+            "encoder": self.encoder.state_dict(),
+            "decoder": self.decoder.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        assert self.encoder is not None
+        assert self.decoder is not None
+        assert self.optimizer is not None
+        self.encoder.load_state_dict(state["encoder"])
+        self.decoder.load_state_dict(state["decoder"])
+        self.optimizer.load_state_dict(state["optimizer"])
 
     def infer_batch_latents(
         self,
@@ -518,6 +544,22 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
                 lr=float(cfg.probe_lr),
             )
 
+    def _probe_state_dict(self) -> dict[str, Any]:
+        if self.probe is None:
+            return {}
+        assert self.probe_optimizer is not None
+        return {
+            "probe": self.probe.state_dict(),
+            "probe_optimizer": self.probe_optimizer.state_dict(),
+        }
+
+    def _load_probe_state_dict(self, state: dict[str, Any]) -> None:
+        if self.probe is None:
+            return
+        assert self.probe_optimizer is not None
+        self.probe.load_state_dict(state["probe"])
+        self.probe_optimizer.load_state_dict(state["probe_optimizer"])
+
     def _features_from_td(
         self,
         td: TensorDict,
@@ -574,6 +616,22 @@ class PolicyKLBottleneckLatentLearner(BaseLatentLearner):
         if self.prior is not None:
             params.extend(list(self.prior.parameters()))
         return params
+
+    def state_dict(self) -> dict[str, Any]:
+        assert self.posterior is not None
+        assert self.prior is not None
+        return {
+            "posterior": self.posterior.state_dict(),
+            "prior": self.prior.state_dict(),
+            **self._probe_state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        assert self.posterior is not None
+        assert self.prior is not None
+        self.posterior.load_state_dict(state["posterior"])
+        self.prior.load_state_dict(state["prior"])
+        self._load_probe_state_dict(state)
 
     def infer_batch_latents(
         self,
@@ -774,6 +832,27 @@ class PolicyMLPEmbeddingLatentLearner(PolicyKLBottleneckLatentLearner):
         if self.encoder is None or not self.uses_joint_policy_loss:
             return []
         return list(self.encoder.parameters())
+
+    def state_dict(self) -> dict[str, Any]:
+        assert self.encoder is not None
+        state = {
+            "encoder": self.encoder.state_dict(),
+            **self._probe_state_dict(),
+        }
+        if self.decoder is not None:
+            assert self.recon_optimizer is not None
+            state["decoder"] = self.decoder.state_dict()
+            state["recon_optimizer"] = self.recon_optimizer.state_dict()
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        assert self.encoder is not None
+        self.encoder.load_state_dict(state["encoder"])
+        if self.decoder is not None:
+            assert self.recon_optimizer is not None
+            self.decoder.load_state_dict(state["decoder"])
+            self.recon_optimizer.load_state_dict(state["recon_optimizer"])
+        self._load_probe_state_dict(state)
 
     def infer_batch_latents(
         self,
@@ -1015,6 +1094,16 @@ class FixedProjectionLatentLearner(BaseLatentLearner):
             msg = "Fixed projection latent learner failed to infer expert latents."
             raise RuntimeError(msg)
         return latent
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"projection": self._projection}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        projection = state["projection"]
+        if projection is not None:
+            assert self.agent is not None
+            projection = projection.to(self.agent.device)
+        self._projection = projection
 
     def sample_expert_prior_latents(
         self,

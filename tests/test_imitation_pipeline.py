@@ -11,6 +11,14 @@ import torch
 
 # Add scripts to path and import modules directly
 scripts_path = Path(__file__).parent.parent / "scripts"
+required_scripts = [
+    scripts_path / "01_collect_expert_data.py",
+    scripts_path / "02_train_ipmd.py",
+    scripts_path / "03_train_bc.py",
+]
+if not all(script.exists() for script in required_scripts):
+    pytest.skip("legacy imitation scripts are not present", allow_module_level=True)
+
 sys.path.insert(0, str(scripts_path))
 
 

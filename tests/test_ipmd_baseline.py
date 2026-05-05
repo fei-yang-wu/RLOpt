@@ -10,6 +10,8 @@ import pytest
 from rlopt.agent import IPMD, PPO, IPMDRLOptConfig, PPORLOptConfig
 from rlopt.env_utils import make_parallel_env
 
+pytestmark = pytest.mark.slow
+
 
 def _apply_obs_input_keys_to_ppo(cfg: PPORLOptConfig) -> None:
     cfg.policy.input_keys = ["observation"]
@@ -33,7 +35,9 @@ def _install_test_expert_sampler(agent: IPMD, env, num_transitions: int = 256) -
     obs_dim = env.observation_spec["observation"].shape[-1]
     act_dim = env.action_spec.shape[-1]
     expert_data = {
-        "observation": rng.standard_normal((num_transitions, obs_dim), dtype=np.float32),
+        "observation": rng.standard_normal(
+            (num_transitions, obs_dim), dtype=np.float32
+        ),
         "action": rng.standard_normal((num_transitions, act_dim), dtype=np.float32),
         ("next", "observation"): rng.standard_normal(
             (num_transitions, obs_dim),

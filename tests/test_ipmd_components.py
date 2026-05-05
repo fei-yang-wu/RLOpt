@@ -504,7 +504,9 @@ def test_ipmd_sampler_missing_required_keys_raises() -> None:
     )
 
     def _sample(_batch_size: int, required_keys):
-        return expert_data.select(*(key for key in required_keys if key in expert_data.keys(True))).clone()
+        return expert_data.select(
+            *(key for key in required_keys if key in expert_data.keys(True))
+        ).clone()
 
     agent._set_test_expert_batch_sampler(_sample)
 
@@ -704,6 +706,111 @@ def test_ipmd_accepts_configured_posterior_keys_present_in_obs_spec() -> None:
 
     agent = rlopt.IPMD(env, cfg, logger=None)
     assert agent._posterior_obs_keys == [("policy", "observation")]
+
+
+def test_ipmd_record_saves_on_rollout_iteration_count(tmp_path) -> None:
+    """IPMD checkpoint cadence should be based on completed rollout iterations."""
+    rlopt = _rlopt()
+    agent = object.__new__(rlopt.IPMD)
+    agent.config = SimpleNamespace(
+        save_interval=2,
+        logger=SimpleNamespace(save_path="models", log_to_console=False),
+    )
+    agent.log_dir = tmp_path
+    agent.episode_lengths = []
+    agent.episode_rewards = []
+    agent.collector = SimpleNamespace(update_policy_weights_=lambda: None)
+    agent._build_control_metrics = lambda _metadata: {}
+    agent._build_timing_metrics = lambda _iteration, _metadata: {}
+    agent._record_env_metrics = lambda _iteration: None
+    agent.log_metrics = lambda *_args, **_kwargs: None
+    agent._log_iteration_file_summary = lambda _metadata, _iteration: None
+    agent._refresh_progress_display = lambda _metadata, _iteration: None
+    saved_paths = []
+
+    def _save_model(*, path):
+        saved_paths.append(path)
+
+    agent.save_model = _save_model
+    rollout = TensorDict(
+        {
+            ("next", "reward"): torch.ones(2, 1),
+            ("next", "episode_reward"): torch.zeros(2, 1),
+            ("next", "done"): torch.zeros(2, 1, dtype=torch.bool),
+            ("next", "step_count"): torch.zeros(2, 1),
+        },
+        batch_size=[2],
+    )
+    metadata = SimpleNamespace(frames_processed=49_152)
+
+    rlopt.IPMD.record(
+        agent,
+        SimpleNamespace(iteration_idx=0, rollout=rollout.clone(), metrics={}),
+        metadata,
+    )
+    rlopt.IPMD.record(
+        agent,
+        SimpleNamespace(iteration_idx=1, rollout=rollout.clone(), metrics={}),
+        metadata,
+    )
+
+    assert [path.name for path in saved_paths] == ["model_iter_2.pt"]
+
+
+def test_ipmd_save_load_roundtrip_includes_reward_estimator(tmp_path) -> None:
+    """IPMD checkpoints should persist the reward estimator, not just PPO state."""
+    rlopt = _rlopt()
+
+    class _LatentLearnerStub:
+        def __init__(self):
+            self.loaded_state = None
+
+        def state_dict(self):
+            return {"latent_weight": torch.tensor([3.0])}
+
+        def load_state_dict(self, state):
+            self.loaded_state = state
+
+    def _make_agent():
+        agent = object.__new__(rlopt.IPMD)
+        agent.log_dir = tmp_path
+        agent.config = SimpleNamespace(device="cpu", feature_extractor=None)
+        agent.env = SimpleNamespace(is_closed=False)
+        agent.policy = torch.nn.Linear(2, 2)
+        agent.value_function = torch.nn.Linear(2, 1)
+        agent.q_function = None
+        agent.feature_extractor = None
+        agent.reward_estimator = torch.nn.Linear(2, 1)
+        params = (
+            list(agent.policy.parameters())
+            + list(agent.value_function.parameters())
+            + list(agent.reward_estimator.parameters())
+        )
+        agent.optim = torch.optim.Adam(params, lr=1.0e-3)
+        agent.lr_scheduler = None
+        agent._latent_learner = _LatentLearnerStub()
+        return agent
+
+    source_agent = _make_agent()
+    with torch.no_grad():
+        source_agent.reward_estimator.weight.fill_(0.25)
+        source_agent.reward_estimator.bias.fill_(0.5)
+    checkpoint_path = tmp_path / "ipmd.pt"
+
+    source_agent.save_model(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert "reward_estimator_state_dict" in checkpoint
+    assert "latent_learner_state_dict" in checkpoint
+
+    target_agent = _make_agent()
+    target_agent.load_model(str(checkpoint_path))
+
+    for key, value in source_agent.reward_estimator.state_dict().items():
+        assert torch.equal(value, target_agent.reward_estimator.state_dict()[key])
+    assert torch.equal(
+        target_agent._latent_learner.loaded_state["latent_weight"],
+        torch.tensor([3.0]),
+    )
 
 
 if __name__ == "__main__":

@@ -1,7 +1,23 @@
 from __future__ import annotations
 
+import os
+import warnings
+
 import pytest
 import torchrl.envs.libs.gym as torchrl_gym_lib
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/rlopt-matplotlib")
+
+warnings.filterwarnings(
+    "ignore",
+    message="Creating .* which inherits from WeightUpdaterBase is deprecated.*",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="`torch.jit.script_method` is deprecated.*",
+    category=DeprecationWarning,
+)
 
 
 @pytest.fixture(autouse=True)

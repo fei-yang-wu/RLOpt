@@ -4,6 +4,7 @@ import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -1206,15 +1207,95 @@ class IPMD(PPO):
         self.collector.update_policy_weights_()
         self._refresh_progress_display(metadata, iteration)
 
+        # Save on completed rollout/update cycles; vectorized frame counts rarely
+        # divide sample-based intervals exactly.
+        iteration_count = iteration.iteration_idx + 1
         if (
             self.config.save_interval > 0
-            and metadata.frames_processed > 0
-            and metadata.frames_processed % self.config.save_interval == 0
+            and iteration_count % self.config.save_interval == 0
         ):
             self.save_model(
-                path=self.log_dir / self.config.logger.save_path,
-                step=metadata.frames_processed,
+                path=self.log_dir
+                / self.config.logger.save_path
+                / f"model_iter_{iteration_count}.pt",
             )
+
+    def save_model(
+        self, path: str | Path | None = None, step: int | None = None
+    ) -> None:
+        """Save PPO and IPMD reward-estimator state into one checkpoint."""
+        default_dir = self.log_dir
+        target_base = Path(path).expanduser() if path else default_dir
+        base_exists = target_base.exists()
+        base_is_file = base_exists and target_base.is_file()
+        has_suffix = bool(target_base.suffix)
+
+        if step:
+            if base_is_file or (has_suffix and not target_base.is_dir()):
+                suffix = target_base.suffix
+                stemmed = target_base.with_suffix("")
+                target_path = stemmed.with_name(stemmed.name + f"_step_{step}{suffix}")
+            else:
+                target_path = target_base / f"model_step_{step}.pt"
+        elif base_is_file or (has_suffix and not target_base.is_dir()):
+            target_path = target_base
+        else:
+            target_path = target_base / "model.pt"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        data_to_save: dict[str, Any] = {
+            "policy_state_dict": self.policy.state_dict() if self.policy else {},
+            "optimizer_state_dict": self.optim.state_dict(),
+            "reward_estimator_state_dict": self.reward_estimator.state_dict(),
+        }
+        if self._latent_learner is not None:
+            data_to_save["latent_learner_state_dict"] = (
+                self._latent_learner.state_dict()
+            )
+        if self.value_function:
+            data_to_save["value_state_dict"] = self.value_function.state_dict()
+        if self.q_function:
+            data_to_save["q_state_dict"] = self.q_function.state_dict()
+        if self.feature_extractor:
+            data_to_save["feature_extractor_state_dict"] = (
+                self.feature_extractor.state_dict()
+            )
+        if self.lr_scheduler is not None:
+            data_to_save["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        if (
+            hasattr(self.env, "is_closed")
+            and not self.env.is_closed
+            and hasattr(self.env, "normalize_obs")
+        ):
+            data_to_save["vec_norm_msg"] = self.env.state_dict()
+
+        torch.save(data_to_save, target_path)
+
+    def load_model(self, path: str) -> None:
+        """Load PPO and IPMD reward-estimator state from a checkpoint."""
+        data = torch.load(path, map_location=self.device)
+        if self.policy:
+            self.policy.load_state_dict(data["policy_state_dict"])  # type: ignore[arg-type]
+        if self.value_function:
+            self.value_function.load_state_dict(data["value_state_dict"])  # type: ignore[arg-type]
+        if self.q_function:
+            self.q_function.load_state_dict(data["q_state_dict"])  # type: ignore[arg-type]
+        if self.feature_extractor:
+            self.feature_extractor.load_state_dict(  # type: ignore[union-attr]
+                data["feature_extractor_state_dict"]  # type: ignore[arg-type]
+            )
+        self.reward_estimator.load_state_dict(
+            data["reward_estimator_state_dict"]  # type: ignore[arg-type]
+        )
+        if self._latent_learner is not None:
+            self._latent_learner.load_state_dict(
+                data["latent_learner_state_dict"]  # type: ignore[arg-type]
+            )
+        self.optim.load_state_dict(data["optimizer_state_dict"])  # type: ignore[arg-type]
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(data["lr_scheduler_state_dict"])
+        if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
+            self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
 
     def predict(self, obs: Tensor | np.ndarray | Mapping[Any, Any]) -> Tensor:  # type: ignore[override]
         """Predict action given observation (deterministic)."""

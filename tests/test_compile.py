@@ -1,12 +1,15 @@
-#!/usr/bin/env python3
 """Test script to verify compilation and CUDAGraphs work correctly."""
 
 from __future__ import annotations
 
+import pytest
 import torch
-from rlopt.agent.rl import SAC, SACRLOptConfig
-from rlopt.configs import NetworkConfig
+
+from rlopt.agent import SAC, SACRLOptConfig
+from rlopt.config_base import NetworkConfig
 from rlopt.env_utils import make_parallel_env
+
+pytestmark = pytest.mark.slow
 
 
 def test_sac_with_compile():
@@ -41,7 +44,7 @@ def test_sac_with_compile():
         input_keys=["observation"],
     )
 
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Device: {cfg.device}")
     print(f"  Compile: {cfg.compile.compile}")
     print(f"  Compile mode: {cfg.compile.compile_mode}")
@@ -101,7 +104,7 @@ def test_sac_with_cudagraphs():
         input_keys=["observation"],
     )
 
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Device: {cfg.device}")
     print(f"  Compile: {cfg.compile.compile}")
     print(f"  Compile mode: {cfg.compile.compile_mode}")

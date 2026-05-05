@@ -1,12 +1,14 @@
-#!/usr/bin/env python3
 """Test script to verify compilation works on CPU (without CUDAGraphs)."""
 
 from __future__ import annotations
 
-import torch
-from rlopt.agent.rl import SAC, SACRLOptConfig
-from rlopt.configs import NetworkConfig
+import pytest
+
+from rlopt.agent import SAC, SACRLOptConfig
+from rlopt.config_base import NetworkConfig
 from rlopt.env_utils import make_parallel_env
+
+pytestmark = pytest.mark.slow
 
 
 def test_sac_cpu_with_cudagraphs_enabled():
@@ -41,12 +43,12 @@ def test_sac_cpu_with_cudagraphs_enabled():
         input_keys=["observation"],
     )
 
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Device: {cfg.device}")
     print(f"  Compile: {cfg.compile.compile}")
     print(f"  Compile mode: {cfg.compile.compile_mode}")
     print(f"  CUDAGraphs in config: {cfg.compile.cudagraphs}")
-    print(f"  Expected behavior: CUDAGraphs should be skipped")
+    print("  Expected behavior: CUDAGraphs should be skipped")
 
     # Create environment
     print("\nCreating environment...")

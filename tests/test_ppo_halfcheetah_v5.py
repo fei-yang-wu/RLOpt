@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from rlopt.agent.rl import PPO, PPORLOptConfig
+from rlopt.agent import PPO, PPORLOptConfig
 from rlopt.env_utils import make_parallel_env
 
 
+@pytest.mark.slow
+@pytest.mark.mujoco("HalfCheetah-v5")
 def test_ppo_train_halfcheetah_v5_smoke():
     """Smoke test: construct PPO on HalfCheetah-v5 and run a tiny training loop.
 
