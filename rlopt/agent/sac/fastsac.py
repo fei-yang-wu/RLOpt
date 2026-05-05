@@ -1098,9 +1098,10 @@ class FastSAC(BaseAlgorithm[FastSACRLOptConfig]):
 
         # save_interval is in *samples* (same unit as log_interval and total_frames).
         if (
-            cfg.save_interval > 0
-            and metadata.frames_processed > 0
-            and metadata.frames_processed % cfg.save_interval == 0
+            self._should_save_checkpoint(
+                frames_processed=metadata.frames_processed,
+                frames_in_iteration=iteration.frames,
+            )
         ):
             self.save_model(
                 path=self.log_dir / cfg.logger.save_path,

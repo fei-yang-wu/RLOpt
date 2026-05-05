@@ -395,4 +395,4 @@ class RLOptConfig:
     """Verbosity for internal debug logging (e.g. ``"debug"``, ``"info"``)."""
 
     save_interval: int = 10
-    """Interval for saving the model."""
+    """Environment-sample interval for model checkpoints. 0 disables saving."""

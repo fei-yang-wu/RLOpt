@@ -136,6 +136,129 @@ class IPMDLatentLearningConfig:
     probe_batch_size: int = 8192
     """Probe for analyzing the latent learner. """
 
+    log_std_min: float = -5.0
+    log_std_max: float = 2.0
+    """Clamps applied to learned log_std heads (Gaussian latent models)."""
+
+    uniformity_coeff: float = 0.0
+    """Weight on the latent uniformity penalty for ``policy_mlp_embedding``."""
+
+    # ----- VQ-VAE / discrete-skill latent settings (used by patch_vqvae) -----
+    quantizer: str = "fsq"
+    """Quantizer choice for ``patch_vqvae``.
+
+    One of ``"fsq" | "vq_ema" | "gumbel" | "identity"``. ``"identity"``
+    keeps the same temporal hold path but removes discrete quantization.
+    """
+
+    code_latent_dim: int | None = None
+    """Latent code width before optional command-phase features.
+
+    ``None`` uses ``ipmd.latent_dim`` when ``command_phase_mode="none"`` and
+    ``ipmd.latent_dim - 2`` when ``command_phase_mode="sin_cos"``.
+    """
+
+    command_phase_mode: str = "none"
+    """Optional phase features appended to held rollout commands.
+
+    Supported values:
+    - ``"none"``: publish only the held code latent.
+    - ``"sin_cos"``: append ``sin(phase), cos(phase)`` within the current hold.
+    """
+
+    fsq_levels: list[int] = field(default_factory=lambda: [8, 8, 8, 5, 5])
+    """Per-dimension level counts for FSQ. Effective codebook size = prod(levels)."""
+
+    codebook_size: int = 512
+    """Codebook size for ``vq_ema`` and ``gumbel`` quantizers."""
+
+    codebook_embed_dim: int | None = None
+    """Embedding dim for codebook entries. ``None`` defaults to ``IPMDConfig.latent_dim``."""
+
+    commitment_coeff: float = 0.25
+    """Commitment-loss weight for ``vq_ema`` (``beta`` in van den Oord 2017)."""
+
+    ema_decay: float = 0.99
+    """EMA decay for codebook updates in ``vq_ema``."""
+
+    dead_code_reset_iters: int = 0
+    """Cadence (in update calls) for reviving unused codes via reinit. 0 disables."""
+
+    gumbel_tau_start: float = 1.0
+    gumbel_tau_end: float = 0.3
+    gumbel_tau_anneal_iters: int = 200_000
+    """Gumbel-Softmax temperature anneal schedule (linear)."""
+
+    gumbel_hard: bool = True
+    """Straight-through hard Gumbel forward, soft backward."""
+
+    gumbel_kl_to_uniform_coeff: float = 0.0
+    """``KL(q(c|x) || Uniform(K))`` regularizer (gumbel only)."""
+
+    code_usage_entropy_coeff: float = 0.0
+    """Marginal-code-usage entropy bonus to discourage collapse (gumbel only)."""
+
+    action_recon_coeff: float = 0.0
+    """If > 0, an extra decoder reconstructs ``expert_action`` from the quantized latent."""
+
+    code_period: int = 30
+    """Env steps a sampled code is held during rollout collection.
+
+    Used by ``patch_vqvae`` when ``ipmd.command_source == "posterior"``.
+    The generic latent command controller's ``latent_steps_min/max`` settings
+    are bypassed in that posterior path.
+    """
+
+    latent_dropout_to_random_code_prob: float = 0.0
+    """Reserved for random-code substitution during PPO updates."""
+
+    def validate(self, *, command_dim: int) -> None:
+        self.quantizer = str(self.quantizer).strip().lower()
+        if self.quantizer not in {"fsq", "vq_ema", "gumbel", "identity"}:
+            msg = (
+                "ipmd.latent_learning.quantizer must be one of "
+                "'fsq', 'vq_ema', 'gumbel', or 'identity', got "
+                f"{self.quantizer!r}."
+            )
+            raise ValueError(msg)
+
+        self.command_phase_mode = str(self.command_phase_mode).strip().lower()
+        if self.command_phase_mode not in {"none", "sin_cos"}:
+            msg = (
+                "ipmd.latent_learning.command_phase_mode must be 'none' or "
+                f"'sin_cos', got {self.command_phase_mode!r}."
+            )
+            raise ValueError(msg)
+
+        self.code_period = require_positive_int(
+            "ipmd.latent_learning.code_period", self.code_period
+        )
+        if self.code_latent_dim is not None:
+            self.code_latent_dim = require_positive_int(
+                "ipmd.latent_learning.code_latent_dim", self.code_latent_dim
+            )
+
+        phase_dim = 2 if self.command_phase_mode == "sin_cos" else 0
+        code_dim = (
+            int(self.code_latent_dim)
+            if self.code_latent_dim is not None
+            else int(command_dim) - phase_dim
+        )
+        if code_dim <= 0:
+            msg = (
+                "ipmd.latent_learning.code_latent_dim must leave a positive code "
+                f"width after phase features, got command_dim={command_dim}, "
+                f"phase_dim={phase_dim}."
+            )
+            raise ValueError(msg)
+        if code_dim + phase_dim != int(command_dim):
+            msg = (
+                "ipmd.latent_dim must equal code_latent_dim plus phase feature "
+                f"width, got latent_dim={command_dim}, code_latent_dim={code_dim}, "
+                f"phase_dim={phase_dim}."
+            )
+            raise ValueError(msg)
+
 
 @dataclass
 class IPMDConfig(PPOConfig):
@@ -347,6 +470,7 @@ class IPMDConfig(PPOConfig):
                 f"{self.latent_steps_min} > {self.latent_steps_max}."
             )
             raise ValueError(msg)
+        self.latent_learning.validate(command_dim=self.latent_dim)
         require_non_negative("ipmd.diversity_bonus_coeff", self.diversity_bonus_coeff)
         require_non_negative("ipmd.diversity_target", self.diversity_target)
         if float(self.latent_uniformity_temperature) <= 0.0:
@@ -755,11 +879,15 @@ class IPMD(PPO):
             return
 
         assert self._latent_learner is not None
-        latents = self._latent_learner.infer_batch_latents(
-            td,
-            detach=True,
-            context="collector posterior latent",
-        )
+        collector_hook = getattr(self._latent_learner, "infer_collector_latents", None)
+        if callable(collector_hook):
+            latents = collector_hook(td)
+        else:
+            latents = self._latent_learner.infer_batch_latents(
+                td,
+                detach=True,
+                context="collector posterior latent",
+            )
         if latents is None:
             msg = (
                 "Active latent learner does not support collector-time posterior "
@@ -1845,10 +1973,9 @@ class IPMD(PPO):
         self.collector.update_policy_weights_()
         self._refresh_progress_display(metadata, iteration)
 
-        if (
-            self.config.save_interval > 0
-            and metadata.frames_processed > 0
-            and metadata.frames_processed % self.config.save_interval == 0
+        if self._should_save_checkpoint(
+            frames_processed=metadata.frames_processed,
+            frames_in_iteration=iteration.frames,
         ):
             self.save_model(
                 path=self.log_dir / self.config.logger.save_path,

@@ -1177,9 +1177,10 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
             self.collector.update_policy_weights_()
 
             if (
-                self.config.save_interval > 0
-                and int(collected_frames) > 0
-                and int(collected_frames) % self.config.save_interval == 0
+                self._should_save_checkpoint(
+                    frames_processed=int(collected_frames),
+                    frames_in_iteration=int(frames_in_batch),
+                )
             ):
                 self.save_model(
                     path=self.log_dir / self.config.logger.save_path,
