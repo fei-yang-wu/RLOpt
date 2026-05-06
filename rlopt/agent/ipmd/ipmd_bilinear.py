@@ -12,7 +12,6 @@ The spectral representation objective is configurable via ``sr_type``:
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -42,6 +41,7 @@ from rlopt.config_utils import (
     dedupe_keys,
     next_obs_key,
     normalize_batch_key,
+    obs_key_feature_dim,
 )
 from rlopt.models.gaussian_policy import GaussianPolicyHead
 from rlopt.utils import get_activation_class
@@ -520,10 +520,7 @@ class IPMDBilinear(IPMD):
         else:
             command_keys = self._bilinear_policy_command_keys()
             command_dim = (
-                sum(
-                    int(math.prod(self.env.observation_spec[key].shape))
-                    for key in command_keys
-                )
+                sum(obs_key_feature_dim(self.env, key) for key in command_keys)
                 if command_keys
                 else None
             )
