@@ -19,12 +19,14 @@ def _rlopt() -> SimpleNamespace:
         category=DeprecationWarning,
         append=False,
     )
-    from rlopt.agent import IPMD, IPMDRLOptConfig
+    from rlopt.agent import IPMD, IPMDBilinear, IPMDBilinearRLOptConfig, IPMDRLOptConfig
     from rlopt.config_base import NetworkConfig
     from rlopt.env_utils import make_parallel_env
 
     return SimpleNamespace(
         IPMD=IPMD,
+        IPMDBilinear=IPMDBilinear,
+        IPMDBilinearRLOptConfig=IPMDBilinearRLOptConfig,
         IPMDRLOptConfig=IPMDRLOptConfig,
         NetworkConfig=NetworkConfig,
         make_parallel_env=make_parallel_env,
@@ -115,6 +117,120 @@ def _make_env_reward_only_ipmd_agent():
     return rlopt.IPMD(env, cfg, logger=None), env
 
 
+def _make_bilinear_offline_cfg():
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDBilinearRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.logger.backend = ""
+    cfg.policy.input_keys = ["observation"]
+    cfg.policy.num_cells = [16]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["observation"]
+        cfg.value_function.num_cells = [16]
+    cfg.ipmd.use_latent_command = False
+    cfg.ipmd.reward_input_keys = ["observation"]
+    cfg.ipmd.reward_num_cells = (16,)
+    cfg.ipmd.reward_loss_coeff = 0.0
+    cfg.ipmd.reward_l2_coeff = 0.0
+    cfg.ipmd.reward_grad_penalty_coeff = 0.0
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.diversity_bonus_coeff = 0.0
+    cfg.bilinear.obs_keys = ["observation"]
+    cfg.bilinear.next_obs_keys = ["observation"]
+    cfg.bilinear.feature_dim = 3
+    cfg.bilinear.embed_dim = 8
+    cfg.bilinear.f_hidden_dims = (16,)
+    cfg.bilinear.g_hidden_dims = (16,)
+    cfg.bilinear.mu_hidden_dims = (16,)
+    cfg.bilinear.sr_batch_size = 4
+    cfg.bilinear.history_buffer_size = 64
+    cfg.bilinear.num_noises = 2
+    cfg.bilinear.sample_eval_interval = 0
+    cfg.bilinear.offline_pretrain.enabled = True
+    cfg.bilinear.offline_pretrain.num_updates = 2
+    cfg.bilinear.offline_pretrain.batch_size = 8
+    cfg.bilinear.offline_pretrain.log_interval = 1
+    return cfg
+
+
+class _BilinearTestPolicyHead(torch.nn.Module):
+    def __init__(self, obs_dim: int, action_dim: int) -> None:
+        super().__init__()
+        self.loc = torch.nn.Linear(obs_dim, action_dim)
+        self.log_std = torch.nn.Parameter(torch.zeros(action_dim))
+
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        loc = self.loc(obs)
+        scale = self.log_std.exp().expand_as(loc)
+        return loc, scale
+
+
+def _make_bilinear_test_policy_head(env) -> _BilinearTestPolicyHead:
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    action_dim = env.action_spec.shape[-1]
+    return _BilinearTestPolicyHead(obs_dim, action_dim)
+
+
+def _make_bilinear_expert_batch(env, num_transitions: int = 32) -> TensorDict:
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    return TensorDict(
+        {
+            "observation": torch.randn(num_transitions, obs_dim),
+            ("next", "observation"): torch.randn(num_transitions, obs_dim),
+            "expert_action": torch.randn(num_transitions, act_dim),
+        },
+        batch_size=[num_transitions],
+    )
+
+
+def test_bilinear_policy_head_splits_command_from_representation_state() -> None:
+    """Policy command keys should not be concatenated into the SR state input."""
+    _rlopt()
+    from rlopt.agent.ipmd.ipmd_bilinear import BilinearPolicyHead
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    bilinear_rep = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=2,
+        feature_dim=3,
+        embed_dim=4,
+        f_hidden_dims=(8,),
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        num_noises=2,
+        use_ema_for_policy=True,
+        device="cpu",
+    )
+    head = BilinearPolicyHead(
+        bilinear_rep=bilinear_rep,
+        num_cells=[8],
+        activation_fn="elu",
+        action_dim=2,
+        num_command_inputs=2,
+        command_dim=7,
+        device="cpu",
+    )
+
+    loc, scale = head(
+        torch.randn(6, 2),
+        torch.randn(6, 5),
+        torch.randn(6, 5),
+    )
+
+    assert loc.shape == (6, 2)
+    assert scale.shape == (6, 2)
+
+
 def test_ipmd_prepare_rollout_rewards_ignores_estimator_when_disabled():
     """Disabled estimated PPO rewards should leave env rewards untouched."""
     agent, env = _make_env_reward_only_ipmd_agent()
@@ -153,6 +269,132 @@ def test_ipmd_disabled_reward_update_disables_expert_minibatch_path():
     """Pure-PPO IPMD configs should skip the expert minibatch path entirely."""
     agent, _ = _make_env_reward_only_ipmd_agent()
     assert agent._expert_minibatch_update_enabled is False
+
+
+def test_ipmd_bilinear_offline_pretrain_requires_expert_sampler() -> None:
+    """Offline SR pretraining should fail at construction without a sampler."""
+    rlopt = _rlopt()
+    cfg = _make_bilinear_offline_cfg()
+    env = rlopt.make_parallel_env(cfg)
+
+    with pytest.raises(ValueError, match="sample_expert_batch"):
+        rlopt.IPMDBilinear(
+            env,
+            cfg,
+            policy_net=_make_bilinear_test_policy_head(env),
+            logger=None,
+        )
+
+
+def test_ipmd_bilinear_offline_pretrain_validates_config() -> None:
+    """Offline SR pretraining validates positive update, batch, and log values."""
+    rlopt = _rlopt()
+    cfg = _make_bilinear_offline_cfg()
+    cfg.bilinear.offline_pretrain.batch_size = 0
+    env = rlopt.make_parallel_env(cfg)
+    env.sample_expert_batch = lambda batch_size, _required_keys: TensorDict(
+        {},
+        batch_size=[batch_size],
+    )
+
+    with pytest.raises(ValueError, match="offline_pretrain.batch_size"):
+        rlopt.IPMDBilinear(
+            env,
+            cfg,
+            policy_net=_make_bilinear_test_policy_head(env),
+            logger=None,
+        )
+
+
+def test_ipmd_bilinear_offline_pretrain_uses_expert_action_and_next_obs() -> None:
+    """Offline SR pretraining should request explicit next-state keys and expert actions."""
+    rlopt = _rlopt()
+    cfg = _make_bilinear_offline_cfg()
+    env = rlopt.make_parallel_env(cfg)
+    expert_data = _make_bilinear_expert_batch(env)
+    requested: list[list[str | tuple[str, ...]]] = []
+
+    def _sample_expert_batch(batch_size: int, required_keys):
+        requested.append(list(required_keys))
+        return expert_data[:batch_size].select(*required_keys).clone()
+
+    env.sample_expert_batch = _sample_expert_batch
+    agent = rlopt.IPMDBilinear(
+        env,
+        cfg,
+        policy_net=_make_bilinear_test_policy_head(env),
+        logger=None,
+    )
+
+    sr_before = {
+        name: param.detach().clone()
+        for name, param in agent.bilinear_rep.named_parameters()
+    }
+    non_sr_actor_before = {
+        name: param.detach().clone()
+        for name, param in agent.actor_critic.named_parameters()
+        if "bilinear_rep" not in name
+    }
+    reward_before = {
+        name: param.detach().clone()
+        for name, param in agent.reward_estimator.named_parameters()
+    }
+
+    agent._offline_pretrain_spectral_representation()
+
+    assert requested
+    assert requested[0] == ["observation", ("next", "observation"), "expert_action"]
+    assert len(agent._sr_history_buffer) == (
+        cfg.bilinear.offline_pretrain.num_updates
+        * cfg.bilinear.offline_pretrain.batch_size
+    )
+    assert agent.bilinear_rep.obs_norm.count.item() == len(agent._sr_history_buffer)
+    assert any(
+        not torch.allclose(param, sr_before[name])
+        for name, param in agent.bilinear_rep.named_parameters()
+    )
+    for name, param in agent.actor_critic.named_parameters():
+        if "bilinear_rep" not in name:
+            assert torch.allclose(param, non_sr_actor_before[name])
+    for name, param in agent.reward_estimator.named_parameters():
+        assert torch.allclose(param, reward_before[name])
+    assert agent.bilinear_rep.state_net_ema is not None
+    for online, ema in zip(
+        agent.bilinear_rep.state_net.parameters(),
+        agent.bilinear_rep.state_net_ema.parameters(),
+        strict=True,
+    ):
+        assert torch.allclose(online, ema)
+
+
+def test_ipmd_bilinear_offline_missing_required_keys_fails_before_update() -> None:
+    """A malformed expert batch should fail before any offline SR optimizer step."""
+    rlopt = _rlopt()
+    cfg = _make_bilinear_offline_cfg()
+    env = rlopt.make_parallel_env(cfg)
+    expert_data = _make_bilinear_expert_batch(env)
+
+    def _sample_expert_batch(batch_size: int, required_keys):
+        del required_keys
+        return expert_data[:batch_size].select("observation").clone()
+
+    env.sample_expert_batch = _sample_expert_batch
+    agent = rlopt.IPMDBilinear(
+        env,
+        cfg,
+        policy_net=_make_bilinear_test_policy_head(env),
+        logger=None,
+    )
+    sr_before = {
+        name: param.detach().clone()
+        for name, param in agent.bilinear_rep.named_parameters()
+    }
+
+    with pytest.raises(RuntimeError, match="missing required keys"):
+        agent._offline_pretrain_spectral_representation()
+
+    for name, param in agent.bilinear_rep.named_parameters():
+        assert torch.allclose(param, sr_before[name])
 
 
 def test_ipmd_prepare_rollout_rewards_honors_estimated_reward_gate():
