@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from tensordict import TensorDict
+from torchrl.data import Unbounded
 
 
 @lru_cache(maxsize=1)
@@ -185,7 +186,7 @@ def _make_bilinear_expert_batch(env, num_transitions: int = 32) -> TensorDict:
         {
             "observation": torch.randn(num_transitions, obs_dim),
             ("next", "observation"): torch.randn(num_transitions, obs_dim),
-            "expert_action": torch.randn(num_transitions, act_dim),
+            "expert_action": torch.tanh(torch.randn(num_transitions, act_dim)),
         },
         batch_size=[num_transitions],
     )
@@ -229,6 +230,27 @@ def test_bilinear_policy_head_splits_command_from_representation_state() -> None
 
     assert loc.shape == (6, 2)
     assert scale.shape == (6, 2)
+    assert head.base[0].in_features == 4
+
+    raw_state_head = BilinearPolicyHead(
+        bilinear_rep=bilinear_rep,
+        num_cells=[8],
+        activation_fn="elu",
+        action_dim=2,
+        num_command_inputs=2,
+        command_dim=7,
+        include_raw_state=True,
+        device="cpu",
+    )
+    loc, scale = raw_state_head(
+        torch.randn(6, 2),
+        torch.randn(6, 5),
+        torch.randn(6, 5),
+    )
+
+    assert loc.shape == (6, 2)
+    assert scale.shape == (6, 2)
+    assert raw_state_head.base[0].in_features == 9
 
 
 def test_ipmd_prepare_rollout_rewards_ignores_estimator_when_disabled():
@@ -306,6 +328,20 @@ def test_ipmd_bilinear_offline_pretrain_validates_config() -> None:
         )
 
 
+def test_ipmd_bilinear_offline_pretrain_constructs_default_policy_head() -> None:
+    """Offline preflight should work with the production bilinear policy head."""
+    rlopt = _rlopt()
+    cfg = _make_bilinear_offline_cfg()
+    env = rlopt.make_parallel_env(cfg)
+    expert_data = _make_bilinear_expert_batch(env)
+    env.sample_expert_batch = _make_test_expert_sampler(expert_data)
+
+    agent = rlopt.IPMDBilinear(env, cfg, logger=None)
+
+    assert agent.policy is not None
+    assert len(agent._sr_history_buffer) == 0
+
+
 def test_ipmd_bilinear_offline_pretrain_uses_expert_action_and_next_obs() -> None:
     """Offline SR pretraining should request explicit next-state keys and expert actions."""
     rlopt = _rlopt()
@@ -367,8 +403,82 @@ def test_ipmd_bilinear_offline_pretrain_uses_expert_action_and_next_obs() -> Non
         assert torch.allclose(online, ema)
 
 
-def test_ipmd_bilinear_offline_missing_required_keys_fails_before_update() -> None:
-    """A malformed expert batch should fail before any offline SR optimizer step."""
+def test_ipmd_bilinear_offline_policy_bc_updates_actor_after_sr_pretrain() -> None:
+    """Offline policy BC should update the same feature-only actor used online."""
+    rlopt = _rlopt()
+    cfg = _make_bilinear_offline_cfg()
+    cfg.bilinear.policy_include_raw_state = False
+    cfg.bilinear.offline_pretrain.policy_bc_updates = 2
+    cfg.bilinear.offline_pretrain.policy_bc_batch_size = 8
+    env = rlopt.make_parallel_env(cfg)
+    expert_data = _make_bilinear_expert_batch(env)
+    requested: list[list[str | tuple[str, ...]]] = []
+
+    def _sample_expert_batch(batch_size: int, required_keys):
+        requested.append(list(required_keys))
+        return expert_data[:batch_size].select(*required_keys).clone()
+
+    env.sample_expert_batch = _sample_expert_batch
+    agent = rlopt.IPMDBilinear(env, cfg, logger=None)
+    non_sr_actor_before = {
+        name: param.detach().clone()
+        for name, param in agent.actor_critic.named_parameters()
+        if "bilinear_rep" not in name
+    }
+
+    agent._offline_pretrain_spectral_representation()
+
+    assert requested
+    assert ["observation", ("next", "observation"), "expert_action"] in requested
+    assert any(
+        not torch.allclose(param, non_sr_actor_before[name])
+        for name, param in agent.actor_critic.named_parameters()
+        if "bilinear_rep" not in name
+    )
+
+
+def test_ipmd_bilinear_offline_pretrain_handles_distinct_next_obs_dim() -> None:
+    """Offline SR pretraining should support s and s' with different feature widths."""
+    rlopt = _rlopt()
+    cfg = _make_bilinear_offline_cfg()
+    cfg.bilinear.next_obs_keys = ["next_observation"]
+    cfg.bilinear.sample_eval_interval = 1
+    env = rlopt.make_parallel_env(cfg)
+    next_obs_dim = 2
+    env.output_spec.unlock_()
+    env.output_spec["full_observation_spec", "next_observation"] = Unbounded(
+        shape=(*env.batch_size, next_obs_dim),
+        device="cpu",
+    )
+    env.output_spec.lock_()
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    expert_data = TensorDict(
+        {
+            "observation": torch.randn(32, obs_dim),
+            ("next", "next_observation"): torch.randn(32, next_obs_dim),
+            "expert_action": torch.randn(32, act_dim),
+        },
+        batch_size=[32],
+    )
+    env.sample_expert_batch = _make_test_expert_sampler(expert_data)
+    agent = rlopt.IPMDBilinear(
+        env,
+        cfg,
+        policy_net=_make_bilinear_test_policy_head(env),
+        logger=None,
+    )
+
+    agent._offline_pretrain_spectral_representation()
+
+    assert len(agent._sr_history_buffer) == (
+        cfg.bilinear.offline_pretrain.num_updates
+        * cfg.bilinear.offline_pretrain.batch_size
+    )
+
+
+def test_ipmd_bilinear_offline_missing_required_keys_fails_at_construction() -> None:
+    """A malformed expert batch should fail during offline pretrain preflight."""
     rlopt = _rlopt()
     cfg = _make_bilinear_offline_cfg()
     env = rlopt.make_parallel_env(cfg)
@@ -379,22 +489,14 @@ def test_ipmd_bilinear_offline_missing_required_keys_fails_before_update() -> No
         return expert_data[:batch_size].select("observation").clone()
 
     env.sample_expert_batch = _sample_expert_batch
-    agent = rlopt.IPMDBilinear(
-        env,
-        cfg,
-        policy_net=_make_bilinear_test_policy_head(env),
-        logger=None,
-    )
-    sr_before = {
-        name: param.detach().clone()
-        for name, param in agent.bilinear_rep.named_parameters()
-    }
 
     with pytest.raises(RuntimeError, match="missing required keys"):
-        agent._offline_pretrain_spectral_representation()
-
-    for name, param in agent.bilinear_rep.named_parameters():
-        assert torch.allclose(param, sr_before[name])
+        rlopt.IPMDBilinear(
+            env,
+            cfg,
+            policy_net=_make_bilinear_test_policy_head(env),
+            logger=None,
+        )
 
 
 def test_ipmd_prepare_rollout_rewards_honors_estimated_reward_gate():

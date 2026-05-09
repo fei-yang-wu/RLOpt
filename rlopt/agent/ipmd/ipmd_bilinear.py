@@ -12,6 +12,7 @@ The spectral representation objective is configurable via ``sr_type``:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -89,6 +90,12 @@ class BilinearOfflinePretrainConfig:
     log_interval: int = 100
     """Log offline SR metrics every N offline updates."""
 
+    policy_bc_updates: int = 0
+    """Number of offline policy behavior-cloning updates after SR pretraining."""
+
+    policy_bc_batch_size: int = 8192
+    """Expert action batch size for offline policy BC."""
+
     def validate(self) -> None:
         if not self.enabled:
             return
@@ -101,6 +108,15 @@ class BilinearOfflinePretrainConfig:
         self.log_interval = require_positive_int(
             "bilinear.offline_pretrain.log_interval", self.log_interval
         )
+        self.policy_bc_updates = _require_non_negative_int(
+            "bilinear.offline_pretrain.policy_bc_updates",
+            self.policy_bc_updates,
+        )
+        if self.policy_bc_updates > 0:
+            self.policy_bc_batch_size = require_positive_int(
+                "bilinear.offline_pretrain.policy_bc_batch_size",
+                self.policy_bc_batch_size,
+            )
 
 
 @dataclass
@@ -155,8 +171,11 @@ class BilinearSRConfig:
     sample_eval_interval: int = 50
     """Run sampling check every N SR updates (only when SR supports sampling)."""
 
-    detach_features_for_policy: bool = True
-    """Detach representation features before feeding to policy (no grad to SR)."""
+    detach_features_for_policy: bool = False
+    """Detach the final policy representation before feeding it to the policy MLP."""
+
+    policy_include_raw_state: bool = False
+    """Append raw SR state to F(s)z before the policy MLP."""
 
     ema_tau: float = 0.01
     """EMA update rate for the policy target state_net. Lower = slower tracking."""
@@ -257,7 +276,8 @@ class BilinearPolicyHead(GaussianPolicyHead):
         log_std_min: float = -20.0,
         log_std_max: float = 2.0,
         clip_log_std: bool = False,
-        detach_features: bool = True,
+        detach_features: bool = False,
+        include_raw_state: bool = False,
         device: str | torch.device = "cpu",
     ) -> None:
         base_mlp = MLP(
@@ -282,6 +302,7 @@ class BilinearPolicyHead(GaussianPolicyHead):
         # Detach prevents PPO gradients flowing into the representation.
         self.bilinear_rep = bilinear_rep
         self.detach_features = detach_features
+        self.include_raw_state = bool(include_raw_state)
         self.num_command_inputs = int(num_command_inputs)
         if self.num_command_inputs < 0:
             msg = "num_command_inputs must be >= 0."
@@ -334,9 +355,13 @@ class BilinearPolicyHead(GaussianPolicyHead):
             else:
                 assert self.command_projector is not None
                 z = self.command_projector(command)
-        rep = self.bilinear_rep.compute_policy_representation(state, z)
-        # if self.detach_features:
-        #     rep = rep.detach()
+        rep = self.bilinear_rep.compute_policy_representation(
+            state,
+            z,
+            include_raw_state=self.include_raw_state,
+        )
+        if self.detach_features:
+            rep = rep.detach()
         # Delegate to GaussianPolicyHead: base MLP + log_std_module
         loc = self.base(rep)
         scale = self.log_std_module(loc)
@@ -486,6 +511,58 @@ class IPMDBilinear(IPMD):
             )
             raise ValueError(msg)
         offline_cfg.validate()
+        self._preflight_offline_pretrain_batch()
+
+    def _preflight_offline_pretrain_batch(self) -> None:
+        offline_cfg = self.config.bilinear.offline_pretrain
+        preflight_batch_size = min(int(offline_cfg.batch_size), 8)
+        expert_batch = self._next_expert_batch(
+            batch_size=preflight_batch_size,
+            required_keys=self._offline_pretrain_required_keys(),
+        )
+        transitions = self._sr_transition_batch_from_td(
+            expert_batch,
+            action_key="expert_action",
+        )
+
+        obs = cast(Tensor, transitions.get("obs"))
+        action = cast(Tensor, transitions.get("action"))
+        next_obs = cast(Tensor, transitions.get(("next", "obs")))
+        self._validate_offline_pretrain_tensor_shape(
+            "obs",
+            obs,
+            batch_size=preflight_batch_size,
+            feature_dim=int(self.bilinear_rep.obs_dim),
+        )
+        self._validate_offline_pretrain_tensor_shape(
+            "action",
+            action,
+            batch_size=preflight_batch_size,
+            feature_dim=int(self.bilinear_rep.action_dim),
+        )
+        self._validate_offline_pretrain_tensor_shape(
+            "next_obs",
+            next_obs,
+            batch_size=preflight_batch_size,
+            feature_dim=int(self.bilinear_rep.next_obs_dim),
+        )
+
+    @staticmethod
+    def _validate_offline_pretrain_tensor_shape(
+        name: str,
+        tensor: Tensor,
+        *,
+        batch_size: int,
+        feature_dim: int,
+    ) -> None:
+        expected = (int(batch_size), int(feature_dim))
+        actual = tuple(tensor.shape)
+        if actual != expected:
+            msg = (
+                "Offline bilinear pretrain expert batch shape mismatch for "
+                f"{name}: expected {expected}, got {actual}."
+            )
+            raise ValueError(msg)
 
     def _bilinear_policy_command_keys(self) -> list[ObsKey]:
         bilinear_state_keys = set(self._bilinear_obs_keys)
@@ -536,6 +613,7 @@ class IPMDBilinear(IPMD):
                 log_std_max=self.config.ppo.log_std_max,
                 clip_log_std=self.config.ppo.clip_log_std,
                 detach_features=self.config.bilinear.detach_features_for_policy,
+                include_raw_state=self.config.bilinear.policy_include_raw_state,
                 device=self.device,
             )
             policy_in_keys = command_keys + list(self._bilinear_obs_keys)
@@ -600,6 +678,20 @@ class IPMDBilinear(IPMD):
         required.append("expert_action")
         return dedupe_keys(required)
 
+    def _offline_policy_bc_required_keys(self) -> list[BatchKey]:
+        required: list[BatchKey] = ["expert_action"]
+        required.extend(self._policy_obs_keys_without_latent)
+        if self._use_latent_command:
+            assert self._latent_learner is not None
+            required.extend(self._latent_learner.required_expert_batch_keys())
+        return dedupe_keys(required)
+
+    def _offline_pretrain_required_keys(self) -> list[BatchKey]:
+        required = self._offline_sr_required_keys()
+        if self.config.bilinear.offline_pretrain.policy_bc_updates > 0:
+            required.extend(self._offline_policy_bc_required_keys())
+        return dedupe_keys(required)
+
     def _sr_loss_from_batch(self, batch: TensorDict) -> tuple[dict[str, float], Tensor]:
         batch = batch.to(self.device)
         obs = cast(Tensor, batch.get("obs"))
@@ -662,12 +754,113 @@ class IPMDBilinear(IPMD):
             "sample/recon_l1": l1.item(),
         }
 
+    def _offline_policy_bc_step(self, expert_batch: TensorDict) -> dict[str, float]:
+        expert_batch = expert_batch.to(self.device)
+        expert_action = cast(Tensor, expert_batch.get("expert_action"))
+        expert_obs_td = expert_batch.clone(False)
+        if self._use_latent_command and self._latent_key not in expert_obs_td.keys(True):
+            expert_latents = self._expert_latents_from_td(
+                expert_batch,
+                detach=True,
+            ).reshape(*expert_batch.batch_size, self._latent_dim)
+            expert_obs_td.set(self._latent_key, expert_latents)
+        expert_obs_td = expert_obs_td.select(*self._policy_operator.in_keys)
+
+        self.optim.zero_grad(set_to_none=True)
+        dist = self._policy_operator.get_dist(expert_obs_td)
+        log_prob = dist.log_prob(expert_action)
+        log_prob = self._reduce_log_prob(log_prob, expert_action)
+        bc_nll = -log_prob.mean()
+        bc_nll.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self._grad_clip_params,
+            self._max_grad_norm,
+        )
+        self.optim.step()
+
+        with torch.no_grad():
+            metrics = {
+                "bc_nll": bc_nll.item(),
+                "bc_log_prob_mean": log_prob.mean().item(),
+                "bc_expert_action_abs_mean": expert_action.abs().mean().item(),
+                "bc_actor_grad_norm": float(grad_norm),
+            }
+            scale = getattr(dist, "scale", None)
+            if isinstance(scale, Tensor):
+                metrics["bc_policy_scale_mean"] = scale.mean().item()
+        return metrics
+
+    def _offline_pretrain_policy_bc(self) -> None:
+        offline_cfg = self.config.bilinear.offline_pretrain
+        if offline_cfg.policy_bc_updates <= 0:
+            return
+
+        required_keys = self._offline_policy_bc_required_keys()
+        total_updates = int(offline_cfg.policy_bc_updates)
+        batch_size = int(offline_cfg.policy_bc_batch_size)
+        start_time = time.perf_counter()
+        self.actor_critic.train()
+        self.log.info(
+            "offline_policy_bc start | updates=%d | batch_size=%d | log_interval=%d",
+            total_updates,
+            batch_size,
+            int(offline_cfg.log_interval),
+        )
+        for update_idx in range(1, total_updates + 1):
+            expert_batch = self._next_expert_batch(
+                batch_size=batch_size,
+                required_keys=required_keys,
+            )
+            bc_metrics = self._offline_policy_bc_step(expert_batch)
+
+            if update_idx % offline_cfg.log_interval == 0 or update_idx in {
+                1,
+                total_updates,
+            }:
+                log_metrics = {
+                    f"offline/policy_bc/{key}": value
+                    for key, value in bc_metrics.items()
+                }
+                self.log_metrics(
+                    log_metrics,
+                    step=update_idx,
+                    log_python=bool(self.config.logger.log_to_console),
+                )
+                elapsed = time.perf_counter() - start_time
+                updates_per_sec = update_idx / elapsed
+                remaining_updates = total_updates - update_idx
+                eta_seconds = remaining_updates / updates_per_sec
+                self.log.info(
+                    "offline_policy_bc progress | update=%d/%d | %.1f%% | "
+                    "elapsed=%.1fs | eta=%.1fs | updates_per_sec=%.3f",
+                    update_idx,
+                    total_updates,
+                    100.0 * update_idx / total_updates,
+                    elapsed,
+                    eta_seconds,
+                    updates_per_sec,
+                )
+
+        self.log.info(
+            "offline_policy_bc complete | updates=%d | elapsed=%.1fs",
+            total_updates,
+            time.perf_counter() - start_time,
+        )
+
     def _offline_pretrain_spectral_representation(self) -> None:
         offline_cfg = self.config.bilinear.offline_pretrain
         if not offline_cfg.enabled:
             return
 
-        required_keys = self._offline_sr_required_keys()
+        required_keys = self._offline_pretrain_required_keys()
+        total_updates = int(offline_cfg.num_updates)
+        start_time = time.perf_counter()
+        self.log.info(
+            "offline_pretrain start | updates=%d | batch_size=%d | log_interval=%d",
+            total_updates,
+            int(offline_cfg.batch_size),
+            int(offline_cfg.log_interval),
+        )
         for update_idx in range(1, offline_cfg.num_updates + 1):
             expert_batch = self._next_expert_batch(
                 batch_size=offline_cfg.batch_size,
@@ -691,8 +884,31 @@ class IPMDBilinear(IPMD):
                     step=update_idx,
                     log_python=bool(self.config.logger.log_to_console),
                 )
+                elapsed = time.perf_counter() - start_time
+                updates_per_sec = update_idx / elapsed
+                remaining_updates = total_updates - update_idx
+                eta_seconds = remaining_updates / updates_per_sec
+                self.log.info(
+                    "offline_pretrain progress | update=%d/%d | %.1f%% | "
+                    "elapsed=%.1fs | eta=%.1fs | updates_per_sec=%.3f | "
+                    "history=%d",
+                    update_idx,
+                    total_updates,
+                    100.0 * update_idx / total_updates,
+                    elapsed,
+                    eta_seconds,
+                    updates_per_sec,
+                    len(self._sr_history_buffer),
+                )
 
         self.bilinear_rep.update_ema(1.0)
+        self.log.info(
+            "offline_pretrain complete | updates=%d | elapsed=%.1fs | history=%d",
+            total_updates,
+            time.perf_counter() - start_time,
+            len(self._sr_history_buffer),
+        )
+        self._offline_pretrain_policy_bc()
 
     def train(self) -> None:  # type: ignore[override]
         """Run offline SR pretraining, then the normal online IPMD loop."""
@@ -728,20 +944,14 @@ class IPMDBilinear(IPMD):
         for k, v in sr_metrics.items():
             self._pending_sr_metrics.setdefault(k, []).append(v)
 
-        self._pending_sr_metrics.setdefault("z_l1_mean", []).append(
-            iteration.rollout.get(self._latent_key)
-            .reshape(-1, self._latent_dim)
-            .abs()
-            .mean()
-            .item()
-        )
-        self._pending_sr_metrics.setdefault("z_l1_std", []).append(
-            iteration.rollout.get(self._latent_key)
-            .reshape(-1, self._latent_dim)
-            .std(dim=0)
-            .mean()
-            .item()
-        )
+        if self._use_latent_command:
+            latent = cast(Tensor, iteration.rollout.get(self._latent_key))
+            self._pending_sr_metrics.setdefault("z_l1_mean", []).append(
+                latent.reshape(-1, self._latent_dim).abs().mean().item()
+            )
+            self._pending_sr_metrics.setdefault("z_l1_std", []).append(
+                latent.reshape(-1, self._latent_dim).std(dim=0).mean().item()
+            )
         self._pending_sr_metrics.setdefault("history_buffer_size", []).append(
             float(len(self._sr_history_buffer))
         )

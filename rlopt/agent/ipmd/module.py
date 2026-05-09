@@ -27,7 +27,6 @@ from rlopt.agent.ipmd.network import (
     get_noise_schedule,
 )
 
-
 # ---------------------------------------------------------------------------
 # Empirical normalization
 # ---------------------------------------------------------------------------
@@ -154,19 +153,25 @@ class BilinearSR(ABC, nn.Module):
         if self.state_net_ema is None:
             return
         for p_ema, p_online in zip(
-            self.state_net_ema.parameters(), self.state_net.parameters()
+            self.state_net_ema.parameters(), self.state_net.parameters(), strict=True
         ):
             p_ema.data.lerp_(p_online.data, tau)
 
     # -- Policy / Q representation (shared) --
 
-    def compute_policy_representation(self, s: Tensor, z: Tensor = None) -> Tensor:
-        """F(s) z -> (B, embed_dim). Detached; uses EMA state_net when enabled."""
+    def compute_policy_representation(
+        self,
+        s: Tensor,
+        z: Tensor = None,
+        *,
+        include_raw_state: bool = True,
+    ) -> Tensor:
+        """F(s) z -> (B, embed_dim). Optionally append raw SR state."""
         F_s = self._F(s, use_ema=True).detach()
-        # return torch.einsum("bef,bf->be", F_s, z)
         component1 = torch.einsum("bef,bf->be", F_s, z)
-        component2 = s.detach()
-        return torch.concat([component1, component2], dim=-1)
+        if include_raw_state:
+            return torch.concat([component1, s.detach()], dim=-1)
+        return component1
 
     def compute_q_representation(self, s: Tensor, a: Tensor) -> Tensor:
         """Return phi(s, a) for Q-function use."""
@@ -198,17 +203,16 @@ class BilinearSR(ABC, nn.Module):
         preserve_history: bool = False,
     ) -> tuple[Tensor, dict]:
         """Generate s' given (s, a). Only supported by diffusion-based SR."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support generative sampling."
-        )
+        msg = f"{type(self).__name__} does not support generative sampling."
+        raise NotImplementedError(msg)
 
     @property
     def supports_sampling(self) -> bool:
         return False
 
-    def update_obs_norm(self, next_obs: Tensor) -> None:
+    def update_obs_norm(self, _next_obs: Tensor) -> None:
         """Update observation normalization statistics. No-op by default."""
-        pass
+        del _next_obs
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +325,7 @@ class DiffSRBilinear(BilinearSR):
         s: Tensor,
         a: Tensor,
         sp: Tensor,
-        r: Tensor,
+        _r: Tensor,
     ) -> tuple[dict[str, float], Tensor, Tensor]:
         x0 = self.obs_norm.normalize(sp)
         xt, t, eps = self.add_noise(x0)
@@ -490,7 +494,7 @@ class SpederBilinear(BilinearSR):
         s: Tensor,
         a: Tensor,
         sp: Tensor,
-        r: Tensor,
+        _r: Tensor,
     ) -> tuple[dict[str, float], Tensor, Tensor]:
         B = sp.shape[0]
         N = self.num_noises if self.use_noise_perturbation else 1
@@ -654,7 +658,7 @@ class CtrlSRBilinear(BilinearSR):
         s: Tensor,
         a: Tensor,
         sp: Tensor,
-        r: Tensor,
+        _r: Tensor,
     ) -> tuple[dict[str, float], Tensor, Tensor]:
         B = sp.shape[0]
         z_phi = self.forward_phi(s, a)  # (B, feature_dim)
@@ -732,7 +736,6 @@ def build_bilinear_sr(sr_type: str, **kwargs) -> BilinearSR:
     """
     cls = SR_REGISTRY.get(sr_type)
     if cls is None:
-        raise ValueError(
-            f"Unknown sr_type={sr_type!r}. Available: {list(SR_REGISTRY.keys())}"
-        )
+        msg = f"Unknown sr_type={sr_type!r}. Available: {list(SR_REGISTRY.keys())}"
+        raise ValueError(msg)
     return cls(**kwargs)
