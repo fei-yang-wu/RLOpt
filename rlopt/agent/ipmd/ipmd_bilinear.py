@@ -397,13 +397,17 @@ class IPMDBilinear(IPMD):
         self.config.bilinear.validate()
         self.env = env
         self._provided_bilinear_policy_net = policy_net
+        offline_dataset_enabled = bool(
+            getattr(self.config.offline_dataset, "enabled", False)
+        )
         if (
             self.config.bilinear.offline_pretrain.enabled
+            and not offline_dataset_enabled
             and self._discover_env_method(env, "sample_expert_batch") is None
         ):
             msg = (
                 "bilinear.offline_pretrain.enabled=True requires "
-                "env.sample_expert_batch(...)."
+                "env.sample_expert_batch(...) or offline_dataset.enabled=True."
             )
             raise ValueError(msg)
 
@@ -504,10 +508,13 @@ class IPMDBilinear(IPMD):
         offline_cfg = self.config.bilinear.offline_pretrain
         if not offline_cfg.enabled:
             return
-        if self._expert_batch_sampler is None:
+        if (
+            self._offline_expert_batch_sampler is None
+            and self._expert_batch_sampler is None
+        ):
             msg = (
                 "bilinear.offline_pretrain.enabled=True requires "
-                "env.sample_expert_batch(...)."
+                "env.sample_expert_batch(...) or offline_dataset.enabled=True."
             )
             raise ValueError(msg)
         offline_cfg.validate()
@@ -516,7 +523,7 @@ class IPMDBilinear(IPMD):
     def _preflight_offline_pretrain_batch(self) -> None:
         offline_cfg = self.config.bilinear.offline_pretrain
         preflight_batch_size = min(int(offline_cfg.batch_size), 8)
-        expert_batch = self._next_expert_batch(
+        expert_batch = self._next_offline_expert_batch(
             batch_size=preflight_batch_size,
             required_keys=self._offline_pretrain_required_keys(),
         )
@@ -758,7 +765,9 @@ class IPMDBilinear(IPMD):
         expert_batch = expert_batch.to(self.device)
         expert_action = cast(Tensor, expert_batch.get("expert_action"))
         expert_obs_td = expert_batch.clone(False)
-        if self._use_latent_command and self._latent_key not in expert_obs_td.keys(True):
+        if self._use_latent_command and self._latent_key not in expert_obs_td.keys(
+            True
+        ):
             expert_latents = self._expert_latents_from_td(
                 expert_batch,
                 detach=True,
@@ -807,7 +816,7 @@ class IPMDBilinear(IPMD):
             int(offline_cfg.log_interval),
         )
         for update_idx in range(1, total_updates + 1):
-            expert_batch = self._next_expert_batch(
+            expert_batch = self._next_offline_expert_batch(
                 batch_size=batch_size,
                 required_keys=required_keys,
             )
@@ -862,7 +871,7 @@ class IPMDBilinear(IPMD):
             int(offline_cfg.log_interval),
         )
         for update_idx in range(1, offline_cfg.num_updates + 1):
-            expert_batch = self._next_expert_batch(
+            expert_batch = self._next_offline_expert_batch(
                 batch_size=offline_cfg.batch_size,
                 required_keys=required_keys,
             )
