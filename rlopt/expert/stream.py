@@ -255,6 +255,18 @@ def build_offline_expert_sampler(
     action_scale = list(offline_cfg.action_scale) or list(
         params.get("action_scale", [])
     )
+    dataset_joint_names = list(offline_cfg.dataset_joint_names) or list(
+        params.get("dataset_joint_names", [])
+    )
+    target_joint_names = list(offline_cfg.target_joint_names) or list(
+        params.get("target_joint_names", params.get("joint_names", []))
+    )
+    default_root_height = float(offline_cfg.default_root_height)
+    if default_root_height == 0.0:
+        default_root_height = float(params.get("default_root_height", 0.0))
+    align_root_z_to_default = bool(
+        offline_cfg.align_root_z_to_default and default_root_height > 0.0
+    )
     cache_dir = str(offline_cfg.cache_dir)
     if not cache_dir:
         cache_dir = str(Path("offline_dataset_cache") / str(offline_cfg.mapper))
@@ -278,11 +290,16 @@ def build_offline_expert_sampler(
         dt=1.0 / float(offline_cfg.fps),
         default_joint_pos=default_joint_pos_pool or default_joint_pos,
         action_scale=action_scale,
+        dataset_joint_names=dataset_joint_names,
+        target_joint_names=target_joint_names,
+        align_root_z_to_default=align_root_z_to_default,
+        default_root_height=default_root_height,
         quat_order=str(offline_cfg.quat_order),
     )
     mapper = UnitreeG1WBT29DofMapper(mapper_cfg)
     cache_cfg = LeRobotStreamingCacheConfig(
         repo_id=str(offline_cfg.repo_id),
+        repo_ids=tuple(str(repo_id) for repo_id in offline_cfg.repo_ids),
         split=str(offline_cfg.split),
         cache_dir=cache_dir,
         max_cache_transitions=int(offline_cfg.max_cache_transitions),
@@ -296,6 +313,9 @@ def build_offline_expert_sampler(
         max_episodes=None
         if int(offline_cfg.max_episodes) <= 0
         else int(offline_cfg.max_episodes),
+        max_episodes_per_repo=None
+        if int(offline_cfg.max_episodes_per_repo) <= 0
+        else int(offline_cfg.max_episodes_per_repo),
         mapper=mapper_cfg,
     )
     cache = StreamingTensorDictReplayCache(cache_cfg, mapper=mapper)
