@@ -210,6 +210,14 @@ class IPMDLatentLearningConfig:
     are bypassed in that posterior path.
     """
 
+    posterior_command_period: int = 1
+    """Env steps a continuous posterior command is held during rollout.
+
+    Used by continuous posterior learners such as ``patch_autoencoder``.
+    A value of 1 preserves the original behavior and refreshes the posterior
+    command every env step.
+    """
+
     latent_dropout_to_random_code_prob: float = 0.0
     """Reserved for random-code substitution during PPO updates."""
 
@@ -233,6 +241,10 @@ class IPMDLatentLearningConfig:
 
         self.code_period = require_positive_int(
             "ipmd.latent_learning.code_period", self.code_period
+        )
+        self.posterior_command_period = require_positive_int(
+            "ipmd.latent_learning.posterior_command_period",
+            self.posterior_command_period,
         )
         if self.code_latent_dim is not None:
             self.code_latent_dim = require_positive_int(
@@ -2102,6 +2114,10 @@ class IPMD(PPO):
             data_to_save["reward_optimizer_state_dict"] = self.reward_optim.state_dict()
         if self.lr_scheduler is not None:
             data_to_save["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        if self._latent_learner is not None:
+            data_to_save["latent_learner_state_dict"] = (
+                self._latent_learner.checkpoint_state_dict()
+            )
         if (
             hasattr(self.env, "is_closed")
             and not self.env.is_closed
@@ -2135,6 +2151,10 @@ class IPMD(PPO):
         if self.config.feature_extractor and "feature_extractor_state_dict" in data:
             self.feature_extractor.load_state_dict(
                 data["feature_extractor_state_dict"]  # type: ignore[arg-type]
+            )
+        if self._latent_learner is not None and "latent_learner_state_dict" in data:
+            self._latent_learner.load_checkpoint_state_dict(
+                data["latent_learner_state_dict"]
             )
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
             self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
