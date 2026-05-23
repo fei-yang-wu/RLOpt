@@ -73,6 +73,98 @@ class ReplayBufferConfig:
 
 
 @dataclass
+class OfflineDatasetConfig:
+    """Offline expert dataset configuration."""
+
+    enabled: bool = False
+    """Whether to build an offline expert dataset cache."""
+
+    replace_expert_sampler: bool = False
+    """Whether the offline cache replaces env.sample_expert_batch during online updates."""
+
+    source: str = "lerobot_stream"
+    """Offline source type. Supported initially: ``"lerobot_stream"``."""
+
+    repo_id: str = "unitreerobotics/G1_WBT_Brainco_Pickup_Pillow"
+    """Primary LeRobot dataset repository id."""
+
+    repo_ids: list[str] = field(default_factory=list)
+    """Optional ordered list of LeRobot dataset repository ids."""
+
+    split: str = "train"
+    """Dataset split to stream."""
+
+    mapper: str = "unitree_g1_wbt_29dof"
+    """Dataset-to-training TensorDict mapper."""
+
+    cache_storage: str = "torchrl_memmap"
+    """Local cache storage backend."""
+
+    cache_dir: str = ""
+    """Directory for the local TorchRL memmap cache. Empty string uses the default."""
+
+    min_ready_transitions: int = 100_000
+    """Minimum converted transitions before training may sample."""
+
+    max_cache_transitions: int = 5_000_000
+    """Maximum local cache size before round-robin overwrite."""
+
+    low_watermark: int = 1_000_000
+    """Refill watermark reserved for rolling-cache policies."""
+
+    starvation_timeout_s: float = 300.0
+    """Timeout while waiting for the background producer to fill the cache."""
+
+    local_sample_prefetch: int = 0
+    """TorchRL sampling-side prefetch for the local cache."""
+
+    batch_size: int = 0
+    """Default replay-buffer sample batch size. Use 0 to defer to sample calls."""
+
+    max_episodes: int = 0
+    """Optional cap for startup probes and bounded dataset subsets. Use 0 for no cap."""
+
+    max_episodes_per_repo: int = 0
+    """Optional per-repo cap for multi-repo startup probes. Use 0 for no cap."""
+
+    fps: float = 30.0
+    """Dataset frame rate used for finite differences."""
+
+    episode_key: str = "episode_index"
+    """LeRobot field containing episode ids."""
+
+    robot_q_current_key: str = "observation.state.robot_q_current"
+    """LeRobot field containing current floating-base robot configuration."""
+
+    robot_q_desired_key: str = "action.robot_q_desired"
+    """LeRobot field containing desired floating-base robot configuration."""
+
+    quat_order: str = "wxyz"
+    """Quaternion order in ``robot_q_current``."""
+
+    default_joint_pos: list[float] = field(default_factory=list)
+    """G1 default joint positions in target/action joint order."""
+
+    default_joint_pos_pool: list[list[float]] = field(default_factory=list)
+    """Optional pool of G1 default joint positions for domain-randomized env offsets."""
+
+    action_scale: list[float] = field(default_factory=list)
+    """G1 action scale in target/action joint order."""
+
+    dataset_joint_names: list[str] = field(default_factory=list)
+    """Optional robot_q[7:] joint names in dataset order."""
+
+    target_joint_names: list[str] = field(default_factory=list)
+    """Optional target/action joint names emitted by the mapper."""
+
+    align_root_z_to_default: bool = True
+    """Align LeRobot root z so the first frame matches the environment default."""
+
+    default_root_height: float = 0.0
+    """Optional default root height for LeRobot z alignment; 0 defers to env params."""
+
+
+@dataclass
 class LoggerConfig:
     """Logger configuration for RLOpt  ."""
 
@@ -357,6 +449,9 @@ class RLOptConfig:
 
     replay_buffer: ReplayBufferConfig = field(default_factory=ReplayBufferConfig)
     """Replay buffer configuration."""
+
+    offline_dataset: OfflineDatasetConfig = field(default_factory=OfflineDatasetConfig)
+    """Offline expert dataset configuration."""
 
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     """Logger configuration."""

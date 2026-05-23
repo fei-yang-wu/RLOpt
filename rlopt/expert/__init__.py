@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Utilities for feeding expert demonstrations into RLOpt agents.
 
 This package provides:
@@ -14,5 +12,12 @@ They are meant to be used as a glue layer between external dataset libs
 such as ImitationLearningTools (iltools) and RLOpt algorithms.
 """
 
-from .stream import StateMapper, build_prefetch_iterator  # noqa: F401
+from __future__ import annotations
 
+from .stream import (  # noqa: F401
+    OfflineExpertSampler,
+    StateMapper,
+    StreamingOfflineExpertSampler,
+    build_offline_expert_sampler,
+    build_prefetch_iterator,
+)

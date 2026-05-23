@@ -260,6 +260,8 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         self.encoder: LatentEncoder | None = None
         self.decoder: LatentDecoder | None = None
         self.optimizer: torch.optim.Optimizer | None = None
+        self._collector_latents: Tensor | None = None
+        self._collector_steps: Tensor | None = None
 
     def _config(self):
         assert self.agent is not None
@@ -345,6 +347,91 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
             with torch.no_grad():
                 return self.encoder(patch_features)
         return self.encoder(patch_features)
+
+    def _renew_collector_latents(
+        self,
+        td: TensorDict,
+        renew_mask: Tensor,
+    ) -> None:
+        assert self.agent is not None
+        latents = self.infer_batch_latents(
+            td,
+            detach=True,
+            context="collector posterior latent",
+        )
+        if latents is None:
+            msg = "patch_autoencoder failed to infer collector latents."
+            raise RuntimeError(msg)
+        latents = latents.to(self.agent.device).reshape(-1, self.agent._latent_dim)
+        if self._collector_latents is None or self._collector_latents.shape != latents.shape:
+            self._collector_latents = latents.clone()
+        else:
+            self._collector_latents[renew_mask] = latents[renew_mask]
+
+    def infer_collector_latents(self, td: TensorDict) -> Tensor:
+        """Infer posterior latents and optionally hold them for multiple env steps."""
+        assert self.agent is not None
+        cfg = self._config()
+        device = self.agent.device
+        command_dim = int(self.agent._latent_dim)
+        period = max(1, int(cfg.posterior_command_period))
+        if period <= 1:
+            latents = self.infer_batch_latents(
+                td,
+                detach=True,
+                context="collector posterior latent",
+            )
+            if latents is None:
+                return torch.empty(0, command_dim, device=device)
+            return latents.to(device=device).reshape(-1, command_dim)
+
+        batch_size = int(td.numel())
+        if batch_size <= 0:
+            return torch.empty(0, command_dim, device=device)
+
+        if (
+            self._collector_latents is None
+            or self._collector_latents.shape[0] != batch_size
+            or self._collector_latents.shape[1] != command_dim
+            or self._collector_latents.device != device
+        ):
+            self._collector_latents = torch.zeros(batch_size, command_dim, device=device)
+            self._collector_steps = torch.zeros(
+                batch_size, device=device, dtype=torch.long
+            )
+
+        assert self._collector_steps is not None
+        done_mask = self._build_done_mask(td, batch_size=batch_size, device=device)
+        renew_mask = done_mask | (self._collector_steps <= 0)
+        if bool(renew_mask.any()):
+            self._renew_collector_latents(td, renew_mask)
+            self._collector_steps[renew_mask] = period
+        command = self._collector_latents
+        self._collector_steps -= 1
+        return command
+
+    @staticmethod
+    def _build_done_mask(
+        td: TensorDict, *, batch_size: int, device: torch.device
+    ) -> Tensor:
+        mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        candidates: list[BatchKey] = [
+            cast(BatchKey, "done"),
+            cast(BatchKey, "terminated"),
+            cast(BatchKey, "truncated"),
+            cast(BatchKey, "is_init"),
+            cast(BatchKey, ("next", "done")),
+            cast(BatchKey, ("next", "terminated")),
+            cast(BatchKey, ("next", "truncated")),
+        ]
+        keys = td.keys(True)
+        for key in candidates:
+            if key not in keys:
+                continue
+            value = cast(Tensor, td.get(key)).reshape(-1).to(device=device).bool()
+            if value.numel() == batch_size:
+                mask |= value
+        return mask
 
     def reconstruct_batch_features(
         self,
@@ -1471,6 +1558,23 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
             agent._obs_feature_dims[key] for key in self._posterior_input_keys()
         )
         self._ensure_modules(int(input_dim))
+
+    def joint_parameters(self) -> list[nn.Parameter]:
+        assert self.agent is not None
+        cfg = self._config()
+        if (
+            not bool(cfg.train_posterior_through_policy)
+            or bool(cfg.freeze_encoder)
+            or self.encoder is None
+        ):
+            return []
+
+        params: list[nn.Parameter] = list(self.encoder.parameters())
+        if self.code_to_latent is not None:
+            params += list(self.code_to_latent.parameters())
+        if self.gumbel is not None:
+            params += list(self.gumbel.parameters())
+        return params
 
     # ----- core encode + quantize -----------------------------------------------
     def _current_tau(self) -> float:

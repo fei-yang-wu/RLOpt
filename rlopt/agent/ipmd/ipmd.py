@@ -60,6 +60,7 @@ from rlopt.config_utils import (
     obs_key_feature_dim,
     obs_key_feature_ndim,
 )
+from rlopt.expert import build_offline_expert_sampler
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
 
@@ -209,6 +210,14 @@ class IPMDLatentLearningConfig:
     are bypassed in that posterior path.
     """
 
+    posterior_command_period: int = 1
+    """Env steps a continuous posterior command is held during rollout.
+
+    Used by continuous posterior learners such as ``patch_autoencoder``.
+    A value of 1 preserves the original behavior and refreshes the posterior
+    command every env step.
+    """
+
     latent_dropout_to_random_code_prob: float = 0.0
     """Reserved for random-code substitution during PPO updates."""
 
@@ -232,6 +241,10 @@ class IPMDLatentLearningConfig:
 
         self.code_period = require_positive_int(
             "ipmd.latent_learning.code_period", self.code_period
+        )
+        self.posterior_command_period = require_positive_int(
+            "ipmd.latent_learning.posterior_command_period",
+            self.posterior_command_period,
         )
         if self.code_latent_dim is not None:
             self.code_latent_dim = require_positive_int(
@@ -763,6 +776,9 @@ class IPMD(PPO):
         self._expert_batch_sampler: (
             Callable[[int, list[BatchKey]], TensorDict | None] | None
         ) = None
+        self._offline_expert_batch_sampler: (
+            Callable[[int, list[BatchKey]], TensorDict | None] | None
+        ) = None
 
         self._latent_learner: BaseLatentLearner | None = None
 
@@ -837,11 +853,85 @@ class IPMD(PPO):
             **kwargs,
         )
         self._auto_attach_env_expert_sampler()
+        self._auto_attach_offline_expert_sampler()
         self._validate_expert_transition_alignment()
         self._refresh_grad_clip_params()
         self._reward_grad_clip_params = list(self.reward_estimator.parameters())
         self._policy_operator = self.actor_critic.get_policy_operator()
         self._bc_debug_anomaly_prints = 0
+
+    def _auto_attach_offline_expert_sampler(self) -> None:
+        """Attach a configured offline dataset sampler after env construction."""
+        sampler = build_offline_expert_sampler(self.config, self.env)
+        if sampler is None:
+            return
+        self._offline_expert_batch_sampler = sampler
+        offline_cfg = self.config.offline_dataset
+        self.log.info(
+            "Using offline dataset sampler: source=%s repo_id=%s mapper=%s",
+            offline_cfg.source,
+            offline_cfg.repo_id,
+            offline_cfg.mapper,
+        )
+        if not bool(offline_cfg.replace_expert_sampler):
+            return
+
+        self._expert_batch_sampler = sampler
+        self._expert_sampler_source_name = "offline_dataset"
+        required_keys = (
+            self._expert_required_keys() if self._expert_minibatch_update_enabled else []
+        )
+        if required_keys:
+            preflight_batch_size = min(
+                int(
+                    self.config.ipmd.expert_batch_size
+                    or self.config.loss.mini_batch_size
+                ),
+                8,
+            )
+            _ = sampler(preflight_batch_size, required_keys)
+
+    def _next_offline_expert_batch(
+        self,
+        batch_size: int | None = None,
+        required_keys: list[BatchKey] | None = None,
+    ) -> TensorDict:
+        if self._offline_expert_batch_sampler is None:
+            return self._next_expert_batch(
+                batch_size=batch_size,
+                required_keys=required_keys,
+            )
+        assert isinstance(self.config, IPMDRLOptConfig)
+        effective_batch_size = int(
+            batch_size
+            or self.config.ipmd.expert_batch_size
+            or self.config.loss.mini_batch_size
+        )
+        required_keys = (
+            self._expert_required_keys() if required_keys is None else required_keys
+        )
+        expert_batch = self._offline_expert_batch_sampler(
+            effective_batch_size,
+            required_keys,
+        )
+        if expert_batch is None:
+            msg = "Offline expert sampler returned None."
+            raise RuntimeError(msg)
+        available_keys = set(expert_batch.keys(True))
+        missing_keys = [key for key in required_keys if key not in available_keys]
+        if missing_keys:
+            msg = (
+                "Offline expert sampler batch is missing required keys: "
+                f"{missing_keys!r}."
+            )
+            raise RuntimeError(msg)
+        if expert_batch.numel() != effective_batch_size:
+            msg = (
+                "Offline expert sampler must return exactly the requested batch size, got "
+                f"{expert_batch.numel()} for request {effective_batch_size}."
+            )
+            raise RuntimeError(msg)
+        return expert_batch.to(self.device)
 
     def _require_latent_command_controller(self) -> LatentCommandController:
         controller = self._latent_command_controller
@@ -996,6 +1086,8 @@ class IPMD(PPO):
             for key in self._expert_required_keys()
         )
         if not requires_next_obs or self._expert_batch_sampler is None:
+            return
+        if getattr(self, "_expert_sampler_source_name", None) == "offline_dataset":
             return
 
         aligned_next = getattr(self.env, "_reference_has_aligned_next", None)
@@ -2022,6 +2114,10 @@ class IPMD(PPO):
             data_to_save["reward_optimizer_state_dict"] = self.reward_optim.state_dict()
         if self.lr_scheduler is not None:
             data_to_save["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        if self._latent_learner is not None:
+            data_to_save["latent_learner_state_dict"] = (
+                self._latent_learner.checkpoint_state_dict()
+            )
         if (
             hasattr(self.env, "is_closed")
             and not self.env.is_closed
@@ -2055,6 +2151,10 @@ class IPMD(PPO):
         if self.config.feature_extractor and "feature_extractor_state_dict" in data:
             self.feature_extractor.load_state_dict(
                 data["feature_extractor_state_dict"]  # type: ignore[arg-type]
+            )
+        if self._latent_learner is not None and "latent_learner_state_dict" in data:
+            self._latent_learner.load_checkpoint_state_dict(
+                data["latent_learner_state_dict"]
             )
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
             self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
