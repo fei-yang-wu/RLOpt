@@ -29,7 +29,13 @@ from torchrl.data import (
 )
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.envs.utils import ExplorationType
-from torchrl.modules import MLP, IndependentNormal, ProbabilisticActor, TanhNormal
+from torchrl.modules import (
+    MLP,
+    IndependentNormal,
+    ProbabilisticActor,
+    TanhNormal,
+    ValueOperator,
+)
 from torchrl.record.loggers import Logger
 
 from rlopt.agent.ipmd.ipmd import IPMD, IPMDRLOptConfig
@@ -184,6 +190,24 @@ class BilinearSRConfig:
     policy_include_raw_state: bool = False
     """Append raw SR state to F(s)z before the policy MLP."""
 
+    policy_input_mode: str = "bilinear"
+    """Policy input mode: "bilinear" uses F(s)z, "raw" uses normal PPO/IPMD policy construction."""
+
+    value_input_mode: str = "mlp"
+    """Value input mode: "mlp" uses normal PPO value construction, "linear_fz" uses a linear head over F(s)z."""
+
+    value_command_keys: list[ObsKey] = field(default_factory=list)
+    """Command keys concatenated into z for linear-Fz value approximation."""
+
+    value_state_keys: list[ObsKey] | None = None
+    """State keys concatenated into s for linear-Fz value approximation. Defaults to obs_keys."""
+
+    detach_features_for_value: bool = True
+    """Detach F(s)z before the linear value head so PPO does not update SR parameters."""
+
+    value_feature_batch_size: int = 4096
+    """Max flat samples passed through F(s) at once for the linear-Fz value head."""
+
     ema_tau: float = 0.01
     """EMA update rate for the policy target state_net. Lower = slower tracking."""
 
@@ -207,6 +231,20 @@ class BilinearSRConfig:
 
     def validate(self) -> None:
         self.sr_type = str(self.sr_type).strip().lower()
+        self.policy_input_mode = str(self.policy_input_mode).strip().lower()
+        self.value_input_mode = str(self.value_input_mode).strip().lower()
+        if self.policy_input_mode not in {"bilinear", "raw"}:
+            msg = (
+                "bilinear.policy_input_mode must be 'bilinear' or 'raw', got "
+                f"{self.policy_input_mode!r}."
+            )
+            raise ValueError(msg)
+        if self.value_input_mode not in {"mlp", "linear_fz"}:
+            msg = (
+                "bilinear.value_input_mode must be 'mlp' or 'linear_fz', got "
+                f"{self.value_input_mode!r}."
+            )
+            raise ValueError(msg)
         self.feature_dim = require_positive_int(
             "bilinear.feature_dim", self.feature_dim
         )
@@ -220,13 +258,26 @@ class BilinearSRConfig:
         self.sr_batch_size = require_positive_int(
             "bilinear.sr_batch_size", self.sr_batch_size
         )
+        self.value_feature_batch_size = require_positive_int(
+            "bilinear.value_feature_batch_size", self.value_feature_batch_size
+        )
         self.num_noises = _require_non_negative_int(
             "bilinear.num_noises", self.num_noises
         )
         self.obs_keys = cast(list[ObsKey], dedupe_keys(list(self.obs_keys)))
         self.next_obs_keys = cast(list[ObsKey], dedupe_keys(list(self.next_obs_keys)))
+        self.value_command_keys = cast(
+            list[ObsKey], dedupe_keys(list(self.value_command_keys))
+        )
+        if self.value_state_keys is not None:
+            self.value_state_keys = cast(
+                list[ObsKey], dedupe_keys(list(self.value_state_keys))
+            )
         if len(self.obs_keys) == 0:
             msg = "bilinear.obs_keys must be non-empty."
+            raise ValueError(msg)
+        if self.value_state_keys is not None and len(self.value_state_keys) == 0:
+            msg = "bilinear.value_state_keys cannot be empty when configured."
             raise ValueError(msg)
         if self.offline_pretrain.enabled and len(self.next_obs_keys) == 0:
             msg = (
@@ -241,6 +292,14 @@ class BilinearSRConfig:
 
     def get_next_obs_keys(self) -> list[ObsKey]:
         return list(self.next_obs_keys)
+
+    def get_value_command_keys(self) -> list[ObsKey]:
+        return list(self.value_command_keys)
+
+    def get_value_state_keys(self) -> list[ObsKey]:
+        if self.value_state_keys is None:
+            return list(self.obs_keys)
+        return list(self.value_state_keys)
 
 
 @dataclass
@@ -375,6 +434,95 @@ class BilinearPolicyHead(GaussianPolicyHead):
         return loc, scale
 
 
+class BilinearLinearValueHead(torch.nn.Module):
+    """Linear value function over the bilinear state-command feature F(s)z."""
+
+    def __init__(
+        self,
+        bilinear_rep: BilinearSR,
+        *,
+        num_command_inputs: int,
+        command_dim: int | None,
+        detach_features: bool = True,
+        feature_batch_size: int = 4096,
+        device: str | torch.device = "cpu",
+    ) -> None:
+        super().__init__()
+        object.__setattr__(self, "_bilinear_rep", bilinear_rep)
+        self.num_command_inputs = int(num_command_inputs)
+        self.detach_features = bool(detach_features)
+        self.feature_batch_size = int(feature_batch_size)
+        if self.num_command_inputs < 0:
+            msg = "num_command_inputs must be >= 0."
+            raise ValueError(msg)
+        if self.feature_batch_size <= 0:
+            msg = "feature_batch_size must be positive."
+            raise ValueError(msg)
+        if self.num_command_inputs == 0:
+            if command_dim is not None:
+                msg = "command_dim must be None when num_command_inputs is 0."
+                raise ValueError(msg)
+            self.command_projector = None
+        else:
+            if command_dim is None or command_dim <= 0:
+                msg = "command_dim must be positive when command inputs are present."
+                raise ValueError(msg)
+            self.command_projector = (
+                None
+                if command_dim == bilinear_rep.feature_dim
+                else torch.nn.Linear(
+                    command_dim, bilinear_rep.feature_dim, device=device
+                )
+            )
+        self.linear = torch.nn.Linear(bilinear_rep.embed_dim, 1, device=device)
+
+    @staticmethod
+    def _concat_inputs(inputs: tuple[Tensor, ...]) -> Tensor:
+        return inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=-1)
+
+    def _chunk_value_feature(self, state_flat: Tensor, z_flat: Tensor) -> Tensor:
+        bilinear_rep = cast(BilinearSR, self._bilinear_rep)
+        batch_size = int(state_flat.shape[0])
+        chunk_size = min(self.feature_batch_size, batch_size)
+        chunks: list[Tensor] = []
+        grad_enabled = torch.is_grad_enabled() and not self.detach_features
+        with torch.set_grad_enabled(grad_enabled):
+            for start in range(0, batch_size, chunk_size):
+                stop = min(start + chunk_size, batch_size)
+                f_s = bilinear_rep._F(state_flat[start:stop], use_ema=True)
+                chunks.append(torch.einsum("bef,bf->be", f_s, z_flat[start:stop]))
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+
+    def forward(self, *obs: Tensor) -> Tensor:
+        if len(obs) <= self.num_command_inputs:
+            msg = (
+                "BilinearLinearValueHead.forward() expected state observations "
+                "after the configured command inputs."
+            )
+            raise ValueError(msg)
+        command_obs = obs[: self.num_command_inputs]
+        state_obs = obs[self.num_command_inputs :]
+        state = self._concat_inputs(state_obs)
+        leading_shape = state.shape[:-1]
+        state_flat = state.reshape(-1, state.shape[-1])
+        bilinear_rep = cast(BilinearSR, self._bilinear_rep)
+        if len(command_obs) == 0:
+            z_flat = state.new_ones((state_flat.shape[0], bilinear_rep.feature_dim))
+        else:
+            command = self._concat_inputs(command_obs)
+            command_flat = command.reshape(-1, command.shape[-1])
+            if command.shape[-1] == bilinear_rep.feature_dim:
+                z_flat = command_flat
+            else:
+                assert self.command_projector is not None
+                z_flat = self.command_projector(command_flat)
+        value_feature = self._chunk_value_feature(state_flat, z_flat)
+        value_feature = value_feature.reshape(*leading_shape, value_feature.shape[-1])
+        if self.detach_features:
+            value_feature = value_feature.detach()
+        return self.linear(value_feature)
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -404,6 +552,7 @@ class IPMDBilinear(IPMD):
         self.config.bilinear.validate()
         self.env = env
         self._provided_bilinear_policy_net = policy_net
+        self._provided_bilinear_value_net = value_net
         offline_dataset_enabled = bool(
             getattr(self.config.offline_dataset, "enabled", False)
         )
@@ -443,10 +592,11 @@ class IPMDBilinear(IPMD):
 
         self._sr_update_count = 0
         self._pending_sr_metrics: dict[str, list[float]] = {}
+        self._sr_replay_device = torch.device("cpu")
         self._sr_history_buffer = TensorDictReplayBuffer(
             storage=LazyTensorStorage(
                 max_size=self.config.bilinear.history_buffer_size,
-                device=self.device,
+                device=self._sr_replay_device,
             ),
             sampler=RandomSampler(),
             batch_size=self.config.bilinear.sr_batch_size,
@@ -607,6 +757,11 @@ class IPMDBilinear(IPMD):
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
+        if self.config.bilinear.policy_input_mode == "raw":
+            return super()._construct_policy(
+                policy_net or self._provided_bilinear_policy_net
+            )
+
         action_spec = self.env.action_spec_unbatched
         action_dim = int(action_spec.shape[-1])
 
@@ -664,6 +819,46 @@ class IPMDBilinear(IPMD):
             default_interaction_type=ExplorationType.RANDOM,
         )
 
+    def _construct_value_function(
+        self, value_net: torch.nn.Module | None = None
+    ) -> TensorDictModule:
+        provided_value_net = value_net or self._provided_bilinear_value_net
+        if (
+            self.config.bilinear.value_input_mode == "mlp"
+            or provided_value_net is not None
+        ):
+            return super()._construct_value_function(provided_value_net)
+
+        value_command_keys = self.config.bilinear.get_value_command_keys()
+        value_state_keys = self.config.bilinear.get_value_state_keys()
+        value_state_dim = sum(
+            obs_key_feature_dim(self.env, key) for key in value_state_keys
+        )
+        if value_state_dim != int(self.bilinear_rep.obs_dim):
+            msg = (
+                "bilinear.value_input_mode='linear_fz' requires value state "
+                "features to match bilinear.obs_keys width: expected "
+                f"{int(self.bilinear_rep.obs_dim)}, got {value_state_dim}."
+            )
+            raise ValueError(msg)
+        command_dim = (
+            sum(obs_key_feature_dim(self.env, key) for key in value_command_keys)
+            if value_command_keys
+            else None
+        )
+        value_head = BilinearLinearValueHead(
+            self.bilinear_rep,
+            num_command_inputs=len(value_command_keys),
+            command_dim=command_dim,
+            detach_features=self.config.bilinear.detach_features_for_value,
+            feature_batch_size=self.config.bilinear.value_feature_batch_size,
+            device=self.device,
+        )
+        return ValueOperator(
+            module=value_head,
+            in_keys=value_command_keys + value_state_keys,
+        )
+
     # -- SR training --
 
     def _sr_transition_batch_from_td(
@@ -695,7 +890,8 @@ class IPMDBilinear(IPMD):
             batch,
             action_key=action_key,
         )
-        self._sr_history_buffer.extend(transitions.reshape(-1).detach())
+        transitions = transitions.reshape(-1).detach().to(self._sr_replay_device)
+        self._sr_history_buffer.extend(transitions)
 
         # Recompute normalization from all effective samples in the buffer
         n = len(self._sr_history_buffer)

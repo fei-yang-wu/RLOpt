@@ -363,7 +363,10 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
             msg = "patch_autoencoder failed to infer collector latents."
             raise RuntimeError(msg)
         latents = latents.to(self.agent.device).reshape(-1, self.agent._latent_dim)
-        if self._collector_latents is None or self._collector_latents.shape != latents.shape:
+        if (
+            self._collector_latents is None
+            or self._collector_latents.shape != latents.shape
+        ):
             self._collector_latents = latents.clone()
         else:
             self._collector_latents[renew_mask] = latents[renew_mask]
@@ -395,7 +398,9 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
             or self._collector_latents.shape[1] != command_dim
             or self._collector_latents.device != device
         ):
-            self._collector_latents = torch.zeros(batch_size, command_dim, device=device)
+            self._collector_latents = torch.zeros(
+                batch_size, command_dim, device=device
+            )
             self._collector_steps = torch.zeros(
                 batch_size, device=device, dtype=torch.long
             )
@@ -459,7 +464,7 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         *,
         detach: bool,
     ) -> Tensor:
-        """Sample latent from the posterior distribution z \sim p(\cdot|s').
+        r"""Sample latent from the posterior distribution z \sim p(\cdot|s').
             Patch here means a windows of expert transitions that centered at the current timestep.
 
         Args:

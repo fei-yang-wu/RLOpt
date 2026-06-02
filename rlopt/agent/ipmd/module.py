@@ -46,9 +46,11 @@ class EmpiricalNormalization(nn.Module):
     def update(self, x: Tensor) -> None:
         """Recompute mean/var from the provided data (e.g. all effective buffer samples)."""
         x = x.reshape(-1, x.shape[-1])
-        self.mean = x.mean(dim=0)
-        self.var = x.var(dim=0, correction=0)
-        self.count = torch.tensor(x.shape[0], dtype=torch.long, device=x.device)
+        self.mean = x.mean(dim=0).to(device=self.mean.device)
+        self.var = x.var(dim=0, correction=0).to(device=self.var.device)
+        self.count = torch.tensor(
+            x.shape[0], dtype=torch.long, device=self.count.device
+        )
 
     def normalize(self, x: Tensor) -> Tensor:
         if self.count < 2:
@@ -125,7 +127,11 @@ class BilinearSR(ABC, nn.Module):
 
     def _F(self, s: Tensor, use_ema: bool = False) -> Tensor:
         """Return F(s) with shape (B, embed_dim, feature_dim), tanh-bounded per element."""
-        net = self.state_net_ema if (use_ema and self.state_net_ema is not None) else self.state_net
+        net = (
+            self.state_net_ema
+            if (use_ema and self.state_net_ema is not None)
+            else self.state_net
+        )
         # return torch.tanh(net(s).reshape(-1, self.embed_dim, self.feature_dim))
         return net(s).reshape(-1, self.embed_dim, self.feature_dim)
 
@@ -142,8 +148,8 @@ class BilinearSR(ABC, nn.Module):
         keeps the bilinear inner product in sigmoid's linear regime, mirroring
         scaled dot-product attention.
         """
-        F_s = self._F(s)                    # (B, E, D), tanh-bounded
-        g_a = self.encode_action(a)         # (B, E),    tanh-bounded
+        F_s = self._F(s)  # (B, E, D), tanh-bounded
+        g_a = self.encode_action(a)  # (B, E),    tanh-bounded
         return torch.einsum("be,bef->bf", g_a, F_s) / math.sqrt(self.embed_dim)
 
     # -- EMA --
@@ -369,9 +375,7 @@ class DiffSRBilinear(BilinearSR):
 
         for t in reversed(range(self.num_noises)):
             z = torch.randn_like(xt)
-            timestep = torch.full(
-                (xt.shape[0],), t, dtype=torch.int64, device=s.device
-            )
+            timestep = torch.full((xt.shape[0],), t, dtype=torch.int64, device=s.device)
             z_mu = self.forward_mu(sp=xt, t=timestep.unsqueeze(-1))
             eps_pred = torch.bmm(z_phi.unsqueeze(1), z_mu).squeeze(1)
 
@@ -385,8 +389,14 @@ class DiffSRBilinear(BilinearSR):
                 sigma_t = sigma_t_sq.clip(1e-20).sqrt()
 
             xt = (
-                1.0 / self.alphas[timestep].sqrt()
-                * (xt - self.betas[timestep] / (1 - self.alphabars[timestep]).sqrt() * eps_pred)
+                1.0
+                / self.alphas[timestep].sqrt()
+                * (
+                    xt
+                    - self.betas[timestep]
+                    / (1 - self.alphabars[timestep]).sqrt()
+                    * eps_pred
+                )
                 + sigma_t * z
             )
             xt = xt.clip(self.x_min, self.x_max)
@@ -540,9 +550,7 @@ class SpederBilinear(BilinearSR):
         # Logging metrics
         with torch.no_grad():
             pos_per_noise = pos.mean(dim=-1)  # (N,)
-            neg_per_noise = (
-                (inner.sum(dim=[-2, -1]) - pos.sum(dim=-1)) / (B * (B - 1))
-            )
+            neg_per_noise = (inner.sum(dim=[-2, -1]) - pos.sum(dim=-1)) / (B * (B - 1))
 
         metrics = {
             "loss/dynamics_loss": model_loss.item(),
@@ -557,7 +565,9 @@ class SpederBilinear(BilinearSR):
         for i in checkpoints:
             metrics[f"detail/pos_prob_{i}"] = pos_per_noise[i].item()
             metrics[f"detail/neg_prob_{i}"] = neg_per_noise[i].item()
-            metrics[f"detail/prob_gap_{i}"] = (pos_per_noise[i] - neg_per_noise[i]).item()
+            metrics[f"detail/prob_gap_{i}"] = (
+                pos_per_noise[i] - neg_per_noise[i]
+            ).item()
 
         return metrics, model_loss, torch.tensor(0.0, device=s.device)
 
@@ -710,7 +720,9 @@ class CtrlSRBilinear(BilinearSR):
         for i in checkpoints:
             metrics[f"detail/pos_logits_{i}"] = pos_per_noise[i].item()
             metrics[f"detail/neg_logits_{i}"] = neg_per_noise[i].item()
-            metrics[f"detail/logit_gap_{i}"] = (pos_per_noise[i] - neg_per_noise[i]).item()
+            metrics[f"detail/logit_gap_{i}"] = (
+                pos_per_noise[i] - neg_per_noise[i]
+            ).item()
             metrics[f"detail/model_loss_{i}"] = per_noise_loss[i].item()
 
         return metrics, model_loss, torch.tensor(0.0, device=s.device)

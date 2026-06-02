@@ -10,6 +10,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 from torchrl.data import Unbounded
+from torchrl.envs.transforms import TensorDictPrimer
 
 
 @lru_cache(maxsize=1)
@@ -179,6 +180,37 @@ def _make_bilinear_test_policy_head(env) -> _BilinearTestPolicyHead:
     return _BilinearTestPolicyHead(obs_dim, action_dim)
 
 
+def _add_unbounded_obs(env, key: str, feature_dim: int):
+    return env.append_transform(
+        TensorDictPrimer(
+            {
+                key: Unbounded(
+                    shape=(int(feature_dim),),
+                    device="cpu",
+                )
+            },
+            default_value=0.0,
+            expand_specs=True,
+        )
+    )
+
+
+def _make_raw_policy_linear_value_bilinear_cfg():
+    cfg = _make_bilinear_offline_cfg()
+    cfg.bilinear.offline_pretrain.enabled = False
+    cfg.bilinear.offline_pretrain.policy_bc_updates = 0
+    cfg.bilinear.policy_input_mode = "raw"
+    cfg.bilinear.value_input_mode = "linear_fz"
+    cfg.bilinear.obs_keys = ["critic_obs"]
+    cfg.bilinear.next_obs_keys = ["critic_obs"]
+    cfg.bilinear.value_command_keys = ["command_obs"]
+    cfg.bilinear.value_state_keys = ["critic_obs"]
+    cfg.policy.input_keys = ["command_obs", "observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["command_obs", "critic_obs"]
+    return cfg
+
+
 def _make_bilinear_expert_batch(env, num_transitions: int = 32) -> TensorDict:
     obs_dim = env.observation_spec["observation"].shape[-1]
     act_dim = env.action_spec.shape[-1]
@@ -253,6 +285,160 @@ def test_bilinear_policy_head_splits_command_from_representation_state() -> None
     assert raw_state_head.base[0].in_features == 9
 
 
+def test_ipmd_bilinear_raw_policy_uses_standard_policy_construction() -> None:
+    """Raw policy mode should not register the SR model under the PPO actor."""
+    rlopt = _rlopt()
+    from rlopt.agent.ipmd.ipmd_bilinear import BilinearPolicyHead
+
+    cfg = _make_raw_policy_linear_value_bilinear_cfg()
+    env = rlopt.make_parallel_env(cfg)
+    env = _add_unbounded_obs(env, "command_obs", cfg.bilinear.feature_dim)
+    env = _add_unbounded_obs(env, "critic_obs", 5)
+
+    agent = rlopt.IPMDBilinear(env, cfg, logger=None)
+
+    assert not any(
+        isinstance(module, BilinearPolicyHead)
+        for module in agent.actor_critic.modules()
+    )
+    assert all(
+        "bilinear_rep" not in name
+        for name, _param in agent.actor_critic.named_parameters()
+    )
+    batch_size = 4
+    td = TensorDict(
+        {
+            "command_obs": torch.randn(batch_size, cfg.bilinear.feature_dim),
+            "observation": torch.randn(
+                batch_size, env.observation_spec["observation"].shape[-1]
+            ),
+        },
+        batch_size=[batch_size],
+        device=agent.device,
+    )
+
+    with torch.no_grad():
+        out = agent.actor_critic.get_policy_operator()(td)
+
+    assert out["action"].shape == (batch_size, env.action_spec.shape[-1])
+
+
+def test_ipmd_bilinear_linear_value_head_uses_command_and_privileged_state() -> None:
+    """Linear-Fz value mode should read z plus its configured privileged state keys."""
+    rlopt = _rlopt()
+    cfg = _make_raw_policy_linear_value_bilinear_cfg()
+    cfg.bilinear.value_feature_batch_size = 3
+    env = rlopt.make_parallel_env(cfg)
+    env = _add_unbounded_obs(env, "command_obs", cfg.bilinear.feature_dim)
+    env = _add_unbounded_obs(env, "critic_obs", 5)
+
+    agent = rlopt.IPMDBilinear(env, cfg, logger=None)
+    sr_param_ids = {id(param) for param in agent.bilinear_rep.parameters()}
+    actor_critic_param_ids = {id(param) for param in agent.actor_critic.parameters()}
+    optim_param_ids = {
+        id(param) for group in agent.optim.param_groups for param in group["params"]
+    }
+
+    assert sr_param_ids.isdisjoint(actor_critic_param_ids)
+    assert sr_param_ids.isdisjoint(optim_param_ids)
+
+    batch_size = 4
+    td = TensorDict(
+        {
+            "command_obs": torch.randn(batch_size, cfg.bilinear.feature_dim),
+            "critic_obs": torch.randn(batch_size, 5),
+        },
+        batch_size=[batch_size],
+        device=agent.device,
+    )
+
+    with torch.no_grad():
+        out = agent.actor_critic.get_value_operator()(td)
+
+    assert out["state_value"].shape == (batch_size, 1)
+
+    rollout_td = TensorDict(
+        {
+            "command_obs": torch.randn(
+                3, batch_size, cfg.bilinear.feature_dim, device=agent.device
+            ),
+            "critic_obs": torch.randn(3, batch_size, 5, device=agent.device),
+        },
+        batch_size=[3, batch_size],
+        device=agent.device,
+    )
+
+    with torch.no_grad():
+        rollout_out = agent.actor_critic.get_value_operator()(rollout_td)
+
+    assert rollout_out["state_value"].shape == (3, batch_size, 1)
+
+
+def test_ipmd_bilinear_linear_value_head_requires_matching_state_width() -> None:
+    """Linear-Fz value state keys must match the state width used by F(s)."""
+    rlopt = _rlopt()
+    cfg = _make_raw_policy_linear_value_bilinear_cfg()
+    cfg.bilinear.value_state_keys = ["observation"]
+    if cfg.value_function is not None:
+        cfg.value_function.input_keys = ["command_obs", "observation"]
+    env = rlopt.make_parallel_env(cfg)
+    env = _add_unbounded_obs(env, "command_obs", cfg.bilinear.feature_dim)
+    env = _add_unbounded_obs(env, "critic_obs", 5)
+
+    with pytest.raises(ValueError, match="value state features"):
+        rlopt.IPMDBilinear(env, cfg, logger=None)
+
+
+def test_ipmd_bilinear_sr_history_buffer_is_cpu_backed() -> None:
+    """SR history replay should stay on CPU and move minibatches at loss time."""
+    rlopt = _rlopt()
+    cfg = _make_raw_policy_linear_value_bilinear_cfg()
+    env = rlopt.make_parallel_env(cfg)
+    env = _add_unbounded_obs(env, "command_obs", cfg.bilinear.feature_dim)
+    env = _add_unbounded_obs(env, "critic_obs", 5)
+
+    agent = rlopt.IPMDBilinear(env, cfg, logger=None)
+    batch_size = 8
+    action_dim = int(env.action_spec.shape[-1])
+    batch = TensorDict(
+        {
+            "critic_obs": torch.randn(batch_size, 5, device=agent.device),
+            ("next", "critic_obs"): torch.randn(batch_size, 5, device=agent.device),
+            "action": torch.randn(batch_size, action_dim, device=agent.device),
+        },
+        batch_size=[batch_size],
+        device=agent.device,
+    )
+
+    agent._store_transitions(batch)
+
+    storage = agent._sr_history_buffer._storage
+    assert storage.device == torch.device("cpu")
+    stored = storage._storage
+    assert stored["obs"].device == torch.device("cpu")
+    assert stored["action"].device == torch.device("cpu")
+    assert stored["next", "obs"].device == torch.device("cpu")
+
+    sample = agent._sr_history_buffer.sample()
+    assert sample.device == torch.device("cpu")
+    _metrics, loss = agent._sr_loss_from_batch(sample)
+    assert loss.device == agent.device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_empirical_normalization_update_from_cpu_preserves_cuda_buffers() -> None:
+    """CPU replay statistics should update CUDA normalizer buffers without migrating them."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import EmpiricalNormalization
+
+    normalizer = EmpiricalNormalization(5).to("cuda")
+    normalizer.update(torch.randn(8, 5))
+
+    assert normalizer.mean.device.type == "cuda"
+    assert normalizer.var.device.type == "cuda"
+    assert normalizer.count.device.type == "cuda"
+
+
 def test_ipmd_prepare_rollout_rewards_ignores_estimator_when_disabled():
     """Disabled estimated PPO rewards should leave env rewards untouched."""
     agent, env = _make_env_reward_only_ipmd_agent()
@@ -319,7 +505,7 @@ def test_ipmd_bilinear_offline_pretrain_validates_config() -> None:
         batch_size=[batch_size],
     )
 
-    with pytest.raises(ValueError, match="offline_pretrain.batch_size"):
+    with pytest.raises(ValueError, match=r"offline_pretrain.batch_size"):
         rlopt.IPMDBilinear(
             env,
             cfg,
@@ -1042,7 +1228,7 @@ def test_ipmd_grouped_reward_model_requires_state_only_inputs() -> None:
     cfg.ipmd.reward_input_type = "sas"
 
     env = rlopt.make_parallel_env(cfg)
-    with pytest.raises(ValueError, match="requires .*reward_input_type='s'"):
+    with pytest.raises(ValueError, match=r"requires .*reward_input_type='s'"):
         rlopt.IPMD(env, cfg, logger=None)
 
 
