@@ -299,7 +299,15 @@ class IPMDConfig(PPOConfig):
     - ``"random"`` - sample unit latents uniformly at random
     - ``"posterior"`` - encode the current rollout posterior inputs and
       publish the latent state as the latent command
+    - ``"hl_skill"`` - load a frozen high-level DiffSR skill encoder and
+      publish its online expert-window latents as commands
     """
+
+    hl_skill_checkpoint_path: str = ""
+    """Checkpoint path used when ``command_source="hl_skill"``."""
+
+    hl_skill_horizon_steps: int = 0
+    """Optional horizon assertion for the frozen high-level skill checkpoint; 0 infers from checkpoint."""
 
     latent_learning: IPMDLatentLearningConfig = field(
         default_factory=IPMDLatentLearningConfig
@@ -477,6 +485,23 @@ class IPMDConfig(PPOConfig):
         self.latent_steps_max = require_positive_int(
             "ipmd.latent_steps_max", self.latent_steps_max
         )
+        if self.command_source == "hl_skill":
+            self.hl_skill_checkpoint_path = str(self.hl_skill_checkpoint_path).strip()
+            if not self.hl_skill_checkpoint_path:
+                msg = (
+                    "ipmd.hl_skill_checkpoint_path is required when "
+                    "ipmd.command_source='hl_skill'."
+                )
+                raise ValueError(msg)
+            self.hl_skill_horizon_steps = int(self.hl_skill_horizon_steps)
+            if self.hl_skill_horizon_steps < 0:
+                msg = "ipmd.hl_skill_horizon_steps must be >= 0."
+                raise ValueError(msg)
+            if self.hl_skill_horizon_steps > 0:
+                self.hl_skill_horizon_steps = require_positive_int(
+                    "ipmd.hl_skill_horizon_steps",
+                    self.hl_skill_horizon_steps,
+                )
         if self.latent_steps_min > self.latent_steps_max:
             msg = (
                 "ipmd.latent_steps_min must be <= ipmd.latent_steps_max, got "
@@ -659,6 +684,7 @@ class IPMD(PPO):
         self._latent_key = normalize_batch_key(self.config.ipmd.latent_key)
         self._latent_dim = int(self.config.ipmd.latent_dim)
         self._latent_command_controller: LatentCommandController | None = None
+        self._hl_skill_command_sampler: Any | None = None
         self._command_source = self._normalize_command_source(
             self.config.ipmd.command_source
         )
@@ -835,10 +861,34 @@ class IPMD(PPO):
         else:
             self._reward_out_fn = lambda r: r
 
-        if self._use_latent_command:
+        if self._use_latent_command and self._command_source != "hl_skill":
             method = str(self.config.ipmd.latent_learning.method)
             self._latent_learner = build_latent_learner(method)
             self._latent_learner.initialize(self)
+        if self._use_latent_command and self._command_source == "hl_skill":
+            from rlopt.agent.hl_skill_diffsr import (  # noqa: PLC0415
+                FrozenHighLevelSkillCommandSampler,
+            )
+
+            self._hl_skill_command_sampler = FrozenHighLevelSkillCommandSampler(
+                env=self.env,
+                checkpoint_path=str(self.config.ipmd.hl_skill_checkpoint_path),
+                latent_dim=self._latent_dim,
+                latent_steps_min=int(self.config.ipmd.latent_steps_min),
+                latent_steps_max=int(self.config.ipmd.latent_steps_max),
+                horizon_steps=(
+                    self.config.ipmd.hl_skill_horizon_steps
+                    if self.config.ipmd.hl_skill_horizon_steps > 0
+                    else None
+                ),
+                command_phase_mode=str(
+                    self.config.ipmd.latent_learning.command_phase_mode
+                ),
+                code_latent_dim=self.config.ipmd.latent_learning.code_latent_dim,
+                phase_period=int(self.config.ipmd.latent_learning.code_period),
+                discover_env_method=self._discover_env_method,
+                device=self._get_device(self.config.device),
+            )
         self._validate_latent_reward_conditioning()
 
         super().__init__(
@@ -879,7 +929,9 @@ class IPMD(PPO):
         self._expert_batch_sampler = sampler
         self._expert_sampler_source_name = "offline_dataset"
         required_keys = (
-            self._expert_required_keys() if self._expert_minibatch_update_enabled else []
+            self._expert_required_keys()
+            if self._expert_minibatch_update_enabled
+            else []
         )
         if required_keys:
             preflight_batch_size = min(
@@ -966,6 +1018,21 @@ class IPMD(PPO):
                 device=self.device,
                 dtype=torch.float32,
             )
+            return
+        if self._command_source == "hl_skill":
+            if self._hl_skill_command_sampler is None:
+                msg = "Frozen high-level skill command sampler is unavailable."
+                raise RuntimeError(msg)
+            latents = self._hl_skill_command_sampler.sample_for_step(
+                td,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            td.set(
+                self._latent_key,
+                latents.reshape(*td.batch_size, self._latent_dim),
+            )
+            controller.publish_latents_to_env(latents.reshape(-1, self._latent_dim))
             return
 
         assert self._latent_learner is not None
