@@ -152,10 +152,10 @@ class IPMDLatentLearningConfig:
     keeps the same temporal hold path but removes discrete quantization.
     """
 
-    code_latent_dim: int | None = None
+    code_latent_dim: int | None = 0
     """Latent code width before optional command-phase features.
 
-    ``None`` uses ``ipmd.latent_dim`` when ``command_phase_mode="none"`` and
+    ``0`` or ``None`` uses ``ipmd.latent_dim`` when ``command_phase_mode="none"`` and
     ``ipmd.latent_dim - 2`` when ``command_phase_mode="sin_cos"``.
     """
 
@@ -246,15 +246,17 @@ class IPMDLatentLearningConfig:
             "ipmd.latent_learning.posterior_command_period",
             self.posterior_command_period,
         )
-        if self.code_latent_dim is not None:
+        if self.code_latent_dim is not None and int(self.code_latent_dim) > 0:
             self.code_latent_dim = require_positive_int(
                 "ipmd.latent_learning.code_latent_dim", self.code_latent_dim
             )
+        else:
+            self.code_latent_dim = 0
 
         phase_dim = 2 if self.command_phase_mode == "sin_cos" else 0
         code_dim = (
             int(self.code_latent_dim)
-            if self.code_latent_dim is not None
+            if self.code_latent_dim is not None and int(self.code_latent_dim) > 0
             else int(command_dim) - phase_dim
         )
         if code_dim <= 0:
@@ -308,6 +310,39 @@ class IPMDConfig(PPOConfig):
 
     hl_skill_horizon_steps: int = 0
     """Optional horizon assertion for the frozen high-level skill checkpoint; 0 infers from checkpoint."""
+
+    hl_skill_command_mode: str = "z"
+    """HL skill command representation: z, phi, or z_phi."""
+
+    hl_skill_finetune_enabled: bool = False
+    """Enable online policy-gradient finetuning for command_source='hl_skill'."""
+
+    hl_skill_pg_coeff: float = 0.05
+    """Weight on the second-pass PPO actor objective for the high-level skill encoder."""
+
+    hl_skill_offline_diffsr_coeff: float = 1.0
+    """Weight on the original offline DiffSR loss during online skill finetuning."""
+
+    hl_skill_anchor_coeff: float = 0.01
+    """Weight anchoring the online encoder output to the checkpoint encoder output."""
+
+    hl_skill_z_norm_coeff: float | None = None
+    """Optional z-norm penalty during online finetuning; None reuses checkpoint config."""
+
+    hl_skill_lr: float = 3.0e-5
+    """Learning rate for the online high-level skill optimizer."""
+
+    hl_skill_grad_clip_norm: float | None = 1.0
+    """Gradient clip for online high-level skill updates. None disables clipping."""
+
+    hl_skill_offline_batch_size: int = 8192
+    """Expert macro batch size for DiffSR/anchor regularization."""
+
+    hl_skill_update_interval: int = 1
+    """Run one high-level skill update every N PPO minibatch updates."""
+
+    hl_skill_train_diffsr: bool = False
+    """Also update the loaded DiffSR model during online high-level skill finetuning."""
 
     latent_learning: IPMDLatentLearningConfig = field(
         default_factory=IPMDLatentLearningConfig
@@ -502,6 +537,55 @@ class IPMDConfig(PPOConfig):
                     "ipmd.hl_skill_horizon_steps",
                     self.hl_skill_horizon_steps,
                 )
+            self.hl_skill_command_mode = str(self.hl_skill_command_mode).strip().lower()
+            hl_skill_command_aliases = {"fz": "phi", "z_fz": "z_phi"}
+            self.hl_skill_command_mode = hl_skill_command_aliases.get(
+                self.hl_skill_command_mode,
+                self.hl_skill_command_mode,
+            )
+            if self.hl_skill_command_mode not in {"z", "phi", "z_phi"}:
+                msg = (
+                    "ipmd.hl_skill_command_mode must be one of 'z', 'phi', "
+                    f"or 'z_phi', got {self.hl_skill_command_mode!r}."
+                )
+                raise ValueError(msg)
+        if self.hl_skill_finetune_enabled and self.command_source != "hl_skill":
+            msg = (
+                "ipmd.hl_skill_finetune_enabled=True requires "
+                "ipmd.command_source='hl_skill'."
+            )
+            raise ValueError(msg)
+        require_non_negative("ipmd.hl_skill_pg_coeff", self.hl_skill_pg_coeff)
+        require_non_negative(
+            "ipmd.hl_skill_offline_diffsr_coeff",
+            self.hl_skill_offline_diffsr_coeff,
+        )
+        require_non_negative("ipmd.hl_skill_anchor_coeff", self.hl_skill_anchor_coeff)
+        if self.hl_skill_z_norm_coeff is not None:
+            require_non_negative(
+                "ipmd.hl_skill_z_norm_coeff",
+                self.hl_skill_z_norm_coeff,
+            )
+        if float(self.hl_skill_lr) <= 0.0:
+            msg = f"ipmd.hl_skill_lr must be > 0, got {self.hl_skill_lr!r}."
+            raise ValueError(msg)
+        if (
+            self.hl_skill_grad_clip_norm is not None
+            and float(self.hl_skill_grad_clip_norm) <= 0.0
+        ):
+            msg = (
+                "ipmd.hl_skill_grad_clip_norm must be > 0 or None, got "
+                f"{self.hl_skill_grad_clip_norm!r}."
+            )
+            raise ValueError(msg)
+        self.hl_skill_offline_batch_size = require_positive_int(
+            "ipmd.hl_skill_offline_batch_size",
+            self.hl_skill_offline_batch_size,
+        )
+        self.hl_skill_update_interval = require_positive_int(
+            "ipmd.hl_skill_update_interval",
+            self.hl_skill_update_interval,
+        )
         if self.latent_steps_min > self.latent_steps_max:
             msg = (
                 "ipmd.latent_steps_min must be <= ipmd.latent_steps_max, got "
@@ -678,6 +762,14 @@ class IPMD(PPO):
     ):
         self.config: IPMDRLOptConfig = config
         self.config.ipmd.validate()
+        if bool(self.config.ipmd.hl_skill_finetune_enabled) and bool(
+            self.config.compile.compile
+        ):
+            msg = (
+                "ipmd.hl_skill_finetune_enabled=True is not compatible with "
+                "compile.compile=True in the v1 rollout-cache implementation."
+            )
+            raise ValueError(msg)
         self.env = env
         self._reward_model_type = self.config.ipmd.reward_model_type
         self._use_latent_command = bool(self.config.ipmd.use_latent_command)
@@ -886,8 +978,21 @@ class IPMD(PPO):
                 ),
                 code_latent_dim=self.config.ipmd.latent_learning.code_latent_dim,
                 phase_period=int(self.config.ipmd.latent_learning.code_period),
+                command_mode=str(self.config.ipmd.hl_skill_command_mode),
                 discover_env_method=self._discover_env_method,
                 device=self._get_device(self.config.device),
+                finetune_enabled=bool(self.config.ipmd.hl_skill_finetune_enabled),
+                pg_coeff=float(self.config.ipmd.hl_skill_pg_coeff),
+                offline_diffsr_coeff=float(
+                    self.config.ipmd.hl_skill_offline_diffsr_coeff
+                ),
+                anchor_coeff=float(self.config.ipmd.hl_skill_anchor_coeff),
+                z_norm_coeff=self.config.ipmd.hl_skill_z_norm_coeff,
+                lr=float(self.config.ipmd.hl_skill_lr),
+                grad_clip_norm=self.config.ipmd.hl_skill_grad_clip_norm,
+                offline_batch_size=int(self.config.ipmd.hl_skill_offline_batch_size),
+                update_interval=int(self.config.ipmd.hl_skill_update_interval),
+                train_diffsr=bool(self.config.ipmd.hl_skill_train_diffsr),
             )
         self._validate_latent_reward_conditioning()
 
@@ -1006,6 +1111,18 @@ class IPMD(PPO):
             inject_fn=self._inject_latent_command,
             policy_module=policy_operator,
         )
+
+    def collect(self, run: PPOTrainingMetadata, iteration_idx: int) -> PPOIterationData:
+        """Collect one rollout, resetting per-rollout HL skill caches when needed."""
+        if self._hl_skill_command_sampler is not None:
+            start_cache = getattr(
+                self._hl_skill_command_sampler,
+                "start_rollout_cache",
+                None,
+            )
+            if callable(start_cache):
+                start_cache()
+        return super().collect(run, iteration_idx)
 
     def _inject_latent_command(
         self,
@@ -1683,6 +1800,17 @@ class IPMD(PPO):
             "bc_policy_action_rmse",
             "bc_actor_grad_norm",
             "bc_policy_scale_mean",
+            "hl_skill_total_loss",
+            "hl_skill_pg_loss",
+            "hl_skill_diffsr_loss",
+            "hl_skill_anchor_loss",
+            "hl_skill_z_norm_loss",
+            "hl_skill_grad_norm",
+            "hl_skill_updates",
+            "hl_skill_z_abs_mean",
+            "hl_skill_z_rms",
+            "hl_skill_z_dim_std_mean",
+            "hl_skill_z_effective_rank",
             "estimated_reward_mean",
             "estimated_reward_std",
             "expert_reward_mean",
@@ -1794,6 +1922,72 @@ class IPMD(PPO):
         for key, value in extra_actor_metrics.items():
             output_loss.set(key, value.detach())
         return output_loss
+
+    def _hl_skill_actor_objective(self, batch: TensorDict) -> Tensor:
+        """Return the PPO actor surrogate used to shape the HL skill encoder."""
+        loss: TensorDict = self.loss_module(batch)
+        actor_loss = loss["loss_objective"]
+        if actor_loss.ndim > 0:
+            actor_loss = actor_loss.mean()
+        return actor_loss
+
+    def _run_hl_skill_online_update(
+        self,
+        batch: TensorDict,
+        *,
+        update_idx: int,
+    ) -> dict[str, Tensor]:
+        """Update the online high-level skill encoder from PG + anchor losses."""
+        sampler = self._hl_skill_command_sampler
+        if sampler is None:
+            return {}
+        should_update = getattr(sampler, "should_update_online", None)
+        if not callable(should_update) or not bool(should_update(update_idx)):
+            return {}
+        optimizer = getattr(sampler, "optimizer", None)
+        if optimizer is None:
+            msg = (
+                "HL skill finetuning is enabled, but the sampler optimizer was "
+                "not initialized."
+            )
+            raise RuntimeError(msg)
+
+        actor_params = list(self.actor_critic.parameters())
+        actor_requires_grad = [param.requires_grad for param in actor_params]
+        for param in actor_params:
+            param.requires_grad_(False)
+
+        try:
+            optimizer.zero_grad(set_to_none=True)
+            total_loss, metrics = sampler.compute_online_finetune_loss(
+                batch,
+                latent_key=self._latent_key,
+                actor_loss_fn=self._hl_skill_actor_objective,
+            )
+            total_loss.backward()
+            trainable_params = sampler.trainable_parameters()
+            grad_clip = getattr(sampler, "grad_clip_norm", None)
+            if grad_clip is not None:
+                grad_norm = clip_grad_norm_(trainable_params, float(grad_clip))
+            else:
+                grad_norm = torch.zeros((), device=self.device)
+            optimizer.step()
+            sampler.finetune_updates = int(getattr(sampler, "finetune_updates", 0)) + 1
+        finally:
+            for param, requires_grad in zip(
+                actor_params,
+                actor_requires_grad,
+                strict=True,
+            ):
+                param.requires_grad_(requires_grad)
+
+        metrics = dict(metrics)
+        metrics["hl_skill_grad_norm"] = grad_norm.detach()
+        metrics["hl_skill_updates"] = torch.tensor(
+            float(getattr(sampler, "finetune_updates", 0)),
+            device=self.device,
+        )
+        return metrics
 
     def _backward_bc_terms(
         self,
@@ -2185,6 +2379,14 @@ class IPMD(PPO):
             data_to_save["latent_learner_state_dict"] = (
                 self._latent_learner.checkpoint_state_dict()
             )
+        if self._hl_skill_command_sampler is not None:
+            checkpoint_state = getattr(
+                self._hl_skill_command_sampler,
+                "checkpoint_state_dict",
+                None,
+            )
+            if callable(checkpoint_state):
+                data_to_save["hl_skill_command_sampler_state_dict"] = checkpoint_state()
         if (
             hasattr(self.env, "is_closed")
             and not self.env.is_closed
@@ -2223,6 +2425,17 @@ class IPMD(PPO):
             self._latent_learner.load_checkpoint_state_dict(
                 data["latent_learner_state_dict"]
             )
+        if (
+            self._hl_skill_command_sampler is not None
+            and "hl_skill_command_sampler_state_dict" in data
+        ):
+            load_checkpoint_state = getattr(
+                self._hl_skill_command_sampler,
+                "load_checkpoint_state_dict",
+                None,
+            )
+            if callable(load_checkpoint_state):
+                load_checkpoint_state(data["hl_skill_command_sampler_state_dict"])
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
             self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
 
@@ -2453,6 +2666,11 @@ class IPMD(PPO):
         has_expert: Tensor,
     ) -> tuple[TensorDict, int]:
         """PPO update plus optional BC loss."""
+        update_idx = (
+            int(num_network_updates.item())
+            if isinstance(num_network_updates, Tensor)
+            else int(num_network_updates)
+        )
         self.optim.zero_grad(set_to_none=True)
         output_loss = self._backward_ppo_terms(batch)
         bc_metrics = self._backward_bc_terms(expert_batch, has_expert)
@@ -2461,10 +2679,16 @@ class IPMD(PPO):
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
         self.optim.step()
+        hl_skill_metrics = self._run_hl_skill_online_update(
+            batch,
+            update_idx=update_idx,
+        )
 
         output_loss.set("alpha", torch.ones((), device=self.device))
         for key, value in bc_metrics.items():
             output_loss.set(key, value)
+        for key, value in hl_skill_metrics.items():
+            output_loss.set(key, value.detach())
         output_loss.set("grad_norm", grad_norm_tensor.detach())
 
         return output_loss, num_network_updates + 1

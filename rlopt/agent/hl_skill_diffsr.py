@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDictBase
 from torch import Tensor, nn
 
@@ -62,6 +63,19 @@ def _normalize_encoder_window_mode(name: str, value: str) -> str:
     normalized = str(value).strip().lower()
     if normalized not in {"full", "intermediate"}:
         msg = f"{name} must be one of 'full' or 'intermediate', got {value!r}."
+        raise ValueError(msg)
+    return normalized
+
+
+def _normalize_command_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    aliases = {"fz": "phi", "z_fz": "z_phi"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"z", "phi", "z_phi"}:
+        msg = (
+            "command_mode must be one of 'z', 'phi', or 'z_phi' "
+            f"(aliases: 'fz', 'z_fz'), got {value!r}."
+        )
         raise ValueError(msg)
     return normalized
 
@@ -263,7 +277,13 @@ class HighLevelSkillEncoder(nn.Module):
 
 
 class FrozenHighLevelSkillCommandSampler:
-    """Frozen high-level encoder used as an online latent-command source."""
+    """High-level encoder used as an online latent-command source.
+
+    The default mode is frozen and preserves the original rollout behavior.  When
+    online finetuning is enabled, the sampler also caches one macro input per
+    renewed command so PPO minibatches can recompute skill commands with gradient
+    flow into the skill encoder.
+    """
 
     def __init__(
         self,
@@ -278,11 +298,40 @@ class FrozenHighLevelSkillCommandSampler:
         command_phase_mode: str = "none",
         code_latent_dim: int | None = None,
         phase_period: int | None = None,
+        command_mode: str = "z",
         device: torch.device | str | None = None,
+        finetune_enabled: bool = False,
+        pg_coeff: float = 0.05,
+        offline_diffsr_coeff: float = 1.0,
+        anchor_coeff: float = 0.01,
+        z_norm_coeff: float | None = None,
+        lr: float = 3.0e-5,
+        grad_clip_norm: float | None = 1.0,
+        offline_batch_size: int = 8192,
+        update_interval: int = 1,
+        train_diffsr: bool = False,
     ) -> None:
         self.latent_dim = _require_positive_int("latent_dim", latent_dim)
         self.latent_steps_min = max(1, int(latent_steps_min))
         self.latent_steps_max = max(self.latent_steps_min, int(latent_steps_max))
+        self.finetune_enabled = bool(finetune_enabled)
+        self.pg_coeff = _require_non_negative_float("pg_coeff", pg_coeff)
+        self.offline_diffsr_coeff = _require_non_negative_float(
+            "offline_diffsr_coeff", offline_diffsr_coeff
+        )
+        self.anchor_coeff = _require_non_negative_float("anchor_coeff", anchor_coeff)
+        self.lr = _require_positive_float("lr", lr)
+        self.grad_clip_norm = (
+            None
+            if grad_clip_norm is None
+            else _require_positive_float("grad_clip_norm", grad_clip_norm)
+        )
+        self.offline_batch_size = _require_positive_int(
+            "offline_batch_size", offline_batch_size
+        )
+        self.update_interval = _require_positive_int("update_interval", update_interval)
+        self.train_diffsr = bool(train_diffsr)
+        self.command_mode = _normalize_command_mode(command_mode)
         self.command_phase_mode = str(command_phase_mode).strip().lower()
         if self.command_phase_mode not in {"none", "sin_cos"}:
             msg = (
@@ -307,6 +356,16 @@ class FrozenHighLevelSkillCommandSampler:
                 "current_expert_macro_transition_batch(...)."
             )
             raise ValueError(msg)
+        self._offline_macro_sampler = discover_env_method(
+            env,
+            "sample_expert_macro_transition_batch",
+        )
+        if self.finetune_enabled and self._offline_macro_sampler is None:
+            msg = (
+                "Online high-level skill finetuning requires the environment to "
+                "expose sample_expert_macro_transition_batch(...)."
+            )
+            raise ValueError(msg)
 
         checkpoint = torch.load(
             Path(checkpoint_path).expanduser(),
@@ -323,19 +382,26 @@ class FrozenHighLevelSkillCommandSampler:
                 f"horizon_steps: {int(horizon_steps)} != {self.config.horizon_steps}."
             )
             raise ValueError(msg)
-        self.code_latent_dim = int(self.config.z_dim)
-        if code_latent_dim is not None and int(code_latent_dim) != self.code_latent_dim:
+        self.skill_z_dim = int(self.config.z_dim)
+        self.command_code_dim = self._command_code_dim_for_mode()
+        if (
+            code_latent_dim is not None
+            and int(code_latent_dim) > 0
+            and int(code_latent_dim) != self.command_code_dim
+        ):
             msg = (
-                "Frozen high-level skill code_latent_dim must match checkpoint "
-                f"z_dim: {int(code_latent_dim)} != {self.code_latent_dim}."
+                "Frozen high-level skill code_latent_dim must match command-mode "
+                f"pre-phase width: {int(code_latent_dim)} != "
+                f"{self.command_code_dim} for command_mode={self.command_mode!r}."
             )
             raise ValueError(msg)
-        expected_latent_dim = self.code_latent_dim + self.phase_dim
+        expected_latent_dim = self.command_code_dim + self.phase_dim
         if expected_latent_dim != self.latent_dim:
             msg = (
                 "Frozen high-level skill command width must match ipmd.latent_dim: "
-                f"checkpoint z_dim {self.code_latent_dim} + phase_dim "
-                f"{self.phase_dim} != {self.latent_dim}."
+                f"command_mode={self.command_mode!r} pre-phase width "
+                f"{self.command_code_dim} + phase_dim {self.phase_dim} "
+                f"!= {self.latent_dim}."
             )
             raise ValueError(msg)
 
@@ -352,10 +418,61 @@ class FrozenHighLevelSkillCommandSampler:
             hidden_dims=self.config.encoder_hidden_dims,
         ).to(self.device)
         self.skill_encoder.load_state_dict(state_dict)
-        self.skill_encoder.eval()
-        self.skill_encoder.requires_grad_(False)
+
+        self.initial_skill_encoder = HighLevelSkillEncoder(
+            state_dim=self.state_dim,
+            window_steps=self.encoder_window_steps,
+            z_dim=self.config.z_dim,
+            hidden_dims=self.config.encoder_hidden_dims,
+        ).to(self.device)
+        self.initial_skill_encoder.load_state_dict(state_dict)
+        self.initial_skill_encoder.eval()
+        self.initial_skill_encoder.requires_grad_(False)
+
+        self.diffsr = self._build_diffsr().to(self.device)
+        diffsr_state = checkpoint.get("diffsr_state_dict")
+        if diffsr_state is None and (
+            self.finetune_enabled or self.command_mode != "z"
+        ):
+            msg = (
+                "Online high-level skill finetuning and non-z command modes "
+                "require checkpoints with diffsr_state_dict."
+            )
+            raise ValueError(msg)
+        if diffsr_state is not None:
+            self.diffsr.load_state_dict(diffsr_state)
+        feature_norm_state = checkpoint.get("feature_normalization_state_dict")
+        obs_norm = getattr(self.diffsr, "obs_norm", None)
+        if isinstance(obs_norm, nn.Module) and feature_norm_state:
+            obs_norm.load_state_dict(feature_norm_state)
+
+        self.z_norm_coeff = (
+            _require_non_negative_float("z_norm_coeff", z_norm_coeff)
+            if z_norm_coeff is not None
+            else float(self.config.z_norm_coeff)
+        )
+
+        self.skill_encoder.train(self.finetune_enabled)
+        self.skill_encoder.requires_grad_(self.finetune_enabled)
+        self.diffsr.train(self.finetune_enabled and self.train_diffsr)
+        self.diffsr.requires_grad_(self.finetune_enabled and self.train_diffsr)
+
+        self.optimizer: torch.optim.Optimizer | None = None
+        if self.finetune_enabled:
+            params: list[nn.Parameter] = list(self.skill_encoder.parameters())
+            if self.train_diffsr:
+                params.extend(list(self.diffsr.parameters()))
+            self.optimizer = torch.optim.Adam(params, lr=self.lr)
+        self.finetune_updates = 0
+
         self._codes: Tensor | None = None
         self._latent_steps: Tensor | None = None
+        self._active_macro_ids: Tensor | None = None
+        self._cache_state_chunks: list[Tensor] = []
+        self._cache_future_window_chunks: list[Tensor] = []
+        self._cache_target_chunks: list[Tensor] = []
+        self._cache_initial_z_chunks: list[Tensor] = []
+        self._next_macro_id = 0
 
     @staticmethod
     def _resolve_device(env: object, device: torch.device | str | None) -> torch.device:
@@ -393,6 +510,34 @@ class FrozenHighLevelSkillCommandSampler:
             )
             raise ValueError(msg)
         return input_dim // divisor
+
+    def _build_diffsr(self) -> BilinearSR:
+        return build_bilinear_sr(
+            "diffsr",
+            obs_dim=self.state_dim,
+            next_obs_dim=self.state_dim,
+            action_dim=self.config.z_dim,
+            feature_dim=self.config.diffsr_feature_dim,
+            embed_dim=self.config.diffsr_embed_dim,
+            f_hidden_dims=self.config.diffsr_f_hidden_dims,
+            g_hidden_dims=self.config.diffsr_g_hidden_dims,
+            mu_hidden_dims=self.config.diffsr_mu_hidden_dims,
+            num_noises=self.config.diffsr_num_noises,
+            use_ema_for_policy=False,
+            x_min=self.config.diffsr_x_min,
+            x_max=self.config.diffsr_x_max,
+            device=self.device,
+        )
+
+    def _command_code_dim_for_mode(self) -> int:
+        if self.command_mode == "z":
+            return int(self.config.z_dim)
+        if self.command_mode == "phi":
+            return int(self.config.diffsr_feature_dim)
+        if self.command_mode == "z_phi":
+            return int(self.config.z_dim) + int(self.config.diffsr_feature_dim)
+        msg = f"Unsupported high-level skill command mode: {self.command_mode!r}."
+        raise ValueError(msg)
 
     @staticmethod
     def _done_mask(
@@ -438,6 +583,91 @@ class FrozenHighLevelSkillCommandSampler:
             return future_window[:, :-1, :]
         return future_window
 
+    def _validate_macro_batch(
+        self,
+        batch: TensorDictBase,
+        *,
+        batch_size: int,
+        source: str,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        state = batch.get(("hl", "state"))
+        future_window = batch.get(("hl", "future_window"))
+        target = batch.get(("hl", "target"))
+        missing = [
+            name
+            for name, value in (
+                ("hl/state", state),
+                ("hl/future_window", future_window),
+                ("hl/target", target),
+            )
+            if value is None
+        ]
+        if missing:
+            msg = f"{source} macro batch is missing keys: {missing}."
+            raise ValueError(msg)
+        state = cast(Tensor, state).to(device=self.device, dtype=torch.float32)
+        future_window = cast(Tensor, future_window).to(
+            device=self.device,
+            dtype=torch.float32,
+        )
+        target = cast(Tensor, target).to(device=self.device, dtype=torch.float32)
+        expected_state = (int(batch_size), self.state_dim)
+        expected_window = (
+            int(batch_size),
+            int(self.config.horizon_steps),
+            self.state_dim,
+        )
+        if tuple(state.shape) != expected_state:
+            msg = (
+                f"{source} macro state shape mismatch: expected "
+                f"{expected_state}, got {tuple(state.shape)}."
+            )
+            raise ValueError(msg)
+        if tuple(future_window.shape) != expected_window:
+            msg = (
+                f"{source} macro future_window shape mismatch: expected "
+                f"{expected_window}, got {tuple(future_window.shape)}."
+            )
+            raise ValueError(msg)
+        if tuple(target.shape) != expected_state:
+            msg = (
+                f"{source} macro target shape mismatch: expected "
+                f"{expected_state}, got {tuple(target.shape)}."
+            )
+            raise ValueError(msg)
+        return state, future_window, target
+
+    def _sample_offline_macro_batch(
+        self,
+        batch_size: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if self._offline_macro_sampler is None:
+            msg = "sample_expert_macro_transition_batch(...) is unavailable."
+            raise RuntimeError(msg)
+        batch = self._offline_macro_sampler(
+            batch_size=int(batch_size),
+            horizon_steps=int(self.config.horizon_steps),
+            split=self.config.train_split,
+            eval_fraction=float(self.config.eval_trajectory_fraction),
+            split_seed=int(self.config.trajectory_split_seed),
+        )
+        return self._validate_macro_batch(
+            batch,
+            batch_size=int(batch_size),
+            source="Offline expert",
+        )
+
+    def _command_code_from_state_z(self, state: Tensor, z: Tensor) -> Tensor:
+        if self.command_mode == "z":
+            return z
+        phi = self.diffsr.forward_phi(state, z)
+        if self.command_mode == "phi":
+            return phi
+        if self.command_mode == "z_phi":
+            return torch.cat((z, phi), dim=-1)
+        msg = f"Unsupported high-level skill command mode: {self.command_mode!r}."
+        raise ValueError(msg)
+
     def _append_command_phase(self, code_latents: Tensor, phase: Tensor) -> Tensor:
         if self.phase_dim == 0:
             return code_latents
@@ -447,29 +677,203 @@ class FrozenHighLevelSkillCommandSampler:
         return torch.cat((code_latents, phase_features), dim=-1)
 
     @torch.no_grad()
-    def _encode_current_latents(self, env_ids: Tensor) -> Tensor:
+    def _encode_current_macro_batch(
+        self,
+        env_ids: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         batch = self._current_macro_sampler(
             horizon_steps=int(self.config.horizon_steps),
             env_ids=env_ids,
         )
-        state = cast(Tensor, batch.get(("hl", "state"))).to(self.device)
-        future_window = cast(Tensor, batch.get(("hl", "future_window"))).to(self.device)
         batch_size = int(env_ids.numel())
-        expected_state = (batch_size, self.state_dim)
-        expected_window = (batch_size, int(self.config.horizon_steps), self.state_dim)
-        if tuple(state.shape) != expected_state:
-            msg = (
-                "Current expert macro state shape mismatch: expected "
-                f"{expected_state}, got {tuple(state.shape)}."
+        state, future_window, target = self._validate_macro_batch(
+            batch,
+            batch_size=batch_size,
+            source="Current expert",
+        )
+        z = self.skill_encoder(state, self._encoder_input_window(future_window))
+        initial_z = self.initial_skill_encoder(
+            state,
+            self._encoder_input_window(future_window),
+        )
+        return z, state, future_window, target, initial_z
+
+    def start_rollout_cache(self) -> None:
+        """Reset one-rollout macro cache used by online skill finetuning."""
+        if not self.finetune_enabled:
+            return
+        self._cache_state_chunks.clear()
+        self._cache_future_window_chunks.clear()
+        self._cache_target_chunks.clear()
+        self._cache_initial_z_chunks.clear()
+        self._next_macro_id = 0
+        if self._latent_steps is not None:
+            self._latent_steps.zero_()
+        if self._active_macro_ids is not None:
+            self._active_macro_ids.fill_(-1)
+
+    def _append_rollout_cache(
+        self,
+        *,
+        state: Tensor,
+        future_window: Tensor,
+        target: Tensor,
+        initial_z: Tensor,
+    ) -> Tensor:
+        count = int(state.shape[0])
+        macro_ids = torch.arange(
+            self._next_macro_id,
+            self._next_macro_id + count,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._next_macro_id += count
+        self._cache_state_chunks.append(state.detach().clone())
+        self._cache_future_window_chunks.append(future_window.detach().clone())
+        self._cache_target_chunks.append(target.detach().clone())
+        self._cache_initial_z_chunks.append(initial_z.detach().clone())
+        return macro_ids
+
+    def _cached_rollout_tensors(self) -> dict[str, Tensor]:
+        if not self._cache_state_chunks:
+            msg = "No high-level skill macro cache is available for this rollout."
+            raise RuntimeError(msg)
+        return {
+            "state": torch.cat(self._cache_state_chunks, dim=0),
+            "future_window": torch.cat(self._cache_future_window_chunks, dim=0),
+            "target": torch.cat(self._cache_target_chunks, dim=0),
+            "initial_z": torch.cat(self._cache_initial_z_chunks, dim=0),
+        }
+
+    def _z_diagnostics_tensors(self, z: Tensor, *, prefix: str) -> dict[str, Tensor]:
+        if int(z.shape[0]) < 2:
+            rank = torch.zeros((), device=z.device, dtype=z.dtype)
+        else:
+            centered = z - z.mean(dim=0, keepdim=True)
+            singular_values = torch.linalg.svdvals(centered)
+            total = singular_values.sum()
+            if bool((total <= 1.0e-12).item()):
+                rank = torch.zeros((), device=z.device, dtype=z.dtype)
+            else:
+                probs = singular_values / total
+                entropy = -(probs * probs.clamp_min(1.0e-12).log()).sum()
+                rank = torch.exp(entropy)
+        z_std = z.std(dim=0, unbiased=False)
+        return {
+            f"{prefix}_z_abs_mean": z.abs().mean().detach(),
+            f"{prefix}_z_rms": z.pow(2).mean().sqrt().detach(),
+            f"{prefix}_z_dim_std_mean": z_std.mean().detach(),
+            f"{prefix}_z_effective_rank": rank.detach(),
+        }
+
+    def latent_commands_from_rollout_batch(
+        self,
+        batch: TensorDictBase,
+        *,
+        detach: bool,
+    ) -> Tensor:
+        macro_id = cast(Tensor, batch.get(("hl_skill", "macro_id"))).reshape(-1)
+        phase = cast(Tensor, batch.get(("hl_skill", "phase"))).reshape(-1)
+        if macro_id.numel() == 0:
+            return torch.empty(0, self.latent_dim, device=self.device)
+        macro_id = macro_id.to(device=self.device, dtype=torch.long)
+        cached = self._cached_rollout_tensors()
+        if bool((macro_id < 0).any()) or bool(
+            (macro_id >= cached["state"].shape[0]).any()
+        ):
+            msg = "Rollout contains high-level skill macro IDs outside the cache."
+            raise RuntimeError(msg)
+        state = cached["state"].index_select(0, macro_id)
+        future_window = cached["future_window"].index_select(0, macro_id)
+        if detach:
+            with torch.no_grad():
+                z = self.skill_encoder(
+                    state,
+                    self._encoder_input_window(future_window),
+                )
+                command_code = self._command_code_from_state_z(state, z)
+                command = self._append_command_phase(command_code, phase)
+        else:
+            z = self.skill_encoder(state, self._encoder_input_window(future_window))
+            command_code = self._command_code_from_state_z(state, z)
+            command = self._append_command_phase(command_code, phase)
+        return command.reshape(*batch.batch_size, self.latent_dim)
+
+    def should_update_online(self, update_idx: int) -> bool:
+        return self.finetune_enabled and int(update_idx) % self.update_interval == 0
+
+    def trainable_parameters(self) -> list[nn.Parameter]:
+        params: list[nn.Parameter] = list(self.skill_encoder.parameters())
+        if self.train_diffsr:
+            params.extend(list(self.diffsr.parameters()))
+        return params
+
+    def compute_online_finetune_loss(
+        self,
+        batch: TensorDictBase,
+        *,
+        latent_key: str | tuple[str, ...],
+        actor_loss_fn: Callable[[TensorDictBase], Tensor],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if not self.finetune_enabled:
+            zero = torch.zeros((), device=self.device)
+            return zero, {}
+
+        pg_loss = torch.zeros((), device=self.device)
+        if self.pg_coeff > 0.0:
+            command = self.latent_commands_from_rollout_batch(batch, detach=False)
+            pg_batch = batch.clone(False)
+            pg_batch.set(latent_key, command)
+            pg_loss = actor_loss_fn(pg_batch)
+
+        offline_size = int(self.offline_batch_size)
+        state, future_window, target = self._sample_offline_macro_batch(offline_size)
+        z = self.skill_encoder(state, self._encoder_input_window(future_window))
+        zero_reward = torch.zeros(state.shape[0], 1, device=self.device)
+        _, diffsr_loss, _ = self.diffsr.compute_loss(state, z, target, zero_reward)
+        with torch.no_grad():
+            initial_z = self.initial_skill_encoder(
+                state,
+                self._encoder_input_window(future_window),
             )
-            raise ValueError(msg)
-        if tuple(future_window.shape) != expected_window:
-            msg = (
-                "Current expert macro future_window shape mismatch: expected "
-                f"{expected_window}, got {tuple(future_window.shape)}."
-            )
-            raise ValueError(msg)
-        return self.skill_encoder(state, self._encoder_input_window(future_window))
+        anchor_loss = F.mse_loss(z, initial_z)
+        z_norm_loss = z.pow(2).mean()
+
+        total_loss = (
+            self.pg_coeff * pg_loss
+            + self.offline_diffsr_coeff * diffsr_loss
+            + self.anchor_coeff * anchor_loss
+            + self.z_norm_coeff * z_norm_loss
+        )
+        metrics = {
+            "hl_skill_total_loss": total_loss.detach(),
+            "hl_skill_pg_loss": pg_loss.detach(),
+            "hl_skill_diffsr_loss": diffsr_loss.detach(),
+            "hl_skill_anchor_loss": anchor_loss.detach(),
+            "hl_skill_z_norm_loss": z_norm_loss.detach(),
+        }
+        metrics.update(self._z_diagnostics_tensors(z.detach(), prefix="hl_skill"))
+        return total_loss, metrics
+
+    def checkpoint_state_dict(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "skill_encoder_state_dict": self.skill_encoder.state_dict(),
+            "finetune_updates": int(self.finetune_updates),
+        }
+        if self.train_diffsr:
+            state["diffsr_state_dict"] = self.diffsr.state_dict()
+        if self.optimizer is not None:
+            state["optimizer_state_dict"] = self.optimizer.state_dict()
+        return state
+
+    def load_checkpoint_state_dict(self, state: Mapping[str, Any]) -> None:
+        if "skill_encoder_state_dict" in state:
+            self.skill_encoder.load_state_dict(state["skill_encoder_state_dict"])
+        if self.train_diffsr and "diffsr_state_dict" in state:
+            self.diffsr.load_state_dict(state["diffsr_state_dict"])
+        if self.optimizer is not None and "optimizer_state_dict" in state:
+            self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        self.finetune_updates = int(state.get("finetune_updates", 0))
 
     @torch.no_grad()
     def sample_for_step(
@@ -486,22 +890,32 @@ class FrozenHighLevelSkillCommandSampler:
             self._codes is None
             or self._latent_steps is None
             or self._codes.shape[0] != batch_size
-            or self._codes.shape[1] != self.code_latent_dim
+            or self._codes.shape[1] != self.command_code_dim
             or self._codes.device != device
             or self._codes.dtype != dtype
+            or self._active_macro_ids is None
+            or self._active_macro_ids.shape[0] != batch_size
+            or self._active_macro_ids.device != device
         ):
             self._codes = torch.zeros(
                 batch_size,
-                self.code_latent_dim,
+                self.command_code_dim,
                 device=device,
                 dtype=dtype,
             )
             self._latent_steps = torch.zeros(
                 batch_size, device=device, dtype=torch.long
             )
+            self._active_macro_ids = torch.full(
+                (batch_size,),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
 
         assert self._codes is not None
         assert self._latent_steps is not None
+        assert self._active_macro_ids is not None
         renew_mask = self._done_mask(
             td,
             batch_size=batch_size,
@@ -509,20 +923,45 @@ class FrozenHighLevelSkillCommandSampler:
         ) | (self._latent_steps <= 0)
         if bool(renew_mask.any()):
             env_ids = torch.nonzero(renew_mask, as_tuple=False).reshape(-1)
-            codes = self._encode_current_latents(env_ids.to(self.device)).to(
+            z, state, future_window, target, initial_z = (
+                self._encode_current_macro_batch(env_ids.to(self.device))
+            )
+            command_codes = self._command_code_from_state_z(state, z)
+            command_codes = command_codes.to(
                 device=device,
                 dtype=dtype,
             )
-            self._codes.index_copy_(0, env_ids.to(device=device), codes)
+            self._codes.index_copy_(0, env_ids.to(device=device), command_codes)
             self._latent_steps.index_copy_(
                 0,
                 env_ids.to(device=device),
                 self._sample_steps(int(env_ids.numel()), device=device),
             )
+            if self.finetune_enabled:
+                macro_ids = self._append_rollout_cache(
+                    state=state,
+                    future_window=future_window,
+                    target=target,
+                    initial_z=initial_z,
+                ).to(device=device)
+                self._active_macro_ids.index_copy_(
+                    0,
+                    env_ids.to(device=device),
+                    macro_ids,
+                )
 
         phase = (self.phase_period - self._latent_steps).clamp(min=0).to(torch.float32)
         phase = phase / float(self.phase_period)
         latents = self._append_command_phase(self._codes, phase)
+        if self.finetune_enabled:
+            td.set(
+                ("hl_skill", "macro_id"),
+                self._active_macro_ids.reshape(*td.batch_size),
+            )
+            td.set(
+                ("hl_skill", "phase"),
+                phase.to(device=device, dtype=torch.float32).reshape(*td.batch_size),
+            )
         self._latent_steps = self._latent_steps - 1
         return latents
 

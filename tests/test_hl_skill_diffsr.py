@@ -392,6 +392,234 @@ def test_frozen_hl_skill_command_sampler_loads_checkpoint_and_holds_latents(
     assert torch.equal(first, second)
     assert not torch.equal(first, third)
     assert not any(param.requires_grad for param in sampler.skill_encoder.parameters())
+    assert not any(param.requires_grad for param in sampler.diffsr.parameters())
+    assert sampler.optimizer is None
+
+
+def test_hl_skill_online_finetune_enables_encoder_only_by_default(tmp_path) -> None:
+    torch.manual_seed(14)
+    config = _config(encoder_window_mode="intermediate")
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeMacroEnv())
+    checkpoint_path = tmp_path / "latest.pt"
+    trainer.save_checkpoint(checkpoint_path)
+    env = _FakeCurrentMacroEnv()
+
+    sampler = FrozenHighLevelSkillCommandSampler(
+        env=env,
+        checkpoint_path=checkpoint_path,
+        latent_dim=config.z_dim,
+        latent_steps_min=2,
+        latent_steps_max=2,
+        discover_env_method=_discover_direct_method,
+        device="cpu",
+        finetune_enabled=True,
+        offline_batch_size=4,
+    )
+
+    assert any(param.requires_grad for param in sampler.skill_encoder.parameters())
+    assert not any(
+        param.requires_grad for param in sampler.initial_skill_encoder.parameters()
+    )
+    assert not any(param.requires_grad for param in sampler.diffsr.parameters())
+    assert sampler.optimizer is not None
+
+
+def test_hl_skill_macro_cache_reconstructs_held_command(tmp_path) -> None:
+    torch.manual_seed(15)
+    config = _config(encoder_window_mode="intermediate")
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeMacroEnv())
+    checkpoint_path = tmp_path / "latest.pt"
+    trainer.save_checkpoint(checkpoint_path)
+    env = _FakeCurrentMacroEnv()
+
+    sampler = FrozenHighLevelSkillCommandSampler(
+        env=env,
+        checkpoint_path=checkpoint_path,
+        latent_dim=config.z_dim + 2,
+        latent_steps_min=3,
+        latent_steps_max=3,
+        discover_env_method=_discover_direct_method,
+        command_phase_mode="sin_cos",
+        code_latent_dim=config.z_dim,
+        phase_period=3,
+        device="cpu",
+        finetune_enabled=True,
+        offline_batch_size=4,
+    )
+    sampler.start_rollout_cache()
+    td = TensorDict({}, batch_size=[2])
+
+    command = sampler.sample_for_step(
+        td,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    reconstructed = sampler.latent_commands_from_rollout_batch(td, detach=True)
+
+    assert ("hl_skill", "macro_id") in td.keys(True)
+    assert ("hl_skill", "phase") in td.keys(True)
+    assert torch.allclose(command, reconstructed)
+
+
+def test_hl_skill_z_phi_command_mode_reconstructs_held_command(tmp_path) -> None:
+    torch.manual_seed(18)
+    config = _config(encoder_window_mode="intermediate")
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeMacroEnv())
+    checkpoint_path = tmp_path / "latest.pt"
+    trainer.save_checkpoint(checkpoint_path)
+
+    command_dim = config.z_dim + config.diffsr_feature_dim + 2
+    sampler = FrozenHighLevelSkillCommandSampler(
+        env=_FakeCurrentMacroEnv(),
+        checkpoint_path=checkpoint_path,
+        latent_dim=command_dim,
+        latent_steps_min=3,
+        latent_steps_max=3,
+        discover_env_method=_discover_direct_method,
+        command_phase_mode="sin_cos",
+        code_latent_dim=config.z_dim + config.diffsr_feature_dim,
+        phase_period=3,
+        command_mode="z_phi",
+        device="cpu",
+        finetune_enabled=True,
+        offline_batch_size=4,
+    )
+    sampler.start_rollout_cache()
+    td = TensorDict({}, batch_size=[2])
+
+    command = sampler.sample_for_step(
+        td,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    reconstructed = sampler.latent_commands_from_rollout_batch(td, detach=True)
+
+    assert command.shape == (2, command_dim)
+    assert torch.allclose(command, reconstructed)
+
+
+def test_hl_skill_online_update_changes_encoder_not_actor(tmp_path) -> None:
+    torch.manual_seed(16)
+    config = _config(encoder_window_mode="intermediate")
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeMacroEnv())
+    checkpoint_path = tmp_path / "latest.pt"
+    trainer.save_checkpoint(checkpoint_path)
+    env = _FakeCurrentMacroEnv()
+
+    sampler = FrozenHighLevelSkillCommandSampler(
+        env=env,
+        checkpoint_path=checkpoint_path,
+        latent_dim=config.z_dim,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover_direct_method,
+        device="cpu",
+        finetune_enabled=True,
+        pg_coeff=1.0,
+        offline_diffsr_coeff=0.1,
+        anchor_coeff=0.01,
+        offline_batch_size=4,
+    )
+    assert sampler.optimizer is not None
+    sampler.start_rollout_cache()
+    td = TensorDict({}, batch_size=[2])
+    sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+
+    actor = torch.nn.Linear(config.z_dim, 1)
+    actor_before = [param.detach().clone() for param in actor.parameters()]
+    for param in actor.parameters():
+        param.requires_grad_(False)
+    encoder_before = [
+        param.detach().clone() for param in sampler.skill_encoder.parameters()
+    ]
+
+    def _actor_loss_fn(batch: TensorDict) -> torch.Tensor:
+        latent = batch.get("latent_command")
+        return actor(latent).pow(2).mean()
+
+    sampler.optimizer.zero_grad(set_to_none=True)
+    total_loss, metrics = sampler.compute_online_finetune_loss(
+        td,
+        latent_key="latent_command",
+        actor_loss_fn=_actor_loss_fn,
+    )
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(sampler.trainable_parameters(), 1.0)
+    sampler.optimizer.step()
+
+    assert "hl_skill_pg_loss" in metrics
+    assert any(
+        not torch.allclose(before, after)
+        for before, after in zip(
+            encoder_before,
+            sampler.skill_encoder.parameters(),
+            strict=True,
+        )
+    )
+    for before, after in zip(actor_before, actor.parameters(), strict=True):
+        assert torch.equal(before, after)
+
+
+def test_hl_skill_online_checkpoint_roundtrip_restores_optimizer(tmp_path) -> None:
+    torch.manual_seed(17)
+    config = _config(encoder_window_mode="intermediate")
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeMacroEnv())
+    checkpoint_path = tmp_path / "latest.pt"
+    trainer.save_checkpoint(checkpoint_path)
+
+    sampler = FrozenHighLevelSkillCommandSampler(
+        env=_FakeCurrentMacroEnv(),
+        checkpoint_path=checkpoint_path,
+        latent_dim=config.z_dim,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover_direct_method,
+        device="cpu",
+        finetune_enabled=True,
+        offline_batch_size=4,
+    )
+    assert sampler.optimizer is not None
+    sampler.start_rollout_cache()
+    td = TensorDict({}, batch_size=[2])
+    sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+
+    def _actor_loss_fn(batch: TensorDict) -> torch.Tensor:
+        return batch.get("latent_command").pow(2).mean()
+
+    sampler.optimizer.zero_grad(set_to_none=True)
+    loss, _ = sampler.compute_online_finetune_loss(
+        td,
+        latent_key="latent_command",
+        actor_loss_fn=_actor_loss_fn,
+    )
+    loss.backward()
+    sampler.optimizer.step()
+    sampler.finetune_updates = 3
+    state = sampler.checkpoint_state_dict()
+
+    loaded = FrozenHighLevelSkillCommandSampler(
+        env=_FakeCurrentMacroEnv(),
+        checkpoint_path=checkpoint_path,
+        latent_dim=config.z_dim,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover_direct_method,
+        device="cpu",
+        finetune_enabled=True,
+        offline_batch_size=4,
+    )
+    loaded.load_checkpoint_state_dict(state)
+
+    assert loaded.finetune_updates == 3
+    assert loaded.optimizer is not None
+    _assert_nested_equal(
+        sampler.skill_encoder.state_dict(),
+        loaded.skill_encoder.state_dict(),
+    )
+    _assert_nested_equal(
+        sampler.optimizer.state_dict(),
+        loaded.optimizer.state_dict(),
+    )
 
 
 def test_frozen_hl_skill_command_sampler_appends_sin_cos_phase(tmp_path) -> None:
