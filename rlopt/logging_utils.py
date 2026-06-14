@@ -334,8 +334,22 @@ class MetricReporter:
         record_step = _coerce_step(step)
 
         if self._metrics_logger is not None:
-            for key, value in sanitized.items():
-                self._metrics_logger.log_scalar(key, value, record_step)
+            # wandb >= 0.18 buffers data indefinitely when log_scalar calls
+            # experiment.log with commit=False.  Batch all metrics into one
+            # experiment.log call with commit=True so every step is committed
+            # immediately.  TensorBoard writers expose add_scalar (not log), so
+            # the check here safely identifies wandb-backed loggers only.
+            experiment = getattr(self._metrics_logger, "experiment", None)
+            if (
+                experiment is not None
+                and sanitized
+                and callable(getattr(experiment, "log", None))
+                and not callable(getattr(experiment, "add_scalar", None))
+            ):
+                experiment.log(sanitized, step=record_step, commit=True)
+            else:
+                for key, value in sanitized.items():
+                    self._metrics_logger.log_scalar(key, value, record_step)
 
         if log_python and self._python_logger is not None:
             message = " | ".join(
