@@ -9,12 +9,12 @@ and a language-goal embedding (e.g. a LAFAN1 trajectory name embedded offline by
 
 Contents:
 
-* ``LanguageSkillGeneratorConfig`` - training/config dataclass.
-* ``LanguageSkillGenerator`` - the ``(state, lang) -> z`` network.
-* ``LanguageSkillGeneratorTrainer`` - offline supervised distillation against a
+* ``SkillCommanderConfig`` - training/config dataclass.
+* ``SkillCommander`` - the ``(state, lang) -> z`` network.
+* ``SkillCommanderTrainer`` - offline supervised distillation against a
   frozen ``HighLevelSkillEncoder`` (target ``z``), with held-out evaluation over
   trajectory names.
-* ``FrozenLanguageSkillCommandSampler`` - rollout-time latent-command source that
+* ``FrozenSkillCommanderSampler`` - rollout-time latent-command source that
   drives the (unchanged) low-level policy from a language goal, reusing the
   command/phase/scheduling machinery of ``FrozenHighLevelSkillCommandSampler``.
 """
@@ -102,7 +102,7 @@ def build_rank_embedding_lookup(
 # Config + network
 # ---------------------------------------------------------------------------
 @dataclass
-class LanguageSkillGeneratorConfig:
+class SkillCommanderConfig:
     """Configuration for offline language-conditioned skill generator training."""
 
     skill_checkpoint_path: str = ""
@@ -123,6 +123,7 @@ class LanguageSkillGeneratorConfig:
     grad_clip_norm: float | None = 1.0
     cosine_loss_coeff: float = 1.0
     z_norm_coeff: float = 1.0e-4
+    state_noise_std: float = 0.0
     device: str = "auto"
 
     def validate(self) -> None:
@@ -169,13 +170,16 @@ class LanguageSkillGeneratorConfig:
         self.z_norm_coeff = _require_non_negative_float(
             "z_norm_coeff", self.z_norm_coeff
         )
+        self.state_noise_std = _require_non_negative_float(
+            "state_noise_std", self.state_noise_std
+        )
         self.device = str(self.device)
 
     def to_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], _jsonable(asdict(self)))
 
     @classmethod
-    def from_dict(cls, values: Mapping[str, Any]) -> LanguageSkillGeneratorConfig:
+    def from_dict(cls, values: Mapping[str, Any]) -> SkillCommanderConfig:
         known_fields = {item.name for item in fields(cls)}
         kwargs = {key: values[key] for key in known_fields if key in values}
         if "generator_hidden_dims" in kwargs:
@@ -187,7 +191,7 @@ class LanguageSkillGeneratorConfig:
         return config
 
 
-class LanguageSkillGenerator(nn.Module):
+class SkillCommander(nn.Module):
     """Map a current state and language-goal embedding to a skill latent ``z``."""
 
     def __init__(
@@ -248,16 +252,16 @@ class LanguageSkillGenerator(nn.Module):
 # Trainer
 # ---------------------------------------------------------------------------
 @dataclass
-class LanguageSkillGeneratorTrainState:
+class SkillCommanderTrainState:
     update: int = 0
     elapsed_seconds: float = 0.0
     last_metrics: dict[str, float] = field(default_factory=dict)
 
 
-class LanguageSkillGeneratorTrainer:
+class SkillCommanderTrainer:
     """Distill a frozen ``HighLevelSkillEncoder`` into a language-conditioned generator."""
 
-    def __init__(self, config: LanguageSkillGeneratorConfig, env: object) -> None:
+    def __init__(self, config: SkillCommanderConfig, env: object) -> None:
         self.config = config
         self.config.validate()
         self.env = env
@@ -304,7 +308,7 @@ class LanguageSkillGeneratorTrainer:
             self.device,
         )
 
-        self.generator = LanguageSkillGenerator(
+        self.generator = SkillCommander(
             state_dim=self.state_dim,
             lang_embed_dim=self.lang_embed_dim,
             z_dim=self.z_dim,
@@ -445,6 +449,20 @@ class LanguageSkillGeneratorTrainer:
     def _lang_for_ranks(self, traj_rank: Tensor) -> Tensor:
         return self.rank_embeddings.index_select(0, traj_rank)
 
+    def _augment_state(self, state: Tensor) -> Tensor:
+        """Optionally corrupt the generator's state input (M3 robustness).
+
+        Per-dim-scaled Gaussian noise forces the generator to lean on the
+        language goal rather than memorize exact expert states - a first step
+        toward tolerating the robot's achieved (non-expert) state at rollout.
+        The distillation target z is always computed from the clean expert state.
+        """
+        std = float(self.config.state_noise_std)
+        if std <= 0.0 or int(state.shape[0]) < 2:
+            return state
+        per_dim = state.std(dim=0, keepdim=True)
+        return state + std * per_dim * torch.randn_like(state)
+
     @staticmethod
     def _distill_metrics(
         z_hat: Tensor, z_target: Tensor, *, prefix: str
@@ -467,7 +485,7 @@ class LanguageSkillGeneratorTrainer:
         )
         z_target = self._target_z(state, future_window)
         lang = self._lang_for_ranks(traj_rank)
-        z_hat = self.generator(state, lang)
+        z_hat = self.generator(self._augment_state(state), lang)
 
         mse_loss = F.mse_loss(z_hat, z_target)
         cosine_loss = 1.0 - F.cosine_similarity(z_hat, z_target, dim=-1).mean()
@@ -551,9 +569,9 @@ class LanguageSkillGeneratorTrainer:
         *,
         log_callback: Callable[[dict[str, float | int]], None] | None = None,
         checkpoint_path: str | Path | None = None,
-    ) -> LanguageSkillGeneratorTrainState:
+    ) -> SkillCommanderTrainState:
         start_time = time.perf_counter()
-        state = LanguageSkillGeneratorTrainState()
+        state = SkillCommanderTrainState()
         for _ in range(self.config.num_updates):
             metrics = self.train_step()
             should_log = (
@@ -605,12 +623,12 @@ class LanguageSkillGeneratorTrainer:
 # ---------------------------------------------------------------------------
 # Rollout-time latent-command source (System 2 driving System 1)
 # ---------------------------------------------------------------------------
-class FrozenLanguageSkillCommandSampler(FrozenHighLevelSkillCommandSampler):
+class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
     """Language-conditioned latent-command source for low-level rollouts.
 
     Drop-in replacement for ``FrozenHighLevelSkillCommandSampler`` that produces
     the skill latent ``z`` from ``(current_state, language_goal)`` via a trained
-    ``LanguageSkillGenerator`` instead of encoding the expert future window. The
+    ``SkillCommander`` instead of encoding the expert future window. The
     command/phase/scheduling machinery of the base class is reused unchanged;
     only the ``z`` production is overridden. Inference-only - online finetuning
     is not supported.
@@ -669,7 +687,7 @@ class FrozenLanguageSkillCommandSampler(FrozenHighLevelSkillCommandSampler):
         )
         if self._current_macro_sampler is None:
             msg = (
-                "command_source='language_skill' requires the environment to "
+                "command_source='skill_commander' requires the environment to "
                 "expose current_expert_macro_transition_batch(...)."
             )
             raise ValueError(msg)
@@ -719,7 +737,7 @@ class FrozenLanguageSkillCommandSampler(FrozenHighLevelSkillCommandSampler):
         generator_hidden_dims = tuple(
             int(dim) for dim in checkpoint["config"]["generator_hidden_dims"]
         )
-        self.generator = LanguageSkillGenerator(
+        self.generator = SkillCommander(
             state_dim=self.state_dim,
             lang_embed_dim=self.lang_embed_dim,
             z_dim=self.skill_z_dim,
@@ -759,7 +777,7 @@ class FrozenLanguageSkillCommandSampler(FrozenHighLevelSkillCommandSampler):
         names_provider = discover_env_method(env, "expert_trajectory_motion_names")
         if names_provider is None:
             msg = (
-                "command_source='language_skill' requires the environment to "
+                "command_source='skill_commander' requires the environment to "
                 "expose expert_trajectory_motion_names()."
             )
             raise ValueError(msg)

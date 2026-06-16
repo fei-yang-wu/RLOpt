@@ -19,11 +19,11 @@ from rlopt.agent.hl_skill_diffsr import (  # noqa: E402
     HighLevelSkillDiffSRConfig,
     HighLevelSkillDiffSRTrainer,
 )
-from rlopt.agent.language_skill_generator import (  # noqa: E402
-    FrozenLanguageSkillCommandSampler,
-    LanguageSkillGenerator,
-    LanguageSkillGeneratorConfig,
-    LanguageSkillGeneratorTrainer,
+from rlopt.agent.skill_commander import (  # noqa: E402
+    FrozenSkillCommanderSampler,
+    SkillCommander,
+    SkillCommanderConfig,
+    SkillCommanderTrainer,
     build_rank_embedding_lookup,
     load_language_embedding_table,
 )
@@ -165,7 +165,7 @@ def _gen_config(
     skill_ckpt: Path,
     lang_table: Path,
     **overrides: Any,
-) -> LanguageSkillGeneratorConfig:
+) -> SkillCommanderConfig:
     values: dict[str, Any] = {
         "skill_checkpoint_path": str(skill_ckpt),
         "language_embeddings_path": str(lang_table),
@@ -182,11 +182,11 @@ def _gen_config(
         "device": "cpu",
     }
     values.update(overrides)
-    return LanguageSkillGeneratorConfig(**values)
+    return SkillCommanderConfig(**values)
 
 
 def test_generator_forward_shapes() -> None:
-    generator = LanguageSkillGenerator(
+    generator = SkillCommander(
         state_dim=7, lang_embed_dim=5, z_dim=3, hidden_dims=(16,)
     )
     state = torch.randn(4, 7)
@@ -215,7 +215,7 @@ def test_trainer_distillation_loss_decreases(tmp_path) -> None:
     env = _FakeMacroEnv(deterministic=True)
     skill_ckpt = _make_skill_checkpoint(tmp_path, env)
     lang_table = _make_language_table(tmp_path, env.motion_names)
-    trainer = LanguageSkillGeneratorTrainer(_gen_config(skill_ckpt, lang_table), env)
+    trainer = SkillCommanderTrainer(_gen_config(skill_ckpt, lang_table), env)
 
     first = trainer.train_step()["train/z_mse"]
     last = first
@@ -229,7 +229,7 @@ def test_trainer_evaluate_returns_distill_metrics(tmp_path) -> None:
     env = _FakeMacroEnv(deterministic=True)
     skill_ckpt = _make_skill_checkpoint(tmp_path, env)
     lang_table = _make_language_table(tmp_path, env.motion_names)
-    trainer = LanguageSkillGeneratorTrainer(_gen_config(skill_ckpt, lang_table), env)
+    trainer = SkillCommanderTrainer(_gen_config(skill_ckpt, lang_table), env)
     metrics = trainer.evaluate(prefix="eval")
     assert "eval/z_mse" in metrics
     assert "eval/z_cosine" in metrics
@@ -241,7 +241,7 @@ def test_trainer_requires_traj_rank_from_env(tmp_path) -> None:
     env = _FakeMacroEnv(deterministic=True)
     skill_ckpt = _make_skill_checkpoint(tmp_path, env)
     lang_table = _make_language_table(tmp_path, env.motion_names)
-    trainer = LanguageSkillGeneratorTrainer(_gen_config(skill_ckpt, lang_table), env)
+    trainer = SkillCommanderTrainer(_gen_config(skill_ckpt, lang_table), env)
 
     class _NoRankEnv(_FakeMacroEnv):
         def sample_expert_macro_transition_batch(self, *args, **kwargs):  # type: ignore[override]
@@ -259,7 +259,7 @@ def test_checkpoint_roundtrips_generator(tmp_path) -> None:
     env = _FakeMacroEnv(deterministic=True)
     skill_ckpt = _make_skill_checkpoint(tmp_path, env)
     lang_table = _make_language_table(tmp_path, env.motion_names)
-    trainer = LanguageSkillGeneratorTrainer(_gen_config(skill_ckpt, lang_table), env)
+    trainer = SkillCommanderTrainer(_gen_config(skill_ckpt, lang_table), env)
     trainer.train_step()
     ckpt_path = tmp_path / "generator.pt"
     trainer.save_checkpoint(ckpt_path)
@@ -288,11 +288,11 @@ def test_frozen_language_sampler_returns_latents(
     env = _FakeMacroEnv(deterministic=False)
     skill_ckpt = _make_skill_checkpoint(tmp_path, env)
     lang_table = _make_language_table(tmp_path, env.motion_names)
-    trainer = LanguageSkillGeneratorTrainer(_gen_config(skill_ckpt, lang_table), env)
+    trainer = SkillCommanderTrainer(_gen_config(skill_ckpt, lang_table), env)
     gen_ckpt = tmp_path / "generator.pt"
     trainer.save_checkpoint(gen_ckpt)
 
-    sampler = FrozenLanguageSkillCommandSampler(
+    sampler = FrozenSkillCommanderSampler(
         env=env,
         checkpoint_path=gen_ckpt,
         language_embeddings_path=lang_table,
@@ -323,12 +323,12 @@ def test_frozen_language_sampler_rejects_wrong_latent_dim(tmp_path) -> None:
     env = _FakeMacroEnv(deterministic=False)
     skill_ckpt = _make_skill_checkpoint(tmp_path, env)
     lang_table = _make_language_table(tmp_path, env.motion_names)
-    trainer = LanguageSkillGeneratorTrainer(_gen_config(skill_ckpt, lang_table), env)
+    trainer = SkillCommanderTrainer(_gen_config(skill_ckpt, lang_table), env)
     gen_ckpt = tmp_path / "generator.pt"
     trainer.save_checkpoint(gen_ckpt)
 
     with pytest.raises(ValueError, match="command width must match"):
-        FrozenLanguageSkillCommandSampler(
+        FrozenSkillCommanderSampler(
             env=env,
             checkpoint_path=gen_ckpt,
             language_embeddings_path=lang_table,

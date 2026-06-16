@@ -344,11 +344,11 @@ class IPMDConfig(PPOConfig):
     hl_skill_train_diffsr: bool = False
     """Also update the loaded DiffSR model during online high-level skill finetuning."""
 
-    language_skill_checkpoint_path: str = ""
-    """Generator checkpoint used when command_source='language_skill'."""
+    skill_commander_checkpoint_path: str = ""
+    """Skill-commander checkpoint used when command_source='skill_commander'."""
 
-    language_skill_embeddings_path: str = ""
-    """Language goal embedding table (.pt) used when command_source='language_skill'."""
+    skill_commander_embeddings_path: str = ""
+    """Language goal embedding table (.pt) used when command_source='skill_commander'."""
 
     latent_learning: IPMDLatentLearningConfig = field(
         default_factory=IPMDLatentLearningConfig
@@ -526,7 +526,7 @@ class IPMDConfig(PPOConfig):
         self.latent_steps_max = require_positive_int(
             "ipmd.latent_steps_max", self.latent_steps_max
         )
-        if self.command_source in ("hl_skill", "language_skill"):
+        if self.command_source in ("hl_skill", "skill_commander"):
             self.hl_skill_horizon_steps = int(self.hl_skill_horizon_steps)
             if self.hl_skill_horizon_steps < 0:
                 msg = "ipmd.hl_skill_horizon_steps must be >= 0."
@@ -556,23 +556,23 @@ class IPMDConfig(PPOConfig):
                     "ipmd.command_source='hl_skill'."
                 )
                 raise ValueError(msg)
-        if self.command_source == "language_skill":
-            self.language_skill_checkpoint_path = str(
-                self.language_skill_checkpoint_path
+        if self.command_source == "skill_commander":
+            self.skill_commander_checkpoint_path = str(
+                self.skill_commander_checkpoint_path
             ).strip()
-            self.language_skill_embeddings_path = str(
-                self.language_skill_embeddings_path
+            self.skill_commander_embeddings_path = str(
+                self.skill_commander_embeddings_path
             ).strip()
-            if not self.language_skill_checkpoint_path:
+            if not self.skill_commander_checkpoint_path:
                 msg = (
-                    "ipmd.language_skill_checkpoint_path is required when "
-                    "ipmd.command_source='language_skill'."
+                    "ipmd.skill_commander_checkpoint_path is required when "
+                    "ipmd.command_source='skill_commander'."
                 )
                 raise ValueError(msg)
-            if not self.language_skill_embeddings_path:
+            if not self.skill_commander_embeddings_path:
                 msg = (
-                    "ipmd.language_skill_embeddings_path is required when "
-                    "ipmd.command_source='language_skill'."
+                    "ipmd.skill_commander_embeddings_path is required when "
+                    "ipmd.command_source='skill_commander'."
                 )
                 raise ValueError(msg)
         if self.hl_skill_finetune_enabled and self.command_source != "hl_skill":
@@ -981,7 +981,7 @@ class IPMD(PPO):
 
         if self._use_latent_command and self._command_source not in (
             "hl_skill",
-            "language_skill",
+            "skill_commander",
         ):
             method = str(self.config.ipmd.latent_learning.method)
             self._latent_learner = build_latent_learner(method)
@@ -1023,16 +1023,16 @@ class IPMD(PPO):
                 update_interval=int(self.config.ipmd.hl_skill_update_interval),
                 train_diffsr=bool(self.config.ipmd.hl_skill_train_diffsr),
             )
-        if self._use_latent_command and self._command_source == "language_skill":
-            from rlopt.agent.language_skill_generator import (  # noqa: PLC0415
-                FrozenLanguageSkillCommandSampler,
+        if self._use_latent_command and self._command_source == "skill_commander":
+            from rlopt.agent.skill_commander import (  # noqa: PLC0415
+                FrozenSkillCommanderSampler,
             )
 
-            self._hl_skill_command_sampler = FrozenLanguageSkillCommandSampler(
+            self._hl_skill_command_sampler = FrozenSkillCommanderSampler(
                 env=self.env,
-                checkpoint_path=str(self.config.ipmd.language_skill_checkpoint_path),
+                checkpoint_path=str(self.config.ipmd.skill_commander_checkpoint_path),
                 language_embeddings_path=str(
-                    self.config.ipmd.language_skill_embeddings_path
+                    self.config.ipmd.skill_commander_embeddings_path
                 ),
                 latent_dim=self._latent_dim,
                 latent_steps_min=int(self.config.ipmd.latent_steps_min),
@@ -1193,7 +1193,7 @@ class IPMD(PPO):
                 dtype=torch.float32,
             )
             return
-        if self._command_source in ("hl_skill", "language_skill"):
+        if self._command_source in ("hl_skill", "skill_commander"):
             if self._hl_skill_command_sampler is None:
                 msg = "Frozen high-level skill command sampler is unavailable."
                 raise RuntimeError(msg)
