@@ -339,3 +339,51 @@ def test_frozen_language_sampler_rejects_wrong_latent_dim(tmp_path) -> None:
             command_mode="z",
             device="cpu",
         )
+
+
+def test_cotrain_commander_in_skill_trainer(tmp_path) -> None:
+    torch.manual_seed(6)
+    env = _FakeMacroEnv(deterministic=True)
+    lang_table = _make_language_table(tmp_path, env.motion_names)
+    config = HighLevelSkillDiffSRConfig(
+        horizon_steps=env.horizon_steps,
+        z_dim=5,
+        diffsr_feature_dim=4,
+        diffsr_embed_dim=8,
+        batch_size=8,
+        num_updates=3,
+        log_interval=1,
+        eval_batches=1,
+        eval_batch_size=8,
+        preflight_batch_size=4,
+        encoder_hidden_dims=(16, 12),
+        diffsr_f_hidden_dims=(16,),
+        diffsr_g_hidden_dims=(16,),
+        diffsr_mu_hidden_dims=(16,),
+        diffsr_num_noises=2,
+        device="cpu",
+        cotrain_commander=True,
+        commander_language_embeddings_path=str(lang_table),
+        commander_hidden_dims=(16,),
+    )
+    trainer = HighLevelSkillDiffSRTrainer(config, env)
+    assert trainer.commander is not None
+    metrics = trainer.train_step()
+    assert "train/commander_cosine" in metrics
+    assert "train/commander_mse" in metrics
+    eval_metrics = trainer.evaluate(prefix="eval")
+    assert "eval/commander_cosine" in eval_metrics
+    # The co-trained commander saves in the SkillCommander rollout-sampler format.
+    ckpt = tmp_path / "commander.pt"
+    trainer.save_commander_checkpoint(ckpt, skill_checkpoint_path="skill.pt")
+    saved = torch.load(ckpt, weights_only=False)
+    for key in (
+        "generator_state_dict",
+        "skill_config",
+        "config",
+        "state_dim",
+        "lang_embed_dim",
+        "z_dim",
+    ):
+        assert key in saved
+    assert "generator_hidden_dims" in saved["config"]
