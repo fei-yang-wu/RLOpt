@@ -20,6 +20,12 @@ from rlopt.agent.ipmd import (
     IPMDRLOptConfig,
     IPMDSRRLOptConfig,
 )
+from rlopt.agent.language_skill_generator import (
+    FrozenLanguageSkillCommandSampler,
+    LanguageSkillGenerator,
+    LanguageSkillGeneratorConfig,
+    LanguageSkillGeneratorTrainer,
+)
 from rlopt.agent.ppo import PPO, PPORLOptConfig
 from rlopt.agent.sac import SAC, FastSAC, FastSACRLOptConfig, SACRLOptConfig
 
@@ -39,6 +45,7 @@ __all__ = [
     "FastTD3",
     "FastTD3RLOptConfig",
     "FrozenHighLevelSkillCommandSampler",
+    "FrozenLanguageSkillCommandSampler",
     "GAILRLOptConfig",
     "HighLevelSkillDiffSRConfig",
     "HighLevelSkillDiffSRTrainer",
@@ -47,6 +54,9 @@ __all__ = [
     "IPMDBilinearRLOptConfig",
     "IPMDRLOptConfig",
     "IPMDSRRLOptConfig",
+    "LanguageSkillGenerator",
+    "LanguageSkillGeneratorConfig",
+    "LanguageSkillGeneratorTrainer",
     "PPORLOptConfig",
     "SACRLOptConfig",
 ]
