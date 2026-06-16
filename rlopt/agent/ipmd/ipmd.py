@@ -350,6 +350,9 @@ class IPMDConfig(PPOConfig):
     skill_commander_embeddings_path: str = ""
     """Language goal embedding table (.pt) used when command_source='skill_commander'."""
 
+    skill_commander_use_achieved_state: bool = False
+    """Condition the commander on the robot's achieved macro state (full-M3 closed loop)."""
+
     latent_learning: IPMDLatentLearningConfig = field(
         default_factory=IPMDLatentLearningConfig
     )
@@ -1048,6 +1051,9 @@ class IPMD(PPO):
                 code_latent_dim=self.config.ipmd.latent_learning.code_latent_dim,
                 phase_period=int(self.config.ipmd.latent_learning.code_period),
                 command_mode=str(self.config.ipmd.hl_skill_command_mode),
+                use_achieved_state=bool(
+                    self.config.ipmd.skill_commander_use_achieved_state
+                ),
                 discover_env_method=self._discover_env_method,
                 device=self._get_device(self.config.device),
             )
