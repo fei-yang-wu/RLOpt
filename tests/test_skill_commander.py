@@ -96,6 +96,16 @@ class _FakeMacroEnv:
             horizon_steps=horizon_steps,
         )
 
+    def current_achieved_macro_transition_batch(
+        self,
+        *,
+        horizon_steps: int,
+        env_ids: torch.Tensor | None = None,
+    ) -> TensorDict:
+        return self.current_expert_macro_transition_batch(
+            horizon_steps=horizon_steps, env_ids=env_ids
+        )
+
     def expert_trajectory_motion_names(self) -> list[str]:
         return list(self.motion_names)
 
@@ -387,3 +397,30 @@ def test_cotrain_commander_in_skill_trainer(tmp_path) -> None:
     ):
         assert key in saved
     assert "generator_hidden_dims" in saved["config"]
+
+
+def test_frozen_commander_uses_achieved_state(tmp_path) -> None:
+    torch.manual_seed(7)
+    env = _FakeMacroEnv(deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    lang_table = _make_language_table(tmp_path, env.motion_names)
+    trainer = SkillCommanderTrainer(_gen_config(skill_ckpt, lang_table), env)
+    gen_ckpt = tmp_path / "generator.pt"
+    trainer.save_checkpoint(gen_ckpt)
+
+    sampler = FrozenSkillCommanderSampler(
+        env=env,
+        checkpoint_path=gen_ckpt,
+        language_embeddings_path=lang_table,
+        latent_dim=5,
+        latent_steps_min=2,
+        latent_steps_max=2,
+        discover_env_method=_discover_direct_method,
+        command_mode="z",
+        use_achieved_state=True,
+        device="cpu",
+    )
+    assert sampler.use_achieved_state
+    td = TensorDict({}, batch_size=[2])
+    out = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+    assert out.shape == (2, 5)

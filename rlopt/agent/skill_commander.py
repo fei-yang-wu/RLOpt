@@ -649,6 +649,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         code_latent_dim: int | None = None,
         phase_period: int | None = None,
         command_mode: str = "z",
+        use_achieved_state: bool = False,
         device: torch.device | str | None = None,
     ) -> None:
         # NOTE: we deliberately do not call super().__init__ - that loads a skill
@@ -689,6 +690,18 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             msg = (
                 "command_source='skill_commander' requires the environment to "
                 "expose current_expert_macro_transition_batch(...)."
+            )
+            raise ValueError(msg)
+        # Closed-loop (full-M3) mode: condition the commander on the robot's
+        # achieved macro state instead of the expert-reference state.
+        self.use_achieved_state = bool(use_achieved_state)
+        self._achieved_macro_sampler = discover_env_method(
+            env, "current_achieved_macro_transition_batch"
+        )
+        if self.use_achieved_state and self._achieved_macro_sampler is None:
+            msg = (
+                "skill_commander_use_achieved_state=True requires the environment "
+                "to expose current_achieved_macro_transition_batch(...)."
             )
             raise ValueError(msg)
         self._offline_macro_sampler = None
@@ -801,7 +814,12 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         self,
         env_ids: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        batch = self._current_macro_sampler(
+        macro_sampler = (
+            self._achieved_macro_sampler
+            if self.use_achieved_state
+            else self._current_macro_sampler
+        )
+        batch = macro_sampler(
             horizon_steps=int(self.config.horizon_steps),
             env_ids=env_ids,
         )
@@ -809,7 +827,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         state, future_window, target = self._validate_macro_batch(
             batch,
             batch_size=batch_size,
-            source="Current language-skill",
+            source="Current skill-commander",
         )
         traj_rank = batch.get(("hl", "traj_rank"))
         if traj_rank is None:
