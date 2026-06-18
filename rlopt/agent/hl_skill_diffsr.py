@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -1589,9 +1590,16 @@ class HighLevelSkillDiffSRTrainer:
         *,
         log_callback: Callable[[dict[str, float | int]], None] | None = None,
         checkpoint_path: str | Path | None = None,
+        reconstruction_eval: bool = False,
     ) -> HighLevelSkillDiffSRTrainState:
         start_time = time.perf_counter()
         state = HighLevelSkillDiffSRTrainState()
+        best_eval = float("inf")
+        best_path = (
+            Path(checkpoint_path).with_name("best.pt")
+            if checkpoint_path is not None
+            else None
+        )
         for _ in range(self.config.num_updates):
             metrics = self.train_step()
             should_log = (
@@ -1599,7 +1607,16 @@ class HighLevelSkillDiffSRTrainer:
                 or self.update % self.config.log_interval == 0
             )
             if should_log:
-                metrics.update(self.evaluate(prefix="train"))
+                metrics.update(
+                    self.evaluate(
+                        prefix="train",
+                        include_reconstruction=reconstruction_eval,
+                    )
+                )
+                eval_loss = metrics.get("train/loss_real_z_eval")
+                if best_path is not None and eval_loss is not None and eval_loss < best_eval:
+                    best_eval = float(eval_loss)
+                    self.save_checkpoint(best_path)
                 elapsed = time.perf_counter() - start_time
                 row: dict[str, float | int] = {
                     "update": int(self.update),
@@ -1635,6 +1652,9 @@ class HighLevelSkillDiffSRTrainer:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.checkpoint_state_dict(), target)
+        Path(f"{target}.json").write_text(
+            json.dumps({"update": int(self.update)}), encoding="utf-8"
+        )
 
     def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
         checkpoint = torch.load(
