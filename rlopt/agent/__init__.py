@@ -23,6 +23,8 @@ from rlopt.agent.ipmd import (
 from rlopt.agent.ppo import PPO, PPORLOptConfig
 from rlopt.agent.sac import SAC, FastSAC, FastSACRLOptConfig, SACRLOptConfig
 from rlopt.agent.skill_commander import (
+    DiffusionSkillCommander,
+    FlowMatchingSkillCommander,
     FrozenSkillCommanderSampler,
     SkillCommander,
     SkillCommanderConfig,
@@ -44,6 +46,8 @@ __all__ = [
     "FastSACRLOptConfig",
     "FastTD3",
     "FastTD3RLOptConfig",
+    "DiffusionSkillCommander",
+    "FlowMatchingSkillCommander",
     "FrozenHighLevelSkillCommandSampler",
     "FrozenSkillCommanderSampler",
     "GAILRLOptConfig",

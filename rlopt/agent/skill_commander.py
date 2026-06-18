@@ -1,4 +1,4 @@
-"""Language-conditioned skill generator (System 2).
+"""Language-conditioned skill generator (System 1).
 
 This module distills a frozen high-level skill encoder (see
 ``hl_skill_diffsr.py``) into a generator that maps ``(current_state,
@@ -10,7 +10,9 @@ and a language-goal embedding (e.g. a LAFAN1 trajectory name embedded offline by
 Contents:
 
 * ``SkillCommanderConfig`` - training/config dataclass.
-* ``SkillCommander`` - the ``(state, lang) -> z`` network.
+* ``SkillCommander`` - the direct ``(state, lang) -> z`` network.
+* ``FlowMatchingSkillCommander`` - conditional flow-matching latent planner.
+* ``DiffusionSkillCommander`` - conditional DDPM latent planner.
 * ``SkillCommanderTrainer`` - offline supervised distillation against a
   frozen ``HighLevelSkillEncoder`` (target ``z``), with held-out evaluation over
   trajectory names.
@@ -29,6 +31,7 @@ from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
+from diffusers import DDIMScheduler, DDPMScheduler
 from tensordict import TensorDictBase
 from torch import Tensor, nn
 
@@ -44,6 +47,14 @@ from rlopt.agent.hl_skill_diffsr import (
     _require_positive_float,
     _require_positive_int,
 )
+
+
+def _require_probability(name: str, value: float) -> float:
+    normalized = _require_non_negative_float(name, value)
+    if normalized > 1.0:
+        msg = f"{name} must be in [0, 1], got {value!r}."
+        raise ValueError(msg)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +118,20 @@ class SkillCommanderConfig:
 
     skill_checkpoint_path: str = ""
     language_embeddings_path: str = ""
+    planner_type: str = "mlp"
     generator_hidden_dims: tuple[int, ...] = (1024, 512, 512)
+    flow_num_inference_steps: int = 16
+    flow_time_embed_dim: int = 64
+    flow_train_noise_std: float = 1.0
+    flow_inference_noise_std: float = 1.0
+    diffusion_num_train_timesteps: int = 100
+    diffusion_num_inference_steps: int = 16
+    diffusion_time_embed_dim: int = 64
+    diffusion_beta_schedule: str = "squaredcos_cap_v2"
+    diffusion_prediction_type: str = "epsilon"
+    diffusion_inference_scheduler: str = "ddpm"
+    diffusion_ddim_eta: float = 0.0
+    diffusion_inference_noise_std: float = 1.0
     batch_size: int = 8192
     num_updates: int = 2000
     log_interval: int = 100
@@ -124,6 +148,13 @@ class SkillCommanderConfig:
     cosine_loss_coeff: float = 1.0
     z_norm_coeff: float = 1.0e-4
     state_noise_std: float = 0.0
+    state_feature_dropout_prob: float = 0.0
+    state_feature_dropout_terms: tuple[str, ...] = ("expert_motion",)
+    state_feature_dropout_mode: str = "shuffle"
+    state_feature_dropout_warmup_updates: int = 0
+    language_contrastive_coeff: float = 0.0
+    language_contrastive_margin: float = 0.05
+    language_contrastive_warmup_updates: int = 0
     device: str = "auto"
 
     def validate(self) -> None:
@@ -135,9 +166,66 @@ class SkillCommanderConfig:
         if not self.language_embeddings_path:
             msg = "language_embeddings_path is required."
             raise ValueError(msg)
+        self.planner_type = str(self.planner_type).strip().lower()
+        if self.planner_type not in {"mlp", "flow_matching", "diffusion_policy"}:
+            msg = (
+                "planner_type must be one of {'mlp', 'flow_matching', "
+                "'diffusion_policy'}, got "
+                f"{self.planner_type!r}."
+            )
+            raise ValueError(msg)
         self.generator_hidden_dims = tuple(
             _require_positive_int("generator_hidden_dims", dim)
             for dim in self.generator_hidden_dims
+        )
+        self.flow_num_inference_steps = _require_positive_int(
+            "flow_num_inference_steps", self.flow_num_inference_steps
+        )
+        self.flow_time_embed_dim = _require_positive_int(
+            "flow_time_embed_dim", self.flow_time_embed_dim
+        )
+        self.flow_train_noise_std = _require_non_negative_float(
+            "flow_train_noise_std", self.flow_train_noise_std
+        )
+        self.flow_inference_noise_std = _require_non_negative_float(
+            "flow_inference_noise_std", self.flow_inference_noise_std
+        )
+        self.diffusion_num_train_timesteps = _require_positive_int(
+            "diffusion_num_train_timesteps", self.diffusion_num_train_timesteps
+        )
+        self.diffusion_num_inference_steps = _require_positive_int(
+            "diffusion_num_inference_steps", self.diffusion_num_inference_steps
+        )
+        self.diffusion_time_embed_dim = _require_positive_int(
+            "diffusion_time_embed_dim", self.diffusion_time_embed_dim
+        )
+        self.diffusion_beta_schedule = str(self.diffusion_beta_schedule).strip()
+        if not self.diffusion_beta_schedule:
+            msg = "diffusion_beta_schedule must be non-empty."
+            raise ValueError(msg)
+        self.diffusion_prediction_type = str(
+            self.diffusion_prediction_type
+        ).strip()
+        if self.diffusion_prediction_type != "epsilon":
+            msg = (
+                "diffusion_prediction_type currently supports only 'epsilon', "
+                f"got {self.diffusion_prediction_type!r}."
+            )
+            raise ValueError(msg)
+        self.diffusion_inference_scheduler = str(
+            self.diffusion_inference_scheduler
+        ).strip().lower()
+        if self.diffusion_inference_scheduler not in {"ddpm", "ddim"}:
+            msg = (
+                "diffusion_inference_scheduler must be 'ddpm' or 'ddim', "
+                f"got {self.diffusion_inference_scheduler!r}."
+            )
+            raise ValueError(msg)
+        self.diffusion_ddim_eta = _require_non_negative_float(
+            "diffusion_ddim_eta", self.diffusion_ddim_eta
+        )
+        self.diffusion_inference_noise_std = _require_non_negative_float(
+            "diffusion_inference_noise_std", self.diffusion_inference_noise_std
         )
         self.batch_size = _require_positive_int("batch_size", self.batch_size)
         self.num_updates = _require_positive_int("num_updates", self.num_updates)
@@ -173,6 +261,35 @@ class SkillCommanderConfig:
         self.state_noise_std = _require_non_negative_float(
             "state_noise_std", self.state_noise_std
         )
+        self.state_feature_dropout_prob = _require_probability(
+            "state_feature_dropout_prob", self.state_feature_dropout_prob
+        )
+        self.state_feature_dropout_terms = tuple(
+            str(term).strip()
+            for term in self.state_feature_dropout_terms
+            if str(term).strip()
+        )
+        self.state_feature_dropout_mode = str(
+            self.state_feature_dropout_mode
+        ).strip().lower()
+        if self.state_feature_dropout_mode not in {"shuffle", "zero", "batch_mean"}:
+            msg = (
+                "state_feature_dropout_mode must be one of 'shuffle', 'zero', "
+                f"or 'batch_mean', got {self.state_feature_dropout_mode!r}."
+            )
+            raise ValueError(msg)
+        self.state_feature_dropout_warmup_updates = max(
+            0, int(self.state_feature_dropout_warmup_updates)
+        )
+        self.language_contrastive_coeff = _require_non_negative_float(
+            "language_contrastive_coeff", self.language_contrastive_coeff
+        )
+        self.language_contrastive_margin = _require_non_negative_float(
+            "language_contrastive_margin", self.language_contrastive_margin
+        )
+        self.language_contrastive_warmup_updates = max(
+            0, int(self.language_contrastive_warmup_updates)
+        )
         self.device = str(self.device)
 
     def to_dict(self) -> dict[str, Any]:
@@ -185,6 +302,10 @@ class SkillCommanderConfig:
         if "generator_hidden_dims" in kwargs:
             kwargs["generator_hidden_dims"] = tuple(
                 int(item) for item in kwargs["generator_hidden_dims"]
+            )
+        if "state_feature_dropout_terms" in kwargs:
+            kwargs["state_feature_dropout_terms"] = tuple(
+                str(item) for item in kwargs["state_feature_dropout_terms"]
             )
         config = cls(**kwargs)
         config.validate()
@@ -248,6 +369,551 @@ class SkillCommander(nn.Module):
         return self.net(torch.cat([state, lang_emb], dim=-1))
 
 
+class FlowMatchingSkillCommander(nn.Module):
+    """Conditional flow-matching planner for skill latents.
+
+    The model learns a vector field that transports Gaussian skill noise to the
+    frozen encoder's target latent ``z`` conditioned on ``(state, language)``.
+    At rollout time it integrates that vector field and exposes the same
+    ``forward(state, lang) -> z`` API as ``SkillCommander``.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        lang_embed_dim: int,
+        z_dim: int,
+        hidden_dims: tuple[int, ...] = (1024, 512, 512),
+        *,
+        time_embed_dim: int = 64,
+        num_inference_steps: int = 16,
+        train_noise_std: float = 1.0,
+        inference_noise_std: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.state_dim = _require_positive_int("state_dim", state_dim)
+        self.lang_embed_dim = _require_positive_int("lang_embed_dim", lang_embed_dim)
+        self.z_dim = _require_positive_int("z_dim", z_dim)
+        self.time_embed_dim = _require_positive_int("time_embed_dim", time_embed_dim)
+        self.num_inference_steps = _require_positive_int(
+            "num_inference_steps", num_inference_steps
+        )
+        self.train_noise_std = _require_non_negative_float(
+            "train_noise_std", train_noise_std
+        )
+        self.inference_noise_std = _require_non_negative_float(
+            "inference_noise_std", inference_noise_std
+        )
+        hidden_dims = tuple(
+            _require_positive_int("hidden_dims", dim) for dim in hidden_dims
+        )
+
+        input_dim = self.z_dim + self.time_embed_dim + self.state_dim + self.lang_embed_dim
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.Mish(),
+                ]
+            )
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, self.z_dim))
+        self.vector_field = nn.Sequential(*layers)
+
+    def _validate_condition(self, state: Tensor, lang_emb: Tensor) -> None:
+        if state.ndim != 2:
+            msg = f"state must have shape [B, D], got {tuple(state.shape)}."
+            raise ValueError(msg)
+        if lang_emb.ndim != 2:
+            msg = f"lang_emb must have shape [B, L], got {tuple(lang_emb.shape)}."
+            raise ValueError(msg)
+        batch_size, state_dim = state.shape
+        if int(state_dim) != self.state_dim:
+            msg = (
+                f"state width mismatch: expected [B, {self.state_dim}], "
+                f"got {tuple(state.shape)}."
+            )
+            raise ValueError(msg)
+        expected_lang = (batch_size, self.lang_embed_dim)
+        if tuple(lang_emb.shape) != expected_lang:
+            msg = (
+                f"lang_emb shape mismatch: expected {expected_lang}, "
+                f"got {tuple(lang_emb.shape)}."
+            )
+            raise ValueError(msg)
+
+    def _time_embedding(self, t: Tensor) -> Tensor:
+        t = t.reshape(-1).to(dtype=torch.float32)
+        half_dim = self.time_embed_dim // 2
+        if half_dim == 0:
+            return t.new_zeros((int(t.numel()), self.time_embed_dim))
+        scale = torch.arange(half_dim, device=t.device, dtype=torch.float32)
+        scale = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=t.device)) * scale / max(half_dim - 1, 1)
+        )
+        args = t[:, None] * scale[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if int(emb.shape[-1]) < self.time_embed_dim:
+            emb = F.pad(emb, (0, self.time_embed_dim - int(emb.shape[-1])))
+        return emb
+
+    def _vector_field(self, z_t: Tensor, t: Tensor, state: Tensor, lang_emb: Tensor) -> Tensor:
+        self._validate_condition(state, lang_emb)
+        expected_z = (int(state.shape[0]), self.z_dim)
+        if tuple(z_t.shape) != expected_z:
+            msg = f"z_t must have shape {expected_z}, got {tuple(z_t.shape)}."
+            raise ValueError(msg)
+        time_emb = self._time_embedding(t).to(device=z_t.device, dtype=z_t.dtype)
+        inputs = torch.cat([z_t, time_emb, state, lang_emb], dim=-1)
+        return self.vector_field(inputs)
+
+    def flow_matching_loss(
+        self,
+        state: Tensor,
+        lang_emb: Tensor,
+        z_target: Tensor,
+    ) -> tuple[Tensor, dict[str, float]]:
+        self._validate_condition(state, lang_emb)
+        expected_z = (int(state.shape[0]), self.z_dim)
+        if tuple(z_target.shape) != expected_z:
+            msg = f"z_target must have shape {expected_z}, got {tuple(z_target.shape)}."
+            raise ValueError(msg)
+        z0 = self.train_noise_std * torch.randn_like(z_target)
+        t = torch.rand(int(state.shape[0]), device=z_target.device, dtype=z_target.dtype)
+        t_view = t[:, None]
+        z_t = (1.0 - t_view) * z0 + t_view * z_target
+        target_velocity = z_target - z0
+        pred_velocity = self._vector_field(z_t, t, state, lang_emb)
+        loss = F.mse_loss(pred_velocity, target_velocity)
+        metrics = {
+            "flow/velocity_mse": float(loss.detach().item()),
+            "flow/target_velocity_rms": float(
+                target_velocity.detach().pow(2).mean().sqrt().item()
+            ),
+            "flow/pred_velocity_rms": float(
+                pred_velocity.detach().pow(2).mean().sqrt().item()
+            ),
+        }
+        return loss, metrics
+
+    def forward(
+        self,
+        state: Tensor,
+        lang_emb: Tensor,
+        *,
+        noise: Tensor | None = None,
+        num_steps: int | None = None,
+    ) -> Tensor:
+        self._validate_condition(state, lang_emb)
+        batch_size = int(state.shape[0])
+        if noise is None:
+            z = self.inference_noise_std * torch.randn(
+                batch_size,
+                self.z_dim,
+                device=state.device,
+                dtype=state.dtype,
+            )
+        else:
+            expected_noise = (batch_size, self.z_dim)
+            if tuple(noise.shape) != expected_noise:
+                msg = (
+                    f"noise must have shape {expected_noise}, "
+                    f"got {tuple(noise.shape)}."
+                )
+                raise ValueError(msg)
+            z = noise.to(device=state.device, dtype=state.dtype)
+        steps = self.num_inference_steps if num_steps is None else int(num_steps)
+        steps = _require_positive_int("num_steps", steps)
+        dt = 1.0 / float(steps)
+        for step in range(steps):
+            t = torch.full(
+                (batch_size,),
+                fill_value=float(step) * dt,
+                device=state.device,
+                dtype=state.dtype,
+            )
+            z = z + dt * self._vector_field(z, t, state, lang_emb)
+        return z
+
+
+class DiffusionSkillCommander(nn.Module):
+    """Conditional DDPM planner for skill latents.
+
+    This is the diffusion-policy variant of the language commander: it learns a
+    denoising network over the skill-command action ``z`` conditioned on the
+    current macro state and language embedding. The scheduler is provided by
+    diffusers, while the public rollout API remains ``forward(state, lang) -> z``.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        lang_embed_dim: int,
+        z_dim: int,
+        hidden_dims: tuple[int, ...] = (1024, 512, 512),
+        *,
+        time_embed_dim: int = 64,
+        num_train_timesteps: int = 100,
+        num_inference_steps: int = 16,
+        beta_schedule: str = "squaredcos_cap_v2",
+        prediction_type: str = "epsilon",
+        inference_scheduler: str = "ddpm",
+        ddim_eta: float = 0.0,
+        inference_noise_std: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.state_dim = _require_positive_int("state_dim", state_dim)
+        self.lang_embed_dim = _require_positive_int("lang_embed_dim", lang_embed_dim)
+        self.z_dim = _require_positive_int("z_dim", z_dim)
+        self.time_embed_dim = _require_positive_int("time_embed_dim", time_embed_dim)
+        self.num_train_timesteps = _require_positive_int(
+            "num_train_timesteps", num_train_timesteps
+        )
+        self.num_inference_steps = _require_positive_int(
+            "num_inference_steps", num_inference_steps
+        )
+        self.inference_noise_std = _require_non_negative_float(
+            "inference_noise_std", inference_noise_std
+        )
+        self.beta_schedule = str(beta_schedule).strip()
+        self.prediction_type = str(prediction_type).strip()
+        if self.prediction_type != "epsilon":
+            msg = (
+                "DiffusionSkillCommander currently supports only epsilon "
+                f"prediction, got {self.prediction_type!r}."
+            )
+            raise ValueError(msg)
+        self.inference_scheduler_name = str(inference_scheduler).strip().lower()
+        if self.inference_scheduler_name not in {"ddpm", "ddim"}:
+            msg = (
+                "inference_scheduler must be 'ddpm' or 'ddim', got "
+                f"{self.inference_scheduler_name!r}."
+            )
+            raise ValueError(msg)
+        self.ddim_eta = _require_non_negative_float("ddim_eta", ddim_eta)
+        hidden_dims = tuple(
+            _require_positive_int("hidden_dims", dim) for dim in hidden_dims
+        )
+
+        self.train_scheduler = DDPMScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            beta_schedule=self.beta_schedule,
+            prediction_type=self.prediction_type,
+            clip_sample=False,
+        )
+        scheduler_cls = (
+            DDIMScheduler
+            if self.inference_scheduler_name == "ddim"
+            else DDPMScheduler
+        )
+        self.inference_scheduler = scheduler_cls(
+            num_train_timesteps=self.num_train_timesteps,
+            beta_schedule=self.beta_schedule,
+            prediction_type=self.prediction_type,
+            clip_sample=False,
+        )
+
+        input_dim = self.z_dim + self.time_embed_dim + self.state_dim + self.lang_embed_dim
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.Mish(),
+                ]
+            )
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, self.z_dim))
+        self.noise_predictor = nn.Sequential(*layers)
+
+    def _validate_condition(self, state: Tensor, lang_emb: Tensor) -> None:
+        if state.ndim != 2:
+            msg = f"state must have shape [B, D], got {tuple(state.shape)}."
+            raise ValueError(msg)
+        if lang_emb.ndim != 2:
+            msg = f"lang_emb must have shape [B, L], got {tuple(lang_emb.shape)}."
+            raise ValueError(msg)
+        batch_size, state_dim = state.shape
+        if int(state_dim) != self.state_dim:
+            msg = (
+                f"state width mismatch: expected [B, {self.state_dim}], "
+                f"got {tuple(state.shape)}."
+            )
+            raise ValueError(msg)
+        expected_lang = (batch_size, self.lang_embed_dim)
+        if tuple(lang_emb.shape) != expected_lang:
+            msg = (
+                f"lang_emb shape mismatch: expected {expected_lang}, "
+                f"got {tuple(lang_emb.shape)}."
+            )
+            raise ValueError(msg)
+
+    def _time_embedding(self, timesteps: Tensor) -> Tensor:
+        t = timesteps.reshape(-1).to(dtype=torch.float32)
+        half_dim = self.time_embed_dim // 2
+        if half_dim == 0:
+            return t.new_zeros((int(t.numel()), self.time_embed_dim))
+        scale = torch.arange(half_dim, device=t.device, dtype=torch.float32)
+        scale = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=t.device))
+            * scale
+            / max(half_dim - 1, 1)
+        )
+        args = (t[:, None] / float(self.num_train_timesteps)) * scale[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if int(emb.shape[-1]) < self.time_embed_dim:
+            emb = F.pad(emb, (0, self.time_embed_dim - int(emb.shape[-1])))
+        return emb
+
+    def _predict_noise(
+        self,
+        z_t: Tensor,
+        timesteps: Tensor,
+        state: Tensor,
+        lang_emb: Tensor,
+    ) -> Tensor:
+        self._validate_condition(state, lang_emb)
+        expected_z = (int(state.shape[0]), self.z_dim)
+        if tuple(z_t.shape) != expected_z:
+            msg = f"z_t must have shape {expected_z}, got {tuple(z_t.shape)}."
+            raise ValueError(msg)
+        if tuple(timesteps.reshape(-1).shape) != (int(state.shape[0]),):
+            msg = (
+                "timesteps must have shape "
+                f"{(int(state.shape[0]),)}, got {tuple(timesteps.shape)}."
+            )
+            raise ValueError(msg)
+        time_emb = self._time_embedding(timesteps).to(
+            device=z_t.device, dtype=z_t.dtype
+        )
+        inputs = torch.cat([z_t, time_emb, state, lang_emb], dim=-1)
+        return self.noise_predictor(inputs)
+
+    def diffusion_loss(
+        self,
+        state: Tensor,
+        lang_emb: Tensor,
+        z_target: Tensor,
+    ) -> tuple[Tensor, dict[str, float]]:
+        self._validate_condition(state, lang_emb)
+        expected_z = (int(state.shape[0]), self.z_dim)
+        if tuple(z_target.shape) != expected_z:
+            msg = f"z_target must have shape {expected_z}, got {tuple(z_target.shape)}."
+            raise ValueError(msg)
+        noise = torch.randn_like(z_target)
+        timesteps = torch.randint(
+            low=0,
+            high=self.num_train_timesteps,
+            size=(int(state.shape[0]),),
+            device=z_target.device,
+            dtype=torch.long,
+        )
+        z_t = self.train_scheduler.add_noise(z_target, noise, timesteps)
+        pred_noise = self._predict_noise(z_t, timesteps, state, lang_emb)
+        loss = F.mse_loss(pred_noise, noise)
+        metrics = {
+            "diffusion/noise_mse": float(loss.detach().item()),
+            "diffusion/noise_rms": float(noise.detach().pow(2).mean().sqrt().item()),
+            "diffusion/pred_noise_rms": float(
+                pred_noise.detach().pow(2).mean().sqrt().item()
+            ),
+            "diffusion/timestep_mean": float(
+                timesteps.detach().to(dtype=torch.float32).mean().item()
+            ),
+        }
+        return loss, metrics
+
+    def forward(
+        self,
+        state: Tensor,
+        lang_emb: Tensor,
+        *,
+        noise: Tensor | None = None,
+        num_steps: int | None = None,
+    ) -> Tensor:
+        self._validate_condition(state, lang_emb)
+        batch_size = int(state.shape[0])
+        if noise is None:
+            z = self.inference_noise_std * torch.randn(
+                batch_size,
+                self.z_dim,
+                device=state.device,
+                dtype=state.dtype,
+            )
+        else:
+            expected_noise = (batch_size, self.z_dim)
+            if tuple(noise.shape) != expected_noise:
+                msg = (
+                    f"noise must have shape {expected_noise}, "
+                    f"got {tuple(noise.shape)}."
+                )
+                raise ValueError(msg)
+            z = noise.to(device=state.device, dtype=state.dtype)
+
+        steps = self.num_inference_steps if num_steps is None else int(num_steps)
+        steps = _require_positive_int("num_steps", steps)
+        self.inference_scheduler.set_timesteps(steps, device=state.device)
+        for timestep in self.inference_scheduler.timesteps:
+            t_int = int(timestep.item())
+            timesteps = torch.full(
+                (batch_size,),
+                fill_value=t_int,
+                device=state.device,
+                dtype=torch.long,
+            )
+            pred_noise = self._predict_noise(z, timesteps, state, lang_emb)
+            if isinstance(self.inference_scheduler, DDIMScheduler):
+                z = self.inference_scheduler.step(
+                    pred_noise,
+                    t_int,
+                    z,
+                    eta=float(self.ddim_eta),
+                ).prev_sample
+            else:
+                z = self.inference_scheduler.step(pred_noise, t_int, z).prev_sample
+        return z
+
+
+def _build_skill_commander_generator(
+    *,
+    planner_type: str,
+    state_dim: int,
+    lang_embed_dim: int,
+    z_dim: int,
+    hidden_dims: tuple[int, ...],
+    flow_num_inference_steps: int = 16,
+    flow_time_embed_dim: int = 64,
+    flow_train_noise_std: float = 1.0,
+    flow_inference_noise_std: float = 1.0,
+    diffusion_num_train_timesteps: int = 100,
+    diffusion_num_inference_steps: int = 16,
+    diffusion_time_embed_dim: int = 64,
+    diffusion_beta_schedule: str = "squaredcos_cap_v2",
+    diffusion_prediction_type: str = "epsilon",
+    diffusion_inference_scheduler: str = "ddpm",
+    diffusion_ddim_eta: float = 0.0,
+    diffusion_inference_noise_std: float = 1.0,
+) -> nn.Module:
+    planner_type = str(planner_type).strip().lower()
+    if planner_type == "mlp":
+        return SkillCommander(
+            state_dim=state_dim,
+            lang_embed_dim=lang_embed_dim,
+            z_dim=z_dim,
+            hidden_dims=hidden_dims,
+        )
+    if planner_type == "flow_matching":
+        return FlowMatchingSkillCommander(
+            state_dim=state_dim,
+            lang_embed_dim=lang_embed_dim,
+            z_dim=z_dim,
+            hidden_dims=hidden_dims,
+            time_embed_dim=flow_time_embed_dim,
+            num_inference_steps=flow_num_inference_steps,
+            train_noise_std=flow_train_noise_std,
+            inference_noise_std=flow_inference_noise_std,
+        )
+    if planner_type == "diffusion_policy":
+        return DiffusionSkillCommander(
+            state_dim=state_dim,
+            lang_embed_dim=lang_embed_dim,
+            z_dim=z_dim,
+            hidden_dims=hidden_dims,
+            time_embed_dim=diffusion_time_embed_dim,
+            num_train_timesteps=diffusion_num_train_timesteps,
+            num_inference_steps=diffusion_num_inference_steps,
+            beta_schedule=diffusion_beta_schedule,
+            prediction_type=diffusion_prediction_type,
+            inference_scheduler=diffusion_inference_scheduler,
+            ddim_eta=diffusion_ddim_eta,
+            inference_noise_std=diffusion_inference_noise_std,
+        )
+    msg = f"Unknown skill commander planner_type: {planner_type!r}."
+    raise ValueError(msg)
+
+
+def _build_skill_commander_generator_from_config(
+    config: SkillCommanderConfig,
+    *,
+    state_dim: int,
+    lang_embed_dim: int,
+    z_dim: int,
+) -> nn.Module:
+    return _build_skill_commander_generator(
+        planner_type=config.planner_type,
+        state_dim=state_dim,
+        lang_embed_dim=lang_embed_dim,
+        z_dim=z_dim,
+        hidden_dims=config.generator_hidden_dims,
+        flow_num_inference_steps=config.flow_num_inference_steps,
+        flow_time_embed_dim=config.flow_time_embed_dim,
+        flow_train_noise_std=config.flow_train_noise_std,
+        flow_inference_noise_std=config.flow_inference_noise_std,
+        diffusion_num_train_timesteps=config.diffusion_num_train_timesteps,
+        diffusion_num_inference_steps=config.diffusion_num_inference_steps,
+        diffusion_time_embed_dim=config.diffusion_time_embed_dim,
+        diffusion_beta_schedule=config.diffusion_beta_schedule,
+        diffusion_prediction_type=config.diffusion_prediction_type,
+        diffusion_inference_scheduler=config.diffusion_inference_scheduler,
+        diffusion_ddim_eta=config.diffusion_ddim_eta,
+        diffusion_inference_noise_std=config.diffusion_inference_noise_std,
+    )
+
+
+def _build_skill_commander_generator_from_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    state_dim: int,
+    lang_embed_dim: int,
+    z_dim: int,
+    config_overrides: Mapping[str, Any] | None = None,
+) -> nn.Module:
+    config = dict(checkpoint.get("config", {}))
+    if config_overrides is not None:
+        config.update(
+            {
+                str(key): value
+                for key, value in dict(config_overrides).items()
+                if value is not None
+            }
+        )
+    hidden_dims = tuple(int(dim) for dim in config.get("generator_hidden_dims", (1024, 512, 512)))
+    return _build_skill_commander_generator(
+        planner_type=str(config.get("planner_type", "mlp")),
+        state_dim=state_dim,
+        lang_embed_dim=lang_embed_dim,
+        z_dim=z_dim,
+        hidden_dims=hidden_dims,
+        flow_num_inference_steps=int(config.get("flow_num_inference_steps", 16)),
+        flow_time_embed_dim=int(config.get("flow_time_embed_dim", 64)),
+        flow_train_noise_std=float(config.get("flow_train_noise_std", 1.0)),
+        flow_inference_noise_std=float(config.get("flow_inference_noise_std", 1.0)),
+        diffusion_num_train_timesteps=int(
+            config.get("diffusion_num_train_timesteps", 100)
+        ),
+        diffusion_num_inference_steps=int(
+            config.get("diffusion_num_inference_steps", 16)
+        ),
+        diffusion_time_embed_dim=int(config.get("diffusion_time_embed_dim", 64)),
+        diffusion_beta_schedule=str(
+            config.get("diffusion_beta_schedule", "squaredcos_cap_v2")
+        ),
+        diffusion_prediction_type=str(config.get("diffusion_prediction_type", "epsilon")),
+        diffusion_inference_scheduler=str(
+            config.get("diffusion_inference_scheduler", "ddpm")
+        ),
+        diffusion_ddim_eta=float(config.get("diffusion_ddim_eta", 0.0)),
+        diffusion_inference_noise_std=float(
+            config.get("diffusion_inference_noise_std", 1.0)
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -296,6 +962,7 @@ class SkillCommanderTrainer:
         self.skill_encoder.load_state_dict(skill_checkpoint["skill_encoder_state_dict"])
         self.skill_encoder.eval()
         self.skill_encoder.requires_grad_(False)
+        self.state_feature_slices = self._state_feature_slices()
 
         # Language goal lookup: trajectory rank -> embedding.
         self.language_table = load_language_embedding_table(
@@ -308,11 +975,11 @@ class SkillCommanderTrainer:
             self.device,
         )
 
-        self.generator = SkillCommander(
+        self.generator = _build_skill_commander_generator_from_config(
+            self.config,
             state_dim=self.state_dim,
             lang_embed_dim=self.lang_embed_dim,
             z_dim=self.z_dim,
-            hidden_dims=self.config.generator_hidden_dims,
         ).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.generator.parameters(),
@@ -346,6 +1013,23 @@ class SkillCommanderTrainer:
             msg = "env must expose expert_trajectory_motion_names()."
             raise ValueError(msg)
         return [str(name) for name in provider()]
+
+    def _state_feature_slices(self) -> dict[str, tuple[int, int]]:
+        provider = getattr(self.env, "expert_macro_feature_slices", None)
+        if not callable(provider):
+            return {}
+        raw_slices = provider(int(self.horizon_steps))
+        slices: dict[str, tuple[int, int]] = {}
+        for name, bounds in dict(raw_slices).items():
+            start, end = int(bounds[0]), int(bounds[1])
+            if start < 0 or end <= start or end > self.state_dim:
+                msg = (
+                    "expert_macro_feature_slices returned invalid bounds for "
+                    f"{name!r}: {(start, end)} with state_dim={self.state_dim}."
+                )
+                raise ValueError(msg)
+            slices[str(name)] = (start, end)
+        return slices
 
     # -- sampling ----------------------------------------------------------
     def _sample_macro_batch(
@@ -449,7 +1133,31 @@ class SkillCommanderTrainer:
     def _lang_for_ranks(self, traj_rank: Tensor) -> Tensor:
         return self.rank_embeddings.index_select(0, traj_rank)
 
-    def _augment_state(self, state: Tensor) -> Tensor:
+    def _current_state_feature_dropout_prob(self) -> float:
+        if int(self.update) < int(self.config.state_feature_dropout_warmup_updates):
+            return 0.0
+        return float(self.config.state_feature_dropout_prob)
+
+    def _state_feature_dropout_slices(self) -> list[tuple[int, int]]:
+        prob = self._current_state_feature_dropout_prob()
+        if prob <= 0.0:
+            return []
+        terms = tuple(self.config.state_feature_dropout_terms)
+        if len(terms) == 0:
+            return []
+        if any(term in {"*", "all"} for term in terms):
+            return [(0, self.state_dim)]
+        missing = [term for term in terms if term not in self.state_feature_slices]
+        if missing:
+            available = sorted(self.state_feature_slices)
+            msg = (
+                "state_feature_dropout_terms requested unavailable macro-state "
+                f"features: {missing}. Available features: {available}."
+            )
+            raise ValueError(msg)
+        return [self.state_feature_slices[term] for term in terms]
+
+    def _augment_state(self, state: Tensor) -> tuple[Tensor, dict[str, float]]:
         """Optionally corrupt the generator's state input (M3 robustness).
 
         Per-dim-scaled Gaussian noise forces the generator to lean on the
@@ -457,11 +1165,152 @@ class SkillCommanderTrainer:
         toward tolerating the robot's achieved (non-expert) state at rollout.
         The distillation target z is always computed from the clean expert state.
         """
+        metrics: dict[str, float] = {}
+        augmented = state
         std = float(self.config.state_noise_std)
-        if std <= 0.0 or int(state.shape[0]) < 2:
-            return state
-        per_dim = state.std(dim=0, keepdim=True)
-        return state + std * per_dim * torch.randn_like(state)
+        if std > 0.0 and int(state.shape[0]) >= 2:
+            per_dim = state.std(dim=0, keepdim=True)
+            augmented = augmented + std * per_dim * torch.randn_like(state)
+            metrics["state_noise_std"] = std
+
+        dropout_prob = self._current_state_feature_dropout_prob()
+        dropout_slices = self._state_feature_dropout_slices()
+        if dropout_prob <= 0.0 or len(dropout_slices) == 0:
+            return augmented, metrics
+
+        row_mask = torch.rand(
+            int(state.shape[0]), device=state.device, dtype=torch.float32
+        ) < dropout_prob
+        active_rows = int(row_mask.sum().item())
+        if active_rows == 0:
+            metrics["state_feature_dropout/prob"] = float(dropout_prob)
+            metrics["state_feature_dropout/active_frac"] = 0.0
+            return augmented, metrics
+
+        augmented = augmented.clone()
+        mode = str(self.config.state_feature_dropout_mode)
+        for start, end in dropout_slices:
+            if mode == "zero":
+                replacement = torch.zeros(
+                    (active_rows, end - start),
+                    device=state.device,
+                    dtype=state.dtype,
+                )
+            elif mode == "batch_mean":
+                replacement = state[:, start:end].mean(dim=0, keepdim=True).expand(
+                    active_rows, -1
+                )
+            elif mode == "shuffle":
+                perm = torch.randperm(int(state.shape[0]), device=state.device)
+                replacement = state.index_select(0, perm)[row_mask, start:end]
+            else:
+                msg = f"Unsupported state_feature_dropout_mode={mode!r}."
+                raise ValueError(msg)
+            augmented[row_mask, start:end] = replacement
+
+        metrics["state_feature_dropout/prob"] = float(dropout_prob)
+        metrics["state_feature_dropout/active_frac"] = float(
+            row_mask.to(dtype=torch.float32).mean().item()
+        )
+        metrics["state_feature_dropout/num_features"] = float(
+            sum(end - start for start, end in dropout_slices)
+        )
+        return augmented, metrics
+
+    def _different_language_ranks(self, traj_rank: Tensor) -> tuple[Tensor, Tensor]:
+        """Choose a trajectory rank with a different language embedding per row."""
+        num_ranks = int(self.rank_embeddings.shape[0])
+        wrong_rank = traj_rank.clone()
+        has_negative = torch.zeros_like(traj_rank, dtype=torch.bool)
+        if num_ranks <= 1:
+            return wrong_rank, has_negative
+
+        current = self.rank_embeddings.index_select(0, traj_rank)
+        unresolved = torch.ones_like(traj_rank, dtype=torch.bool)
+        for offset in range(1, num_ranks):
+            candidate = (traj_rank + offset) % num_ranks
+            candidate_embedding = self.rank_embeddings.index_select(0, candidate)
+            different = (candidate_embedding - current).abs().amax(dim=-1) > 1.0e-6
+            take = unresolved & different
+            wrong_rank = torch.where(take, candidate, wrong_rank)
+            has_negative = has_negative | take
+            unresolved = unresolved & ~take
+            if not bool(unresolved.any().item()):
+                break
+        return wrong_rank, has_negative
+
+    def _generator_forward_for_contrastive(
+        self,
+        state: Tensor,
+        lang: Tensor,
+        *,
+        shared_noise: Tensor | None,
+    ) -> Tensor:
+        if isinstance(
+            self.generator, (FlowMatchingSkillCommander, DiffusionSkillCommander)
+        ):
+            return self.generator(state, lang, noise=shared_noise)
+        return self.generator(state, lang)
+
+    def _current_language_contrastive_coeff(self) -> float:
+        if int(self.update) < int(self.config.language_contrastive_warmup_updates):
+            return 0.0
+        return float(self.config.language_contrastive_coeff)
+
+    def _language_contrastive_loss(
+        self,
+        state: Tensor,
+        lang: Tensor,
+        z_target: Tensor,
+        traj_rank: Tensor,
+    ) -> tuple[Tensor, dict[str, float]]:
+        coeff = self._current_language_contrastive_coeff()
+        zero = z_target.new_zeros(())
+        if coeff <= 0.0:
+            return zero, {}
+
+        wrong_rank, has_negative = self._different_language_ranks(traj_rank)
+        active = has_negative.to(dtype=z_target.dtype)
+        active_count = active.sum().clamp_min(1.0)
+        if not bool(has_negative.any().item()):
+            return zero, {
+                "language_contrastive/active_frac": 0.0,
+                "language_contrastive/loss": 0.0,
+            }
+
+        wrong_lang = self.rank_embeddings.index_select(0, wrong_rank)
+        shared_noise = None
+        if isinstance(
+            self.generator, (FlowMatchingSkillCommander, DiffusionSkillCommander)
+        ):
+            shared_noise = torch.randn_like(z_target) * float(
+                self.generator.inference_noise_std
+            )
+        z_pos = self._generator_forward_for_contrastive(
+            state, lang, shared_noise=shared_noise
+        )
+        z_neg = self._generator_forward_for_contrastive(
+            state, wrong_lang, shared_noise=shared_noise
+        )
+        pos_cos = F.cosine_similarity(z_pos, z_target, dim=-1)
+        neg_cos = F.cosine_similarity(z_neg, z_target, dim=-1)
+        margin = float(self.config.language_contrastive_margin)
+        per_row = F.relu(neg_cos - pos_cos + margin)
+        loss = (per_row * active).sum() / active_count
+        metrics = {
+            "language_contrastive/active_frac": float(active.mean().detach().item()),
+            "language_contrastive/loss": float(loss.detach().item()),
+            "language_contrastive/pos_cosine": float(
+                ((pos_cos * active).sum() / active_count).detach().item()
+            ),
+            "language_contrastive/neg_cosine": float(
+                ((neg_cos * active).sum() / active_count).detach().item()
+            ),
+            "language_contrastive/delta": float(
+                (((pos_cos - neg_cos) * active).sum() / active_count).detach().item()
+            ),
+        }
+        return loss, metrics
 
     @staticmethod
     def _distill_metrics(
@@ -485,20 +1334,97 @@ class SkillCommanderTrainer:
         )
         z_target = self._target_z(state, future_window)
         lang = self._lang_for_ranks(traj_rank)
-        z_hat = self.generator(self._augment_state(state), lang)
-
-        mse_loss = F.mse_loss(z_hat, z_target)
-        cosine_loss = 1.0 - F.cosine_similarity(z_hat, z_target, dim=-1).mean()
-        z_norm_loss = z_hat.pow(2).mean()
-        loss = (
-            mse_loss
-            + self.config.cosine_loss_coeff * cosine_loss
-            + self.config.z_norm_coeff * z_norm_loss
-        )
+        cmd_state, augment_metrics = self._augment_state(state)
+        if isinstance(self.generator, FlowMatchingSkillCommander):
+            flow_loss, flow_metrics = self.generator.flow_matching_loss(
+                cmd_state, lang, z_target
+            )
+            contrastive_loss, contrastive_metrics = self._language_contrastive_loss(
+                cmd_state, lang, z_target, traj_rank
+            )
+            contrastive_coeff = self._current_language_contrastive_coeff()
+            loss = flow_loss + contrastive_coeff * contrastive_loss
+            with torch.no_grad():
+                z_hat = self.generator(state, lang)
+            metrics = self._distill_metrics(z_hat.detach(), z_target, prefix="train")
+            metrics.update(
+                {f"train/{key}": value for key, value in augment_metrics.items()}
+            )
+            metrics.update(
+                {f"train/{key}": value for key, value in flow_metrics.items()}
+            )
+            metrics.update(
+                {f"train/{key}": value for key, value in contrastive_metrics.items()}
+            )
+            loss_metrics = {
+                "train/loss": float(loss.detach().item()),
+                "train/flow_loss": float(flow_loss.detach().item()),
+                "train/language_contrastive_weighted_loss": float(
+                    (contrastive_coeff * contrastive_loss).detach().item()
+                ),
+            }
+        elif isinstance(self.generator, DiffusionSkillCommander):
+            diffusion_loss, diffusion_metrics = self.generator.diffusion_loss(
+                cmd_state, lang, z_target
+            )
+            contrastive_loss, contrastive_metrics = self._language_contrastive_loss(
+                cmd_state, lang, z_target, traj_rank
+            )
+            contrastive_coeff = self._current_language_contrastive_coeff()
+            loss = diffusion_loss + contrastive_coeff * contrastive_loss
+            with torch.no_grad():
+                z_hat = self.generator(state, lang)
+            metrics = self._distill_metrics(z_hat.detach(), z_target, prefix="train")
+            metrics.update(
+                {f"train/{key}": value for key, value in augment_metrics.items()}
+            )
+            metrics.update(
+                {f"train/{key}": value for key, value in diffusion_metrics.items()}
+            )
+            metrics.update(
+                {f"train/{key}": value for key, value in contrastive_metrics.items()}
+            )
+            loss_metrics = {
+                "train/loss": float(loss.detach().item()),
+                "train/diffusion_loss": float(diffusion_loss.detach().item()),
+                "train/language_contrastive_weighted_loss": float(
+                    (contrastive_coeff * contrastive_loss).detach().item()
+                ),
+            }
+        else:
+            z_hat = self.generator(cmd_state, lang)
+            mse_loss = F.mse_loss(z_hat, z_target)
+            cosine_loss = 1.0 - F.cosine_similarity(z_hat, z_target, dim=-1).mean()
+            z_norm_loss = z_hat.pow(2).mean()
+            contrastive_loss, contrastive_metrics = self._language_contrastive_loss(
+                cmd_state, lang, z_target, traj_rank
+            )
+            contrastive_coeff = self._current_language_contrastive_coeff()
+            loss = (
+                mse_loss
+                + self.config.cosine_loss_coeff * cosine_loss
+                + self.config.z_norm_coeff * z_norm_loss
+                + contrastive_coeff * contrastive_loss
+            )
+            metrics = self._distill_metrics(z_hat.detach(), z_target, prefix="train")
+            metrics.update(
+                {f"train/{key}": value for key, value in augment_metrics.items()}
+            )
+            metrics.update(
+                {f"train/{key}": value for key, value in contrastive_metrics.items()}
+            )
+            loss_metrics = {
+                "train/loss": float(loss.detach().item()),
+                "train/mse_loss": float(mse_loss.detach().item()),
+                "train/cosine_loss": float(cosine_loss.detach().item()),
+                "train/z_norm_loss": float(z_norm_loss.detach().item()),
+                "train/language_contrastive_weighted_loss": float(
+                    (contrastive_coeff * contrastive_loss).detach().item()
+                ),
+            }
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        metrics = self._distill_metrics(z_hat.detach(), z_target, prefix="train")
         if self.config.grad_clip_norm is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.generator.parameters(),
@@ -507,14 +1433,7 @@ class SkillCommanderTrainer:
             metrics["train/grad_norm"] = float(grad_norm.item())
         self.optimizer.step()
         self.update += 1
-        metrics.update(
-            {
-                "train/loss": float(loss.detach().item()),
-                "train/mse_loss": float(mse_loss.detach().item()),
-                "train/cosine_loss": float(cosine_loss.detach().item()),
-                "train/z_norm_loss": float(z_norm_loss.detach().item()),
-            }
-        )
+        metrics.update(loss_metrics)
         return metrics
 
     @torch.no_grad()
@@ -548,13 +1467,28 @@ class SkillCommanderTrainer:
             lang = self._lang_for_ranks(traj_rank)
             z_hat = self.generator(state, lang)
             batch_metrics = self._distill_metrics(z_hat, z_target, prefix=prefix)
-            # Wrong-language control: shuffling goals should degrade the match if
-            # the generator actually uses the language conditioning.
-            if int(lang.shape[0]) > 1:
-                shuffled = lang[torch.randperm(lang.shape[0], device=lang.device)]
-                z_hat_shuffled = self.generator(state, shuffled)
-                batch_metrics[f"{prefix}/z_cosine_shuffled_lang"] = float(
-                    F.cosine_similarity(z_hat_shuffled, z_target, dim=-1).mean().item()
+            # Wrong-language control: a different language embedding should
+            # degrade the match if the generator actually uses conditioning.
+            wrong_rank, has_negative = self._different_language_ranks(traj_rank)
+            if bool(has_negative.any().item()):
+                wrong_lang = self.rank_embeddings.index_select(0, wrong_rank)
+                z_hat_wrong = self.generator(state, wrong_lang)
+                active = has_negative.to(dtype=z_target.dtype)
+                active_count = active.sum().clamp_min(1.0)
+                pos_cos = F.cosine_similarity(z_hat, z_target, dim=-1)
+                wrong_cos = F.cosine_similarity(z_hat_wrong, z_target, dim=-1)
+                wrong_mse = (z_hat_wrong - z_target).pow(2).mean(dim=-1)
+                batch_metrics[f"{prefix}/z_cosine_wrong_lang"] = float(
+                    ((wrong_cos * active).sum() / active_count).item()
+                )
+                batch_metrics[f"{prefix}/z_cosine_shuffled_lang"] = batch_metrics[
+                    f"{prefix}/z_cosine_wrong_lang"
+                ]
+                batch_metrics[f"{prefix}/z_mse_wrong_lang"] = float(
+                    ((wrong_mse * active).sum() / active_count).item()
+                )
+                batch_metrics[f"{prefix}/z_cosine_language_delta"] = float(
+                    (((pos_cos - wrong_cos) * active).sum() / active_count).item()
                 )
             for key, value in batch_metrics.items():
                 accum[key] = accum.get(key, 0.0) + float(value)
@@ -621,7 +1555,7 @@ class SkillCommanderTrainer:
 
 
 # ---------------------------------------------------------------------------
-# Rollout-time latent-command source (System 2 driving System 1)
+# Rollout-time latent-command source (System 1 driving System 0)
 # ---------------------------------------------------------------------------
 class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
     """Language-conditioned latent-command source for low-level rollouts.
@@ -644,6 +1578,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         latent_steps_min: int,
         latent_steps_max: int,
         discover_env_method: Callable[[object, str], Callable[..., Any] | None],
+        generator_config_overrides: Mapping[str, Any] | None = None,
         horizon_steps: int | None = None,
         command_phase_mode: str = "none",
         code_latent_dim: int | None = None,
@@ -747,14 +1682,12 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
 
         self.state_dim = int(checkpoint["state_dim"])
         self.lang_embed_dim = int(checkpoint["lang_embed_dim"])
-        generator_hidden_dims = tuple(
-            int(dim) for dim in checkpoint["config"]["generator_hidden_dims"]
-        )
-        self.generator = SkillCommander(
+        self.generator = _build_skill_commander_generator_from_checkpoint(
+            checkpoint,
             state_dim=self.state_dim,
             lang_embed_dim=self.lang_embed_dim,
             z_dim=self.skill_z_dim,
-            hidden_dims=generator_hidden_dims,
+            config_overrides=generator_config_overrides,
         ).to(self.device)
         self.generator.load_state_dict(checkpoint["generator_state_dict"])
         self.generator.eval()
