@@ -20,6 +20,8 @@ from rlopt.agent.hl_skill_diffsr import (  # noqa: E402
     HighLevelSkillDiffSRTrainer,
 )
 from rlopt.agent.skill_commander import (  # noqa: E402
+    DiffusionSkillCommander,
+    FlowMatchingSkillCommander,
     FrozenSkillCommanderSampler,
     SkillCommander,
     SkillCommanderConfig,
@@ -108,6 +110,14 @@ class _FakeMacroEnv:
 
     def expert_trajectory_motion_names(self) -> list[str]:
         return list(self.motion_names)
+
+    def expert_macro_feature_slices(self, horizon_steps: int) -> dict[str, tuple[int, int]]:
+        assert int(horizon_steps) == self.horizon_steps
+        split = max(1, min(3, self.state_dim))
+        return {
+            "expert_motion": (0, split),
+            "anchor": (split, self.state_dim),
+        }
 
 
 def _discover_direct_method(env: object, method_name: str):
@@ -209,6 +219,57 @@ def test_generator_forward_shapes() -> None:
         generator(state, torch.randn(4, 6))
 
 
+def test_flow_matching_generator_forward_and_loss_shapes() -> None:
+    torch.manual_seed(11)
+    generator = FlowMatchingSkillCommander(
+        state_dim=7,
+        lang_embed_dim=5,
+        z_dim=3,
+        hidden_dims=(16,),
+        time_embed_dim=8,
+        num_inference_steps=2,
+        inference_noise_std=0.0,
+    )
+    state = torch.randn(4, 7)
+    lang = torch.randn(4, 5)
+    z_target = torch.randn(4, 3)
+    loss, metrics = generator.flow_matching_loss(state, lang, z_target)
+    z = generator(state, lang)
+
+    assert loss.ndim == 0
+    assert "flow/velocity_mse" in metrics
+    assert z.shape == (4, 3)
+    with pytest.raises(ValueError, match="z_target must have shape"):
+        generator.flow_matching_loss(state, lang, torch.randn(4, 4))
+
+
+def test_diffusion_generator_forward_and_loss_shapes() -> None:
+    torch.manual_seed(14)
+    generator = DiffusionSkillCommander(
+        state_dim=7,
+        lang_embed_dim=5,
+        z_dim=3,
+        hidden_dims=(16,),
+        time_embed_dim=8,
+        num_train_timesteps=10,
+        num_inference_steps=2,
+        inference_scheduler="ddim",
+        ddim_eta=0.0,
+        inference_noise_std=0.0,
+    )
+    state = torch.randn(4, 7)
+    lang = torch.randn(4, 5)
+    z_target = torch.randn(4, 3)
+    loss, metrics = generator.diffusion_loss(state, lang, z_target)
+    z = generator(state, lang)
+
+    assert loss.ndim == 0
+    assert "diffusion/noise_mse" in metrics
+    assert z.shape == (4, 3)
+    with pytest.raises(ValueError, match="z_target must have shape"):
+        generator.diffusion_loss(state, lang, torch.randn(4, 4))
+
+
 def test_language_table_lookup_and_missing_name(tmp_path) -> None:
     path = _make_language_table(tmp_path, ["walk", "dance"], embed_dim=5)
     table = load_language_embedding_table(path)
@@ -283,6 +344,149 @@ def test_checkpoint_roundtrips_generator(tmp_path) -> None:
         "z_dim",
     ):
         assert key in saved
+
+
+def test_flow_matching_trainer_checkpoint_and_sampler(tmp_path) -> None:
+    torch.manual_seed(12)
+    env = _FakeMacroEnv(deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    lang_table = _make_language_table(tmp_path, env.motion_names)
+    config = _gen_config(
+        skill_ckpt,
+        lang_table,
+        planner_type="flow_matching",
+        generator_hidden_dims=(32,),
+        flow_time_embed_dim=8,
+        flow_num_inference_steps=2,
+        flow_inference_noise_std=0.0,
+        language_contrastive_coeff=0.25,
+        language_contrastive_margin=0.05,
+    )
+    trainer = SkillCommanderTrainer(config, env)
+    metrics = trainer.train_step()
+    assert "train/flow_loss" in metrics
+    assert "train/flow/velocity_mse" in metrics
+    assert "train/language_contrastive/loss" in metrics
+    assert "train/language_contrastive_weighted_loss" in metrics
+
+    eval_metrics = trainer.evaluate()
+    assert "eval/z_cosine_wrong_lang" in eval_metrics
+    assert "eval/z_mse_wrong_lang" in eval_metrics
+    assert "eval/z_cosine_language_delta" in eval_metrics
+
+    ckpt_path = tmp_path / "flow_generator.pt"
+    trainer.save_checkpoint(ckpt_path)
+    saved = torch.load(ckpt_path, weights_only=False)
+    assert saved["config"]["planner_type"] == "flow_matching"
+
+    sampler = FrozenSkillCommanderSampler(
+        env=env,
+        checkpoint_path=ckpt_path,
+        language_embeddings_path=lang_table,
+        latent_dim=5,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover_direct_method,
+        generator_config_overrides={
+            "diffusion_inference_scheduler": "ddpm",
+            "diffusion_inference_noise_std": 0.0,
+        },
+        command_mode="z",
+        device="cpu",
+    )
+    td = TensorDict({}, batch_size=[2])
+    z = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+    assert z.shape == (2, 5)
+    assert isinstance(sampler.generator, FlowMatchingSkillCommander)
+
+
+def test_diffusion_trainer_checkpoint_and_sampler(tmp_path) -> None:
+    torch.manual_seed(15)
+    env = _FakeMacroEnv(deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    lang_table = _make_language_table(tmp_path, env.motion_names)
+    config = _gen_config(
+        skill_ckpt,
+        lang_table,
+        planner_type="diffusion_policy",
+        generator_hidden_dims=(32,),
+        diffusion_time_embed_dim=8,
+        diffusion_num_train_timesteps=10,
+        diffusion_num_inference_steps=2,
+        diffusion_inference_scheduler="ddim",
+        diffusion_ddim_eta=0.0,
+        diffusion_inference_noise_std=0.0,
+        language_contrastive_coeff=0.25,
+        language_contrastive_margin=0.05,
+    )
+    trainer = SkillCommanderTrainer(config, env)
+    metrics = trainer.train_step()
+    assert "train/diffusion_loss" in metrics
+    assert "train/diffusion/noise_mse" in metrics
+    assert "train/language_contrastive/loss" in metrics
+    assert "train/language_contrastive_weighted_loss" in metrics
+
+    eval_metrics = trainer.evaluate()
+    assert "eval/z_cosine_wrong_lang" in eval_metrics
+    assert "eval/z_mse_wrong_lang" in eval_metrics
+    assert "eval/z_cosine_language_delta" in eval_metrics
+
+    ckpt_path = tmp_path / "diffusion_generator.pt"
+    trainer.save_checkpoint(ckpt_path)
+    saved = torch.load(ckpt_path, weights_only=False)
+    assert saved["config"]["planner_type"] == "diffusion_policy"
+    assert saved["config"]["diffusion_inference_scheduler"] == "ddim"
+
+    sampler = FrozenSkillCommanderSampler(
+        env=env,
+        checkpoint_path=ckpt_path,
+        language_embeddings_path=lang_table,
+        latent_dim=5,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover_direct_method,
+        generator_config_overrides={
+            "diffusion_inference_scheduler": "ddpm",
+            "diffusion_inference_noise_std": 0.0,
+        },
+        command_mode="z",
+        device="cpu",
+    )
+    td = TensorDict({}, batch_size=[2])
+    z = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+    assert z.shape == (2, 5)
+    assert isinstance(sampler.generator, DiffusionSkillCommander)
+    assert sampler.generator.inference_scheduler_name == "ddpm"
+    assert sampler.generator.inference_noise_std == pytest.approx(0.0)
+
+
+def test_state_feature_dropout_targets_named_slices(tmp_path) -> None:
+    torch.manual_seed(13)
+    env = _FakeMacroEnv(state_dim=7, deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    lang_table = _make_language_table(tmp_path, env.motion_names)
+    trainer = SkillCommanderTrainer(
+        _gen_config(
+            skill_ckpt,
+            lang_table,
+            state_feature_dropout_prob=1.0,
+            state_feature_dropout_terms=("expert_motion",),
+            state_feature_dropout_mode="zero",
+            state_feature_dropout_warmup_updates=2,
+        ),
+        env,
+    )
+    state = torch.ones(4, env.state_dim)
+    augmented, metrics = trainer._augment_state(state)
+    assert torch.equal(augmented, state)
+    assert metrics == {}
+
+    trainer.update = 2
+    augmented, metrics = trainer._augment_state(state)
+    assert torch.count_nonzero(augmented[:, :3]).item() == 0
+    assert torch.allclose(augmented[:, 3:], torch.ones(4, env.state_dim - 3))
+    assert metrics["state_feature_dropout/active_frac"] == pytest.approx(1.0)
+    assert metrics["state_feature_dropout/num_features"] == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize(

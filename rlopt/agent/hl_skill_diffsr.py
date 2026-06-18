@@ -124,7 +124,7 @@ class HighLevelSkillDiffSRConfig:
     reconstruction_norm_eps: float = 1.0e-6
     device: str = "auto"
     diffsr_state_output_init_std: float = 1.0e-3
-    # Optional co-trained skill commander (System-2 planner). When enabled, a
+    # Optional co-trained skill commander (System-1 planner). When enabled, a
     # SkillCommander is BC'd to the encoder's z (detached) from the current
     # state + language goal, jointly with the encoder/DiffSR pretraining.
     cotrain_commander: bool = False
@@ -1044,7 +1044,7 @@ class HighLevelSkillDiffSRTrainer:
         )
         self.update = 0
 
-        # Optional co-trained skill commander (System-2 planner). BC'd to the
+        # Optional co-trained skill commander (System-1 planner). BC'd to the
         # encoder's z (detached) from current state + language goal.
         self.commander: nn.Module | None = None
         self.commander_optimizer: torch.optim.Optimizer | None = None
