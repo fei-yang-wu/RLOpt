@@ -57,17 +57,29 @@ class _FakeMacroEnv:
         split: str | None = None,
         eval_fraction: float = 0.1,
         split_seed: int = 0,
+        state_history_steps: int = 0,
     ) -> TensorDict:
         assert int(horizon_steps) == self.horizon_steps
         assert split in (None, "all", "train", "eval")
         assert 0.0 < float(eval_fraction) < 1.0
         assert isinstance(split_seed, int)
+        assert int(state_history_steps) >= 0
         self.calls += 1
         # Deterministic mode seeds by batch_size so a fixed batch_size always
         # yields the same batch (enabling overfit tests); otherwise vary by call.
         seed = (1000 + batch_size) if self.deterministic else self.calls
         gen = torch.Generator().manual_seed(int(seed))
-        state = torch.randn(batch_size, self.state_dim, generator=gen)
+        if int(state_history_steps) > 0:
+            state_history = torch.randn(
+                batch_size,
+                int(state_history_steps) + 1,
+                self.state_dim,
+                generator=gen,
+            )
+            state = state_history[:, -1, :].clone()
+        else:
+            state_history = None
+            state = torch.randn(batch_size, self.state_dim, generator=gen)
         future_window = torch.randn(
             batch_size, horizon_steps, self.state_dim, generator=gen
         )
@@ -75,13 +87,16 @@ class _FakeMacroEnv:
         traj_rank = torch.randint(
             0, self.num_trajectories, (batch_size,), generator=gen
         )
+        hl_payload = {
+            "state": state,
+            "future_window": future_window,
+            "target": target,
+            "traj_rank": traj_rank,
+        }
+        if state_history is not None:
+            hl_payload["state_history"] = state_history
         hl = TensorDict(
-            {
-                "state": state,
-                "future_window": future_window,
-                "target": target,
-                "traj_rank": traj_rank,
-            },
+            hl_payload,
             batch_size=[batch_size],
         )
         return TensorDict({"hl": hl}, batch_size=[batch_size])
@@ -91,11 +106,13 @@ class _FakeMacroEnv:
         *,
         horizon_steps: int,
         env_ids: torch.Tensor | None = None,
+        state_history_steps: int = 0,
     ) -> TensorDict:
         batch_size = 2 if env_ids is None else int(env_ids.numel())
         return self.sample_expert_macro_transition_batch(
             batch_size=batch_size,
             horizon_steps=horizon_steps,
+            state_history_steps=state_history_steps,
         )
 
     def current_achieved_macro_transition_batch(
@@ -103,9 +120,12 @@ class _FakeMacroEnv:
         *,
         horizon_steps: int,
         env_ids: torch.Tensor | None = None,
+        state_history_steps: int = 0,
     ) -> TensorDict:
         return self.current_expert_macro_transition_batch(
-            horizon_steps=horizon_steps, env_ids=env_ids
+            horizon_steps=horizon_steps,
+            env_ids=env_ids,
+            state_history_steps=state_history_steps,
         )
 
     def expert_trajectory_motion_names(self) -> list[str]:
@@ -344,6 +364,69 @@ def test_checkpoint_roundtrips_generator(tmp_path) -> None:
         "z_dim",
     ):
         assert key in saved
+
+
+
+def test_no_language_history_flow_trainer_checkpoint_and_sampler(tmp_path) -> None:
+    torch.manual_seed(16)
+    env = _FakeMacroEnv(deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    config = SkillCommanderConfig(
+        skill_checkpoint_path=str(skill_ckpt),
+        condition_on_language=False,
+        state_history_steps=2,
+        planner_type="flow_matching",
+        generator_hidden_dims=(32,),
+        flow_time_embed_dim=8,
+        flow_num_inference_steps=2,
+        flow_inference_noise_std=0.0,
+        batch_size=8,
+        num_updates=2,
+        log_interval=1,
+        eval_batches=1,
+        eval_batch_size=8,
+        preflight_batch_size=4,
+        train_split="all",
+        eval_split="all",
+        eval_trajectory_fraction=0.25,
+        device="cpu",
+    )
+    trainer = SkillCommanderTrainer(config, env)
+    assert trainer.lang_embed_dim == 0
+    assert trainer.state_dim == env.state_dim
+    assert trainer.planner_state_dim == env.state_dim * 3
+
+    metrics = trainer.train_step()
+    assert "train/flow_loss" in metrics
+    eval_metrics = trainer.evaluate()
+    assert "eval/z_cosine_wrong_lang" not in eval_metrics
+
+    ckpt_path = tmp_path / "no_language_flow_generator.pt"
+    trainer.save_checkpoint(ckpt_path)
+    saved = torch.load(ckpt_path, weights_only=False)
+    assert saved["config"]["condition_on_language"] is False
+    assert saved["config"]["state_history_steps"] == 2
+    assert saved["state_dim"] == env.state_dim * 3
+    assert saved["macro_state_dim"] == env.state_dim
+    assert saved["lang_embed_dim"] == 0
+
+    sampler = FrozenSkillCommanderSampler(
+        env=env,
+        checkpoint_path=ckpt_path,
+        language_embeddings_path="",
+        latent_dim=5,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover_direct_method,
+        generator_config_overrides={"flow_inference_noise_std": 0.0},
+        command_mode="z",
+        device="cpu",
+    )
+    td = TensorDict({}, batch_size=[2])
+    z = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+    assert z.shape == (2, 5)
+    assert sampler.condition_on_language is False
+    assert sampler.planner_state_dim == env.state_dim * 3
 
 
 def test_flow_matching_trainer_checkpoint_and_sampler(tmp_path) -> None:
