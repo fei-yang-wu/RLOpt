@@ -57,6 +57,29 @@ def _require_probability(name: str, value: float) -> float:
     return normalized
 
 
+def _require_non_negative_int(name: str, value: int) -> int:
+    normalized = int(value)
+    if normalized < 0:
+        msg = f"{name} must be >= 0, got {value!r}."
+        raise ValueError(msg)
+    return normalized
+
+
+def _coerce_bool(name: str, value: bool | str | int) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    msg = f"{name} must be a boolean value, got {value!r}."
+    raise ValueError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Language embedding table helpers (produced by build_language_goal_embeddings)
 # ---------------------------------------------------------------------------
@@ -118,6 +141,8 @@ class SkillCommanderConfig:
 
     skill_checkpoint_path: str = ""
     language_embeddings_path: str = ""
+    condition_on_language: bool = True
+    state_history_steps: int = 0
     planner_type: str = "mlp"
     generator_hidden_dims: tuple[int, ...] = (1024, 512, 512)
     flow_num_inference_steps: int = 16
@@ -163,9 +188,15 @@ class SkillCommanderConfig:
             msg = "skill_checkpoint_path is required."
             raise ValueError(msg)
         self.language_embeddings_path = str(self.language_embeddings_path).strip()
-        if not self.language_embeddings_path:
+        self.condition_on_language = _coerce_bool(
+            "condition_on_language", self.condition_on_language
+        )
+        if self.condition_on_language and not self.language_embeddings_path:
             msg = "language_embeddings_path is required."
             raise ValueError(msg)
+        self.state_history_steps = _require_non_negative_int(
+            "state_history_steps", self.state_history_steps
+        )
         self.planner_type = str(self.planner_type).strip().lower()
         if self.planner_type not in {"mlp", "flow_matching", "diffusion_policy"}:
             msg = (
@@ -284,6 +315,9 @@ class SkillCommanderConfig:
         self.language_contrastive_coeff = _require_non_negative_float(
             "language_contrastive_coeff", self.language_contrastive_coeff
         )
+        if not self.condition_on_language and self.language_contrastive_coeff > 0.0:
+            msg = "language_contrastive_coeff requires condition_on_language=True."
+            raise ValueError(msg)
         self.language_contrastive_margin = _require_non_negative_float(
             "language_contrastive_margin", self.language_contrastive_margin
         )
@@ -324,7 +358,7 @@ class SkillCommander(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.lang_embed_dim = _require_positive_int("lang_embed_dim", lang_embed_dim)
+        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
         self.z_dim = _require_positive_int("z_dim", z_dim)
         hidden_dims = tuple(
             _require_positive_int("hidden_dims", dim) for dim in hidden_dims
@@ -392,7 +426,7 @@ class FlowMatchingSkillCommander(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.lang_embed_dim = _require_positive_int("lang_embed_dim", lang_embed_dim)
+        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
         self.z_dim = _require_positive_int("z_dim", z_dim)
         self.time_embed_dim = _require_positive_int("time_embed_dim", time_embed_dim)
         self.num_inference_steps = _require_positive_int(
@@ -566,7 +600,7 @@ class DiffusionSkillCommander(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.lang_embed_dim = _require_positive_int("lang_embed_dim", lang_embed_dim)
+        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
         self.z_dim = _require_positive_int("z_dim", z_dim)
         self.time_embed_dim = _require_positive_int("time_embed_dim", time_embed_dim)
         self.num_train_timesteps = _require_positive_int(
@@ -946,12 +980,15 @@ class SkillCommanderTrainer:
         self.encoder_window_steps = self._encoder_window_steps()
         self.z_dim = int(self.skill_config.z_dim)
 
-        # Preflight a small batch to discover the macro state dimension.
-        state, _, _, _ = self._sample_and_validate_macro_batch(
+        self.condition_on_language = bool(self.config.condition_on_language)
+
+        # Preflight a small batch to discover macro-state and planner-input widths.
+        state, planner_state, _, _, _ = self._sample_and_validate_macro_batch(
             min(self.config.batch_size, self.config.preflight_batch_size),
             split=self.config.train_split,
         )
         self.state_dim = int(state.shape[-1])
+        self.planner_state_dim = int(planner_state.shape[-1])
 
         self.skill_encoder = HighLevelSkillEncoder(
             state_dim=self.state_dim,
@@ -963,21 +1000,45 @@ class SkillCommanderTrainer:
         self.skill_encoder.eval()
         self.skill_encoder.requires_grad_(False)
         self.state_feature_slices = self._state_feature_slices()
+        self.motion_names = self._expert_trajectory_motion_names()
 
-        # Language goal lookup: trajectory rank -> embedding.
-        self.language_table = load_language_embedding_table(
-            self.config.language_embeddings_path
-        )
-        self.lang_embed_dim = int(self.language_table["embed_dim"])
-        self.rank_embeddings = build_rank_embedding_lookup(
-            self.language_table,
-            self._expert_trajectory_motion_names(),
-            self.device,
-        )
+        # Optional language lookup: no-language planners use a [B, 0] condition.
+        if self.condition_on_language:
+            self.language_table = load_language_embedding_table(
+                self.config.language_embeddings_path
+            )
+            self.lang_embed_dim = int(self.language_table["embed_dim"])
+            self.rank_embeddings = build_rank_embedding_lookup(
+                self.language_table,
+                self.motion_names,
+                self.device,
+            )
+        else:
+            self.lang_embed_dim = 0
+            self.language_table = {
+                "names": list(self.motion_names),
+                "phrases": list(self.motion_names),
+                "name_to_index": {
+                    str(name): index for index, name in enumerate(self.motion_names)
+                },
+                "embeddings": torch.empty(
+                    (len(self.motion_names), 0), dtype=torch.float32
+                ),
+                "embed_dim": 0,
+                "backend": "none",
+                "model": None,
+                "raw_names": True,
+                "manifest": "no_language",
+            }
+            self.rank_embeddings = torch.empty(
+                (len(self.motion_names), 0),
+                device=self.device,
+                dtype=torch.float32,
+            )
 
         self.generator = _build_skill_commander_generator_from_config(
             self.config,
-            state_dim=self.state_dim,
+            state_dim=self.planner_state_dim,
             lang_embed_dim=self.lang_embed_dim,
             z_dim=self.z_dim,
         ).to(self.device)
@@ -1048,6 +1109,7 @@ class SkillCommanderTrainer:
             split=split,
             eval_fraction=float(self.config.eval_trajectory_fraction),
             split_seed=int(self.config.trajectory_split_seed),
+            state_history_steps=int(self.config.state_history_steps),
         )
 
     def _sample_and_validate_macro_batch(
@@ -1055,7 +1117,7 @@ class SkillCommanderTrainer:
         batch_size: int,
         *,
         split: str | None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         batch = self._sample_macro_batch(batch_size, split=split)
         return self._validate_macro_batch(batch, batch_size=batch_size)
 
@@ -1064,35 +1126,41 @@ class SkillCommanderTrainer:
         batch: TensorDictBase,
         *,
         batch_size: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         state = batch.get(("hl", "state"))
         future_window = batch.get(("hl", "future_window"))
         target = batch.get(("hl", "target"))
         traj_rank = batch.get(("hl", "traj_rank"))
+        state_history = batch.get(("hl", "state_history"))
         missing = [
             name
             for name, value in (
                 ("hl/state", state),
                 ("hl/future_window", future_window),
                 ("hl/target", target),
-                ("hl/traj_rank", traj_rank),
             )
             if value is None
         ]
+        if self.condition_on_language and traj_rank is None:
+            missing.append("hl/traj_rank")
+        if int(self.config.state_history_steps) > 0 and state_history is None:
+            missing.append("hl/state_history")
         if missing:
-            msg = (
-                f"Expert macro batch is missing keys: {missing}. The environment "
-                "must return 'traj_rank' for language-skill training."
-            )
+            msg = f"Expert macro batch is missing keys: {missing}."
             raise ValueError(msg)
         state = cast(Tensor, state).to(device=self.device, dtype=torch.float32)
         future_window = cast(Tensor, future_window).to(
             device=self.device, dtype=torch.float32
         )
         target = cast(Tensor, target).to(device=self.device, dtype=torch.float32)
-        traj_rank = (
-            cast(Tensor, traj_rank).reshape(-1).to(device=self.device, dtype=torch.long)
-        )
+        if traj_rank is None:
+            traj_rank_t = torch.zeros(
+                int(batch_size), device=self.device, dtype=torch.long
+            )
+        else:
+            traj_rank_t = cast(Tensor, traj_rank).reshape(-1).to(
+                device=self.device, dtype=torch.long
+            )
         if state.ndim != 2:
             msg = f"hl/state must have shape [B, D], got {tuple(state.shape)}."
             raise ValueError(msg)
@@ -1117,13 +1185,29 @@ class SkillCommanderTrainer:
                 f"{expected_state}, got {tuple(target.shape)}."
             )
             raise ValueError(msg)
-        if tuple(traj_rank.shape) != (int(batch_size),):
+        if tuple(traj_rank_t.shape) != (int(batch_size),):
             msg = (
                 "hl/traj_rank shape mismatch: expected "
-                f"{(int(batch_size),)}, got {tuple(traj_rank.shape)}."
+                f"{(int(batch_size),)}, got {tuple(traj_rank_t.shape)}."
             )
             raise ValueError(msg)
-        return state, future_window, target, traj_rank
+
+        history_steps = int(self.config.state_history_steps)
+        if history_steps > 0:
+            state_history_t = cast(Tensor, state_history).to(
+                device=self.device, dtype=torch.float32
+            )
+            expected_history = (int(batch_size), history_steps + 1, state_dim)
+            if tuple(state_history_t.shape) != expected_history:
+                msg = (
+                    "hl/state_history shape mismatch: expected "
+                    f"{expected_history}, got {tuple(state_history_t.shape)}."
+                )
+                raise ValueError(msg)
+            planner_state = state_history_t.reshape(int(batch_size), -1).contiguous()
+        else:
+            planner_state = state
+        return state, planner_state, future_window, target, traj_rank_t
 
     # -- losses / diagnostics ---------------------------------------------
     def _target_z(self, state: Tensor, future_window: Tensor) -> Tensor:
@@ -1131,6 +1215,12 @@ class SkillCommanderTrainer:
             return self.skill_encoder(state, self._encoder_input_window(future_window))
 
     def _lang_for_ranks(self, traj_rank: Tensor) -> Tensor:
+        if not self.condition_on_language:
+            return torch.empty(
+                (int(traj_rank.numel()), 0),
+                device=self.device,
+                dtype=torch.float32,
+            )
         return self.rank_embeddings.index_select(0, traj_rank)
 
     def _current_state_feature_dropout_prob(self) -> float:
@@ -1146,7 +1236,7 @@ class SkillCommanderTrainer:
         if len(terms) == 0:
             return []
         if any(term in {"*", "all"} for term in terms):
-            return [(0, self.state_dim)]
+            return [(0, self.planner_state_dim)]
         missing = [term for term in terms if term not in self.state_feature_slices]
         if missing:
             available = sorted(self.state_feature_slices)
@@ -1155,7 +1245,14 @@ class SkillCommanderTrainer:
                 f"features: {missing}. Available features: {available}."
             )
             raise ValueError(msg)
-        return [self.state_feature_slices[term] for term in terms]
+        history_len = int(self.config.state_history_steps) + 1
+        slices: list[tuple[int, int]] = []
+        for term in terms:
+            start, end = self.state_feature_slices[term]
+            for history_index in range(history_len):
+                offset = history_index * self.state_dim
+                slices.append((offset + start, offset + end))
+        return slices
 
     def _augment_state(self, state: Tensor) -> tuple[Tensor, dict[str, float]]:
         """Optionally corrupt the generator's state input (M3 robustness).
@@ -1219,6 +1316,8 @@ class SkillCommanderTrainer:
 
     def _different_language_ranks(self, traj_rank: Tensor) -> tuple[Tensor, Tensor]:
         """Choose a trajectory rank with a different language embedding per row."""
+        if not self.condition_on_language:
+            return traj_rank.clone(), torch.zeros_like(traj_rank, dtype=torch.bool)
         num_ranks = int(self.rank_embeddings.shape[0])
         wrong_rank = traj_rank.clone()
         has_negative = torch.zeros_like(traj_rank, dtype=torch.bool)
@@ -1266,7 +1365,7 @@ class SkillCommanderTrainer:
     ) -> tuple[Tensor, dict[str, float]]:
         coeff = self._current_language_contrastive_coeff()
         zero = z_target.new_zeros(())
-        if coeff <= 0.0:
+        if coeff <= 0.0 or not self.condition_on_language:
             return zero, {}
 
         wrong_rank, has_negative = self._different_language_ranks(traj_rank)
@@ -1328,13 +1427,15 @@ class SkillCommanderTrainer:
     # -- train / eval ------------------------------------------------------
     def train_step(self) -> dict[str, float]:
         self.generator.train()
-        state, future_window, _, traj_rank = self._sample_and_validate_macro_batch(
-            self.config.batch_size,
-            split=self.config.train_split,
+        state, planner_state, future_window, _, traj_rank = (
+            self._sample_and_validate_macro_batch(
+                self.config.batch_size,
+                split=self.config.train_split,
+            )
         )
         z_target = self._target_z(state, future_window)
         lang = self._lang_for_ranks(traj_rank)
-        cmd_state, augment_metrics = self._augment_state(state)
+        cmd_state, augment_metrics = self._augment_state(planner_state)
         if isinstance(self.generator, FlowMatchingSkillCommander):
             flow_loss, flow_metrics = self.generator.flow_matching_loss(
                 cmd_state, lang, z_target
@@ -1345,7 +1446,7 @@ class SkillCommanderTrainer:
             contrastive_coeff = self._current_language_contrastive_coeff()
             loss = flow_loss + contrastive_coeff * contrastive_loss
             with torch.no_grad():
-                z_hat = self.generator(state, lang)
+                z_hat = self.generator(planner_state, lang)
             metrics = self._distill_metrics(z_hat.detach(), z_target, prefix="train")
             metrics.update(
                 {f"train/{key}": value for key, value in augment_metrics.items()}
@@ -1373,7 +1474,7 @@ class SkillCommanderTrainer:
             contrastive_coeff = self._current_language_contrastive_coeff()
             loss = diffusion_loss + contrastive_coeff * contrastive_loss
             with torch.no_grad():
-                z_hat = self.generator(state, lang)
+                z_hat = self.generator(planner_state, lang)
             metrics = self._distill_metrics(z_hat.detach(), z_target, prefix="train")
             metrics.update(
                 {f"train/{key}": value for key, value in augment_metrics.items()}
@@ -1459,20 +1560,22 @@ class SkillCommanderTrainer:
         self.generator.eval()
         accum: dict[str, float] = {}
         for _ in range(num_batches):
-            state, future_window, _, traj_rank = self._sample_and_validate_macro_batch(
-                batch_size,
-                split=split,
+            state, planner_state, future_window, _, traj_rank = (
+                self._sample_and_validate_macro_batch(
+                    batch_size,
+                    split=split,
+                )
             )
             z_target = self._target_z(state, future_window)
             lang = self._lang_for_ranks(traj_rank)
-            z_hat = self.generator(state, lang)
+            z_hat = self.generator(planner_state, lang)
             batch_metrics = self._distill_metrics(z_hat, z_target, prefix=prefix)
             # Wrong-language control: a different language embedding should
             # degrade the match if the generator actually uses conditioning.
             wrong_rank, has_negative = self._different_language_ranks(traj_rank)
             if bool(has_negative.any().item()):
                 wrong_lang = self.rank_embeddings.index_select(0, wrong_rank)
-                z_hat_wrong = self.generator(state, wrong_lang)
+                z_hat_wrong = self.generator(planner_state, wrong_lang)
                 active = has_negative.to(dtype=z_target.dtype)
                 active_count = active.sum().clamp_min(1.0)
                 pos_cos = F.cosine_similarity(z_hat, z_target, dim=-1)
@@ -1540,7 +1643,11 @@ class SkillCommanderTrainer:
             "skill_config": self.skill_config.to_dict(),
             "skill_checkpoint_path": str(self.config.skill_checkpoint_path),
             "language_embeddings_path": str(self.config.language_embeddings_path),
-            "state_dim": int(self.state_dim),
+            "condition_on_language": bool(self.condition_on_language),
+            "state_history_steps": int(self.config.state_history_steps),
+            "state_dim": int(self.planner_state_dim),
+            "macro_state_dim": int(self.state_dim),
+            "planner_state_dim": int(self.planner_state_dim),
             "lang_embed_dim": int(self.lang_embed_dim),
             "z_dim": int(self.z_dim),
             "horizon_steps": int(self.horizon_steps),
@@ -1558,7 +1665,7 @@ class SkillCommanderTrainer:
 # Rollout-time latent-command source (System 1 driving System 0)
 # ---------------------------------------------------------------------------
 class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
-    """Language-conditioned latent-command source for low-level rollouts.
+    """Skill-commander latent-command source for low-level rollouts.
 
     Drop-in replacement for ``FrozenHighLevelSkillCommandSampler`` that produces
     the skill latent ``z`` from ``(current_state, language_goal)`` via a trained
@@ -1680,11 +1787,30 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             )
             raise ValueError(msg)
 
-        self.state_dim = int(checkpoint["state_dim"])
+        config_payload = dict(checkpoint.get("config", {}))
+        self.condition_on_language = _coerce_bool(
+            "condition_on_language",
+            config_payload.get(
+                "condition_on_language",
+                checkpoint.get("condition_on_language", True),
+            ),
+        )
+        self.state_history_steps = _require_non_negative_int(
+            "state_history_steps",
+            config_payload.get(
+                "state_history_steps", checkpoint.get("state_history_steps", 0)
+            ),
+        )
+        self.planner_state_dim = int(
+            checkpoint.get("planner_state_dim", checkpoint["state_dim"])
+        )
+        self.state_dim = int(
+            checkpoint.get("macro_state_dim", self.planner_state_dim)
+        )
         self.lang_embed_dim = int(checkpoint["lang_embed_dim"])
         self.generator = _build_skill_commander_generator_from_checkpoint(
             checkpoint,
-            state_dim=self.state_dim,
+            state_dim=self.planner_state_dim,
             lang_embed_dim=self.lang_embed_dim,
             z_dim=self.skill_z_dim,
             config_overrides=generator_config_overrides,
@@ -1720,17 +1846,31 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         self.diffsr.eval()
         self.diffsr.requires_grad_(False)
 
-        names_provider = discover_env_method(env, "expert_trajectory_motion_names")
-        if names_provider is None:
-            msg = (
-                "command_source='skill_commander' requires the environment to "
-                "expose expert_trajectory_motion_names()."
+        if self.condition_on_language:
+            names_provider = discover_env_method(env, "expert_trajectory_motion_names")
+            if names_provider is None:
+                msg = (
+                    "command_source='skill_commander' requires the environment to "
+                    "expose expert_trajectory_motion_names()."
+                )
+                raise ValueError(msg)
+            language_path = str(language_embeddings_path).strip() or str(
+                checkpoint.get("language_embeddings_path", "")
+            ).strip()
+            if not language_path:
+                msg = (
+                    "Language-conditioned skill commander checkpoints require "
+                    "language_embeddings_path."
+                )
+                raise ValueError(msg)
+            table = load_language_embedding_table(language_path)
+            self.rank_embeddings = build_rank_embedding_lookup(
+                table, [str(name) for name in names_provider()], self.device
             )
-            raise ValueError(msg)
-        table = load_language_embedding_table(language_embeddings_path)
-        self.rank_embeddings = build_rank_embedding_lookup(
-            table, [str(name) for name in names_provider()], self.device
-        )
+        else:
+            self.rank_embeddings = torch.empty(
+                (0, 0), device=self.device, dtype=torch.float32
+            )
 
         # Rollout command buffers (managed by the inherited sample_for_step).
         self._codes: Tensor | None = None
@@ -1741,6 +1881,60 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         self._cache_target_chunks: list[Tensor] = []
         self._cache_initial_z_chunks: list[Tensor] = []
         self._next_macro_id = 0
+
+    def _planner_state_from_batch(
+        self,
+        batch: TensorDictBase,
+        state: Tensor,
+        *,
+        batch_size: int,
+        source: str,
+    ) -> Tensor:
+        if int(self.state_history_steps) <= 0:
+            return state
+        state_history = batch.get(("hl", "state_history"))
+        if state_history is None:
+            msg = f"{source} macro batch is missing hl/state_history."
+            raise ValueError(msg)
+        state_history_t = cast(Tensor, state_history).to(
+            device=self.device, dtype=torch.float32
+        )
+        expected_history = (
+            int(batch_size),
+            int(self.state_history_steps) + 1,
+            self.state_dim,
+        )
+        if tuple(state_history_t.shape) != expected_history:
+            msg = (
+                f"{source} macro state_history shape mismatch: expected "
+                f"{expected_history}, got {tuple(state_history_t.shape)}."
+            )
+            raise ValueError(msg)
+        return state_history_t.reshape(int(batch_size), -1).contiguous()
+
+    def _lang_from_batch(self, batch: TensorDictBase, *, batch_size: int) -> Tensor:
+        if not self.condition_on_language:
+            return torch.empty(
+                (int(batch_size), 0), device=self.device, dtype=torch.float32
+            )
+        traj_rank = batch.get(("hl", "traj_rank"))
+        if traj_rank is None:
+            msg = (
+                "Current expert macro batch is missing 'traj_rank' required for "
+                "language-skill command generation."
+            )
+            raise ValueError(msg)
+        traj_rank_t = cast(Tensor, traj_rank).reshape(-1).to(
+            device=self.device, dtype=torch.long
+        )
+        expected = (int(batch_size),)
+        if tuple(traj_rank_t.shape) != expected:
+            msg = (
+                "hl/traj_rank shape mismatch: expected "
+                f"{expected}, got {tuple(traj_rank_t.shape)}."
+            )
+            raise ValueError(msg)
+        return self.rank_embeddings.index_select(0, traj_rank_t)
 
     @torch.no_grad()
     def _encode_current_macro_batch(
@@ -1755,6 +1949,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         batch = macro_sampler(
             horizon_steps=int(self.config.horizon_steps),
             env_ids=env_ids,
+            state_history_steps=int(self.state_history_steps),
         )
         batch_size = int(env_ids.numel())
         state, future_window, target = self._validate_macro_batch(
@@ -1762,16 +1957,14 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             batch_size=batch_size,
             source="Current skill-commander",
         )
-        traj_rank = batch.get(("hl", "traj_rank"))
-        if traj_rank is None:
-            msg = (
-                "Current expert macro batch is missing 'traj_rank' required for "
-                "language-skill command generation."
-            )
-            raise ValueError(msg)
-        traj_rank = traj_rank.reshape(-1).to(device=self.device, dtype=torch.long)
-        lang = self.rank_embeddings.index_select(0, traj_rank)
-        z = self.generator(state, lang)
+        planner_state = self._planner_state_from_batch(
+            batch,
+            state,
+            batch_size=batch_size,
+            source="Current skill-commander",
+        )
+        lang = self._lang_from_batch(batch, batch_size=batch_size)
+        z = self.generator(planner_state, lang)
         # initial_z mirrors z; it is only consumed by the (disabled) finetune path.
         return z, state, future_window, target, z
 

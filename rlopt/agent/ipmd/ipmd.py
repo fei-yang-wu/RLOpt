@@ -590,12 +590,6 @@ class IPMDConfig(PPOConfig):
                     "ipmd.command_source='skill_commander'."
                 )
                 raise ValueError(msg)
-            if not self.skill_commander_embeddings_path:
-                msg = (
-                    "ipmd.skill_commander_embeddings_path is required when "
-                    "ipmd.command_source='skill_commander'."
-                )
-                raise ValueError(msg)
             self.skill_commander_flow_num_inference_steps = int(
                 self.skill_commander_flow_num_inference_steps
             )
