@@ -10,7 +10,11 @@ from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
     HighLevelSkillDiffSRConfig,
     HighLevelSkillDiffSRTrainer,
+)
+from rlopt.agent.hl_skill_encoder import (
     HighLevelSkillEncoder,
+    SkillLatentSpec,
+    build_skill_encoder,
 )
 from rlopt.agent.ipmd import (
     IPMD,
@@ -60,6 +64,8 @@ __all__ = [
     "IPMDSRRLOptConfig",
     "PPORLOptConfig",
     "SACRLOptConfig",
+    "SkillLatentSpec",
+    "build_skill_encoder",
     "SkillCommander",
     "SkillCommanderConfig",
     "SkillCommanderTrainer",
