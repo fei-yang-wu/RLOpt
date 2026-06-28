@@ -93,22 +93,22 @@ class BilinearSR(ABC, nn.Module):
         self.embed_dim = embed_dim
 
         # --- Shared bilinear phi components ---
-        # F(s): flat output is reshaped to (embed_dim, feature_dim) per sample.
         self.state_net = ResidualMLP(
             input_dim=obs_dim,
-            output_dim=embed_dim * feature_dim,
-            hidden_dims=f_hidden_dims,
+            output_dim=embed_dim,
+            hidden_dims=g_hidden_dims,
             activation=nn.Mish(),
         )
-        # Zero-init the final projection of F(s) so phi(s,a) = g(a)^T F(s) = 0
-        # at step 0. This keeps the initial SR loss bounded (diffusion loss
-        # starts at E[||eps||^2] = next_obs_dim; Speder inner products start at 0).
-        nn.init.zeros_(self.state_net.fc2.weight)
-        nn.init.zeros_(self.state_net.fc2.bias)
-        # g(a): vector in R^{embed_dim}.
         self.action_net = ResidualMLP(
             input_dim=action_dim,
             output_dim=embed_dim,
+            hidden_dims=g_hidden_dims,
+            activation=nn.Mish(),
+        )
+        
+        self.phi_net = ResidualMLP(
+            input_dim=embed_dim+embed_dim,
+            output_dim=feature_dim,
             hidden_dims=g_hidden_dims,
             activation=nn.Mish(),
         )
@@ -121,16 +121,8 @@ class BilinearSR(ABC, nn.Module):
         else:
             self.state_net_ema = None
 
-    # -- Bilinear phi (shared) --
-
-    def _F(self, s: Tensor, use_ema: bool = False) -> Tensor:
-        """Return F(s) with shape (B, embed_dim, feature_dim), tanh-bounded per element."""
-        net = self.state_net_ema if (use_ema and self.state_net_ema is not None) else self.state_net
-        # return torch.tanh(net(s).reshape(-1, self.embed_dim, self.feature_dim))
-        return net(s).reshape(-1, self.embed_dim, self.feature_dim)
-
     def encode_state(self, s: Tensor) -> Tensor:
-        return self._F(s)
+        return self.state_net(s)
 
     def encode_action(self, a: Tensor) -> Tensor:
         return self.action_net(a)
@@ -142,9 +134,9 @@ class BilinearSR(ABC, nn.Module):
         keeps the bilinear inner product in sigmoid's linear regime, mirroring
         scaled dot-product attention.
         """
-        F_s = self._F(s)                    # (B, E, D), tanh-bounded
-        g_a = self.encode_action(a)         # (B, E),    tanh-bounded
-        return torch.einsum("be,bef->bf", g_a, F_s) / math.sqrt(self.embed_dim)
+        s = self.state_net(s)
+        a = self.action_net(a)
+        return self.phi_net(torch.concat([s, a], dim=-1))
 
     # -- EMA --
 

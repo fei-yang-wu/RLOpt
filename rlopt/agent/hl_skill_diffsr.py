@@ -13,6 +13,13 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 from torch import Tensor, nn
 
+from rlopt.agent.hl_skill_encoder import (
+    LATENT_MODES as _LATENT_MODES,
+)
+from rlopt.agent.hl_skill_encoder import (
+    SkillLatentSpec,
+    build_skill_encoder,
+)
 from rlopt.agent.ipmd.module import BilinearSR, build_bilinear_sr
 
 
@@ -91,6 +98,124 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _resolve_device(device: torch.device | str | None, env: object) -> torch.device:
+    if device is not None and str(device).strip().lower() != "auto":
+        return torch.device(device)
+    env_device = getattr(env, "device", None)
+    if env_device is not None:
+        return torch.device(env_device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _encoder_window_steps(config: HighLevelSkillDiffSRConfig) -> int:
+    if config.encoder_window_mode == "intermediate":
+        return int(config.horizon_steps) - 1
+    return int(config.horizon_steps)
+
+
+def _encoder_input_window(
+    config: HighLevelSkillDiffSRConfig, future_window: Tensor
+) -> Tensor:
+    if config.encoder_window_mode == "intermediate":
+        return future_window[:, :-1, :]
+    return future_window
+
+
+def _build_diffsr(
+    config: HighLevelSkillDiffSRConfig, state_dim: int, device: torch.device
+) -> BilinearSR:
+    return build_bilinear_sr(
+        "diffsr",
+        obs_dim=state_dim,
+        next_obs_dim=state_dim,
+        action_dim=config.z_dim,
+        feature_dim=config.diffsr_feature_dim,
+        embed_dim=config.diffsr_embed_dim,
+        f_hidden_dims=config.diffsr_f_hidden_dims,
+        g_hidden_dims=config.diffsr_g_hidden_dims,
+        mu_hidden_dims=config.diffsr_mu_hidden_dims,
+        num_noises=config.diffsr_num_noises,
+        use_ema_for_policy=False,
+        x_min=config.diffsr_x_min,
+        x_max=config.diffsr_x_max,
+        device=device,
+    )
+
+
+def _validate_macro_batch(
+    batch: TensorDictBase,
+    *,
+    batch_size: int,
+    horizon_steps: int,
+    device: torch.device,
+    state_dim: int | None = None,
+    source: str = "Expert",
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Validate and materialize ``hl/{state,future_window,target}`` from a macro batch.
+
+    ``state_dim=None`` infers the state width from the batch (offline trainer /
+    preflight); a provided ``state_dim`` is asserted (online sampler). ``source``
+    only prefixes the missing-keys message.
+    """
+    state = batch.get(("hl", "state"))
+    future_window = batch.get(("hl", "future_window"))
+    target = batch.get(("hl", "target"))
+    missing = [
+        name
+        for name, value in (
+            ("hl/state", state),
+            ("hl/future_window", future_window),
+            ("hl/target", target),
+        )
+        if value is None
+    ]
+    if missing:
+        msg = f"{source} macro batch is missing keys: {missing}."
+        raise ValueError(msg)
+    state = cast(Tensor, state).to(device=device, dtype=torch.float32)
+    future_window = cast(Tensor, future_window).to(device=device, dtype=torch.float32)
+    target = cast(Tensor, target).to(device=device, dtype=torch.float32)
+    if state.ndim != 2:
+        msg = f"hl/state must have shape [B, D], got {tuple(state.shape)}."
+        raise ValueError(msg)
+    resolved_dim = int(state.shape[-1]) if state_dim is None else int(state_dim)
+    expected_state = (int(batch_size), resolved_dim)
+    expected_window = (int(batch_size), int(horizon_steps), resolved_dim)
+    if tuple(state.shape) != expected_state:
+        msg = (
+            f"hl/state shape mismatch: expected {expected_state}, "
+            f"got {tuple(state.shape)}."
+        )
+        raise ValueError(msg)
+    if tuple(future_window.shape) != expected_window:
+        msg = (
+            f"hl/future_window shape mismatch: expected {expected_window}, "
+            f"got {tuple(future_window.shape)}."
+        )
+        raise ValueError(msg)
+    if tuple(target.shape) != expected_state:
+        msg = (
+            f"hl/target shape mismatch: expected {expected_state}, "
+            f"got {tuple(target.shape)}."
+        )
+        raise ValueError(msg)
+    return state, future_window, target
+
+
+def _effective_rank(z: Tensor) -> Tensor:
+    """Participation-ratio effective rank of ``z`` as a 0-dim tensor."""
+    if int(z.shape[0]) < 2:
+        return z.new_zeros(())
+    centered = z - z.mean(dim=0, keepdim=True)
+    singular_values = torch.linalg.svdvals(centered)
+    total = singular_values.sum()
+    if bool((total <= 1.0e-12).item()):
+        return z.new_zeros(())
+    probs = singular_values / total
+    entropy = -(probs * probs.clamp_min(1.0e-12).log()).sum()
+    return torch.exp(entropy)
+
+
 @dataclass
 class HighLevelSkillDiffSRConfig:
     """Configuration for offline high-level skill DiffSR training."""
@@ -110,6 +235,21 @@ class HighLevelSkillDiffSRConfig:
     trajectory_split_seed: int = 0
     preflight_batch_size: int = 8
     encoder_window_mode: str = "full"
+    latent_mode: str = "deterministic"
+    reg_coeff: float = 1.0e-3
+    categorical_groups: int = 8
+    categorical_categories: int = 32
+    gaussian_logstd_min: float = -5.0
+    gaussian_logstd_max: float = 2.0
+    gumbel_codebook_size: int = 512
+    gumbel_tau_start: float = 2.0
+    gumbel_tau_end: float = 0.5
+    gumbel_tau_anneal_iters: int = 2000
+    gumbel_hard: bool = True
+    fsq_levels: tuple[int, ...] = (8, 8, 8, 5, 5)
+    vq_codebook_size: int = 512
+    vq_ema_decay: float = 0.99
+    vq_dead_code_reset_iters: int = 0
     encoder_hidden_dims: tuple[int, ...] = (1024, 512, 512)
     diffsr_f_hidden_dims: tuple[int, ...] = (512, 512)
     diffsr_g_hidden_dims: tuple[int, ...] = (512,)
@@ -121,7 +261,6 @@ class HighLevelSkillDiffSRConfig:
     diffsr_lr: float = 1.0e-4
     weight_decay: float = 0.0
     grad_clip_norm: float | None = 1.0
-    z_norm_coeff: float = 1.0e-4
     reconstruction_norm_eps: float = 1.0e-6
     device: str = "auto"
     diffsr_state_output_init_std: float = 1.0e-3
@@ -158,6 +297,50 @@ class HighLevelSkillDiffSRConfig:
         if self.encoder_window_mode == "intermediate" and self.horizon_steps <= 1:
             msg = "encoder_window_mode='intermediate' requires horizon_steps > 1."
             raise ValueError(msg)
+        if self.latent_mode not in _LATENT_MODES:
+            msg = (
+                f"latent_mode must be one of {_LATENT_MODES}, got {self.latent_mode!r}."
+            )
+            raise ValueError(msg)
+        self.reg_coeff = _require_non_negative_float("reg_coeff", self.reg_coeff)
+        self.categorical_groups = _require_positive_int(
+            "categorical_groups", self.categorical_groups
+        )
+        self.categorical_categories = _require_positive_int(
+            "categorical_categories", self.categorical_categories
+        )
+        if (
+            self.latent_mode in ("categorical", "gumbel_multicat")
+            and self.z_dim % self.categorical_groups != 0
+        ):
+            msg = (
+                f"latent_mode={self.latent_mode!r} requires z_dim divisible by "
+                f"categorical_groups (per-group code dim = z_dim // groups): "
+                f"z_dim={self.z_dim}, categorical_groups={self.categorical_groups}."
+            )
+            raise ValueError(msg)
+        self.gaussian_logstd_min = float(self.gaussian_logstd_min)
+        self.gaussian_logstd_max = float(self.gaussian_logstd_max)
+        if self.gaussian_logstd_max <= self.gaussian_logstd_min:
+            msg = (
+                "gaussian_logstd_max must be > gaussian_logstd_min, got "
+                f"{self.gaussian_logstd_max} <= {self.gaussian_logstd_min}."
+            )
+            raise ValueError(msg)
+        self.gumbel_codebook_size = _require_positive_int(
+            "gumbel_codebook_size", self.gumbel_codebook_size
+        )
+        self.gumbel_hard = bool(self.gumbel_hard)
+        self.fsq_levels = tuple(
+            _require_positive_int("fsq_levels", level) for level in self.fsq_levels
+        )
+        if self.latent_mode == "fsq" and any(level < 2 for level in self.fsq_levels):
+            msg = f"fsq_levels must each be >= 2, got {self.fsq_levels!r}."
+            raise ValueError(msg)
+        self.vq_codebook_size = _require_positive_int(
+            "vq_codebook_size", self.vq_codebook_size
+        )
+        self.vq_dead_code_reset_iters = int(self.vq_dead_code_reset_iters)
         self.encoder_hidden_dims = tuple(
             _require_positive_int("encoder_hidden_dims", dim)
             for dim in self.encoder_hidden_dims
@@ -186,9 +369,6 @@ class HighLevelSkillDiffSRConfig:
             self.grad_clip_norm = _require_positive_float(
                 "grad_clip_norm", self.grad_clip_norm
             )
-        self.z_norm_coeff = _require_non_negative_float(
-            "z_norm_coeff", self.z_norm_coeff
-        )
         self.reconstruction_norm_eps = _require_positive_float(
             "reconstruction_norm_eps", self.reconstruction_norm_eps
         )
@@ -196,6 +376,25 @@ class HighLevelSkillDiffSRConfig:
             "diffsr_state_output_init_std", self.diffsr_state_output_init_std
         )
         self.device = str(self.device)
+
+    def latent_spec(self) -> SkillLatentSpec:
+        """Project the latent-method fields into the encoder factory's spec."""
+        return SkillLatentSpec(
+            latent_mode=self.latent_mode,
+            gaussian_logstd_min=self.gaussian_logstd_min,
+            gaussian_logstd_max=self.gaussian_logstd_max,
+            categorical_groups=self.categorical_groups,
+            categorical_categories=self.categorical_categories,
+            gumbel_codebook_size=self.gumbel_codebook_size,
+            gumbel_tau_start=self.gumbel_tau_start,
+            gumbel_tau_end=self.gumbel_tau_end,
+            gumbel_tau_anneal_iters=self.gumbel_tau_anneal_iters,
+            gumbel_hard=self.gumbel_hard,
+            fsq_levels=tuple(self.fsq_levels),
+            vq_codebook_size=self.vq_codebook_size,
+            vq_ema_decay=self.vq_ema_decay,
+            vq_dead_code_reset_iters=self.vq_dead_code_reset_iters,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], _jsonable(asdict(self)))
@@ -209,6 +408,7 @@ class HighLevelSkillDiffSRConfig:
             "diffsr_f_hidden_dims",
             "diffsr_g_hidden_dims",
             "diffsr_mu_hidden_dims",
+            "fsq_levels",
         }
         for key in tuple_fields:
             if key in kwargs:
@@ -216,65 +416,6 @@ class HighLevelSkillDiffSRConfig:
         config = cls(**kwargs)
         config.validate()
         return config
-
-
-class HighLevelSkillEncoder(nn.Module):
-    """Encode a current state and future expert window into a continuous skill."""
-
-    def __init__(
-        self,
-        state_dim: int,
-        window_steps: int,
-        z_dim: int,
-        hidden_dims: tuple[int, ...] = (1024, 512, 512),
-    ) -> None:
-        super().__init__()
-        self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.window_steps = _require_positive_int("window_steps", window_steps)
-        self.z_dim = _require_positive_int("z_dim", z_dim)
-        hidden_dims = tuple(
-            _require_positive_int("hidden_dims", dim) for dim in hidden_dims
-        )
-
-        input_dim = self.state_dim * (self.window_steps + 1)
-        layers: list[nn.Module] = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.extend(
-                [
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.Mish(),
-                ]
-            )
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, self.z_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, state: Tensor, future_window: Tensor) -> Tensor:
-        if state.ndim != 2:
-            msg = f"state must have shape [B, D], got {tuple(state.shape)}."
-            raise ValueError(msg)
-        if future_window.ndim != 3:
-            msg = (
-                "future_window must have shape [B, W, D], got "
-                f"{tuple(future_window.shape)}."
-            )
-            raise ValueError(msg)
-        batch_size, state_dim = state.shape
-        expected_window = (batch_size, self.window_steps, state_dim)
-        if (
-            int(state_dim) != self.state_dim
-            or tuple(future_window.shape) != expected_window
-        ):
-            msg = (
-                "state/future_window shape mismatch: expected state "
-                f"[B, {self.state_dim}] and future_window {expected_window}, "
-                f"got {tuple(state.shape)} and {tuple(future_window.shape)}."
-            )
-            raise ValueError(msg)
-        flat_window = future_window.reshape(batch_size, self.window_steps * state_dim)
-        return self.net(torch.cat([state, flat_window], dim=-1))
 
 
 class FrozenHighLevelSkillCommandSampler:
@@ -346,7 +487,7 @@ class FrozenHighLevelSkillCommandSampler:
             if phase_period is not None
             else self.latent_steps_max
         )
-        self.device = self._resolve_device(env, device)
+        self.device = _resolve_device(device, env)
         self._current_macro_sampler = discover_env_method(
             env,
             "current_expert_macro_transition_batch",
@@ -407,30 +548,34 @@ class FrozenHighLevelSkillCommandSampler:
             raise ValueError(msg)
 
         state_dict = checkpoint["skill_encoder_state_dict"]
-        self.encoder_window_steps = self._encoder_window_steps(self.config)
+        self.encoder_window_steps = _encoder_window_steps(self.config)
         self.state_dim = self._state_dim_from_encoder_state(
             state_dict,
             window_steps=self.encoder_window_steps,
         )
-        self.skill_encoder = HighLevelSkillEncoder(
+        self.skill_encoder = build_skill_encoder(
             state_dim=self.state_dim,
             window_steps=self.encoder_window_steps,
             z_dim=self.config.z_dim,
             hidden_dims=self.config.encoder_hidden_dims,
+            spec=self.config.latent_spec(),
         ).to(self.device)
         self.skill_encoder.load_state_dict(state_dict)
 
-        self.initial_skill_encoder = HighLevelSkillEncoder(
+        self.initial_skill_encoder = build_skill_encoder(
             state_dim=self.state_dim,
             window_steps=self.encoder_window_steps,
             z_dim=self.config.z_dim,
             hidden_dims=self.config.encoder_hidden_dims,
+            spec=self.config.latent_spec(),
         ).to(self.device)
         self.initial_skill_encoder.load_state_dict(state_dict)
         self.initial_skill_encoder.eval()
         self.initial_skill_encoder.requires_grad_(False)
 
-        self.diffsr = self._build_diffsr().to(self.device)
+        self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
+            self.device
+        )
         diffsr_state = checkpoint.get("diffsr_state_dict")
         if diffsr_state is None and (
             self.finetune_enabled or self.command_mode != "z"
@@ -450,7 +595,7 @@ class FrozenHighLevelSkillCommandSampler:
         self.z_norm_coeff = (
             _require_non_negative_float("z_norm_coeff", z_norm_coeff)
             if z_norm_coeff is not None
-            else float(self.config.z_norm_coeff)
+            else float(self.config.reg_coeff)
         )
 
         self.skill_encoder.train(self.finetune_enabled)
@@ -476,21 +621,6 @@ class FrozenHighLevelSkillCommandSampler:
         self._next_macro_id = 0
 
     @staticmethod
-    def _resolve_device(env: object, device: torch.device | str | None) -> torch.device:
-        if device is not None:
-            return torch.device(device)
-        env_device = getattr(env, "device", None)
-        if env_device is not None:
-            return torch.device(env_device)
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    @staticmethod
-    def _encoder_window_steps(config: HighLevelSkillDiffSRConfig) -> int:
-        if config.encoder_window_mode == "intermediate":
-            return int(config.horizon_steps) - 1
-        return int(config.horizon_steps)
-
-    @staticmethod
     def _state_dim_from_encoder_state(
         state_dict: Mapping[str, Tensor],
         *,
@@ -511,24 +641,6 @@ class FrozenHighLevelSkillCommandSampler:
             )
             raise ValueError(msg)
         return input_dim // divisor
-
-    def _build_diffsr(self) -> BilinearSR:
-        return build_bilinear_sr(
-            "diffsr",
-            obs_dim=self.state_dim,
-            next_obs_dim=self.state_dim,
-            action_dim=self.config.z_dim,
-            feature_dim=self.config.diffsr_feature_dim,
-            embed_dim=self.config.diffsr_embed_dim,
-            f_hidden_dims=self.config.diffsr_f_hidden_dims,
-            g_hidden_dims=self.config.diffsr_g_hidden_dims,
-            mu_hidden_dims=self.config.diffsr_mu_hidden_dims,
-            num_noises=self.config.diffsr_num_noises,
-            use_ema_for_policy=False,
-            x_min=self.config.diffsr_x_min,
-            x_max=self.config.diffsr_x_max,
-            device=self.device,
-        )
 
     def _command_code_dim_for_mode(self) -> int:
         if self.command_mode == "z":
@@ -579,65 +691,6 @@ class FrozenHighLevelSkillCommandSampler:
             device=device,
         )
 
-    def _encoder_input_window(self, future_window: Tensor) -> Tensor:
-        if self.config.encoder_window_mode == "intermediate":
-            return future_window[:, :-1, :]
-        return future_window
-
-    def _validate_macro_batch(
-        self,
-        batch: TensorDictBase,
-        *,
-        batch_size: int,
-        source: str,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        state = batch.get(("hl", "state"))
-        future_window = batch.get(("hl", "future_window"))
-        target = batch.get(("hl", "target"))
-        missing = [
-            name
-            for name, value in (
-                ("hl/state", state),
-                ("hl/future_window", future_window),
-                ("hl/target", target),
-            )
-            if value is None
-        ]
-        if missing:
-            msg = f"{source} macro batch is missing keys: {missing}."
-            raise ValueError(msg)
-        state = cast(Tensor, state).to(device=self.device, dtype=torch.float32)
-        future_window = cast(Tensor, future_window).to(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        target = cast(Tensor, target).to(device=self.device, dtype=torch.float32)
-        expected_state = (int(batch_size), self.state_dim)
-        expected_window = (
-            int(batch_size),
-            int(self.config.horizon_steps),
-            self.state_dim,
-        )
-        if tuple(state.shape) != expected_state:
-            msg = (
-                f"{source} macro state shape mismatch: expected "
-                f"{expected_state}, got {tuple(state.shape)}."
-            )
-            raise ValueError(msg)
-        if tuple(future_window.shape) != expected_window:
-            msg = (
-                f"{source} macro future_window shape mismatch: expected "
-                f"{expected_window}, got {tuple(future_window.shape)}."
-            )
-            raise ValueError(msg)
-        if tuple(target.shape) != expected_state:
-            msg = (
-                f"{source} macro target shape mismatch: expected "
-                f"{expected_state}, got {tuple(target.shape)}."
-            )
-            raise ValueError(msg)
-        return state, future_window, target
-
     def _sample_offline_macro_batch(
         self,
         batch_size: int,
@@ -652,9 +705,12 @@ class FrozenHighLevelSkillCommandSampler:
             eval_fraction=float(self.config.eval_trajectory_fraction),
             split_seed=int(self.config.trajectory_split_seed),
         )
-        return self._validate_macro_batch(
+        return _validate_macro_batch(
             batch,
             batch_size=int(batch_size),
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+            state_dim=self.state_dim,
             source="Offline expert",
         )
 
@@ -687,15 +743,18 @@ class FrozenHighLevelSkillCommandSampler:
             env_ids=env_ids,
         )
         batch_size = int(env_ids.numel())
-        state, future_window, target = self._validate_macro_batch(
+        state, future_window, target = _validate_macro_batch(
             batch,
             batch_size=batch_size,
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+            state_dim=self.state_dim,
             source="Current expert",
         )
-        z = self.skill_encoder(state, self._encoder_input_window(future_window))
+        z = self.skill_encoder(state, _encoder_input_window(self.config, future_window))
         initial_z = self.initial_skill_encoder(
             state,
-            self._encoder_input_window(future_window),
+            _encoder_input_window(self.config, future_window),
         )
         return z, state, future_window, target, initial_z
 
@@ -790,12 +849,14 @@ class FrozenHighLevelSkillCommandSampler:
             with torch.no_grad():
                 z = self.skill_encoder(
                     state,
-                    self._encoder_input_window(future_window),
+                    _encoder_input_window(self.config, future_window),
                 )
                 command_code = self._command_code_from_state_z(state, z)
                 command = self._append_command_phase(command_code, phase)
         else:
-            z = self.skill_encoder(state, self._encoder_input_window(future_window))
+            z = self.skill_encoder(
+                state, _encoder_input_window(self.config, future_window)
+            )
             command_code = self._command_code_from_state_z(state, z)
             command = self._append_command_phase(command_code, phase)
         return command.reshape(*batch.batch_size, self.latent_dim)
@@ -829,13 +890,13 @@ class FrozenHighLevelSkillCommandSampler:
 
         offline_size = int(self.offline_batch_size)
         state, future_window, target = self._sample_offline_macro_batch(offline_size)
-        z = self.skill_encoder(state, self._encoder_input_window(future_window))
+        z = self.skill_encoder(state, _encoder_input_window(self.config, future_window))
         zero_reward = torch.zeros(state.shape[0], 1, device=self.device)
         _, diffsr_loss, _ = self.diffsr.compute_loss(state, z, target, zero_reward)
         with torch.no_grad():
             initial_z = self.initial_skill_encoder(
                 state,
-                self._encoder_input_window(future_window),
+                _encoder_input_window(self.config, future_window),
             )
         anchor_loss = F.mse_loss(z, initial_z)
         z_norm_loss = z.pow(2).mean()
@@ -981,7 +1042,7 @@ class HighLevelSkillDiffSRTrainer:
         self.config = config
         self.config.validate()
         self.env = env
-        self.device = self._resolve_device()
+        self.device = _resolve_device(self.config.device, self.env)
         preflight_size = min(self.config.batch_size, self.config.preflight_batch_size)
         state, future_window, target = self._sample_and_validate_macro_batch(
             preflight_size,
@@ -989,16 +1050,19 @@ class HighLevelSkillDiffSRTrainer:
         )
         del future_window, target
         self.state_dim = int(state.shape[-1])
-        self.encoder_window_steps = self._encoder_window_steps()
+        self.encoder_window_steps = _encoder_window_steps(self.config)
         self.feature_slices = self._resolve_feature_slices()
 
-        self.skill_encoder = HighLevelSkillEncoder(
+        self.skill_encoder = build_skill_encoder(
             state_dim=self.state_dim,
             window_steps=self.encoder_window_steps,
             z_dim=self.config.z_dim,
             hidden_dims=self.config.encoder_hidden_dims,
+            spec=self.config.latent_spec(),
         ).to(self.device)
-        self.diffsr = self._build_diffsr().to(self.device)
+        self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
+            self.device
+        )
         self._initialize_diffsr_state_output()
         self.optimizer = torch.optim.AdamW(
             [
@@ -1012,43 +1076,19 @@ class HighLevelSkillDiffSRTrainer:
         )
         self.update = 0
 
-    def _resolve_device(self) -> torch.device:
-        if self.config.device.strip().lower() != "auto":
-            return torch.device(self.config.device)
-        env_device = getattr(self.env, "device", None)
-        if env_device is not None:
-            return torch.device(env_device)
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    def _encoder_window_steps(self) -> int:
-        if self.config.encoder_window_mode == "intermediate":
-            return int(self.config.horizon_steps) - 1
-        return int(self.config.horizon_steps)
-
-    def _encoder_input_window(self, future_window: Tensor) -> Tensor:
-        if self.config.encoder_window_mode == "intermediate":
-            return future_window[:, :-1, :]
-        return future_window
-
-    def _encode_skill(self, state: Tensor, future_window: Tensor) -> Tensor:
-        return self.skill_encoder(state, self._encoder_input_window(future_window))
-
-    def _build_diffsr(self) -> BilinearSR:
-        return build_bilinear_sr(
-            "diffsr",
-            obs_dim=self.state_dim,
-            next_obs_dim=self.state_dim,
-            action_dim=self.config.z_dim,
-            feature_dim=self.config.diffsr_feature_dim,
-            embed_dim=self.config.diffsr_embed_dim,
-            f_hidden_dims=self.config.diffsr_f_hidden_dims,
-            g_hidden_dims=self.config.diffsr_g_hidden_dims,
-            mu_hidden_dims=self.config.diffsr_mu_hidden_dims,
-            num_noises=self.config.diffsr_num_noises,
-            use_ema_for_policy=False,
-            x_min=self.config.diffsr_x_min,
-            x_max=self.config.diffsr_x_max,
-            device=self.device,
+    def _encode_skill(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        *,
+        deterministic: bool = False,
+        step: int | None = None,
+    ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        return self.skill_encoder.encode(
+            state,
+            _encoder_input_window(self.config, future_window),
+            deterministic=deterministic,
+            step=step,
         )
 
     def _initialize_diffsr_state_output(self) -> None:
@@ -1086,7 +1126,13 @@ class HighLevelSkillDiffSRTrainer:
         split: str | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         batch = self._sample_macro_batch(batch_size, split=split)
-        return self._validate_macro_batch(batch, batch_size=batch_size)
+        return _validate_macro_batch(
+            batch,
+            batch_size=batch_size,
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+            source="Expert",
+        )
 
     def _resolve_feature_slices(self) -> dict[str, tuple[int, int]]:
         provider = getattr(self.env, "expert_macro_feature_slices", None)
@@ -1120,81 +1166,15 @@ class HighLevelSkillDiffSRTrainer:
             feature_slices[name] = (start, end)
         return feature_slices
 
-    def _validate_macro_batch(
-        self,
-        batch: TensorDictBase,
-        *,
-        batch_size: int,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        state = batch.get(("hl", "state"))
-        future_window = batch.get(("hl", "future_window"))
-        target = batch.get(("hl", "target"))
-        missing = [
-            name
-            for name, value in (
-                ("hl/state", state),
-                ("hl/future_window", future_window),
-                ("hl/target", target),
-            )
-            if value is None
-        ]
-        if missing:
-            msg = f"Expert macro batch is missing keys: {missing}."
-            raise ValueError(msg)
-        state = cast(Tensor, state).to(device=self.device, dtype=torch.float32)
-        future_window = cast(Tensor, future_window).to(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        target = cast(Tensor, target).to(device=self.device, dtype=torch.float32)
-        if state.ndim != 2:
-            msg = f"hl/state must have shape [B, D], got {tuple(state.shape)}."
-            raise ValueError(msg)
-        state_dim = int(state.shape[-1])
-        expected_state = (int(batch_size), state_dim)
-        expected_window = (int(batch_size), self.config.horizon_steps, state_dim)
-        if tuple(state.shape) != expected_state:
-            msg = (
-                "hl/state shape mismatch: expected "
-                f"{expected_state}, got {tuple(state.shape)}."
-            )
-            raise ValueError(msg)
-        if tuple(future_window.shape) != expected_window:
-            msg = (
-                "hl/future_window shape mismatch: expected "
-                f"{expected_window}, got {tuple(future_window.shape)}."
-            )
-            raise ValueError(msg)
-        if tuple(target.shape) != expected_state:
-            msg = (
-                "hl/target shape mismatch: expected "
-                f"{expected_state}, got {tuple(target.shape)}."
-            )
-            raise ValueError(msg)
-        return state, future_window, target
-
     @staticmethod
-    def _effective_rank(z: Tensor) -> float:
-        if int(z.shape[0]) < 2:
-            return 0.0
-        centered = z - z.mean(dim=0, keepdim=True)
-        singular_values = torch.linalg.svdvals(centered)
-        total = singular_values.sum()
-        if float(total.item()) <= 1.0e-12:
-            return 0.0
-        probs = singular_values / total
-        entropy = -(probs * probs.clamp_min(1.0e-12).log()).sum()
-        return float(torch.exp(entropy).item())
-
-    @classmethod
-    def _z_diagnostics(cls, z: Tensor, *, prefix: str) -> dict[str, float]:
+    def _z_diagnostics(z: Tensor, *, prefix: str) -> dict[str, float]:
         z_std = z.std(dim=0, unbiased=False)
         return {
             f"{prefix}/z_abs_mean": float(z.abs().mean().item()),
             f"{prefix}/z_rms": float(z.pow(2).mean().sqrt().item()),
             f"{prefix}/z_dim_std_mean": float(z_std.mean().item()),
             f"{prefix}/z_dim_std_min": float(z_std.min().item()),
-            f"{prefix}/z_effective_rank": cls._effective_rank(z),
+            f"{prefix}/z_effective_rank": float(_effective_rank(z).item()),
         }
 
     def _diffsr_loss_for_z(self, state: Tensor, z: Tensor, target: Tensor) -> Tensor:
@@ -1393,7 +1373,7 @@ class HighLevelSkillDiffSRTrainer:
                 batch_size,
                 split=train_split,
             )
-            z = self._encode_skill(state, future_window)
+            z, *_ = self._encode_skill(state, future_window, deterministic=True)
             target_flat = future_window.reshape(batch_size, -1)
             z_design = self._linear_probe_design(z).to(torch.float64)
             state_design = self._linear_probe_design(state).to(torch.float64)
@@ -1445,7 +1425,7 @@ class HighLevelSkillDiffSRTrainer:
                 batch_size,
                 split=eval_split,
             )
-            z = self._encode_skill(state, future_window)
+            z, *_ = self._encode_skill(state, future_window, deterministic=True)
             if int(z.shape[0]) > 1:
                 shuffled_z = z[torch.randperm(z.shape[0], device=z.device)]
             else:
@@ -1493,10 +1473,12 @@ class HighLevelSkillDiffSRTrainer:
             split=self.config.train_split,
         )
         self.diffsr.update_obs_norm(target.detach())
-        z = self._encode_skill(state, future_window)
+        # reg_loss is the per-method latent regularizer (L2 / KL / commitment / 0),
+        # weighted uniformly by reg_coeff; info carries method-specific diagnostics.
+        z, reg_loss, info = self._encode_skill(state, future_window, step=self.update)
         diffsr_loss = self._diffsr_loss_for_z(state, z, target)
         z_norm_loss = z.pow(2).mean()
-        loss = diffsr_loss + self.config.z_norm_coeff * z_norm_loss
+        loss = diffsr_loss + self.config.reg_coeff * reg_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -1509,12 +1491,15 @@ class HighLevelSkillDiffSRTrainer:
             )
             metrics["train/grad_norm"] = float(grad_norm.item())
         self.optimizer.step()
+        self.skill_encoder.on_after_train_step(self.update)
         self.update += 1
         metrics.update(
             {
                 "train/loss": float(loss.detach().item()),
                 "train/diffsr_loss": float(diffsr_loss.detach().item()),
                 "train/z_norm_loss": float(z_norm_loss.detach().item()),
+                "train/reg_loss": float(reg_loss.detach().item()),
+                **{f"train/{k}": float(v.item()) for k, v in info.items()},
             }
         )
         return metrics
@@ -1549,7 +1534,7 @@ class HighLevelSkillDiffSRTrainer:
                 batch_size,
                 split=split,
             )
-            z = self._encode_skill(state, future_window)
+            z, *_ = self._encode_skill(state, future_window, deterministic=True)
             zero_z = torch.zeros_like(z)
             if int(z.shape[0]) > 1:
                 shuffled_z = z[torch.randperm(z.shape[0], device=z.device)]
@@ -1565,6 +1550,14 @@ class HighLevelSkillDiffSRTrainer:
                     f"{prefix}/loss_zero_z_eval": float(zero_loss.item()),
                     f"{prefix}/loss_shuffled_z_eval": float(shuffled_loss.item()),
                 }
+            )
+            # Per-method diversity / collapse diagnostics.
+            diversity = self.skill_encoder.diversity_metrics(
+                state, _encoder_input_window(self.config, future_window)
+            )
+            batch_metrics.update(
+                {f"{prefix}/diversity/{key}": float(value.item())
+                 for key, value in diversity.items()}
             )
             if include_reconstruction:
                 batch_metrics.update(
@@ -1680,7 +1673,7 @@ class HighLevelSkillDiffSRTrainer:
             )
             raise ValueError(msg)
         self.config = loaded_config
-        self.encoder_window_steps = self._encoder_window_steps()
+        self.encoder_window_steps = _encoder_window_steps(self.config)
         self.skill_encoder.load_state_dict(checkpoint["skill_encoder_state_dict"])
         self.diffsr.load_state_dict(checkpoint["diffsr_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
