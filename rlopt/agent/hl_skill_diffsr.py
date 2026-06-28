@@ -264,6 +264,16 @@ class HighLevelSkillDiffSRConfig:
     reconstruction_norm_eps: float = 1.0e-6
     device: str = "auto"
     diffsr_state_output_init_std: float = 1.0e-3
+    # Optional co-trained skill commander (System-1 planner). When enabled, a
+    # SkillCommander is BC'd to the encoder's z (detached) from the current
+    # state + language goal, jointly with the encoder/DiffSR pretraining.
+    cotrain_commander: bool = False
+    commander_language_embeddings_path: str = ""
+    commander_hidden_dims: tuple[int, ...] = (1024, 512, 512)
+    commander_lr: float = 3.0e-4
+    commander_cosine_loss_coeff: float = 1.0
+    commander_z_norm_coeff: float = 1.0e-4
+    commander_state_noise_std: float = 0.0
 
     def validate(self) -> None:
         self.horizon_steps = _require_positive_int("horizon_steps", self.horizon_steps)
@@ -375,6 +385,30 @@ class HighLevelSkillDiffSRConfig:
         self.diffsr_state_output_init_std = _require_non_negative_float(
             "diffsr_state_output_init_std", self.diffsr_state_output_init_std
         )
+        self.cotrain_commander = bool(self.cotrain_commander)
+        self.commander_hidden_dims = tuple(
+            _require_positive_int("commander_hidden_dims", dim)
+            for dim in self.commander_hidden_dims
+        )
+        self.commander_lr = _require_positive_float("commander_lr", self.commander_lr)
+        self.commander_cosine_loss_coeff = _require_non_negative_float(
+            "commander_cosine_loss_coeff", self.commander_cosine_loss_coeff
+        )
+        self.commander_z_norm_coeff = _require_non_negative_float(
+            "commander_z_norm_coeff", self.commander_z_norm_coeff
+        )
+        self.commander_state_noise_std = _require_non_negative_float(
+            "commander_state_noise_std", self.commander_state_noise_std
+        )
+        self.commander_language_embeddings_path = str(
+            self.commander_language_embeddings_path
+        ).strip()
+        if self.cotrain_commander and not self.commander_language_embeddings_path:
+            msg = (
+                "commander_language_embeddings_path is required when "
+                "cotrain_commander is enabled."
+            )
+            raise ValueError(msg)
         self.device = str(self.device)
 
     def latent_spec(self) -> SkillLatentSpec:
@@ -409,6 +443,7 @@ class HighLevelSkillDiffSRConfig:
             "diffsr_g_hidden_dims",
             "diffsr_mu_hidden_dims",
             "fsq_levels",
+            "commander_hidden_dims",
         }
         for key in tuple_fields:
             if key in kwargs:
@@ -577,9 +612,7 @@ class FrozenHighLevelSkillCommandSampler:
             self.device
         )
         diffsr_state = checkpoint.get("diffsr_state_dict")
-        if diffsr_state is None and (
-            self.finetune_enabled or self.command_mode != "z"
-        ):
+        if diffsr_state is None and (self.finetune_enabled or self.command_mode != "z"):
             msg = (
                 "Online high-level skill finetuning and non-z command modes "
                 "require checkpoints with diffsr_state_dict."
@@ -1075,6 +1108,15 @@ class HighLevelSkillDiffSRTrainer:
             weight_decay=self.config.weight_decay,
         )
         self.update = 0
+        
+        # Optional co-trained skill commander (System-1 planner). BC'd to the
+        # encoder's z (detached) from current state + language goal.
+        self.commander: nn.Module | None = None
+        self.commander_optimizer: torch.optim.Optimizer | None = None
+        self.commander_rank_embeddings: Tensor | None = None
+        self.commander_lang_embed_dim = 0
+        if self.config.cotrain_commander:
+            self._init_commander()
 
     def _encode_skill(
         self,
@@ -1465,12 +1507,111 @@ class HighLevelSkillDiffSRTrainer:
             self.skill_encoder.train()
         return accum
 
+    def _init_commander(self) -> None:
+        from rlopt.agent.skill_commander import (  # noqa: PLC0415
+            SkillCommander,
+            build_rank_embedding_lookup,
+            load_language_embedding_table,
+        )
+
+        names_provider = getattr(self.env, "expert_trajectory_motion_names", None)
+        if not callable(names_provider):
+            msg = "cotrain_commander requires env.expert_trajectory_motion_names()."
+            raise ValueError(msg)
+        table = load_language_embedding_table(
+            self.config.commander_language_embeddings_path
+        )
+        self.commander_lang_embed_dim = int(table["embed_dim"])
+        self.commander_rank_embeddings = build_rank_embedding_lookup(
+            table, [str(name) for name in names_provider()], self.device
+        )
+        self.commander = SkillCommander(
+            state_dim=self.state_dim,
+            lang_embed_dim=self.commander_lang_embed_dim,
+            z_dim=self.config.z_dim,
+            hidden_dims=self.config.commander_hidden_dims,
+        ).to(self.device)
+        self.commander_optimizer = torch.optim.AdamW(
+            self.commander.parameters(), lr=self.config.commander_lr
+        )
+
+    def _commander_lang_for_batch(self, batch: TensorDictBase) -> Tensor:
+        traj_rank = batch.get(("hl", "traj_rank"))
+        if traj_rank is None:
+            msg = "cotrain_commander requires 'traj_rank' in the macro batch."
+            raise ValueError(msg)
+        traj_rank = traj_rank.reshape(-1).to(device=self.device, dtype=torch.long)
+        assert self.commander_rank_embeddings is not None
+        return self.commander_rank_embeddings.index_select(0, traj_rank)
+
+    def _commander_train_step(
+        self, batch: TensorDictBase, state: Tensor, z: Tensor
+    ) -> dict[str, float]:
+        assert self.commander is not None
+        assert self.commander_optimizer is not None
+        self.commander.train()
+        lang = self._commander_lang_for_batch(batch)
+        z_target = z.detach()
+        cmd_state = state
+        std = float(self.config.commander_state_noise_std)
+        if std > 0.0 and int(state.shape[0]) > 1:
+            per_dim = state.std(dim=0, keepdim=True)
+            cmd_state = state + std * per_dim * torch.randn_like(state)
+        z_hat = self.commander(cmd_state, lang)
+        mse = F.mse_loss(z_hat, z_target)
+        cosine = F.cosine_similarity(z_hat, z_target, dim=-1).mean()
+        loss = (
+            mse
+            + self.config.commander_cosine_loss_coeff * (1.0 - cosine)
+            + self.config.commander_z_norm_coeff * z_hat.pow(2).mean()
+        )
+        self.commander_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if self.config.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.commander.parameters(),
+                max_norm=float(self.config.grad_clip_norm),
+            )
+        self.commander_optimizer.step()
+        return {
+            "train/commander_mse": float(mse.detach().item()),
+            "train/commander_cosine": float(cosine.detach().item()),
+            "train/commander_loss": float(loss.detach().item()),
+        }
+
+    @torch.no_grad()
+    def _commander_eval_metrics(
+        self, batch: TensorDictBase, state: Tensor, z: Tensor, *, prefix: str
+    ) -> dict[str, float]:
+        assert self.commander is not None
+        was_training = self.commander.training
+        self.commander.eval()
+        lang = self._commander_lang_for_batch(batch)
+        z_hat = self.commander(state, lang)
+        metrics = {
+            f"{prefix}/commander_cosine": float(
+                F.cosine_similarity(z_hat, z, dim=-1).mean().item()
+            ),
+            f"{prefix}/commander_mse": float(F.mse_loss(z_hat, z).item()),
+        }
+        if int(lang.shape[0]) > 1:
+            shuffled = lang[torch.randperm(lang.shape[0], device=lang.device)]
+            z_hat_shuffled = self.commander(state, shuffled)
+            metrics[f"{prefix}/commander_cosine_shuffled_lang"] = float(
+                F.cosine_similarity(z_hat_shuffled, z, dim=-1).mean().item()
+            )
+        if was_training:
+            self.commander.train()
+        return metrics
+
     def train_step(self) -> dict[str, float]:
         self.skill_encoder.train()
         self.diffsr.train()
-        state, future_window, target = self._sample_and_validate_macro_batch(
-            self.config.batch_size,
-            split=self.config.train_split,
+        batch = self._sample_macro_batch(
+            self.config.batch_size, split=self.config.train_split
+        )
+        state, future_window, target = self._validate_macro_batch(
+            batch, batch_size=self.config.batch_size
         )
         self.diffsr.update_obs_norm(target.detach())
         # reg_loss is the per-method latent regularizer (L2 / KL / commitment / 0),
@@ -1502,6 +1643,8 @@ class HighLevelSkillDiffSRTrainer:
                 **{f"train/{k}": float(v.item()) for k, v in info.items()},
             }
         )
+        if self.commander is not None:
+            metrics.update(self._commander_train_step(batch, state, z))
         return metrics
 
     @torch.no_grad()
@@ -1530,9 +1673,9 @@ class HighLevelSkillDiffSRTrainer:
         self.diffsr.eval()
         accum: dict[str, float] = {}
         for _ in range(num_batches):
-            state, future_window, target = self._sample_and_validate_macro_batch(
-                batch_size,
-                split=split,
+            batch = self._sample_macro_batch(batch_size, split=split)
+            state, future_window, target = self._validate_macro_batch(
+                batch, batch_size=batch_size
             )
             z, *_ = self._encode_skill(state, future_window, deterministic=True)
             zero_z = torch.zeros_like(z)
@@ -1559,6 +1702,10 @@ class HighLevelSkillDiffSRTrainer:
                 {f"{prefix}/diversity/{key}": float(value.item())
                  for key, value in diversity.items()}
             )
+            if self.commander is not None:
+                batch_metrics.update(
+                    self._commander_eval_metrics(batch, state, z, prefix=prefix)
+                )
             if include_reconstruction:
                 batch_metrics.update(
                     self._sample_reconstruction_metrics(
@@ -1647,6 +1794,38 @@ class HighLevelSkillDiffSRTrainer:
         torch.save(self.checkpoint_state_dict(), target)
         Path(f"{target}.json").write_text(
             json.dumps({"update": int(self.update)}), encoding="utf-8"
+        )
+
+    def commander_checkpoint_state_dict(
+        self, *, skill_checkpoint_path: str = ""
+    ) -> dict[str, Any]:
+        """SkillCommander-format checkpoint for the co-trained commander."""
+        if self.commander is None:
+            msg = "No co-trained commander to checkpoint."
+            raise RuntimeError(msg)
+        return {
+            "generator_state_dict": self.commander.state_dict(),
+            "config": {
+                "generator_hidden_dims": list(self.config.commander_hidden_dims)
+            },
+            "skill_config": self.config.to_dict(),
+            "skill_checkpoint_path": str(skill_checkpoint_path),
+            "state_dim": int(self.state_dim),
+            "lang_embed_dim": int(self.commander_lang_embed_dim),
+            "z_dim": int(self.config.z_dim),
+            "update": int(self.update),
+        }
+
+    def save_commander_checkpoint(
+        self, path: str | Path, *, skill_checkpoint_path: str = ""
+    ) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            self.commander_checkpoint_state_dict(
+                skill_checkpoint_path=skill_checkpoint_path
+            ),
+            target,
         )
 
     def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
