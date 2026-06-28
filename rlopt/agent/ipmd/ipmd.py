@@ -344,6 +344,33 @@ class IPMDConfig(PPOConfig):
     hl_skill_train_diffsr: bool = False
     """Also update the loaded DiffSR model during online high-level skill finetuning."""
 
+    skill_commander_checkpoint_path: str = ""
+    """Skill-commander checkpoint used when command_source='skill_commander'."""
+
+    skill_commander_embeddings_path: str = ""
+    """Language goal embedding table (.pt) used when command_source='skill_commander'."""
+
+    skill_commander_use_achieved_state: bool = False
+    """Condition the commander on the robot's achieved macro state (full-M3 closed loop)."""
+
+    skill_commander_flow_num_inference_steps: int = 0
+    """Optional override for flow-matching commander inference steps; 0 uses checkpoint config."""
+
+    skill_commander_flow_inference_noise_std: float = -1.0
+    """Optional override for flow-matching commander inference noise std; <0 uses checkpoint config."""
+
+    skill_commander_diffusion_num_inference_steps: int = 0
+    """Optional override for diffusion commander inference steps; 0 uses checkpoint config."""
+
+    skill_commander_diffusion_inference_scheduler: str = ""
+    """Optional diffusion commander inference scheduler override: ddpm or ddim."""
+
+    skill_commander_diffusion_ddim_eta: float = -1.0
+    """Optional DDIM eta override for diffusion commander inference; <0 uses checkpoint config."""
+
+    skill_commander_diffusion_inference_noise_std: float = -1.0
+    """Optional diffusion commander initial-noise std override; <0 uses checkpoint config."""
+
     latent_learning: IPMDLatentLearningConfig = field(
         default_factory=IPMDLatentLearningConfig
     )
@@ -520,14 +547,7 @@ class IPMDConfig(PPOConfig):
         self.latent_steps_max = require_positive_int(
             "ipmd.latent_steps_max", self.latent_steps_max
         )
-        if self.command_source == "hl_skill":
-            self.hl_skill_checkpoint_path = str(self.hl_skill_checkpoint_path).strip()
-            if not self.hl_skill_checkpoint_path:
-                msg = (
-                    "ipmd.hl_skill_checkpoint_path is required when "
-                    "ipmd.command_source='hl_skill'."
-                )
-                raise ValueError(msg)
+        if self.command_source in ("hl_skill", "skill_commander"):
             self.hl_skill_horizon_steps = int(self.hl_skill_horizon_steps)
             if self.hl_skill_horizon_steps < 0:
                 msg = "ipmd.hl_skill_horizon_steps must be >= 0."
@@ -549,6 +569,77 @@ class IPMDConfig(PPOConfig):
                     f"or 'z_phi', got {self.hl_skill_command_mode!r}."
                 )
                 raise ValueError(msg)
+        if self.command_source == "hl_skill":
+            self.hl_skill_checkpoint_path = str(self.hl_skill_checkpoint_path).strip()
+            if not self.hl_skill_checkpoint_path:
+                msg = (
+                    "ipmd.hl_skill_checkpoint_path is required when "
+                    "ipmd.command_source='hl_skill'."
+                )
+                raise ValueError(msg)
+        if self.command_source == "skill_commander":
+            self.skill_commander_checkpoint_path = str(
+                self.skill_commander_checkpoint_path
+            ).strip()
+            self.skill_commander_embeddings_path = str(
+                self.skill_commander_embeddings_path
+            ).strip()
+            if not self.skill_commander_checkpoint_path:
+                msg = (
+                    "ipmd.skill_commander_checkpoint_path is required when "
+                    "ipmd.command_source='skill_commander'."
+                )
+                raise ValueError(msg)
+            self.skill_commander_flow_num_inference_steps = int(
+                self.skill_commander_flow_num_inference_steps
+            )
+            if self.skill_commander_flow_num_inference_steps < 0:
+                msg = "ipmd.skill_commander_flow_num_inference_steps must be >= 0."
+                raise ValueError(msg)
+            self.skill_commander_diffusion_num_inference_steps = int(
+                self.skill_commander_diffusion_num_inference_steps
+            )
+            if self.skill_commander_diffusion_num_inference_steps < 0:
+                msg = (
+                    "ipmd.skill_commander_diffusion_num_inference_steps must be >= 0."
+                )
+                raise ValueError(msg)
+            scheduler = str(self.skill_commander_diffusion_inference_scheduler).strip()
+            self.skill_commander_diffusion_inference_scheduler = scheduler.lower()
+            if self.skill_commander_diffusion_inference_scheduler not in {
+                "",
+                "ddpm",
+                "ddim",
+            }:
+                msg = (
+                    "ipmd.skill_commander_diffusion_inference_scheduler must be "
+                    "'ddpm', 'ddim', or empty."
+                )
+                raise ValueError(msg)
+            self.skill_commander_flow_inference_noise_std = float(
+                self.skill_commander_flow_inference_noise_std
+            )
+            if self.skill_commander_flow_inference_noise_std >= 0.0:
+                require_non_negative(
+                    "ipmd.skill_commander_flow_inference_noise_std",
+                    self.skill_commander_flow_inference_noise_std,
+                )
+            self.skill_commander_diffusion_ddim_eta = float(
+                self.skill_commander_diffusion_ddim_eta
+            )
+            if self.skill_commander_diffusion_ddim_eta >= 0.0:
+                require_non_negative(
+                    "ipmd.skill_commander_diffusion_ddim_eta",
+                    self.skill_commander_diffusion_ddim_eta,
+                )
+            self.skill_commander_diffusion_inference_noise_std = float(
+                self.skill_commander_diffusion_inference_noise_std
+            )
+            if self.skill_commander_diffusion_inference_noise_std >= 0.0:
+                require_non_negative(
+                    "ipmd.skill_commander_diffusion_inference_noise_std",
+                    self.skill_commander_diffusion_inference_noise_std,
+                )
         if self.hl_skill_finetune_enabled and self.command_source != "hl_skill":
             msg = (
                 "ipmd.hl_skill_finetune_enabled=True requires "
@@ -953,7 +1044,10 @@ class IPMD(PPO):
         else:
             self._reward_out_fn = lambda r: r
 
-        if self._use_latent_command and self._command_source != "hl_skill":
+        if self._use_latent_command and self._command_source not in (
+            "hl_skill",
+            "skill_commander",
+        ):
             method = str(self.config.ipmd.latent_learning.method)
             self._latent_learner = build_latent_learner(method)
             self._latent_learner.initialize(self)
@@ -993,6 +1087,64 @@ class IPMD(PPO):
                 offline_batch_size=int(self.config.ipmd.hl_skill_offline_batch_size),
                 update_interval=int(self.config.ipmd.hl_skill_update_interval),
                 train_diffsr=bool(self.config.ipmd.hl_skill_train_diffsr),
+            )
+        if self._use_latent_command and self._command_source == "skill_commander":
+            from rlopt.agent.skill_commander import (  # noqa: PLC0415
+                FrozenSkillCommanderSampler,
+            )
+
+            commander_overrides: dict[str, object] = {}
+            if self.config.ipmd.skill_commander_flow_num_inference_steps > 0:
+                commander_overrides["flow_num_inference_steps"] = int(
+                    self.config.ipmd.skill_commander_flow_num_inference_steps
+                )
+            if self.config.ipmd.skill_commander_flow_inference_noise_std >= 0.0:
+                commander_overrides["flow_inference_noise_std"] = float(
+                    self.config.ipmd.skill_commander_flow_inference_noise_std
+                )
+            if self.config.ipmd.skill_commander_diffusion_num_inference_steps > 0:
+                commander_overrides["diffusion_num_inference_steps"] = int(
+                    self.config.ipmd.skill_commander_diffusion_num_inference_steps
+                )
+            if self.config.ipmd.skill_commander_diffusion_inference_scheduler:
+                commander_overrides["diffusion_inference_scheduler"] = str(
+                    self.config.ipmd.skill_commander_diffusion_inference_scheduler
+                )
+            if self.config.ipmd.skill_commander_diffusion_ddim_eta >= 0.0:
+                commander_overrides["diffusion_ddim_eta"] = float(
+                    self.config.ipmd.skill_commander_diffusion_ddim_eta
+                )
+            if self.config.ipmd.skill_commander_diffusion_inference_noise_std >= 0.0:
+                commander_overrides["diffusion_inference_noise_std"] = float(
+                    self.config.ipmd.skill_commander_diffusion_inference_noise_std
+                )
+
+            self._hl_skill_command_sampler = FrozenSkillCommanderSampler(
+                env=self.env,
+                checkpoint_path=str(self.config.ipmd.skill_commander_checkpoint_path),
+                language_embeddings_path=str(
+                    self.config.ipmd.skill_commander_embeddings_path
+                ),
+                latent_dim=self._latent_dim,
+                latent_steps_min=int(self.config.ipmd.latent_steps_min),
+                latent_steps_max=int(self.config.ipmd.latent_steps_max),
+                generator_config_overrides=commander_overrides,
+                horizon_steps=(
+                    self.config.ipmd.hl_skill_horizon_steps
+                    if self.config.ipmd.hl_skill_horizon_steps > 0
+                    else None
+                ),
+                command_phase_mode=str(
+                    self.config.ipmd.latent_learning.command_phase_mode
+                ),
+                code_latent_dim=self.config.ipmd.latent_learning.code_latent_dim,
+                phase_period=int(self.config.ipmd.latent_learning.code_period),
+                command_mode=str(self.config.ipmd.hl_skill_command_mode),
+                use_achieved_state=bool(
+                    self.config.ipmd.skill_commander_use_achieved_state
+                ),
+                discover_env_method=self._discover_env_method,
+                device=self._get_device(self.config.device),
             )
         self._validate_latent_reward_conditioning()
 
@@ -1136,7 +1288,7 @@ class IPMD(PPO):
                 dtype=torch.float32,
             )
             return
-        if self._command_source == "hl_skill":
+        if self._command_source in ("hl_skill", "skill_commander"):
             if self._hl_skill_command_sampler is None:
                 msg = "Frozen high-level skill command sampler is unavailable."
                 raise RuntimeError(msg)
