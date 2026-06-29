@@ -147,7 +147,6 @@ def _make_bilinear_offline_cfg():
     cfg.bilinear.next_obs_keys = ["observation"]
     cfg.bilinear.feature_dim = 3
     cfg.bilinear.embed_dim = 8
-    cfg.bilinear.f_hidden_dims = (16,)
     cfg.bilinear.g_hidden_dims = (16,)
     cfg.bilinear.mu_hidden_dims = (16,)
     cfg.bilinear.sr_batch_size = 4
@@ -205,7 +204,6 @@ def test_bilinear_policy_head_splits_command_from_representation_state() -> None
         action_dim=2,
         feature_dim=3,
         embed_dim=4,
-        f_hidden_dims=(8,),
         g_hidden_dims=(8,),
         mu_hidden_dims=(8,),
         num_noises=2,
@@ -230,7 +228,7 @@ def test_bilinear_policy_head_splits_command_from_representation_state() -> None
 
     assert loc.shape == (6, 2)
     assert scale.shape == (6, 2)
-    assert head.base[0].in_features == 4
+    assert head.base[0].in_features == 7
 
     raw_state_head = BilinearPolicyHead(
         bilinear_rep=bilinear_rep,
@@ -250,7 +248,7 @@ def test_bilinear_policy_head_splits_command_from_representation_state() -> None
 
     assert loc.shape == (6, 2)
     assert scale.shape == (6, 2)
-    assert raw_state_head.base[0].in_features == 9
+    assert raw_state_head.base[0].in_features == 12
 
 
 def test_ipmd_prepare_rollout_rewards_ignores_estimator_when_disabled():
