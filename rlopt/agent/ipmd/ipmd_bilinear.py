@@ -139,9 +139,6 @@ class BilinearSRConfig:
     embed_dim: int = 512
     """Shared embedding dimension for state and action encoders."""
 
-    f_hidden_dims: tuple[int, ...] = (512, 512)
-    """Hidden layers for state encoder f(s)."""
-
     g_hidden_dims: tuple[int, ...] = (512,)
     """Hidden layers for action encoder g(a)."""
 
@@ -496,7 +493,6 @@ class IPMDBilinear(IPMD):
             "action_dim": action_spec.shape[-1],
             "feature_dim": cfg.feature_dim,
             "embed_dim": cfg.embed_dim,
-            "f_hidden_dims": cfg.f_hidden_dims,
             "g_hidden_dims": cfg.g_hidden_dims,
             "mu_hidden_dims": cfg.mu_hidden_dims,
             "num_noises": cfg.num_noises,
