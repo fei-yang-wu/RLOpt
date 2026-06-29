@@ -79,7 +79,6 @@ class BilinearSR(ABC, nn.Module):
         action_dim: int,
         feature_dim: int,
         embed_dim: int,
-        f_hidden_dims: tuple[int, ...],
         g_hidden_dims: tuple[int, ...],
         use_ema_for_policy: bool = True,
         device: str | torch.device = "cpu",
@@ -158,9 +157,9 @@ class BilinearSR(ABC, nn.Module):
         *,
         include_raw_state: bool = True,
     ) -> Tensor:
-        """F(s) z -> (B, embed_dim). Optionally append raw SR state."""
-        F_s = self._F(s, use_ema=True).detach()
-        component1 = torch.einsum("bef,bf->be", F_s, z)
+        net = self.state_net_ema if self.state_net_ema is not None else self.state_net
+        state_embed = net(s).detach()
+        component1 = torch.concat([state_embed, z], dim=-1)
         if include_raw_state:
             return torch.concat([component1, s.detach()], dim=-1)
         return component1
@@ -227,7 +226,6 @@ class DiffSRBilinear(BilinearSR):
         action_dim: int,
         feature_dim: int,
         embed_dim: int,
-        f_hidden_dims: tuple[int, ...],
         g_hidden_dims: tuple[int, ...],
         mu_hidden_dims: tuple[int, ...],
         num_noises: int = 16,
@@ -242,7 +240,6 @@ class DiffSRBilinear(BilinearSR):
             action_dim=action_dim,
             feature_dim=feature_dim,
             embed_dim=embed_dim,
-            f_hidden_dims=f_hidden_dims,
             g_hidden_dims=g_hidden_dims,
             use_ema_for_policy=use_ema_for_policy,
             device=device,
@@ -415,7 +412,6 @@ class SpederBilinear(BilinearSR):
         action_dim: int,
         feature_dim: int,
         embed_dim: int,
-        f_hidden_dims: tuple[int, ...],
         g_hidden_dims: tuple[int, ...],
         mu_hidden_dims: tuple[int, ...],
         num_noises: int = 25,
@@ -429,7 +425,6 @@ class SpederBilinear(BilinearSR):
             action_dim=action_dim,
             feature_dim=feature_dim,
             embed_dim=embed_dim,
-            f_hidden_dims=f_hidden_dims,
             g_hidden_dims=g_hidden_dims,
             use_ema_for_policy=use_ema_for_policy,
             device=device,
@@ -585,7 +580,6 @@ class CtrlSRBilinear(BilinearSR):
         action_dim: int,
         feature_dim: int,
         embed_dim: int,
-        f_hidden_dims: tuple[int, ...],
         g_hidden_dims: tuple[int, ...],
         mu_hidden_dims: tuple[int, ...],
         num_noises: int = 16,
@@ -598,7 +592,6 @@ class CtrlSRBilinear(BilinearSR):
             action_dim=action_dim,
             feature_dim=feature_dim,
             embed_dim=embed_dim,
-            f_hidden_dims=f_hidden_dims,
             g_hidden_dims=g_hidden_dims,
             use_ema_for_policy=use_ema_for_policy,
             device=device,
