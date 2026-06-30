@@ -131,7 +131,6 @@ def _build_diffsr(
         action_dim=config.z_dim,
         feature_dim=config.diffsr_feature_dim,
         embed_dim=config.diffsr_embed_dim,
-        f_hidden_dims=config.diffsr_f_hidden_dims,
         g_hidden_dims=config.diffsr_g_hidden_dims,
         mu_hidden_dims=config.diffsr_mu_hidden_dims,
         num_noises=config.diffsr_num_noises,
@@ -1610,8 +1609,11 @@ class HighLevelSkillDiffSRTrainer:
         batch = self._sample_macro_batch(
             self.config.batch_size, split=self.config.train_split
         )
-        state, future_window, target = self._validate_macro_batch(
-            batch, batch_size=self.config.batch_size
+        state, future_window, target = _validate_macro_batch(
+            batch,
+            batch_size=self.config.batch_size,
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
         )
         self.diffsr.update_obs_norm(target.detach())
         # reg_loss is the per-method latent regularizer (L2 / KL / commitment / 0),
@@ -1674,8 +1676,11 @@ class HighLevelSkillDiffSRTrainer:
         accum: dict[str, float] = {}
         for _ in range(num_batches):
             batch = self._sample_macro_batch(batch_size, split=split)
-            state, future_window, target = self._validate_macro_batch(
-                batch, batch_size=batch_size
+            state, future_window, target = _validate_macro_batch(
+                batch,
+                batch_size=batch_size,
+                horizon_steps=int(self.config.horizon_steps),
+                device=self.device,
             )
             z, *_ = self._encode_skill(state, future_window, deterministic=True)
             zero_z = torch.zeros_like(z)

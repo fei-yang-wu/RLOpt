@@ -38,7 +38,6 @@ from torch import Tensor, nn
 from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
     HighLevelSkillDiffSRConfig,
-    HighLevelSkillEncoder,
     _jsonable,
     _normalize_command_mode,
     _normalize_split_value,
@@ -47,6 +46,7 @@ from rlopt.agent.hl_skill_diffsr import (
     _require_positive_float,
     _require_positive_int,
 )
+from rlopt.agent.hl_skill_encoder import build_skill_encoder
 
 
 def _require_probability(name: str, value: float) -> float:
@@ -990,11 +990,12 @@ class SkillCommanderTrainer:
         self.state_dim = int(state.shape[-1])
         self.planner_state_dim = int(planner_state.shape[-1])
 
-        self.skill_encoder = HighLevelSkillEncoder(
+        self.skill_encoder = build_skill_encoder(
             state_dim=self.state_dim,
             window_steps=self.encoder_window_steps,
             z_dim=self.z_dim,
             hidden_dims=self.skill_config.encoder_hidden_dims,
+            spec=self.skill_config.latent_spec(),
         ).to(self.device)
         self.skill_encoder.load_state_dict(skill_checkpoint["skill_encoder_state_dict"])
         self.skill_encoder.eval()
