@@ -88,6 +88,19 @@ def _normalize_command_mode(value: str) -> str:
     return normalized
 
 
+def _normalize_phi_parameterization(value: str) -> str:
+    normalized = str(value).strip().lower()
+    aliases = {"legacy": "bilinear", "f_matrix": "bilinear", "simple_concat": "concat"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"concat", "bilinear"}:
+        msg = (
+            "diffsr_phi_parameterization must be one of 'concat' or 'bilinear' "
+            f"(aliases: 'legacy', 'f_matrix', 'simple_concat'), got {value!r}."
+        )
+        raise ValueError(msg)
+    return normalized
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_jsonable(item) for item in value]
@@ -132,7 +145,9 @@ def _build_diffsr(
         feature_dim=config.diffsr_feature_dim,
         embed_dim=config.diffsr_embed_dim,
         g_hidden_dims=config.diffsr_g_hidden_dims,
+        f_hidden_dims=config.diffsr_f_hidden_dims,
         mu_hidden_dims=config.diffsr_mu_hidden_dims,
+        phi_parameterization=config.diffsr_phi_parameterization,
         num_noises=config.diffsr_num_noises,
         use_ema_for_policy=False,
         x_min=config.diffsr_x_min,
@@ -250,6 +265,7 @@ class HighLevelSkillDiffSRConfig:
     vq_ema_decay: float = 0.99
     vq_dead_code_reset_iters: int = 0
     encoder_hidden_dims: tuple[int, ...] = (1024, 512, 512)
+    diffsr_phi_parameterization: str = "concat"
     diffsr_f_hidden_dims: tuple[int, ...] = (512, 512)
     diffsr_g_hidden_dims: tuple[int, ...] = (512,)
     diffsr_mu_hidden_dims: tuple[int, ...] = (512,)
@@ -354,6 +370,9 @@ class HighLevelSkillDiffSRConfig:
             _require_positive_int("encoder_hidden_dims", dim)
             for dim in self.encoder_hidden_dims
         )
+        self.diffsr_phi_parameterization = _normalize_phi_parameterization(
+            self.diffsr_phi_parameterization
+        )
         self.diffsr_f_hidden_dims = tuple(
             _require_positive_int("diffsr_f_hidden_dims", dim)
             for dim in self.diffsr_f_hidden_dims
@@ -436,6 +455,10 @@ class HighLevelSkillDiffSRConfig:
     def from_dict(cls, values: Mapping[str, Any]) -> HighLevelSkillDiffSRConfig:
         known_fields = {item.name for item in fields(cls)}
         kwargs = {key: values[key] for key in known_fields if key in values}
+        if "diffsr_phi_parameterization" not in kwargs:
+            # Backward compatibility: checkpoints written before this field was
+            # introduced used the matrix-valued F(s) bilinear parameterization.
+            kwargs["diffsr_phi_parameterization"] = "bilinear"
         tuple_fields = {
             "encoder_hidden_dims",
             "diffsr_f_hidden_dims",
@@ -1614,6 +1637,7 @@ class HighLevelSkillDiffSRTrainer:
             batch_size=self.config.batch_size,
             horizon_steps=int(self.config.horizon_steps),
             device=self.device,
+            state_dim=self.state_dim,
         )
         self.diffsr.update_obs_norm(target.detach())
         # reg_loss is the per-method latent regularizer (L2 / KL / commitment / 0),
@@ -1681,6 +1705,7 @@ class HighLevelSkillDiffSRTrainer:
                 batch_size=batch_size,
                 horizon_steps=int(self.config.horizon_steps),
                 device=self.device,
+                state_dim=self.state_dim,
             )
             z, *_ = self._encode_skill(state, future_window, deterministic=True)
             zero_z = torch.zeros_like(z)
