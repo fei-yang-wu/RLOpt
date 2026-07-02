@@ -191,6 +191,49 @@ def _make_bilinear_expert_batch(env, num_transitions: int = 32) -> TensorDict:
     )
 
 
+def test_bilinear_sr_legacy_phi_parameterization_restores_matrix_state() -> None:
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    rep = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=2,
+        feature_dim=3,
+        embed_dim=4,
+        f_hidden_dims=(8,),
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        num_noises=2,
+        phi_parameterization="bilinear",
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+    state = torch.randn(6, 5)
+    action = torch.randn(6, 2)
+
+    assert rep.encode_state(state).shape == (6, 4, 3)
+    phi = rep.forward_phi(state, action)
+    assert phi.shape == (6, 3)
+    assert torch.allclose(phi, torch.zeros_like(phi))
+
+    concat_rep = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=2,
+        feature_dim=3,
+        embed_dim=4,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+    assert concat_rep.encode_state(state).shape == (6, 4)
+
+
 def test_bilinear_policy_head_splits_command_from_representation_state() -> None:
     """Policy command keys should not be concatenated into the SR state input."""
     _rlopt()
@@ -317,7 +360,7 @@ def test_ipmd_bilinear_offline_pretrain_validates_config() -> None:
         batch_size=[batch_size],
     )
 
-    with pytest.raises(ValueError, match="offline_pretrain.batch_size"):
+    with pytest.raises(ValueError, match=r"offline_pretrain\.batch_size"):
         rlopt.IPMDBilinear(
             env,
             cfg,
@@ -1040,7 +1083,7 @@ def test_ipmd_grouped_reward_model_requires_state_only_inputs() -> None:
     cfg.ipmd.reward_input_type = "sas"
 
     env = rlopt.make_parallel_env(cfg)
-    with pytest.raises(ValueError, match="requires .*reward_input_type='s'"):
+    with pytest.raises(ValueError, match=r"requires .*reward_input_type='s'"):
         rlopt.IPMD(env, cfg, logger=None)
 
 

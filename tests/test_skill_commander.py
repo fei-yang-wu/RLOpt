@@ -31,6 +31,27 @@ from rlopt.agent.skill_commander import (  # noqa: E402
 )
 
 
+def test_hl_skill_diffsr_legacy_config_defaults_to_bilinear() -> None:
+    fresh_config = HighLevelSkillDiffSRConfig()
+    assert fresh_config.diffsr_phi_parameterization == "concat"
+
+    legacy_config = HighLevelSkillDiffSRConfig.from_dict(
+        {
+            "horizon_steps": 25,
+            "z_dim": 256,
+            "diffsr_feature_dim": 128,
+            "diffsr_embed_dim": 512,
+            "encoder_window_mode": "intermediate",
+        }
+    )
+    assert legacy_config.diffsr_phi_parameterization == "bilinear"
+
+    explicit_config = HighLevelSkillDiffSRConfig.from_dict(
+        {"diffsr_phi_parameterization": "concat"}
+    )
+    assert explicit_config.diffsr_phi_parameterization == "concat"
+
+
 class _FakeMacroEnv:
     """Minimal env exposing the macro-transition surface with trajectory ranks."""
 
