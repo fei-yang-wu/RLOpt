@@ -13,7 +13,7 @@ from torch import Tensor
 from tensordict import TensorDict
 
 from rlopt.agent.gail.gail import GAIL, GAILConfig, GAILRLOptConfig
-from rlopt.configs import NetworkConfig
+from rlopt.config_base import NetworkConfig
 from .skill_encoder import SkillEncoder
 from .posterior import SkillPosterior
 from .skill_discriminator import SkillConditionedDiscriminator

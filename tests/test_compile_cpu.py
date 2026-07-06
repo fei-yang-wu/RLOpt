@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
-from rlopt.agent.rl import SAC, SACRLOptConfig
-from rlopt.configs import NetworkConfig
+
+from rlopt.agent import SAC, SACRLOptConfig
+from rlopt.config_base import NetworkConfig
 from rlopt.env_utils import make_parallel_env
+
+pytestmark = pytest.mark.compile
 
 
 def test_sac_cpu_with_cudagraphs_enabled():
@@ -30,6 +34,12 @@ def test_sac_cpu_with_cudagraphs_enabled():
 
     # Network configurations
     cfg.q_function = NetworkConfig(
+        num_cells=[64, 64],
+        activation_fn="relu",
+        output_dim=1,
+        input_keys=["observation"],
+    )
+    cfg.value_function = NetworkConfig(
         num_cells=[64, 64],
         activation_fn="relu",
         output_dim=1,

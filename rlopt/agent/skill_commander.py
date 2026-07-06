@@ -38,6 +38,7 @@ from torch import Tensor, nn
 from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
     HighLevelSkillDiffSRConfig,
+    _build_diffsr,
     _jsonable,
     _normalize_command_mode,
     _normalize_split_value,
@@ -45,6 +46,8 @@ from rlopt.agent.hl_skill_diffsr import (
     _require_non_negative_float,
     _require_positive_float,
     _require_positive_int,
+    _resolve_device,
+    _validate_macro_batch,
 )
 from rlopt.agent.hl_skill_encoder import build_skill_encoder
 
@@ -1724,7 +1727,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             if phase_period is not None
             else self.latent_steps_max
         )
-        self.device = self._resolve_device(env, device)
+        self.device = _resolve_device(device, env)
 
         self._current_macro_sampler = discover_env_method(
             env, "current_expert_macro_transition_batch"
@@ -1822,7 +1825,9 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
 
         # DiffSR is only needed to expand z -> phi for non-z command modes; load
         # it from the source skill checkpoint the generator distilled against.
-        self.diffsr = self._build_diffsr().to(self.device)
+        self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
+            self.device
+        )
         if self.command_mode != "z":
             skill_checkpoint_path = str(checkpoint.get("skill_checkpoint_path", ""))
             skill_checkpoint = torch.load(
@@ -1953,9 +1958,12 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             state_history_steps=int(self.state_history_steps),
         )
         batch_size = int(env_ids.numel())
-        state, future_window, target = self._validate_macro_batch(
+        state, future_window, target = _validate_macro_batch(
             batch,
             batch_size=batch_size,
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+            state_dim=self.state_dim,
             source="Current skill-commander",
         )
         planner_state = self._planner_state_from_batch(

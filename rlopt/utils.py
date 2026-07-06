@@ -589,7 +589,6 @@ def get_activation_class(activation_name: str) -> type[torch.nn.Module]:
     return activation_map.get(activation_name, torch.nn.ELU)
 
 
-@torch.compile
 def gaussian_log_prob(
     action: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
@@ -600,7 +599,7 @@ def gaussian_log_prob(
     return -0.5 * (
         ((action - loc) / scale).pow(2)
         + 2.0 * scale.log()
-        + matorch.log(2.0 * matorch.pi)
+        + math.log(2.0 * math.pi)
     ).sum(dim=-1)
 
 
