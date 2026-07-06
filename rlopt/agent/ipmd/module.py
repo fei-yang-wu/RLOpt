@@ -80,6 +80,8 @@ class BilinearSR(ABC, nn.Module):
         feature_dim: int,
         embed_dim: int,
         g_hidden_dims: tuple[int, ...],
+        f_hidden_dims: tuple[int, ...] | None = None,
+        phi_parameterization: str = "concat",
         use_ema_for_policy: bool = True,
         device: str | torch.device = "cpu",
     ) -> None:
@@ -90,27 +92,50 @@ class BilinearSR(ABC, nn.Module):
         self.action_dim = action_dim
         self.feature_dim = feature_dim
         self.embed_dim = embed_dim
-
-        # --- Shared bilinear phi components ---
-        self.state_net = ResidualMLP(
-            input_dim=obs_dim,
-            output_dim=embed_dim,
-            hidden_dims=g_hidden_dims,
-            activation=nn.Mish(),
+        self.phi_parameterization = str(phi_parameterization).strip().lower()
+        aliases = {"legacy": "bilinear", "f_matrix": "bilinear"}
+        self.phi_parameterization = aliases.get(
+            self.phi_parameterization, self.phi_parameterization
         )
+        if self.phi_parameterization not in {"concat", "bilinear"}:
+            msg = (
+                "phi_parameterization must be one of 'concat' or 'bilinear' "
+                f"(aliases: 'legacy', 'f_matrix'), got {phi_parameterization!r}."
+            )
+            raise ValueError(msg)
+
+        # --- Shared phi components ---
+        if self.phi_parameterization == "bilinear":
+            # Checkpoint-era parameterization: F(s) is matrix-valued and the
+            # policy consumes F(s) z. Kept for backwards-compatible evaluation.
+            self.state_net = ResidualMLP(
+                input_dim=obs_dim,
+                output_dim=embed_dim * feature_dim,
+                hidden_dims=f_hidden_dims or g_hidden_dims,
+                activation=nn.Mish(),
+            )
+        else:
+            self.state_net = ResidualMLP(
+                input_dim=obs_dim,
+                output_dim=embed_dim,
+                hidden_dims=g_hidden_dims,
+                activation=nn.Mish(),
+            )
         self.action_net = ResidualMLP(
             input_dim=action_dim,
             output_dim=embed_dim,
             hidden_dims=g_hidden_dims,
             activation=nn.Mish(),
         )
-        
-        self.phi_net = ResidualMLP(
-            input_dim=embed_dim+embed_dim,
-            output_dim=feature_dim,
-            hidden_dims=g_hidden_dims,
-            activation=nn.Mish(),
-        )
+
+        self.phi_net: ResidualMLP | None = None
+        if self.phi_parameterization == "concat":
+            self.phi_net = ResidualMLP(
+                input_dim=embed_dim + embed_dim,
+                output_dim=feature_dim,
+                hidden_dims=g_hidden_dims,
+                activation=nn.Mish(),
+            )
 
         # --- EMA target state_net for policy ---
         if use_ema_for_policy:
@@ -120,7 +145,18 @@ class BilinearSR(ABC, nn.Module):
         else:
             self.state_net_ema = None
 
+    def _F(self, s: Tensor, use_ema: bool = False) -> Tensor:
+        """Return matrix-valued F(s) for legacy bilinear checkpoints."""
+        net = (
+            self.state_net_ema
+            if use_ema and self.state_net_ema is not None
+            else self.state_net
+        )
+        return net(s).reshape(-1, self.embed_dim, self.feature_dim)
+
     def encode_state(self, s: Tensor) -> Tensor:
+        if self.phi_parameterization == "bilinear":
+            return self._F(s)
         return self.state_net(s)
 
     def encode_action(self, a: Tensor) -> Tensor:
@@ -133,8 +169,15 @@ class BilinearSR(ABC, nn.Module):
         keeps the bilinear inner product in sigmoid's linear regime, mirroring
         scaled dot-product attention.
         """
+        if self.phi_parameterization == "bilinear":
+            f_s = self._F(s)
+            g_a = self.encode_action(a)
+            return torch.einsum("be,bef->bf", g_a, f_s) / math.sqrt(
+                self.embed_dim
+            )
         s = self.state_net(s)
         a = self.action_net(a)
+        assert self.phi_net is not None
         return self.phi_net(torch.concat([s, a], dim=-1))
 
     # -- EMA --
@@ -157,9 +200,17 @@ class BilinearSR(ABC, nn.Module):
         *,
         include_raw_state: bool = True,
     ) -> Tensor:
-        net = self.state_net_ema if self.state_net_ema is not None else self.state_net
-        state_embed = net(s).detach()
-        component1 = torch.concat([state_embed, z], dim=-1)
+        if self.phi_parameterization == "bilinear":
+            f_s = self._F(s, use_ema=True).detach()
+            component1 = torch.einsum("bef,bf->be", f_s, z)
+        else:
+            net = (
+                self.state_net_ema
+                if self.state_net_ema is not None
+                else self.state_net
+            )
+            state_embed = net(s).detach()
+            component1 = torch.concat([state_embed, z], dim=-1)
         if include_raw_state:
             return torch.concat([component1, s.detach()], dim=-1)
         return component1
@@ -228,6 +279,8 @@ class DiffSRBilinear(BilinearSR):
         embed_dim: int,
         g_hidden_dims: tuple[int, ...],
         mu_hidden_dims: tuple[int, ...],
+        f_hidden_dims: tuple[int, ...] | None = None,
+        phi_parameterization: str = "concat",
         num_noises: int = 16,
         use_ema_for_policy: bool = True,
         x_min: float = -10.0,
@@ -241,6 +294,8 @@ class DiffSRBilinear(BilinearSR):
             feature_dim=feature_dim,
             embed_dim=embed_dim,
             g_hidden_dims=g_hidden_dims,
+            f_hidden_dims=f_hidden_dims,
+            phi_parameterization=phi_parameterization,
             use_ema_for_policy=use_ema_for_policy,
             device=device,
         )
@@ -414,6 +469,8 @@ class SpederBilinear(BilinearSR):
         embed_dim: int,
         g_hidden_dims: tuple[int, ...],
         mu_hidden_dims: tuple[int, ...],
+        f_hidden_dims: tuple[int, ...] | None = None,
+        phi_parameterization: str = "concat",
         num_noises: int = 25,
         lam: float = 1024.0,
         use_ema_for_policy: bool = True,
@@ -426,6 +483,8 @@ class SpederBilinear(BilinearSR):
             feature_dim=feature_dim,
             embed_dim=embed_dim,
             g_hidden_dims=g_hidden_dims,
+            f_hidden_dims=f_hidden_dims,
+            phi_parameterization=phi_parameterization,
             use_ema_for_policy=use_ema_for_policy,
             device=device,
         )
@@ -582,6 +641,8 @@ class CtrlSRBilinear(BilinearSR):
         embed_dim: int,
         g_hidden_dims: tuple[int, ...],
         mu_hidden_dims: tuple[int, ...],
+        f_hidden_dims: tuple[int, ...] | None = None,
+        phi_parameterization: str = "concat",
         num_noises: int = 16,
         use_ema_for_policy: bool = True,
         device: str | torch.device = "cpu",
@@ -593,6 +654,8 @@ class CtrlSRBilinear(BilinearSR):
             feature_dim=feature_dim,
             embed_dim=embed_dim,
             g_hidden_dims=g_hidden_dims,
+            f_hidden_dims=f_hidden_dims,
+            phi_parameterization=phi_parameterization,
             use_ema_for_policy=use_ema_for_policy,
             device=device,
         )

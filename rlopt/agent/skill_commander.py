@@ -13,6 +13,7 @@ Contents:
 * ``SkillCommander`` - the direct ``(state, lang) -> z`` network.
 * ``FlowMatchingSkillCommander`` - conditional flow-matching latent planner.
 * ``DiffusionSkillCommander`` - conditional DDPM latent planner.
+* ``DiTLatentSkillCommander`` - transformer-based latent diffusion planner.
 * ``SkillCommanderTrainer`` - offline supervised distillation against a
   frozen ``HighLevelSkillEncoder`` (target ``z``), with held-out evaluation over
   trajectory names.
@@ -38,6 +39,7 @@ from torch import Tensor, nn
 from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
     HighLevelSkillDiffSRConfig,
+    _build_diffsr,
     _jsonable,
     _normalize_command_mode,
     _normalize_split_value,
@@ -45,6 +47,10 @@ from rlopt.agent.hl_skill_diffsr import (
     _require_non_negative_float,
     _require_positive_float,
     _require_positive_int,
+    _validate_macro_batch,
+)
+from rlopt.agent.hl_skill_diffsr import (
+    _resolve_device as _resolve_hl_device,
 )
 from rlopt.agent.hl_skill_encoder import build_skill_encoder
 
@@ -157,6 +163,13 @@ class SkillCommanderConfig:
     diffusion_inference_scheduler: str = "ddpm"
     diffusion_ddim_eta: float = 0.0
     diffusion_inference_noise_std: float = 1.0
+    dit_model_dim: int = 176
+    dit_num_layers: int = 4
+    dit_num_heads: int = 8
+    dit_feedforward_dim: int = 704
+    dit_patch_dim: int = 16
+    dit_num_state_tokens: int = 4
+    dit_dropout: float = 0.0
     batch_size: int = 8192
     num_updates: int = 2000
     log_interval: int = 100
@@ -198,10 +211,17 @@ class SkillCommanderConfig:
             "state_history_steps", self.state_history_steps
         )
         self.planner_type = str(self.planner_type).strip().lower()
-        if self.planner_type not in {"mlp", "flow_matching", "diffusion_policy"}:
+        if self.planner_type in {"dit", "dit_policy"}:
+            self.planner_type = "dit_diffusion"
+        if self.planner_type not in {
+            "mlp",
+            "flow_matching",
+            "diffusion_policy",
+            "dit_diffusion",
+        }:
             msg = (
                 "planner_type must be one of {'mlp', 'flow_matching', "
-                "'diffusion_policy'}, got "
+                "'diffusion_policy', 'dit_diffusion'}, got "
                 f"{self.planner_type!r}."
             )
             raise ValueError(msg)
@@ -258,6 +278,29 @@ class SkillCommanderConfig:
         self.diffusion_inference_noise_std = _require_non_negative_float(
             "diffusion_inference_noise_std", self.diffusion_inference_noise_std
         )
+        self.dit_model_dim = _require_positive_int(
+            "dit_model_dim", self.dit_model_dim
+        )
+        self.dit_num_layers = _require_positive_int(
+            "dit_num_layers", self.dit_num_layers
+        )
+        self.dit_num_heads = _require_positive_int(
+            "dit_num_heads", self.dit_num_heads
+        )
+        if self.dit_model_dim % self.dit_num_heads != 0:
+            msg = (
+                "dit_model_dim must be divisible by dit_num_heads, got "
+                f"{self.dit_model_dim} and {self.dit_num_heads}."
+            )
+            raise ValueError(msg)
+        self.dit_feedforward_dim = _require_positive_int(
+            "dit_feedforward_dim", self.dit_feedforward_dim
+        )
+        self.dit_patch_dim = _require_positive_int("dit_patch_dim", self.dit_patch_dim)
+        self.dit_num_state_tokens = _require_positive_int(
+            "dit_num_state_tokens", self.dit_num_state_tokens
+        )
+        self.dit_dropout = _require_probability("dit_dropout", self.dit_dropout)
         self.batch_size = _require_positive_int("batch_size", self.batch_size)
         self.num_updates = _require_positive_int("num_updates", self.num_updates)
         self.log_interval = _require_positive_int("log_interval", self.log_interval)
@@ -813,6 +856,317 @@ class DiffusionSkillCommander(nn.Module):
         return z
 
 
+class DiTLatentSkillCommander(nn.Module):
+    """Transformer denoiser for diffusion over skill latents.
+
+    The target action is still the latent skill vector ``z``. The DiT variant
+    patchifies ``z_t`` into latent tokens, conditions on learned state tokens and
+    a timestep token, and predicts diffusion noise for DDPM/DDIM inference.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        lang_embed_dim: int,
+        z_dim: int,
+        *,
+        model_dim: int = 176,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        feedforward_dim: int = 704,
+        patch_dim: int = 16,
+        num_state_tokens: int = 4,
+        dropout: float = 0.0,
+        time_embed_dim: int = 64,
+        num_train_timesteps: int = 100,
+        num_inference_steps: int = 16,
+        beta_schedule: str = "squaredcos_cap_v2",
+        prediction_type: str = "epsilon",
+        inference_scheduler: str = "ddpm",
+        ddim_eta: float = 0.0,
+        inference_noise_std: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.state_dim = _require_positive_int("state_dim", state_dim)
+        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
+        self.z_dim = _require_positive_int("z_dim", z_dim)
+        self.model_dim = _require_positive_int("model_dim", model_dim)
+        self.num_layers = _require_positive_int("num_layers", num_layers)
+        self.num_heads = _require_positive_int("num_heads", num_heads)
+        if self.model_dim % self.num_heads != 0:
+            msg = (
+                "model_dim must be divisible by num_heads, got "
+                f"{self.model_dim} and {self.num_heads}."
+            )
+            raise ValueError(msg)
+        self.feedforward_dim = _require_positive_int(
+            "feedforward_dim", feedforward_dim
+        )
+        self.patch_dim = _require_positive_int("patch_dim", patch_dim)
+        self.num_state_tokens = _require_positive_int(
+            "num_state_tokens", num_state_tokens
+        )
+        self.dropout = _require_probability("dropout", dropout)
+        self.time_embed_dim = _require_positive_int("time_embed_dim", time_embed_dim)
+        self.num_train_timesteps = _require_positive_int(
+            "num_train_timesteps", num_train_timesteps
+        )
+        self.num_inference_steps = _require_positive_int(
+            "num_inference_steps", num_inference_steps
+        )
+        self.inference_noise_std = _require_non_negative_float(
+            "inference_noise_std", inference_noise_std
+        )
+        self.beta_schedule = str(beta_schedule).strip()
+        self.prediction_type = str(prediction_type).strip()
+        if self.prediction_type != "epsilon":
+            msg = (
+                "DiTLatentSkillCommander currently supports only epsilon "
+                f"prediction, got {self.prediction_type!r}."
+            )
+            raise ValueError(msg)
+        self.inference_scheduler_name = str(inference_scheduler).strip().lower()
+        if self.inference_scheduler_name not in {"ddpm", "ddim"}:
+            msg = (
+                "inference_scheduler must be 'ddpm' or 'ddim', got "
+                f"{self.inference_scheduler_name!r}."
+            )
+            raise ValueError(msg)
+        self.ddim_eta = _require_non_negative_float("ddim_eta", ddim_eta)
+        self.num_z_tokens = (self.z_dim + self.patch_dim - 1) // self.patch_dim
+        self.padded_z_dim = self.num_z_tokens * self.patch_dim
+
+        self.train_scheduler = DDPMScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            beta_schedule=self.beta_schedule,
+            prediction_type=self.prediction_type,
+            clip_sample=False,
+        )
+        scheduler_cls = (
+            DDIMScheduler
+            if self.inference_scheduler_name == "ddim"
+            else DDPMScheduler
+        )
+        self.inference_scheduler = scheduler_cls(
+            num_train_timesteps=self.num_train_timesteps,
+            beta_schedule=self.beta_schedule,
+            prediction_type=self.prediction_type,
+            clip_sample=False,
+        )
+
+        cond_dim = self.state_dim + self.lang_embed_dim
+        self.state_condition_proj = nn.Linear(
+            cond_dim, self.num_state_tokens * self.model_dim
+        )
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.time_embed_dim, self.model_dim),
+            nn.Mish(),
+            nn.Linear(self.model_dim, self.model_dim),
+        )
+        self.z_patch_proj = nn.Linear(self.patch_dim, self.model_dim)
+        self.z_out_proj = nn.Linear(self.model_dim, self.patch_dim)
+        self.state_pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_state_tokens, self.model_dim)
+        )
+        self.time_pos_embed = nn.Parameter(torch.zeros(1, 1, self.model_dim))
+        self.z_pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_z_tokens, self.model_dim)
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.model_dim,
+            nhead=self.num_heads,
+            dim_feedforward=self.feedforward_dim,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=self.num_layers,
+            enable_nested_tensor=False,
+        )
+        self.output_norm = nn.LayerNorm(self.model_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.trunc_normal_(self.state_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.time_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.z_pos_embed, std=0.02)
+
+    def _validate_condition(self, state: Tensor, lang_emb: Tensor) -> None:
+        if state.ndim != 2:
+            msg = f"state must have shape [B, D], got {tuple(state.shape)}."
+            raise ValueError(msg)
+        if lang_emb.ndim != 2:
+            msg = f"lang_emb must have shape [B, L], got {tuple(lang_emb.shape)}."
+            raise ValueError(msg)
+        batch_size, state_dim = state.shape
+        if int(state_dim) != self.state_dim:
+            msg = (
+                f"state width mismatch: expected [B, {self.state_dim}], "
+                f"got {tuple(state.shape)}."
+            )
+            raise ValueError(msg)
+        expected_lang = (batch_size, self.lang_embed_dim)
+        if tuple(lang_emb.shape) != expected_lang:
+            msg = (
+                f"lang_emb shape mismatch: expected {expected_lang}, "
+                f"got {tuple(lang_emb.shape)}."
+            )
+            raise ValueError(msg)
+
+    def _time_embedding(self, timesteps: Tensor) -> Tensor:
+        t = timesteps.reshape(-1).to(dtype=torch.float32)
+        half_dim = self.time_embed_dim // 2
+        if half_dim == 0:
+            return t.new_zeros((int(t.numel()), self.time_embed_dim))
+        scale = torch.arange(half_dim, device=t.device, dtype=torch.float32)
+        scale = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=t.device))
+            * scale
+            / max(half_dim - 1, 1)
+        )
+        args = (t[:, None] / float(self.num_train_timesteps)) * scale[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if int(emb.shape[-1]) < self.time_embed_dim:
+            emb = F.pad(emb, (0, self.time_embed_dim - int(emb.shape[-1])))
+        return emb
+
+    def _predict_noise(
+        self,
+        z_t: Tensor,
+        timesteps: Tensor,
+        state: Tensor,
+        lang_emb: Tensor,
+    ) -> Tensor:
+        self._validate_condition(state, lang_emb)
+        batch_size = int(state.shape[0])
+        expected_z = (batch_size, self.z_dim)
+        if tuple(z_t.shape) != expected_z:
+            msg = f"z_t must have shape {expected_z}, got {tuple(z_t.shape)}."
+            raise ValueError(msg)
+        if tuple(timesteps.reshape(-1).shape) != (batch_size,):
+            msg = (
+                "timesteps must have shape "
+                f"{(batch_size,)}, got {tuple(timesteps.shape)}."
+            )
+            raise ValueError(msg)
+
+        cond = torch.cat([state, lang_emb], dim=-1)
+        state_tokens = self.state_condition_proj(cond).reshape(
+            batch_size, self.num_state_tokens, self.model_dim
+        )
+        state_tokens = state_tokens + self.state_pos_embed.to(
+            device=state_tokens.device, dtype=state_tokens.dtype
+        )
+        time_emb = self._time_embedding(timesteps).to(
+            device=z_t.device, dtype=z_t.dtype
+        )
+        time_token = self.time_mlp(time_emb).unsqueeze(1)
+        time_token = time_token + self.time_pos_embed.to(
+            device=time_token.device, dtype=time_token.dtype
+        )
+        if self.padded_z_dim != self.z_dim:
+            z_t = F.pad(z_t, (0, self.padded_z_dim - self.z_dim))
+        z_patches = z_t.reshape(batch_size, self.num_z_tokens, self.patch_dim)
+        z_tokens = self.z_patch_proj(z_patches)
+        z_tokens = z_tokens + self.z_pos_embed.to(
+            device=z_tokens.device, dtype=z_tokens.dtype
+        )
+
+        tokens = torch.cat([state_tokens, time_token, z_tokens], dim=1)
+        encoded = self.transformer(tokens)
+        z_encoded = encoded[:, self.num_state_tokens + 1 :, :]
+        z_encoded = self.output_norm(z_encoded)
+        pred = self.z_out_proj(z_encoded).reshape(batch_size, self.padded_z_dim)
+        return pred[:, : self.z_dim].contiguous()
+
+    def diffusion_loss(
+        self,
+        state: Tensor,
+        lang_emb: Tensor,
+        z_target: Tensor,
+    ) -> tuple[Tensor, dict[str, float]]:
+        self._validate_condition(state, lang_emb)
+        expected_z = (int(state.shape[0]), self.z_dim)
+        if tuple(z_target.shape) != expected_z:
+            msg = f"z_target must have shape {expected_z}, got {tuple(z_target.shape)}."
+            raise ValueError(msg)
+        noise = torch.randn_like(z_target)
+        timesteps = torch.randint(
+            low=0,
+            high=self.num_train_timesteps,
+            size=(int(state.shape[0]),),
+            device=z_target.device,
+            dtype=torch.long,
+        )
+        z_t = self.train_scheduler.add_noise(z_target, noise, timesteps)
+        pred_noise = self._predict_noise(z_t, timesteps, state, lang_emb)
+        loss = F.mse_loss(pred_noise, noise)
+        metrics = {
+            "diffusion/noise_mse": float(loss.detach().item()),
+            "diffusion/noise_rms": float(noise.detach().pow(2).mean().sqrt().item()),
+            "diffusion/pred_noise_rms": float(
+                pred_noise.detach().pow(2).mean().sqrt().item()
+            ),
+            "diffusion/timestep_mean": float(
+                timesteps.detach().to(dtype=torch.float32).mean().item()
+            ),
+        }
+        return loss, metrics
+
+    def forward(
+        self,
+        state: Tensor,
+        lang_emb: Tensor,
+        *,
+        noise: Tensor | None = None,
+        num_steps: int | None = None,
+    ) -> Tensor:
+        self._validate_condition(state, lang_emb)
+        batch_size = int(state.shape[0])
+        if noise is None:
+            z = self.inference_noise_std * torch.randn(
+                batch_size,
+                self.z_dim,
+                device=state.device,
+                dtype=state.dtype,
+            )
+        else:
+            expected_noise = (batch_size, self.z_dim)
+            if tuple(noise.shape) != expected_noise:
+                msg = (
+                    f"noise must have shape {expected_noise}, "
+                    f"got {tuple(noise.shape)}."
+                )
+                raise ValueError(msg)
+            z = noise.to(device=state.device, dtype=state.dtype)
+
+        steps = self.num_inference_steps if num_steps is None else int(num_steps)
+        steps = _require_positive_int("num_steps", steps)
+        self.inference_scheduler.set_timesteps(steps, device=state.device)
+        for timestep in self.inference_scheduler.timesteps:
+            t_int = int(timestep.item())
+            timesteps = torch.full(
+                (batch_size,),
+                fill_value=t_int,
+                device=state.device,
+                dtype=torch.long,
+            )
+            pred_noise = self._predict_noise(z, timesteps, state, lang_emb)
+            if isinstance(self.inference_scheduler, DDIMScheduler):
+                z = self.inference_scheduler.step(
+                    pred_noise,
+                    t_int,
+                    z,
+                    eta=float(self.ddim_eta),
+                ).prev_sample
+            else:
+                z = self.inference_scheduler.step(pred_noise, t_int, z).prev_sample
+        return z
+
+
 def _build_skill_commander_generator(
     *,
     planner_type: str,
@@ -832,8 +1186,17 @@ def _build_skill_commander_generator(
     diffusion_inference_scheduler: str = "ddpm",
     diffusion_ddim_eta: float = 0.0,
     diffusion_inference_noise_std: float = 1.0,
+    dit_model_dim: int = 176,
+    dit_num_layers: int = 4,
+    dit_num_heads: int = 8,
+    dit_feedforward_dim: int = 704,
+    dit_patch_dim: int = 16,
+    dit_num_state_tokens: int = 4,
+    dit_dropout: float = 0.0,
 ) -> nn.Module:
     planner_type = str(planner_type).strip().lower()
+    if planner_type in {"dit", "dit_policy"}:
+        planner_type = "dit_diffusion"
     if planner_type == "mlp":
         return SkillCommander(
             state_dim=state_dim,
@@ -858,6 +1221,27 @@ def _build_skill_commander_generator(
             lang_embed_dim=lang_embed_dim,
             z_dim=z_dim,
             hidden_dims=hidden_dims,
+            time_embed_dim=diffusion_time_embed_dim,
+            num_train_timesteps=diffusion_num_train_timesteps,
+            num_inference_steps=diffusion_num_inference_steps,
+            beta_schedule=diffusion_beta_schedule,
+            prediction_type=diffusion_prediction_type,
+            inference_scheduler=diffusion_inference_scheduler,
+            ddim_eta=diffusion_ddim_eta,
+            inference_noise_std=diffusion_inference_noise_std,
+        )
+    if planner_type == "dit_diffusion":
+        return DiTLatentSkillCommander(
+            state_dim=state_dim,
+            lang_embed_dim=lang_embed_dim,
+            z_dim=z_dim,
+            model_dim=dit_model_dim,
+            num_layers=dit_num_layers,
+            num_heads=dit_num_heads,
+            feedforward_dim=dit_feedforward_dim,
+            patch_dim=dit_patch_dim,
+            num_state_tokens=dit_num_state_tokens,
+            dropout=dit_dropout,
             time_embed_dim=diffusion_time_embed_dim,
             num_train_timesteps=diffusion_num_train_timesteps,
             num_inference_steps=diffusion_num_inference_steps,
@@ -896,6 +1280,13 @@ def _build_skill_commander_generator_from_config(
         diffusion_inference_scheduler=config.diffusion_inference_scheduler,
         diffusion_ddim_eta=config.diffusion_ddim_eta,
         diffusion_inference_noise_std=config.diffusion_inference_noise_std,
+        dit_model_dim=config.dit_model_dim,
+        dit_num_layers=config.dit_num_layers,
+        dit_num_heads=config.dit_num_heads,
+        dit_feedforward_dim=config.dit_feedforward_dim,
+        dit_patch_dim=config.dit_patch_dim,
+        dit_num_state_tokens=config.dit_num_state_tokens,
+        dit_dropout=config.dit_dropout,
     )
 
 
@@ -945,6 +1336,13 @@ def _build_skill_commander_generator_from_checkpoint(
         diffusion_inference_noise_std=float(
             config.get("diffusion_inference_noise_std", 1.0)
         ),
+        dit_model_dim=int(config.get("dit_model_dim", 176)),
+        dit_num_layers=int(config.get("dit_num_layers", 4)),
+        dit_num_heads=int(config.get("dit_num_heads", 8)),
+        dit_feedforward_dim=int(config.get("dit_feedforward_dim", 704)),
+        dit_patch_dim=int(config.get("dit_patch_dim", 16)),
+        dit_num_state_tokens=int(config.get("dit_num_state_tokens", 4)),
+        dit_dropout=float(config.get("dit_dropout", 0.0)),
     )
 
 
@@ -1347,7 +1745,8 @@ class SkillCommanderTrainer:
         shared_noise: Tensor | None,
     ) -> Tensor:
         if isinstance(
-            self.generator, (FlowMatchingSkillCommander, DiffusionSkillCommander)
+            self.generator,
+            (FlowMatchingSkillCommander, DiffusionSkillCommander, DiTLatentSkillCommander),
         ):
             return self.generator(state, lang, noise=shared_noise)
         return self.generator(state, lang)
@@ -1381,7 +1780,8 @@ class SkillCommanderTrainer:
         wrong_lang = self.rank_embeddings.index_select(0, wrong_rank)
         shared_noise = None
         if isinstance(
-            self.generator, (FlowMatchingSkillCommander, DiffusionSkillCommander)
+            self.generator,
+            (FlowMatchingSkillCommander, DiffusionSkillCommander, DiTLatentSkillCommander),
         ):
             shared_noise = torch.randn_like(z_target) * float(
                 self.generator.inference_noise_std
@@ -1465,7 +1865,7 @@ class SkillCommanderTrainer:
                     (contrastive_coeff * contrastive_loss).detach().item()
                 ),
             }
-        elif isinstance(self.generator, DiffusionSkillCommander):
+        elif isinstance(self.generator, (DiffusionSkillCommander, DiTLatentSkillCommander)):
             diffusion_loss, diffusion_metrics = self.generator.diffusion_loss(
                 cmd_state, lang, z_target
             )
@@ -1724,7 +2124,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             if phase_period is not None
             else self.latent_steps_max
         )
-        self.device = self._resolve_device(env, device)
+        self.device = _resolve_hl_device(device, env)
 
         self._current_macro_sampler = discover_env_method(
             env, "current_expert_macro_transition_batch"
@@ -1822,8 +2222,11 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
 
         # DiffSR is only needed to expand z -> phi for non-z command modes; load
         # it from the source skill checkpoint the generator distilled against.
-        self.diffsr = self._build_diffsr().to(self.device)
+        self.diffsr = None
         if self.command_mode != "z":
+            self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
+                self.device
+            )
             skill_checkpoint_path = str(checkpoint.get("skill_checkpoint_path", ""))
             skill_checkpoint = torch.load(
                 Path(skill_checkpoint_path).expanduser(),
@@ -1844,8 +2247,8 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             obs_norm = getattr(self.diffsr, "obs_norm", None)
             if isinstance(obs_norm, nn.Module) and feature_norm_state:
                 obs_norm.load_state_dict(feature_norm_state)
-        self.diffsr.eval()
-        self.diffsr.requires_grad_(False)
+            self.diffsr.eval()
+            self.diffsr.requires_grad_(False)
 
         if self.condition_on_language:
             names_provider = discover_env_method(env, "expert_trajectory_motion_names")
@@ -1953,9 +2356,12 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             state_history_steps=int(self.state_history_steps),
         )
         batch_size = int(env_ids.numel())
-        state, future_window, target = self._validate_macro_batch(
+        state, future_window, target = _validate_macro_batch(
             batch,
             batch_size=batch_size,
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+            state_dim=self.state_dim,
             source="Current skill-commander",
         )
         planner_state = self._planner_state_from_batch(
