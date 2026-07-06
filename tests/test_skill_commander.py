@@ -21,6 +21,7 @@ from rlopt.agent.hl_skill_diffsr import (  # noqa: E402
 )
 from rlopt.agent.skill_commander import (  # noqa: E402
     DiffusionSkillCommander,
+    DiTLatentSkillCommander,
     FlowMatchingSkillCommander,
     FrozenSkillCommanderSampler,
     SkillCommander,
@@ -290,6 +291,39 @@ def test_diffusion_generator_forward_and_loss_shapes() -> None:
         generator.diffusion_loss(state, lang, torch.randn(4, 4))
 
 
+def test_dit_latent_generator_forward_and_loss_shapes() -> None:
+    torch.manual_seed(17)
+    generator = DiTLatentSkillCommander(
+        state_dim=7,
+        lang_embed_dim=5,
+        z_dim=5,
+        model_dim=16,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=32,
+        patch_dim=2,
+        num_state_tokens=2,
+        time_embed_dim=8,
+        num_train_timesteps=10,
+        num_inference_steps=2,
+        inference_scheduler="ddim",
+        ddim_eta=0.0,
+        inference_noise_std=0.0,
+    )
+    state = torch.randn(4, 7)
+    lang = torch.randn(4, 5)
+    z_target = torch.randn(4, 5)
+    loss, metrics = generator.diffusion_loss(state, lang, z_target)
+    z = generator(state, lang)
+
+    assert loss.ndim == 0
+    assert "diffusion/noise_mse" in metrics
+    assert z.shape == (4, 5)
+    assert generator.padded_z_dim == 6
+    with pytest.raises(ValueError, match="z_target must have shape"):
+        generator.diffusion_loss(state, lang, torch.randn(4, 4))
+
+
 def test_language_table_lookup_and_missing_name(tmp_path) -> None:
     path = _make_language_table(tmp_path, ["walk", "dance"], embed_dim=5)
     table = load_language_embedding_table(path)
@@ -541,6 +575,64 @@ def test_diffusion_trainer_checkpoint_and_sampler(tmp_path) -> None:
     assert isinstance(sampler.generator, DiffusionSkillCommander)
     assert sampler.generator.inference_scheduler_name == "ddpm"
     assert sampler.generator.inference_noise_std == pytest.approx(0.0)
+
+
+def test_dit_trainer_checkpoint_and_sampler(tmp_path) -> None:
+    torch.manual_seed(18)
+    env = _FakeMacroEnv(deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    lang_table = _make_language_table(tmp_path, env.motion_names)
+    config = _gen_config(
+        skill_ckpt,
+        lang_table,
+        planner_type="dit",
+        diffusion_time_embed_dim=8,
+        diffusion_num_train_timesteps=10,
+        diffusion_num_inference_steps=2,
+        diffusion_inference_scheduler="ddim",
+        diffusion_ddim_eta=0.0,
+        diffusion_inference_noise_std=0.0,
+        dit_model_dim=16,
+        dit_num_layers=1,
+        dit_num_heads=4,
+        dit_feedforward_dim=32,
+        dit_patch_dim=2,
+        dit_num_state_tokens=2,
+        language_contrastive_coeff=0.25,
+        language_contrastive_margin=0.05,
+    )
+    trainer = SkillCommanderTrainer(config, env)
+    metrics = trainer.train_step()
+    assert "train/diffusion_loss" in metrics
+    assert "train/diffusion/noise_mse" in metrics
+    assert "train/language_contrastive/loss" in metrics
+
+    ckpt_path = tmp_path / "dit_generator.pt"
+    trainer.save_checkpoint(ckpt_path)
+    saved = torch.load(ckpt_path, weights_only=False)
+    assert saved["config"]["planner_type"] == "dit_diffusion"
+    assert saved["config"]["dit_model_dim"] == 16
+
+    sampler = FrozenSkillCommanderSampler(
+        env=env,
+        checkpoint_path=ckpt_path,
+        language_embeddings_path=lang_table,
+        latent_dim=5,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover_direct_method,
+        generator_config_overrides={
+            "diffusion_inference_scheduler": "ddpm",
+            "diffusion_inference_noise_std": 0.0,
+        },
+        command_mode="z",
+        device="cpu",
+    )
+    td = TensorDict({}, batch_size=[2])
+    z = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+    assert z.shape == (2, 5)
+    assert isinstance(sampler.generator, DiTLatentSkillCommander)
+    assert sampler.generator.inference_scheduler_name == "ddpm"
 
 
 def test_state_feature_dropout_targets_named_slices(tmp_path) -> None:
