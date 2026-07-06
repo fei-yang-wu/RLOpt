@@ -157,6 +157,7 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
         )
 
         assert self.q_function, "SAC requires a Q-function configuration."
+        self._update_policy_operator = self.actor_critic.get_policy_operator()
 
         # Compile if requested
         self._compile_components()
@@ -172,7 +173,7 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
                 self.update, mode=self.compile_mode, warmup=1
             )
 
-        if self.config.compile.cudagraphs:
+        if self.config.compile.cudagraphs and self.device.type == "cuda":
             # self.logger.warn(
             #     "CudaGraphModule is experimental and may lead to silently wrong results. Use with caution.",
             #     category=UserWarning,
@@ -503,7 +504,7 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
 
     def update(self, sampled_tensordict: TensorDict) -> TensorDict:
         assert isinstance(self.config, SACRLOptConfig)
-        policy_op = self.actor_critic.get_policy_operator()
+        policy_op = self._update_policy_operator
         kl_context = None
         if (self.config.optim.scheduler or "").lower() == "adaptive":
             kl_context = self._prepare_kl_context(sampled_tensordict, policy_op)

@@ -121,7 +121,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         lr_scheduler: Optional learning rate scheduler.
 
     Workflow for Implementing New Algorithms:
-        1. Define configuration dataclass in `rlopt/configs.py` inheriting from RLOptConfig.
+        1. Define configuration dataclass in `rlopt/config_base.py` inheriting from RLOptConfig.
         2. Create algorithm class inheriting from BaseAlgorithm.
         3. Implement abstract methods:
            - _construct_policy(): Build policy network
@@ -535,6 +535,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
                 if self.config.compile.cudagraphs and self.device.type == "cuda"
                 else False
             ),
+            auto_register_policy_transforms=True,
             # heterogeneous devices
             device=self.device,
             # storing_device=self.device,

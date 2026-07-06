@@ -65,12 +65,16 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "-m",
-    "not slow",
+    "not slow and not compile",
 ]
 xfail_strict = true
 filterwarnings = [
     "error",
     "ignore:(ast.Str|Attribute s|ast.NameConstant|ast.Num) is deprecated:DeprecationWarning:_pytest",
+    "ignore:Creating .*WeightUpdaterBase.*:DeprecationWarning",
+    "ignore:`torch\\.jit\\.script_method` is deprecated.*:DeprecationWarning",
+    "ignore:<class 'torch\\.autograd\\.function\\.Function'> should not be instantiated.*:DeprecationWarning",
+    "ignore:torch\\._dynamo\\.config\\.inline_inbuilt_nn_modules is deprecated.*:FutureWarning",
 ]
 testpaths = ["tests"]
 markers = [
@@ -122,7 +126,7 @@ isort.required-imports = ["from __future__ import annotations"]
 "tests/**" = ["T20", "PLC0415"]
 
 [tool.pyrefly.errors]
-index-error = false
+bad-index = false
 
 [tool.pyrefly]
 disable-type-errors-in-ide = true

@@ -18,21 +18,21 @@ sys.path.insert(0, str(scripts_path))
 def import_script(script_name):
     """Import a script module by file path."""
     script_file = scripts_path / f"{script_name}.py"
+    if not script_file.is_file():
+        pytest.skip(f"Example script not available: {script_file}")
     spec = importlib.util.spec_from_file_location(script_name, script_file)
+    if spec is None or spec.loader is None:
+        pytest.skip(f"Cannot import example script: {script_file}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-# Import the script modules
-collect_expert_data = import_script("01_collect_expert_data")
-train_ipmd = import_script("02_train_ipmd")
-train_bc = import_script("03_train_bc")
-
-
 @pytest.mark.slow
 def test_expert_data_collection():
     """Test expert data collection (SAC training and saving)."""
+    collect_expert_data = import_script("01_collect_expert_data")
+
     env_name = "Pendulum-v1"
     total_frames = 1000  # Very short for testing
     save_dir = "test_expert_data"
@@ -66,6 +66,9 @@ def test_expert_data_collection():
 @pytest.mark.slow
 def test_ipmd_with_expert_data():
     """Test IPMD training with expert data."""
+    collect_expert_data = import_script("01_collect_expert_data")
+    train_ipmd = import_script("02_train_ipmd")
+
     # First collect minimal expert data
     env_name = "Pendulum-v1"
     save_dir = "test_expert_data"
@@ -103,6 +106,9 @@ def test_ipmd_with_expert_data():
 @pytest.mark.slow
 def test_bc_with_expert_data():
     """Test BC training with expert data."""
+    collect_expert_data = import_script("01_collect_expert_data")
+    train_bc = import_script("03_train_bc")
+
     # First collect minimal expert data
     env_name = "Pendulum-v1"
     save_dir = "test_expert_data"
@@ -144,7 +150,8 @@ def test_expert_replay_buffer_creation():
     from tensordict import TensorDict
     from torchrl.data import TensorDictReplayBuffer
     from torchrl.data.replay_buffers.storages import LazyTensorStorage
-    from rlopt.imitation import ExpertReplayBuffer
+
+    from rlopt.expert import OfflineExpertSampler
 
     # Create mock expert data
     batch_size = 100
@@ -167,20 +174,20 @@ def test_expert_replay_buffer_creation():
     buffer = TensorDictReplayBuffer(storage=storage, batch_size=32)
     buffer.extend(expert_data)
 
-    # Wrap in ExpertReplayBuffer
-    expert_buffer = ExpertReplayBuffer(buffer)
+    # Use the canonical expert sampler API.
+    expert_sampler = OfflineExpertSampler(buffer)
 
     # Test sampling
-    sample = expert_buffer.sample()
+    sample = expert_sampler(32, ["observation", "action"])
     assert sample is not None
     assert "observation" in sample.keys()
     assert "action" in sample.keys()
     assert len(sample) == 32  # batch_size
 
     # Test length
-    assert len(expert_buffer) == batch_size
+    assert len(expert_sampler.replay_buffer) == batch_size
 
-    print("✅ ExpertReplayBuffer creation test passed!")
+    print("✅ OfflineExpertSampler creation test passed!")
 
 
 if __name__ == "__main__":

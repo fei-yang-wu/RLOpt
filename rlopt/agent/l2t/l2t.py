@@ -36,10 +36,7 @@ from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 
 from rlopt.base_class import BaseAlgorithm
-from rlopt.configs import (
-    NetworkLayout,
-    RLOptConfig,
-)
+from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class
 
@@ -48,12 +45,12 @@ from rlopt.utils import get_activation_class
 class L2TConfig:
     """L2T-specific configuration.
 
-    - Uses ``RLOptConfig.network`` for the teacher layout (PPO-style).
+    - Uses ``RLOptConfig.policy`` for the teacher layout (PPO-style).
     - Provides a separate ``student`` layout and imitation loss options.
     """
 
-    student: NetworkLayout = field(default_factory=NetworkLayout)
-    """Student network layout (separate from teacher, which uses RLOptConfig.network)"""
+    student: NetworkConfig = field(default_factory=NetworkConfig)
+    """Student network layout (separate from teacher, which uses RLOptConfig.policy)"""
 
     mixture_coeff: float = 0.2
     """Mixture coefficient for potential teacher-student action mixing (not required for training)"""

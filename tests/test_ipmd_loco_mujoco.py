@@ -268,10 +268,7 @@ def test_ipmd_with_g1_and_iltools():
             ]
             replay_manager.set_assignment(assignment)
 
-            from rlopt.imitation import ExpertReplayBuffer
-
-            expert_buffer = ExpertReplayBuffer(replay_manager)
-            sample = expert_buffer.sample()
+            sample = replay_manager.sample()
             assert isinstance(sample, TensorDict)
             assert sample.batch_size[0] == len(assignment)
             assert "observation" in sample
@@ -292,7 +289,7 @@ def test_ipmd_with_g1_and_iltools():
             agent._set_test_expert_batch_sampler(
                 lambda batch_size, required_keys: cast(
                     TensorDict,
-                    expert_buffer.sample()[:batch_size].select(*required_keys).clone(),
+                    replay_manager.sample()[:batch_size].select(*required_keys).clone(),
                 )
             )
 

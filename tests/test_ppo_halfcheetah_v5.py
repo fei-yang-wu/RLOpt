@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from rlopt.agent.rl import PPO, PPORLOptConfig
+from rlopt.agent import PPO, PPORLOptConfig
 from rlopt.env_utils import make_parallel_env
 
 
