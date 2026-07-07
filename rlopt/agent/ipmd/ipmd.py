@@ -353,6 +353,12 @@ class IPMDConfig(PPOConfig):
     skill_commander_use_achieved_state: bool = False
     """Condition the commander on the robot's achieved macro state (full-M3 closed loop)."""
 
+    skill_commander_goal_name: str = ""
+    """Optional fixed language-goal name for command_source='skill_commander'."""
+
+    skill_commander_goal_rank: int = -1
+    """Optional fixed language-goal rank from the embedding table; -1 disables."""
+
     skill_commander_flow_num_inference_steps: int = 0
     """Optional override for flow-matching commander inference steps; 0 uses checkpoint config."""
 
@@ -588,6 +594,19 @@ class IPMDConfig(PPOConfig):
                 msg = (
                     "ipmd.skill_commander_checkpoint_path is required when "
                     "ipmd.command_source='skill_commander'."
+                )
+                raise ValueError(msg)
+            self.skill_commander_goal_name = str(
+                self.skill_commander_goal_name
+            ).strip()
+            self.skill_commander_goal_rank = int(self.skill_commander_goal_rank)
+            if self.skill_commander_goal_rank < -1:
+                msg = "ipmd.skill_commander_goal_rank must be >= -1."
+                raise ValueError(msg)
+            if self.skill_commander_goal_name and self.skill_commander_goal_rank >= 0:
+                msg = (
+                    "Set only one of ipmd.skill_commander_goal_name or "
+                    "ipmd.skill_commander_goal_rank."
                 )
                 raise ValueError(msg)
             self.skill_commander_flow_num_inference_steps = int(
@@ -1143,6 +1162,8 @@ class IPMD(PPO):
                 use_achieved_state=bool(
                     self.config.ipmd.skill_commander_use_achieved_state
                 ),
+                goal_name=str(self.config.ipmd.skill_commander_goal_name),
+                goal_rank=int(self.config.ipmd.skill_commander_goal_rank),
                 discover_env_method=self._discover_env_method,
                 device=self._get_device(self.config.device),
             )
