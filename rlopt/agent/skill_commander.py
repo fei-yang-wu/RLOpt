@@ -1724,7 +1724,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             if phase_period is not None
             else self.latent_steps_max
         )
-        self.device = self._resolve_device(env, device)
+        self.device = self._resolve_device(device, env)
 
         self._current_macro_sampler = discover_env_method(
             env, "current_expert_macro_transition_batch"
@@ -1820,10 +1820,10 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         self.generator.eval()
         self.generator.requires_grad_(False)
 
-        # DiffSR is only needed to expand z -> phi for non-z command modes; load
-        # it from the source skill checkpoint the generator distilled against.
-        self.diffsr = self._build_diffsr().to(self.device)
+        # DiffSR is only needed to expand z -> phi for non-z command modes.
+        self.diffsr = None
         if self.command_mode != "z":
+            self.diffsr = self._build_diffsr().to(self.device)
             skill_checkpoint_path = str(checkpoint.get("skill_checkpoint_path", ""))
             skill_checkpoint = torch.load(
                 Path(skill_checkpoint_path).expanduser(),
@@ -1844,8 +1844,8 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             obs_norm = getattr(self.diffsr, "obs_norm", None)
             if isinstance(obs_norm, nn.Module) and feature_norm_state:
                 obs_norm.load_state_dict(feature_norm_state)
-        self.diffsr.eval()
-        self.diffsr.requires_grad_(False)
+            self.diffsr.eval()
+            self.diffsr.requires_grad_(False)
 
         if self.condition_on_language:
             names_provider = discover_env_method(env, "expert_trajectory_motion_names")

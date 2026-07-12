@@ -521,7 +521,7 @@ class FrozenHighLevelSkillCommandSampler:
             if phase_period is not None
             else self.latent_steps_max
         )
-        self.device = _resolve_device(device, env)
+        self.device = self._resolve_device(device, env)
         self._current_macro_sampler = discover_env_method(
             env,
             "current_expert_macro_transition_batch",
@@ -607,9 +607,7 @@ class FrozenHighLevelSkillCommandSampler:
         self.initial_skill_encoder.eval()
         self.initial_skill_encoder.requires_grad_(False)
 
-        self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
-            self.device
-        )
+        self.diffsr = self._build_diffsr().to(self.device)
         diffsr_state = checkpoint.get("diffsr_state_dict")
         if diffsr_state is None and (self.finetune_enabled or self.command_mode != "z"):
             msg = (
@@ -674,6 +672,32 @@ class FrozenHighLevelSkillCommandSampler:
             raise ValueError(msg)
         return input_dim // divisor
 
+    @staticmethod
+    def _resolve_device(
+        device: torch.device | str | None,
+        env: object,
+    ) -> torch.device:
+        return _resolve_device(device, env)
+
+    def _build_diffsr(self) -> nn.Module:
+        return _build_diffsr(self.config, self.state_dim, self.device)
+
+    def _validate_macro_batch(
+        self,
+        batch: TensorDictBase,
+        *,
+        batch_size: int,
+        source: str,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return _validate_macro_batch(
+            batch,
+            batch_size=int(batch_size),
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+            state_dim=self.state_dim,
+            source=source,
+        )
+
     def _command_code_dim_for_mode(self) -> int:
         if self.command_mode == "z":
             return int(self.config.z_dim)
@@ -737,12 +761,9 @@ class FrozenHighLevelSkillCommandSampler:
             eval_fraction=float(self.config.eval_trajectory_fraction),
             split_seed=int(self.config.trajectory_split_seed),
         )
-        return _validate_macro_batch(
+        return self._validate_macro_batch(
             batch,
             batch_size=int(batch_size),
-            horizon_steps=int(self.config.horizon_steps),
-            device=self.device,
-            state_dim=self.state_dim,
             source="Offline expert",
         )
 
@@ -775,12 +796,9 @@ class FrozenHighLevelSkillCommandSampler:
             env_ids=env_ids,
         )
         batch_size = int(env_ids.numel())
-        state, future_window, target = _validate_macro_batch(
+        state, future_window, target = self._validate_macro_batch(
             batch,
             batch_size=batch_size,
-            horizon_steps=int(self.config.horizon_steps),
-            device=self.device,
-            state_dim=self.state_dim,
             source="Current expert",
         )
         z = self.skill_encoder(state, _encoder_input_window(self.config, future_window))
