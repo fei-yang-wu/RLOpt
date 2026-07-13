@@ -38,6 +38,7 @@ from torch import Tensor, nn
 from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
     HighLevelSkillDiffSRConfig,
+    _build_diffsr,
     _jsonable,
     _normalize_command_mode,
     _normalize_split_value,
@@ -45,6 +46,8 @@ from rlopt.agent.hl_skill_diffsr import (
     _require_non_negative_float,
     _require_positive_float,
     _require_positive_int,
+    _resolve_device,
+    _validate_macro_batch as _validate_hl_macro_batch,
 )
 from rlopt.agent.hl_skill_encoder import build_skill_encoder
 
@@ -1693,6 +1696,8 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         phase_period: int | None = None,
         command_mode: str = "z",
         use_achieved_state: bool = False,
+        goal_name: str = "",
+        goal_rank: int = -1,
         device: torch.device | str | None = None,
     ) -> None:
         # NOTE: we deliberately do not call super().__init__ - that loads a skill
@@ -1748,6 +1753,15 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             )
             raise ValueError(msg)
         self._offline_macro_sampler = None
+        self.forced_language_goal_name = str(goal_name).strip()
+        self.forced_language_goal_rank = int(goal_rank)
+        self.forced_language_embedding: Tensor | None = None
+        if self.forced_language_goal_rank < -1:
+            msg = "goal_rank must be >= -1."
+            raise ValueError(msg)
+        if self.forced_language_goal_name and self.forced_language_goal_rank >= 0:
+            msg = "Set only one of goal_name or goal_rank."
+            raise ValueError(msg)
 
         checkpoint = torch.load(
             Path(checkpoint_path).expanduser(),
@@ -1868,6 +1882,38 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             self.rank_embeddings = build_rank_embedding_lookup(
                 table, [str(name) for name in names_provider()], self.device
             )
+            if (
+                not self.forced_language_goal_name
+                and self.forced_language_goal_rank >= 0
+            ):
+                names = table.get("names")
+                if not isinstance(names, list):
+                    msg = "Language embedding table is missing a list of names."
+                    raise ValueError(msg)
+                if self.forced_language_goal_rank >= len(names):
+                    msg = (
+                        f"goal_rank={self.forced_language_goal_rank} is out of "
+                        f"range for {len(names)} language goals."
+                    )
+                    raise ValueError(msg)
+                self.forced_language_goal_name = str(
+                    names[self.forced_language_goal_rank]
+                )
+            if self.forced_language_goal_name:
+                name_to_index = table["name_to_index"]
+                goal_index = name_to_index.get(self.forced_language_goal_name)
+                if goal_index is None:
+                    msg = (
+                        "Language embedding table has no entry for forced goal "
+                        f"{self.forced_language_goal_name!r}."
+                    )
+                    raise ValueError(msg)
+                embeddings = cast(Tensor, table["embeddings"]).to(
+                    device=self.device, dtype=torch.float32
+                )
+                self.forced_language_embedding = embeddings[
+                    int(goal_index)
+                ].reshape(1, -1)
         else:
             self.rank_embeddings = torch.empty(
                 (0, 0), device=self.device, dtype=torch.float32
@@ -1918,6 +1964,8 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             return torch.empty(
                 (int(batch_size), 0), device=self.device, dtype=torch.float32
             )
+        if self.forced_language_embedding is not None:
+            return self.forced_language_embedding.expand(int(batch_size), -1)
         traj_rank = batch.get(("hl", "traj_rank"))
         if traj_rank is None:
             msg = (
@@ -1953,9 +2001,12 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             state_history_steps=int(self.state_history_steps),
         )
         batch_size = int(env_ids.numel())
-        state, future_window, target = self._validate_macro_batch(
+        state, future_window, target = _validate_hl_macro_batch(
             batch,
             batch_size=batch_size,
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+            state_dim=self.state_dim,
             source="Current skill-commander",
         )
         planner_state = self._planner_state_from_batch(
