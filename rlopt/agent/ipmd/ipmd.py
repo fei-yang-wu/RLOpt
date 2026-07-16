@@ -76,7 +76,15 @@ class IPMDLatentLearningConfig:
     """Keys for posterior."""
 
     prior_input_keys: list[ObsKey] = field(default_factory=list)
-    """Keys for prior. """
+    """Keys for the learned prior."""
+
+    reconstruction_target_keys: list[ObsKey] = field(default_factory=list)
+    """Expert keys reconstructed by decoder-based latent learners.
+
+    ``future_cvae`` should set this to the future reference window. When left
+    empty, it falls back to ``posterior_input_keys`` for backward-compatible
+    autoencoder behavior.
+    """
 
     encoder_hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     """Encoder hidden dimension if use NN. """
@@ -218,6 +226,9 @@ class IPMDLatentLearningConfig:
     command every env step.
     """
 
+    token_sequence_horizon: int = 10
+    """Number of per-step tokens in ``per_step_vq_sequence`` packets."""
+
     latent_dropout_to_random_code_prob: float = 0.0
     """Reserved for random-code substitution during PPO updates."""
 
@@ -245,6 +256,10 @@ class IPMDLatentLearningConfig:
         self.posterior_command_period = require_positive_int(
             "ipmd.latent_learning.posterior_command_period",
             self.posterior_command_period,
+        )
+        self.token_sequence_horizon = require_positive_int(
+            "ipmd.latent_learning.token_sequence_horizon",
+            self.token_sequence_horizon,
         )
         if self.code_latent_dim is not None and int(self.code_latent_dim) > 0:
             self.code_latent_dim = require_positive_int(
@@ -347,11 +362,23 @@ class IPMDConfig(PPOConfig):
     skill_commander_checkpoint_path: str = ""
     """Skill-commander checkpoint used when command_source='skill_commander'."""
 
+    token_planner_checkpoint_path: str = ""
+    """Categorical planner checkpoint used when command_source='token_planner'."""
+
+    continuous_planner_checkpoint_path: str = ""
+    """Continuous planner checkpoint used when command_source='continuous_planner'."""
+
     skill_commander_embeddings_path: str = ""
     """Language goal embedding table (.pt) used when command_source='skill_commander'."""
 
     skill_commander_use_achieved_state: bool = False
     """Condition the commander on the robot's achieved macro state (full-M3 closed loop)."""
+
+    skill_commander_goal_name: str = ""
+    """Optional fixed language-goal name for command_source='skill_commander'."""
+
+    skill_commander_goal_rank: int = -1
+    """Optional fixed language-goal rank from the embedding table; -1 disables."""
 
     skill_commander_flow_num_inference_steps: int = 0
     """Optional override for flow-matching commander inference steps; 0 uses checkpoint config."""
@@ -529,6 +556,27 @@ class IPMDConfig(PPOConfig):
     during early training.  Set to 0 to disable (default).
     """
 
+    bc_pretrain_updates: int = 0
+    """Number of initial optimizer updates that use BC without PPO gradients.
+
+    This provides an offline policy bootstrap when early on-policy rollouts are
+    too short to learn from. After this many updates, the usual PPO plus BC
+    update resumes. Set to 0 to mix BC and PPO from the first update.
+    """
+
+    rollout_bc_coef: float = 0.0
+    """Behavior-cloning coefficient on states visited by the current policy.
+
+    The target is read from ``rollout_bc_action_key`` in the rollout. This key
+    is a training-only label and must not be an actor, critic, reward-model, or
+    latent-model input. Unlike ``bc_coef``, this loss keeps the policy state
+    distribution from the live rollout instead of replacing it with clean
+    demonstration observations.
+    """
+
+    rollout_bc_action_key: ObsKey = ("policy_supervision", "expert_action")
+    """Rollout observation key containing the aligned expert action label."""
+
     def validate(self) -> None:
         self.command_source = normalize_ipmd_command_source(self.command_source)
         self.reward_model_type = normalize_ipmd_reward_model_type(
@@ -547,6 +595,24 @@ class IPMDConfig(PPOConfig):
         self.latent_steps_max = require_positive_int(
             "ipmd.latent_steps_max", self.latent_steps_max
         )
+        if (
+            self.command_source == "token_planner"
+            and not str(self.token_planner_checkpoint_path).strip()
+        ):
+            msg = (
+                "ipmd.token_planner_checkpoint_path is required when "
+                "command_source='token_planner'."
+            )
+            raise ValueError(msg)
+        if (
+            self.command_source == "continuous_planner"
+            and not str(self.continuous_planner_checkpoint_path).strip()
+        ):
+            msg = (
+                "ipmd.continuous_planner_checkpoint_path is required when "
+                "command_source='continuous_planner'."
+            )
+            raise ValueError(msg)
         if self.command_source in ("hl_skill", "skill_commander"):
             self.hl_skill_horizon_steps = int(self.hl_skill_horizon_steps)
             if self.hl_skill_horizon_steps < 0:
@@ -590,6 +656,17 @@ class IPMDConfig(PPOConfig):
                     "ipmd.command_source='skill_commander'."
                 )
                 raise ValueError(msg)
+            self.skill_commander_goal_name = str(self.skill_commander_goal_name).strip()
+            self.skill_commander_goal_rank = int(self.skill_commander_goal_rank)
+            if self.skill_commander_goal_rank < -1:
+                msg = "ipmd.skill_commander_goal_rank must be >= -1."
+                raise ValueError(msg)
+            if self.skill_commander_goal_name and self.skill_commander_goal_rank >= 0:
+                msg = (
+                    "Set only one of ipmd.skill_commander_goal_name or "
+                    "ipmd.skill_commander_goal_rank."
+                )
+                raise ValueError(msg)
             self.skill_commander_flow_num_inference_steps = int(
                 self.skill_commander_flow_num_inference_steps
             )
@@ -600,9 +677,7 @@ class IPMDConfig(PPOConfig):
                 self.skill_commander_diffusion_num_inference_steps
             )
             if self.skill_commander_diffusion_num_inference_steps < 0:
-                msg = (
-                    "ipmd.skill_commander_diffusion_num_inference_steps must be >= 0."
-                )
+                msg = "ipmd.skill_commander_diffusion_num_inference_steps must be >= 0."
                 raise ValueError(msg)
             scheduler = str(self.skill_commander_diffusion_inference_scheduler).strip()
             self.skill_commander_diffusion_inference_scheduler = scheduler.lower()
@@ -776,6 +851,24 @@ class IPMDConfig(PPOConfig):
         require_non_negative("ipmd.est_reward_weight", self.est_reward_weight)
         require_non_negative("ipmd.env_reward_weight", self.env_reward_weight)
         require_non_negative("ipmd.bc_coef", self.bc_coef)
+        require_non_negative("ipmd.rollout_bc_coef", self.rollout_bc_coef)
+        self.rollout_bc_action_key = normalize_batch_key(self.rollout_bc_action_key)
+        if int(self.bc_pretrain_updates) < 0:
+            msg = (
+                "ipmd.bc_pretrain_updates must be >= 0, got "
+                f"{self.bc_pretrain_updates!r}."
+            )
+            raise ValueError(msg)
+        if (
+            int(self.bc_pretrain_updates) > 0
+            and float(self.bc_coef) <= 0.0
+            and float(self.rollout_bc_coef) <= 0.0
+        ):
+            msg = (
+                "ipmd.bc_pretrain_updates requires ipmd.bc_coef > 0 or "
+                "ipmd.rollout_bc_coef > 0."
+            )
+            raise ValueError(msg)
         if self.expert_batch_size is not None:
             self.expert_batch_size = require_positive_int(
                 "ipmd.expert_batch_size", self.expert_batch_size
@@ -897,6 +990,9 @@ class IPMD(PPO):
             if self._use_latent_command
             else list(self._policy_obs_keys)
         )
+        self._rollout_bc_action_key = normalize_batch_key(
+            self.config.ipmd.rollout_bc_action_key
+        )
         reward_keys = self.config.ipmd.reward_input_keys
         if not reward_keys:
             reward_keys = (
@@ -914,6 +1010,10 @@ class IPMD(PPO):
         )
         self._prior_obs_keys: list[ObsKey] = dedupe_keys(
             [normalize_batch_key(key) for key in latent_cfg.prior_input_keys]
+        )
+        target_keys = latent_cfg.reconstruction_target_keys or self._posterior_obs_keys
+        self._reconstruction_target_obs_keys: list[ObsKey] = dedupe_keys(
+            [normalize_batch_key(key) for key in target_keys]
         )
         self._current_reference_obs_getter = None
 
@@ -941,9 +1041,29 @@ class IPMD(PPO):
             + self._reward_obs_keys
             + self._posterior_obs_keys
             + self._prior_obs_keys
+            + self._reconstruction_target_obs_keys
         )
+        if (
+            float(self.config.ipmd.rollout_bc_coef) > 0.0
+            and self._rollout_bc_action_key in all_obs_keys
+        ):
+            msg = (
+                "ipmd.rollout_bc_action_key is a training-only label and must not "
+                "be used by the policy, value function, reward model, posterior, "
+                f"prior, or reconstruction model: {self._rollout_bc_action_key!r}."
+            )
+            raise ValueError(msg)
         for key in all_obs_keys:
             env.observation_spec[key]
+        if float(self.config.ipmd.rollout_bc_coef) > 0.0:
+            try:
+                env.observation_spec[self._rollout_bc_action_key]
+            except KeyError as err:
+                msg = (
+                    "ipmd.rollout_bc_coef > 0 requires the environment observation "
+                    f"{self._rollout_bc_action_key!r}."
+                )
+                raise ValueError(msg) from err
         self._obs_feature_ndims: dict[ObsKey, int] = {
             key: obs_key_feature_ndim(self.env, key) for key in all_obs_keys
         }
@@ -1012,6 +1132,8 @@ class IPMD(PPO):
             cfg.use_estimated_rewards_for_ppo
         )
         self._bc_coeff: float = float(cfg.bc_coef)
+        self._rollout_bc_coeff: float = float(cfg.rollout_bc_coef)
+        self._bc_pretrain_updates: int = int(cfg.bc_pretrain_updates)
         self._reward_update_enabled: bool = any(
             coeff > 0.0
             for coeff in (
@@ -1143,6 +1265,45 @@ class IPMD(PPO):
                 use_achieved_state=bool(
                     self.config.ipmd.skill_commander_use_achieved_state
                 ),
+                goal_name=str(self.config.ipmd.skill_commander_goal_name),
+                goal_rank=int(self.config.ipmd.skill_commander_goal_rank),
+                discover_env_method=self._discover_env_method,
+                device=self._get_device(self.config.device),
+            )
+        if self._use_latent_command and self._command_source == "token_planner":
+            from rlopt.agent.causal_interface_planner import (  # noqa: PLC0415
+                FrozenCategoricalTokenPlannerSampler,
+            )
+
+            if self._latent_learner is None:
+                msg = "token_planner requires an initialized per-step latent learner."
+                raise RuntimeError(msg)
+            decode_token_ids = getattr(self._latent_learner, "decode_token_ids", None)
+            if not callable(decode_token_ids):
+                msg = (
+                    "token_planner requires latent_learning.method="
+                    "'per_step_vq_sequence'."
+                )
+                raise ValueError(msg)
+            self._hl_skill_command_sampler = FrozenCategoricalTokenPlannerSampler(
+                env=self.env,
+                checkpoint_path=str(self.config.ipmd.token_planner_checkpoint_path),
+                decode_token_ids=decode_token_ids,
+                latent_dim=self._latent_dim,
+                discover_env_method=self._discover_env_method,
+                device=self._get_device(self.config.device),
+            )
+        if self._use_latent_command and self._command_source == "continuous_planner":
+            from rlopt.agent.causal_interface_planner import (  # noqa: PLC0415
+                FrozenContinuousInterfacePlannerSampler,
+            )
+
+            self._hl_skill_command_sampler = FrozenContinuousInterfacePlannerSampler(
+                env=self.env,
+                checkpoint_path=str(
+                    self.config.ipmd.continuous_planner_checkpoint_path
+                ),
+                latent_dim=self._latent_dim,
                 discover_env_method=self._discover_env_method,
                 device=self._get_device(self.config.device),
             )
@@ -1288,7 +1449,12 @@ class IPMD(PPO):
                 dtype=torch.float32,
             )
             return
-        if self._command_source in ("hl_skill", "skill_commander"):
+        if self._command_source in (
+            "hl_skill",
+            "skill_commander",
+            "token_planner",
+            "continuous_planner",
+        ):
             if self._hl_skill_command_sampler is None:
                 msg = "Frozen high-level skill command sampler is unavailable."
                 raise RuntimeError(msg)
@@ -1952,6 +2118,14 @@ class IPMD(PPO):
             "bc_policy_action_rmse",
             "bc_actor_grad_norm",
             "bc_policy_scale_mean",
+            "loss_rollout_bc",
+            "rollout_bc_nll",
+            "rollout_bc_log_prob_mean",
+            "rollout_bc_target_abs_mean",
+            "rollout_bc_policy_action_abs_mean",
+            "rollout_bc_policy_action_mae",
+            "rollout_bc_policy_action_rmse",
+            "bc_pretrain_active",
             "hl_skill_total_loss",
             "hl_skill_pg_loss",
             "hl_skill_diffsr_loss",
@@ -2075,6 +2249,12 @@ class IPMD(PPO):
             output_loss.set(key, value.detach())
         return output_loss
 
+    def _ppo_metrics_without_backward(self, batch: TensorDict) -> TensorDict:
+        """Return PPO diagnostics without adding PPO gradients during BC pretraining."""
+        with torch.no_grad():
+            loss: TensorDict = self.loss_module(batch)
+        return loss.clone().detach_()
+
     def _hl_skill_actor_objective(self, batch: TensorDict) -> Tensor:
         """Return the PPO actor surrogate used to shape the HL skill encoder."""
         loss: TensorDict = self.loss_module(batch)
@@ -2156,7 +2336,9 @@ class IPMD(PPO):
             msg = "BC update requires expert_batch['expert_action'] to be a Tensor."
             raise RuntimeError(msg)
         expert_obs_td = expert_batch.clone(False)
-        if self._latent_key not in expert_obs_td.keys(True):
+        if self._use_latent_command and self._latent_key not in expert_obs_td.keys(
+            True
+        ):
             expert_latents = self._expert_latents_from_td(
                 expert_batch,
                 detach=True,
@@ -2173,6 +2355,35 @@ class IPMD(PPO):
         metrics["loss_bc"] = bc_loss.detach()
         metrics["bc_nll"] = bc_nll.detach()
         return metrics
+
+    def _backward_rollout_bc_terms(self, batch: TensorDict) -> dict[str, Tensor]:
+        """Backpropagate BC from live rollout states to aligned expert actions."""
+        if self._rollout_bc_coeff <= 0.0:
+            return {}
+
+        target = batch.get(self._rollout_bc_action_key)
+        if not isinstance(target, Tensor):
+            msg = f"Rollout BC requires a Tensor at {self._rollout_bc_action_key!r}."
+            raise RuntimeError(msg)
+        policy_obs_td = batch.select(*self._policy_obs_keys)
+        dist = self._policy_operator.get_dist(policy_obs_td)
+        log_prob = dist.log_prob(target)
+        log_prob = self._reduce_log_prob(log_prob, target)
+        rollout_bc_nll = -log_prob.mean()
+        rollout_bc_loss = rollout_bc_nll * self._rollout_bc_coeff
+        rollout_bc_loss.backward()
+
+        policy_action = dist.deterministic_sample
+        error = policy_action - target
+        return {
+            "loss_rollout_bc": rollout_bc_loss.detach(),
+            "rollout_bc_nll": rollout_bc_nll.detach(),
+            "rollout_bc_log_prob_mean": log_prob.detach().mean(),
+            "rollout_bc_target_abs_mean": target.detach().abs().mean(),
+            "rollout_bc_policy_action_abs_mean": policy_action.detach().abs().mean(),
+            "rollout_bc_policy_action_mae": error.detach().abs().mean(),
+            "rollout_bc_policy_action_rmse": error.detach().square().mean().sqrt(),
+        }
 
     def _backward_reward_terms(
         self,
@@ -2396,6 +2607,7 @@ class IPMD(PPO):
             ("episode/length", "ep_len"),
             ("episode/return", "r_ep"),
             ("train/loss_objective", "pi_loss"),
+            ("train/loss_rollout_bc", "rollout_bc"),
             ("train/loss_reward_diff", "reward_diff"),
             ("train/expert_reward_mean", "exp_r"),
             ("time/speed", "fps"),
@@ -2412,6 +2624,10 @@ class IPMD(PPO):
             ("train/loss_reward_grad_penalty", "reward_gp"),
             ("train/loss_bc", "bc_loss"),
             ("train/bc_policy_action_mae", "bc_act_mae"),
+            ("train/loss_rollout_bc", "rollout_bc_loss"),
+            ("train/rollout_bc_policy_action_mae", "rollout_bc_act_mae"),
+            ("train/rollout_bc_target_abs_mean", "rollout_bc_target_abs"),
+            ("train/bc_pretrain_active", "bc_pretrain"),
             ("train/latent_posterior_recon_mae", "latent_recon_mae"),
             ("train/latent_posterior_recon_max_abs", "latent_recon_max"),
         )
@@ -2577,6 +2793,10 @@ class IPMD(PPO):
             self._latent_learner.load_checkpoint_state_dict(
                 data["latent_learner_state_dict"]
             )
+        if self._hl_skill_command_sampler is not None:
+            reset_sampler = getattr(self._hl_skill_command_sampler, "reset", None)
+            if callable(reset_sampler):
+                reset_sampler()
         if (
             self._hl_skill_command_sampler is not None
             and "hl_skill_command_sampler_state_dict" in data
@@ -2824,8 +3044,14 @@ class IPMD(PPO):
             else int(num_network_updates)
         )
         self.optim.zero_grad(set_to_none=True)
-        output_loss = self._backward_ppo_terms(batch)
+        bc_pretrain_active = update_idx < self._bc_pretrain_updates
+        output_loss = (
+            self._ppo_metrics_without_backward(batch)
+            if bc_pretrain_active
+            else self._backward_ppo_terms(batch)
+        )
         bc_metrics = self._backward_bc_terms(expert_batch, has_expert)
+        rollout_bc_metrics = self._backward_rollout_bc_terms(batch)
 
         # Gradient clipping — always call for a fixed graph
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
@@ -2839,6 +3065,16 @@ class IPMD(PPO):
         output_loss.set("alpha", torch.ones((), device=self.device))
         for key, value in bc_metrics.items():
             output_loss.set(key, value)
+        for key, value in rollout_bc_metrics.items():
+            output_loss.set(key, value)
+        output_loss.set(
+            "bc_pretrain_active",
+            torch.tensor(
+                float(bc_pretrain_active),
+                device=self.device,
+                dtype=torch.float32,
+            ),
+        )
         for key, value in hl_skill_metrics.items():
             output_loss.set(key, value.detach())
         output_loss.set("grad_norm", grad_norm_tensor.detach())
