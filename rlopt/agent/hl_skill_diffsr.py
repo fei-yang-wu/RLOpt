@@ -611,17 +611,22 @@ class FrozenHighLevelSkillCommandSampler:
             self.device
         )
         diffsr_state = checkpoint.get("diffsr_state_dict")
-        if diffsr_state is None and (self.finetune_enabled or self.command_mode != "z"):
+        needs_diffsr_checkpoint = self.finetune_enabled or self.command_mode != "z"
+        if diffsr_state is None and needs_diffsr_checkpoint:
             msg = (
                 "Online high-level skill finetuning and non-z command modes "
                 "require checkpoints with diffsr_state_dict."
             )
             raise ValueError(msg)
-        if diffsr_state is not None:
+        if diffsr_state is not None and needs_diffsr_checkpoint:
             self.diffsr.load_state_dict(diffsr_state)
         feature_norm_state = checkpoint.get("feature_normalization_state_dict")
         obs_norm = getattr(self.diffsr, "obs_norm", None)
-        if isinstance(obs_norm, nn.Module) and feature_norm_state:
+        if (
+            needs_diffsr_checkpoint
+            and isinstance(obs_norm, nn.Module)
+            and feature_norm_state
+        ):
             obs_norm.load_state_dict(feature_norm_state)
 
         self.z_norm_coeff = (
@@ -1107,7 +1112,7 @@ class HighLevelSkillDiffSRTrainer:
             weight_decay=self.config.weight_decay,
         )
         self.update = 0
-        
+
         # Optional co-trained skill commander (System-1 planner). BC'd to the
         # encoder's z (detached) from current state + language goal.
         self.commander: nn.Module | None = None
@@ -1704,8 +1709,10 @@ class HighLevelSkillDiffSRTrainer:
                 state, _encoder_input_window(self.config, future_window)
             )
             batch_metrics.update(
-                {f"{prefix}/diversity/{key}": float(value.item())
-                 for key, value in diversity.items()}
+                {
+                    f"{prefix}/diversity/{key}": float(value.item())
+                    for key, value in diversity.items()
+                }
             )
             if self.commander is not None:
                 batch_metrics.update(
@@ -1759,7 +1766,11 @@ class HighLevelSkillDiffSRTrainer:
                     )
                 )
                 eval_loss = metrics.get("train/loss_real_z_eval")
-                if best_path is not None and eval_loss is not None and eval_loss < best_eval:
+                if (
+                    best_path is not None
+                    and eval_loss is not None
+                    and eval_loss < best_eval
+                ):
                     best_eval = float(eval_loss)
                     self.save_checkpoint(best_path)
                 elapsed = time.perf_counter() - start_time

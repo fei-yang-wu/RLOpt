@@ -16,7 +16,16 @@ from rlopt.config_utils import (
     next_obs_key,
 )
 
-IPMD_COMMAND_SOURCES = frozenset({"random", "posterior", "hl_skill", "skill_commander"})
+IPMD_COMMAND_SOURCES = frozenset(
+    {
+        "random",
+        "posterior",
+        "hl_skill",
+        "skill_commander",
+        "token_planner",
+        "continuous_planner",
+    }
+)
 IPMD_REWARD_MODEL_TYPES = frozenset({"mlp", "grouped"})
 IPMD_REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
 IPMD_REWARD_OUTPUT_ACTIVATIONS = frozenset({"none", "tanh", "sigmoid"})

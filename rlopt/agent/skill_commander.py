@@ -36,6 +36,9 @@ from diffusers import DDIMScheduler, DDPMScheduler
 from tensordict import TensorDictBase
 from torch import Tensor, nn
 
+from rlopt.agent.causal_interface_planner import (
+    CausalInterfaceTransformerFlowPlanner,
+)
 from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
     HighLevelSkillDiffSRConfig,
@@ -47,10 +50,10 @@ from rlopt.agent.hl_skill_diffsr import (
     _require_non_negative_float,
     _require_positive_float,
     _require_positive_int,
-    _validate_macro_batch,
+    _resolve_device,
 )
 from rlopt.agent.hl_skill_diffsr import (
-    _resolve_device as _resolve_hl_device,
+    _validate_macro_batch as _validate_hl_macro_batch,
 )
 from rlopt.agent.hl_skill_encoder import build_skill_encoder
 
@@ -254,18 +257,16 @@ class SkillCommanderConfig:
         if not self.diffusion_beta_schedule:
             msg = "diffusion_beta_schedule must be non-empty."
             raise ValueError(msg)
-        self.diffusion_prediction_type = str(
-            self.diffusion_prediction_type
-        ).strip()
+        self.diffusion_prediction_type = str(self.diffusion_prediction_type).strip()
         if self.diffusion_prediction_type != "epsilon":
             msg = (
                 "diffusion_prediction_type currently supports only 'epsilon', "
                 f"got {self.diffusion_prediction_type!r}."
             )
             raise ValueError(msg)
-        self.diffusion_inference_scheduler = str(
-            self.diffusion_inference_scheduler
-        ).strip().lower()
+        self.diffusion_inference_scheduler = (
+            str(self.diffusion_inference_scheduler).strip().lower()
+        )
         if self.diffusion_inference_scheduler not in {"ddpm", "ddim"}:
             msg = (
                 "diffusion_inference_scheduler must be 'ddpm' or 'ddim', "
@@ -278,15 +279,11 @@ class SkillCommanderConfig:
         self.diffusion_inference_noise_std = _require_non_negative_float(
             "diffusion_inference_noise_std", self.diffusion_inference_noise_std
         )
-        self.dit_model_dim = _require_positive_int(
-            "dit_model_dim", self.dit_model_dim
-        )
+        self.dit_model_dim = _require_positive_int("dit_model_dim", self.dit_model_dim)
         self.dit_num_layers = _require_positive_int(
             "dit_num_layers", self.dit_num_layers
         )
-        self.dit_num_heads = _require_positive_int(
-            "dit_num_heads", self.dit_num_heads
-        )
+        self.dit_num_heads = _require_positive_int("dit_num_heads", self.dit_num_heads)
         if self.dit_model_dim % self.dit_num_heads != 0:
             msg = (
                 "dit_model_dim must be divisible by dit_num_heads, got "
@@ -343,9 +340,9 @@ class SkillCommanderConfig:
             for term in self.state_feature_dropout_terms
             if str(term).strip()
         )
-        self.state_feature_dropout_mode = str(
-            self.state_feature_dropout_mode
-        ).strip().lower()
+        self.state_feature_dropout_mode = (
+            str(self.state_feature_dropout_mode).strip().lower()
+        )
         if self.state_feature_dropout_mode not in {"shuffle", "zero", "batch_mean"}:
             msg = (
                 "state_feature_dropout_mode must be one of 'shuffle', 'zero', "
@@ -401,7 +398,9 @@ class SkillCommander(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
+        self.lang_embed_dim = _require_non_negative_int(
+            "lang_embed_dim", lang_embed_dim
+        )
         self.z_dim = _require_positive_int("z_dim", z_dim)
         hidden_dims = tuple(
             _require_positive_int("hidden_dims", dim) for dim in hidden_dims
@@ -469,7 +468,9 @@ class FlowMatchingSkillCommander(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
+        self.lang_embed_dim = _require_non_negative_int(
+            "lang_embed_dim", lang_embed_dim
+        )
         self.z_dim = _require_positive_int("z_dim", z_dim)
         self.time_embed_dim = _require_positive_int("time_embed_dim", time_embed_dim)
         self.num_inference_steps = _require_positive_int(
@@ -485,7 +486,9 @@ class FlowMatchingSkillCommander(nn.Module):
             _require_positive_int("hidden_dims", dim) for dim in hidden_dims
         )
 
-        input_dim = self.z_dim + self.time_embed_dim + self.state_dim + self.lang_embed_dim
+        input_dim = (
+            self.z_dim + self.time_embed_dim + self.state_dim + self.lang_embed_dim
+        )
         layers: list[nn.Module] = []
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
@@ -529,7 +532,9 @@ class FlowMatchingSkillCommander(nn.Module):
             return t.new_zeros((int(t.numel()), self.time_embed_dim))
         scale = torch.arange(half_dim, device=t.device, dtype=torch.float32)
         scale = torch.exp(
-            -torch.log(torch.tensor(10000.0, device=t.device)) * scale / max(half_dim - 1, 1)
+            -torch.log(torch.tensor(10000.0, device=t.device))
+            * scale
+            / max(half_dim - 1, 1)
         )
         args = t[:, None] * scale[None, :]
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
@@ -537,7 +542,9 @@ class FlowMatchingSkillCommander(nn.Module):
             emb = F.pad(emb, (0, self.time_embed_dim - int(emb.shape[-1])))
         return emb
 
-    def _vector_field(self, z_t: Tensor, t: Tensor, state: Tensor, lang_emb: Tensor) -> Tensor:
+    def _vector_field(
+        self, z_t: Tensor, t: Tensor, state: Tensor, lang_emb: Tensor
+    ) -> Tensor:
         self._validate_condition(state, lang_emb)
         expected_z = (int(state.shape[0]), self.z_dim)
         if tuple(z_t.shape) != expected_z:
@@ -559,7 +566,9 @@ class FlowMatchingSkillCommander(nn.Module):
             msg = f"z_target must have shape {expected_z}, got {tuple(z_target.shape)}."
             raise ValueError(msg)
         z0 = self.train_noise_std * torch.randn_like(z_target)
-        t = torch.rand(int(state.shape[0]), device=z_target.device, dtype=z_target.dtype)
+        t = torch.rand(
+            int(state.shape[0]), device=z_target.device, dtype=z_target.dtype
+        )
         t_view = t[:, None]
         z_t = (1.0 - t_view) * z0 + t_view * z_target
         target_velocity = z_target - z0
@@ -597,8 +606,7 @@ class FlowMatchingSkillCommander(nn.Module):
             expected_noise = (batch_size, self.z_dim)
             if tuple(noise.shape) != expected_noise:
                 msg = (
-                    f"noise must have shape {expected_noise}, "
-                    f"got {tuple(noise.shape)}."
+                    f"noise must have shape {expected_noise}, got {tuple(noise.shape)}."
                 )
                 raise ValueError(msg)
             z = noise.to(device=state.device, dtype=state.dtype)
@@ -643,7 +651,9 @@ class DiffusionSkillCommander(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
+        self.lang_embed_dim = _require_non_negative_int(
+            "lang_embed_dim", lang_embed_dim
+        )
         self.z_dim = _require_positive_int("z_dim", z_dim)
         self.time_embed_dim = _require_positive_int("time_embed_dim", time_embed_dim)
         self.num_train_timesteps = _require_positive_int(
@@ -682,9 +692,7 @@ class DiffusionSkillCommander(nn.Module):
             clip_sample=False,
         )
         scheduler_cls = (
-            DDIMScheduler
-            if self.inference_scheduler_name == "ddim"
-            else DDPMScheduler
+            DDIMScheduler if self.inference_scheduler_name == "ddim" else DDPMScheduler
         )
         self.inference_scheduler = scheduler_cls(
             num_train_timesteps=self.num_train_timesteps,
@@ -693,7 +701,9 @@ class DiffusionSkillCommander(nn.Module):
             clip_sample=False,
         )
 
-        input_dim = self.z_dim + self.time_embed_dim + self.state_dim + self.lang_embed_dim
+        input_dim = (
+            self.z_dim + self.time_embed_dim + self.state_dim + self.lang_embed_dim
+        )
         layers: list[nn.Module] = []
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
@@ -826,8 +836,7 @@ class DiffusionSkillCommander(nn.Module):
             expected_noise = (batch_size, self.z_dim)
             if tuple(noise.shape) != expected_noise:
                 msg = (
-                    f"noise must have shape {expected_noise}, "
-                    f"got {tuple(noise.shape)}."
+                    f"noise must have shape {expected_noise}, got {tuple(noise.shape)}."
                 )
                 raise ValueError(msg)
             z = noise.to(device=state.device, dtype=state.dtype)
@@ -888,7 +897,9 @@ class DiTLatentSkillCommander(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = _require_positive_int("state_dim", state_dim)
-        self.lang_embed_dim = _require_non_negative_int("lang_embed_dim", lang_embed_dim)
+        self.lang_embed_dim = _require_non_negative_int(
+            "lang_embed_dim", lang_embed_dim
+        )
         self.z_dim = _require_positive_int("z_dim", z_dim)
         self.model_dim = _require_positive_int("model_dim", model_dim)
         self.num_layers = _require_positive_int("num_layers", num_layers)
@@ -899,9 +910,7 @@ class DiTLatentSkillCommander(nn.Module):
                 f"{self.model_dim} and {self.num_heads}."
             )
             raise ValueError(msg)
-        self.feedforward_dim = _require_positive_int(
-            "feedforward_dim", feedforward_dim
-        )
+        self.feedforward_dim = _require_positive_int("feedforward_dim", feedforward_dim)
         self.patch_dim = _require_positive_int("patch_dim", patch_dim)
         self.num_state_tokens = _require_positive_int(
             "num_state_tokens", num_state_tokens
@@ -943,9 +952,7 @@ class DiTLatentSkillCommander(nn.Module):
             clip_sample=False,
         )
         scheduler_cls = (
-            DDIMScheduler
-            if self.inference_scheduler_name == "ddim"
-            else DDPMScheduler
+            DDIMScheduler if self.inference_scheduler_name == "ddim" else DDPMScheduler
         )
         self.inference_scheduler = scheduler_cls(
             num_train_timesteps=self.num_train_timesteps,
@@ -1137,8 +1144,7 @@ class DiTLatentSkillCommander(nn.Module):
             expected_noise = (batch_size, self.z_dim)
             if tuple(noise.shape) != expected_noise:
                 msg = (
-                    f"noise must have shape {expected_noise}, "
-                    f"got {tuple(noise.shape)}."
+                    f"noise must have shape {expected_noise}, got {tuple(noise.shape)}."
                 )
                 raise ValueError(msg)
             z = noise.to(device=state.device, dtype=state.dtype)
@@ -1307,7 +1313,9 @@ def _build_skill_commander_generator_from_checkpoint(
                 if value is not None
             }
         )
-    hidden_dims = tuple(int(dim) for dim in config.get("generator_hidden_dims", (1024, 512, 512)))
+    hidden_dims = tuple(
+        int(dim) for dim in config.get("generator_hidden_dims", (1024, 512, 512))
+    )
     return _build_skill_commander_generator(
         planner_type=str(config.get("planner_type", "mlp")),
         state_dim=state_dim,
@@ -1328,7 +1336,9 @@ def _build_skill_commander_generator_from_checkpoint(
         diffusion_beta_schedule=str(
             config.get("diffusion_beta_schedule", "squaredcos_cap_v2")
         ),
-        diffusion_prediction_type=str(config.get("diffusion_prediction_type", "epsilon")),
+        diffusion_prediction_type=str(
+            config.get("diffusion_prediction_type", "epsilon")
+        ),
         diffusion_inference_scheduler=str(
             config.get("diffusion_inference_scheduler", "ddpm")
         ),
@@ -1398,6 +1408,7 @@ class SkillCommanderTrainer:
         self.skill_encoder.load_state_dict(skill_checkpoint["skill_encoder_state_dict"])
         self.skill_encoder.eval()
         self.skill_encoder.requires_grad_(False)
+        self.planner_observation_spec = self._planner_observation_spec()
         self.state_feature_slices = self._state_feature_slices()
         self.motion_names = self._expert_trajectory_motion_names()
 
@@ -1475,21 +1486,40 @@ class SkillCommanderTrainer:
         return [str(name) for name in provider()]
 
     def _state_feature_slices(self) -> dict[str, tuple[int, int]]:
-        provider = getattr(self.env, "expert_macro_feature_slices", None)
-        if not callable(provider):
-            return {}
-        raw_slices = provider(int(self.horizon_steps))
+        feature_names = list(self.planner_observation_spec.get("feature_names", ()))
+        feature_widths = list(self.planner_observation_spec.get("feature_widths", ()))
+        if len(feature_names) != len(feature_widths):
+            msg = "planner observation feature_names and feature_widths must match."
+            raise ValueError(msg)
         slices: dict[str, tuple[int, int]] = {}
-        for name, bounds in dict(raw_slices).items():
-            start, end = int(bounds[0]), int(bounds[1])
-            if start < 0 or end <= start or end > self.state_dim:
-                msg = (
-                    "expert_macro_feature_slices returned invalid bounds for "
-                    f"{name!r}: {(start, end)} with state_dim={self.state_dim}."
-                )
+        offset = 0
+        for name, raw_width in zip(feature_names, feature_widths, strict=True):
+            width = int(raw_width)
+            if width <= 0:
+                msg = f"Planner observation feature {name!r} has invalid width {width}."
                 raise ValueError(msg)
-            slices[str(name)] = (start, end)
+            slices[str(name)] = (offset, offset + width)
+            offset += width
+        frame_dim = int(self.planner_observation_spec.get("frame_dim", offset))
+        if offset != frame_dim:
+            msg = f"Planner feature widths sum to {offset}, expected frame_dim={frame_dim}."
+            raise ValueError(msg)
         return slices
+
+    def _planner_observation_spec(self) -> dict[str, Any]:
+        provider = getattr(self.env, "causal_planner_observation_spec", None)
+        if not callable(provider):
+            msg = "env must expose causal_planner_observation_spec(...)."
+            raise ValueError(msg)
+        spec = dict(provider(history_steps=int(self.config.state_history_steps)))
+        expected = int(self.planner_state_dim)
+        if int(spec.get("flat_dim", -1)) != expected:
+            msg = (
+                "Causal planner observation width does not match sampled planner state: "
+                f"{spec.get('flat_dim')} != {expected}."
+            )
+            raise ValueError(msg)
+        return spec
 
     # -- sampling ----------------------------------------------------------
     def _sample_macro_batch(
@@ -1498,9 +1528,9 @@ class SkillCommanderTrainer:
         *,
         split: str | None,
     ) -> TensorDictBase:
-        sampler = getattr(self.env, "sample_expert_macro_transition_batch", None)
+        sampler = getattr(self.env, "sample_causal_planner_training_batch", None)
         if not callable(sampler):
-            msg = "env must expose sample_expert_macro_transition_batch(...)."
+            msg = "env must expose sample_causal_planner_training_batch(...)."
             raise ValueError(msg)
         return sampler(
             batch_size=int(batch_size),
@@ -1508,7 +1538,7 @@ class SkillCommanderTrainer:
             split=split,
             eval_fraction=float(self.config.eval_trajectory_fraction),
             split_seed=int(self.config.trajectory_split_seed),
-            state_history_steps=int(self.config.state_history_steps),
+            history_steps=int(self.config.state_history_steps),
         )
 
     def _sample_and_validate_macro_batch(
@@ -1530,7 +1560,8 @@ class SkillCommanderTrainer:
         future_window = batch.get(("hl", "future_window"))
         target = batch.get(("hl", "target"))
         traj_rank = batch.get(("hl", "traj_rank"))
-        state_history = batch.get(("hl", "state_history"))
+        planner_state_current = batch.get(("planner", "state"))
+        planner_state_history = batch.get(("planner", "state_history"))
         missing = [
             name
             for name, value in (
@@ -1542,8 +1573,10 @@ class SkillCommanderTrainer:
         ]
         if self.condition_on_language and traj_rank is None:
             missing.append("hl/traj_rank")
-        if int(self.config.state_history_steps) > 0 and state_history is None:
-            missing.append("hl/state_history")
+        if planner_state_current is None:
+            missing.append("planner/state")
+        if int(self.config.state_history_steps) > 0 and planner_state_history is None:
+            missing.append("planner/state_history")
         if missing:
             msg = f"Expert macro batch is missing keys: {missing}."
             raise ValueError(msg)
@@ -1557,8 +1590,10 @@ class SkillCommanderTrainer:
                 int(batch_size), device=self.device, dtype=torch.long
             )
         else:
-            traj_rank_t = cast(Tensor, traj_rank).reshape(-1).to(
-                device=self.device, dtype=torch.long
+            traj_rank_t = (
+                cast(Tensor, traj_rank)
+                .reshape(-1)
+                .to(device=self.device, dtype=torch.long)
             )
         if state.ndim != 2:
             msg = f"hl/state must have shape [B, D], got {tuple(state.shape)}."
@@ -1593,19 +1628,26 @@ class SkillCommanderTrainer:
 
         history_steps = int(self.config.state_history_steps)
         if history_steps > 0:
-            state_history_t = cast(Tensor, state_history).to(
+            state_history_t = cast(Tensor, planner_state_history).to(
                 device=self.device, dtype=torch.float32
             )
-            expected_history = (int(batch_size), history_steps + 1, state_dim)
+            planner_frame_dim = int(cast(Tensor, planner_state_current).shape[-1])
+            expected_history = (
+                int(batch_size),
+                history_steps + 1,
+                planner_frame_dim,
+            )
             if tuple(state_history_t.shape) != expected_history:
                 msg = (
-                    "hl/state_history shape mismatch: expected "
+                    "planner/state_history shape mismatch: expected "
                     f"{expected_history}, got {tuple(state_history_t.shape)}."
                 )
                 raise ValueError(msg)
             planner_state = state_history_t.reshape(int(batch_size), -1).contiguous()
         else:
-            planner_state = state
+            planner_state = cast(Tensor, planner_state_current).to(
+                device=self.device, dtype=torch.float32
+            )
         return state, planner_state, future_window, target, traj_rank_t
 
     # -- losses / diagnostics ---------------------------------------------
@@ -1646,10 +1688,11 @@ class SkillCommanderTrainer:
             raise ValueError(msg)
         history_len = int(self.config.state_history_steps) + 1
         slices: list[tuple[int, int]] = []
+        planner_frame_dim = int(self.planner_observation_spec["frame_dim"])
         for term in terms:
             start, end = self.state_feature_slices[term]
             for history_index in range(history_len):
-                offset = history_index * self.state_dim
+                offset = history_index * planner_frame_dim
                 slices.append((offset + start, offset + end))
         return slices
 
@@ -1674,9 +1717,10 @@ class SkillCommanderTrainer:
         if dropout_prob <= 0.0 or len(dropout_slices) == 0:
             return augmented, metrics
 
-        row_mask = torch.rand(
-            int(state.shape[0]), device=state.device, dtype=torch.float32
-        ) < dropout_prob
+        row_mask = (
+            torch.rand(int(state.shape[0]), device=state.device, dtype=torch.float32)
+            < dropout_prob
+        )
         active_rows = int(row_mask.sum().item())
         if active_rows == 0:
             metrics["state_feature_dropout/prob"] = float(dropout_prob)
@@ -1693,8 +1737,10 @@ class SkillCommanderTrainer:
                     dtype=state.dtype,
                 )
             elif mode == "batch_mean":
-                replacement = state[:, start:end].mean(dim=0, keepdim=True).expand(
-                    active_rows, -1
+                replacement = (
+                    state[:, start:end]
+                    .mean(dim=0, keepdim=True)
+                    .expand(active_rows, -1)
                 )
             elif mode == "shuffle":
                 perm = torch.randperm(int(state.shape[0]), device=state.device)
@@ -1746,7 +1792,11 @@ class SkillCommanderTrainer:
     ) -> Tensor:
         if isinstance(
             self.generator,
-            (FlowMatchingSkillCommander, DiffusionSkillCommander, DiTLatentSkillCommander),
+            (
+                FlowMatchingSkillCommander,
+                DiffusionSkillCommander,
+                DiTLatentSkillCommander,
+            ),
         ):
             return self.generator(state, lang, noise=shared_noise)
         return self.generator(state, lang)
@@ -1781,7 +1831,11 @@ class SkillCommanderTrainer:
         shared_noise = None
         if isinstance(
             self.generator,
-            (FlowMatchingSkillCommander, DiffusionSkillCommander, DiTLatentSkillCommander),
+            (
+                FlowMatchingSkillCommander,
+                DiffusionSkillCommander,
+                DiTLatentSkillCommander,
+            ),
         ):
             shared_noise = torch.randn_like(z_target) * float(
                 self.generator.inference_noise_std
@@ -1865,7 +1919,9 @@ class SkillCommanderTrainer:
                     (contrastive_coeff * contrastive_loss).detach().item()
                 ),
             }
-        elif isinstance(self.generator, (DiffusionSkillCommander, DiTLatentSkillCommander)):
+        elif isinstance(
+            self.generator, (DiffusionSkillCommander, DiTLatentSkillCommander)
+        ):
             diffusion_loss, diffusion_metrics = self.generator.diffusion_loss(
                 cmd_state, lang, z_target
             )
@@ -2049,6 +2105,7 @@ class SkillCommanderTrainer:
             "state_dim": int(self.planner_state_dim),
             "macro_state_dim": int(self.state_dim),
             "planner_state_dim": int(self.planner_state_dim),
+            "planner_observation_spec": dict(self.planner_observation_spec),
             "lang_embed_dim": int(self.lang_embed_dim),
             "z_dim": int(self.z_dim),
             "horizon_steps": int(self.horizon_steps),
@@ -2093,6 +2150,8 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         phase_period: int | None = None,
         command_mode: str = "z",
         use_achieved_state: bool = False,
+        goal_name: str = "",
+        goal_rank: int = -1,
         device: torch.device | str | None = None,
     ) -> None:
         # NOTE: we deliberately do not call super().__init__ - that loads a skill
@@ -2124,7 +2183,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             if phase_period is not None
             else self.latent_steps_max
         )
-        self.device = _resolve_hl_device(device, env)
+        self.device = _resolve_device(device, env)
 
         self._current_macro_sampler = discover_env_method(
             env, "current_expert_macro_transition_batch"
@@ -2135,26 +2194,93 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
                 "expose current_expert_macro_transition_batch(...)."
             )
             raise ValueError(msg)
-        # Closed-loop (full-M3) mode: condition the commander on the robot's
-        # achieved macro state instead of the expert-reference state.
+        # Closed-loop mode: condition the commander on robot-only causal history.
         self.use_achieved_state = bool(use_achieved_state)
         self._achieved_macro_sampler = discover_env_method(
-            env, "current_achieved_macro_transition_batch"
+            env, "current_causal_planner_observation"
+        )
+        self._planner_observation_spec_provider = discover_env_method(
+            env, "causal_planner_observation_spec"
         )
         if self.use_achieved_state and self._achieved_macro_sampler is None:
             msg = (
                 "skill_commander_use_achieved_state=True requires the environment "
-                "to expose current_achieved_macro_transition_batch(...)."
+                "to expose current_causal_planner_observation(...)."
+            )
+            raise ValueError(msg)
+        if self.use_achieved_state and self._planner_observation_spec_provider is None:
+            msg = (
+                "skill_commander_use_achieved_state=True requires the environment "
+                "to expose causal_planner_observation_spec(...)."
             )
             raise ValueError(msg)
         self._offline_macro_sampler = None
+        self.forced_language_goal_name = str(goal_name).strip()
+        self.forced_language_goal_rank = int(goal_rank)
+        self.forced_language_embedding: Tensor | None = None
+        if self.forced_language_goal_rank < -1:
+            msg = "goal_rank must be >= -1."
+            raise ValueError(msg)
+        if self.forced_language_goal_name and self.forced_language_goal_rank >= 0:
+            msg = "Set only one of goal_name or goal_rank."
+            raise ValueError(msg)
 
         checkpoint = torch.load(
             Path(checkpoint_path).expanduser(),
             map_location=self.device,
             weights_only=False,
         )
-        self.config = HighLevelSkillDiffSRConfig.from_dict(checkpoint["skill_config"])
+        generator_config_overrides = dict(generator_config_overrides or {})
+        self._uses_shared_interface_planner = (
+            "planner_config" in checkpoint and "planner_state_dict" in checkpoint
+        )
+        shared_sample_metadata: dict[str, Any] = {}
+        source_skill_checkpoint: dict[str, Any] | None = None
+        self.source_skill_checkpoint_path = str(
+            checkpoint.get("skill_checkpoint_path", "")
+        )
+        if self._uses_shared_interface_planner:
+            target_spec = checkpoint.get("target_spec", {})
+            if (
+                not isinstance(target_spec, Mapping)
+                or str(target_spec.get("interface", "")) != "latent_skill"
+            ):
+                msg = "Shared SkillCommander checkpoint must target latent_skill."
+                raise ValueError(msg)
+            checkpoint_metadata = checkpoint.get("metadata", {})
+            if isinstance(checkpoint_metadata, Mapping):
+                raw_sample_metadata = checkpoint_metadata.get("sample_metadata", {})
+                if isinstance(raw_sample_metadata, Mapping):
+                    shared_sample_metadata = dict(raw_sample_metadata)
+            provenance = shared_sample_metadata.get("provenance", {})
+            if isinstance(provenance, Mapping):
+                self.source_skill_checkpoint_path = str(
+                    provenance.get("skill_checkpoint", "")
+                )
+            if not self.source_skill_checkpoint_path:
+                msg = (
+                    "Shared latent planner checkpoint metadata is missing the "
+                    "source skill checkpoint."
+                )
+                raise ValueError(msg)
+            source_skill_checkpoint = torch.load(
+                Path(self.source_skill_checkpoint_path).expanduser(),
+                map_location=self.device,
+                weights_only=False,
+            )
+            source_skill_config = source_skill_checkpoint.get(
+                "skill_config", source_skill_checkpoint.get("config")
+            )
+            if not isinstance(source_skill_config, Mapping):
+                msg = "Source skill checkpoint is missing its skill configuration."
+                raise ValueError(msg)
+            self.config = HighLevelSkillDiffSRConfig.from_dict(
+                dict(source_skill_config)
+            )
+        else:
+            self.config = HighLevelSkillDiffSRConfig.from_dict(
+                checkpoint["skill_config"]
+            )
         if (
             horizon_steps is not None
             and int(horizon_steps) != self.config.horizon_steps
@@ -2188,46 +2314,116 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             )
             raise ValueError(msg)
 
-        config_payload = dict(checkpoint.get("config", {}))
-        self.condition_on_language = _coerce_bool(
-            "condition_on_language",
-            config_payload.get(
+        if self._uses_shared_interface_planner:
+            planner_config = dict(checkpoint["planner_config"])
+            self.condition_on_language = int(planner_config.get("language_dim", 0)) > 0
+            self.state_history_steps = _require_non_negative_int(
+                "state_history_steps",
+                shared_sample_metadata.get("state_history_steps", 0),
+            )
+            self.planner_state_dim = int(planner_config["state_dim"])
+            self.planner_observation_spec = shared_sample_metadata.get(
+                "planner_observation_spec"
+            )
+        else:
+            config_payload = dict(checkpoint.get("config", {}))
+            self.condition_on_language = _coerce_bool(
                 "condition_on_language",
-                checkpoint.get("condition_on_language", True),
-            ),
-        )
-        self.state_history_steps = _require_non_negative_int(
-            "state_history_steps",
-            config_payload.get(
-                "state_history_steps", checkpoint.get("state_history_steps", 0)
-            ),
-        )
-        self.planner_state_dim = int(
-            checkpoint.get("planner_state_dim", checkpoint["state_dim"])
-        )
-        self.state_dim = int(
-            checkpoint.get("macro_state_dim", self.planner_state_dim)
-        )
-        self.lang_embed_dim = int(checkpoint["lang_embed_dim"])
-        self.generator = _build_skill_commander_generator_from_checkpoint(
-            checkpoint,
-            state_dim=self.planner_state_dim,
-            lang_embed_dim=self.lang_embed_dim,
-            z_dim=self.skill_z_dim,
-            config_overrides=generator_config_overrides,
-        ).to(self.device)
-        self.generator.load_state_dict(checkpoint["generator_state_dict"])
+                config_payload.get(
+                    "condition_on_language",
+                    checkpoint.get("condition_on_language", True),
+                ),
+            )
+            self.state_history_steps = _require_non_negative_int(
+                "state_history_steps",
+                config_payload.get(
+                    "state_history_steps", checkpoint.get("state_history_steps", 0)
+                ),
+            )
+            self.planner_state_dim = int(
+                checkpoint.get("planner_state_dim", checkpoint["state_dim"])
+            )
+            self.planner_observation_spec = checkpoint.get("planner_observation_spec")
+        if self.use_achieved_state:
+            if not isinstance(self.planner_observation_spec, Mapping):
+                msg = (
+                    "Deployable skill-commander checkpoints must contain "
+                    "planner_observation_spec. Retrain with causal planner inputs."
+                )
+                raise ValueError(msg)
+            assert self._planner_observation_spec_provider is not None
+            runtime_spec = dict(
+                self._planner_observation_spec_provider(
+                    history_steps=int(self.state_history_steps)
+                )
+            )
+            if dict(self.planner_observation_spec) != runtime_spec:
+                msg = (
+                    "Planner observation specification mismatch between checkpoint "
+                    f"and environment: {dict(self.planner_observation_spec)} != "
+                    f"{runtime_spec}."
+                )
+                raise ValueError(msg)
+            if int(runtime_spec.get("flat_dim", -1)) != self.planner_state_dim:
+                msg = (
+                    "Planner checkpoint width does not match its causal observation "
+                    f"specification: {self.planner_state_dim} != "
+                    f"{runtime_spec.get('flat_dim')}."
+                )
+                raise ValueError(msg)
+        if self._uses_shared_interface_planner:
+            assert source_skill_checkpoint is not None
+            self.state_dim = int(
+                source_skill_checkpoint.get("state_dim", self.planner_state_dim)
+            )
+            self.lang_embed_dim = int(planner_config.get("language_dim", 0))
+            self.generator = CausalInterfaceTransformerFlowPlanner.from_config(
+                dict(checkpoint["planner_config"])
+            ).to(self.device)
+            self.generator.load_state_dict(checkpoint["planner_state_dict"])
+            checkpoint_metadata = checkpoint.get("metadata", {})
+            self.shared_flow_num_inference_steps = int(
+                generator_config_overrides.get(
+                    "flow_num_inference_steps",
+                    checkpoint_metadata.get("flow_num_inference_steps", 16)
+                    if isinstance(checkpoint_metadata, Mapping)
+                    else 16,
+                )
+            )
+            self.shared_flow_inference_noise_std = float(
+                generator_config_overrides.get(
+                    "flow_inference_noise_std",
+                    checkpoint_metadata.get("flow_inference_noise_std", 0.0)
+                    if isinstance(checkpoint_metadata, Mapping)
+                    else 0.0,
+                )
+            )
+        else:
+            self.state_dim = int(
+                checkpoint.get("macro_state_dim", self.planner_state_dim)
+            )
+            self.lang_embed_dim = int(checkpoint["lang_embed_dim"])
+            self.generator = _build_skill_commander_generator_from_checkpoint(
+                checkpoint,
+                state_dim=self.planner_state_dim,
+                lang_embed_dim=self.lang_embed_dim,
+                z_dim=self.skill_z_dim,
+                config_overrides=generator_config_overrides,
+            ).to(self.device)
+            self.generator.load_state_dict(checkpoint["generator_state_dict"])
         self.generator.eval()
         self.generator.requires_grad_(False)
 
         # DiffSR is only needed to expand z -> phi for non-z command modes; load
         # it from the source skill checkpoint the generator distilled against.
-        self.diffsr = None
+        self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
+            self.device
+        )
         if self.command_mode != "z":
             self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
                 self.device
             )
-            skill_checkpoint_path = str(checkpoint.get("skill_checkpoint_path", ""))
+            skill_checkpoint_path = self.source_skill_checkpoint_path
             skill_checkpoint = torch.load(
                 Path(skill_checkpoint_path).expanduser(),
                 map_location=self.device,
@@ -2258,9 +2454,18 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
                     "expose expert_trajectory_motion_names()."
                 )
                 raise ValueError(msg)
-            language_path = str(language_embeddings_path).strip() or str(
-                checkpoint.get("language_embeddings_path", "")
-            ).strip()
+            language_path = (
+                str(language_embeddings_path).strip()
+                or str(checkpoint.get("language_embeddings_path", "")).strip()
+            )
+            if not language_path and self._uses_shared_interface_planner:
+                language_metadata = shared_sample_metadata.get(
+                    "language_conditioning", {}
+                )
+                if isinstance(language_metadata, Mapping):
+                    language_path = str(
+                        language_metadata.get("embedding_path", "")
+                    ).strip()
             if not language_path:
                 msg = (
                     "Language-conditioned skill commander checkpoints require "
@@ -2271,10 +2476,53 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             self.rank_embeddings = build_rank_embedding_lookup(
                 table, [str(name) for name in names_provider()], self.device
             )
+            if (
+                not self.forced_language_goal_name
+                and self.forced_language_goal_rank >= 0
+            ):
+                names = table.get("names")
+                if not isinstance(names, list):
+                    msg = "Language embedding table is missing a list of names."
+                    raise ValueError(msg)
+                if self.forced_language_goal_rank >= len(names):
+                    msg = (
+                        f"goal_rank={self.forced_language_goal_rank} is out of "
+                        f"range for {len(names)} language goals."
+                    )
+                    raise ValueError(msg)
+                self.forced_language_goal_name = str(
+                    names[self.forced_language_goal_rank]
+                )
+            if self.forced_language_goal_name:
+                name_to_index = table["name_to_index"]
+                goal_index = name_to_index.get(self.forced_language_goal_name)
+                if goal_index is None:
+                    msg = (
+                        "Language embedding table has no entry for forced goal "
+                        f"{self.forced_language_goal_name!r}."
+                    )
+                    raise ValueError(msg)
+                embeddings = cast(Tensor, table["embeddings"]).to(
+                    device=self.device, dtype=torch.float32
+                )
+                self.forced_language_embedding = embeddings[int(goal_index)].reshape(
+                    1, -1
+                )
         else:
             self.rank_embeddings = torch.empty(
                 (0, 0), device=self.device, dtype=torch.float32
             )
+        if (
+            self.use_achieved_state
+            and self.condition_on_language
+            and self.forced_language_embedding is None
+        ):
+            msg = (
+                "Deployable language-conditioned skill commander inference "
+                "requires an explicit goal_name or goal_rank; trajectory rank "
+                "cannot be read from the expert reference."
+            )
+            raise ValueError(msg)
 
         # Rollout command buffers (managed by the inherited sample_for_step).
         self._codes: Tensor | None = None
@@ -2316,11 +2564,41 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             raise ValueError(msg)
         return state_history_t.reshape(int(batch_size), -1).contiguous()
 
+    def _causal_planner_state_from_batch(
+        self,
+        batch: TensorDictBase,
+        *,
+        batch_size: int,
+    ) -> Tensor:
+        state = batch.get(("planner", "state"))
+        history = batch.get(("planner", "state_history"))
+        selected = history if int(self.state_history_steps) > 0 else state
+        if selected is None:
+            key = (
+                "planner/state_history"
+                if int(self.state_history_steps) > 0
+                else "planner/state"
+            )
+            msg = f"Causal planner batch is missing {key}."
+            raise ValueError(msg)
+        selected_t = cast(Tensor, selected).to(device=self.device, dtype=torch.float32)
+        planner_state = selected_t.reshape(int(batch_size), -1).contiguous()
+        expected = (int(batch_size), int(self.planner_state_dim))
+        if tuple(planner_state.shape) != expected:
+            msg = (
+                "Causal planner state shape mismatch: expected "
+                f"{expected}, got {tuple(planner_state.shape)}."
+            )
+            raise ValueError(msg)
+        return planner_state
+
     def _lang_from_batch(self, batch: TensorDictBase, *, batch_size: int) -> Tensor:
         if not self.condition_on_language:
             return torch.empty(
                 (int(batch_size), 0), device=self.device, dtype=torch.float32
             )
+        if self.forced_language_embedding is not None:
+            return self.forced_language_embedding.expand(int(batch_size), -1)
         traj_rank = batch.get(("hl", "traj_rank"))
         if traj_rank is None:
             msg = (
@@ -2328,8 +2606,8 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
                 "language-skill command generation."
             )
             raise ValueError(msg)
-        traj_rank_t = cast(Tensor, traj_rank).reshape(-1).to(
-            device=self.device, dtype=torch.long
+        traj_rank_t = (
+            cast(Tensor, traj_rank).reshape(-1).to(device=self.device, dtype=torch.long)
         )
         expected = (int(batch_size),)
         if tuple(traj_rank_t.shape) != expected:
@@ -2345,33 +2623,58 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         self,
         env_ids: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        macro_sampler = (
-            self._achieved_macro_sampler
-            if self.use_achieved_state
-            else self._current_macro_sampler
-        )
-        batch = macro_sampler(
-            horizon_steps=int(self.config.horizon_steps),
-            env_ids=env_ids,
-            state_history_steps=int(self.state_history_steps),
-        )
         batch_size = int(env_ids.numel())
-        state, future_window, target = _validate_macro_batch(
-            batch,
-            batch_size=batch_size,
-            horizon_steps=int(self.config.horizon_steps),
-            device=self.device,
-            state_dim=self.state_dim,
-            source="Current skill-commander",
-        )
-        planner_state = self._planner_state_from_batch(
-            batch,
-            state,
-            batch_size=batch_size,
-            source="Current skill-commander",
-        )
-        lang = self._lang_from_batch(batch, batch_size=batch_size)
-        z = self.generator(planner_state, lang)
+        if self.use_achieved_state:
+            assert self._achieved_macro_sampler is not None
+            causal_batch = self._achieved_macro_sampler(
+                env_ids=env_ids,
+                history_steps=int(self.state_history_steps),
+            )
+            planner_state = self._causal_planner_state_from_batch(
+                causal_batch, batch_size=batch_size
+            )
+            state = torch.zeros(
+                (batch_size, self.state_dim),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            future_window = torch.zeros(
+                (batch_size, int(self.config.horizon_steps), self.state_dim),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            target = torch.zeros_like(state)
+            lang = self._lang_from_batch(causal_batch, batch_size=batch_size)
+        else:
+            batch = self._current_macro_sampler(
+                horizon_steps=int(self.config.horizon_steps),
+                env_ids=env_ids,
+                state_history_steps=int(self.state_history_steps),
+            )
+            state, future_window, target = _validate_hl_macro_batch(
+                batch,
+                batch_size=batch_size,
+                horizon_steps=int(self.config.horizon_steps),
+                device=self.device,
+                state_dim=self.state_dim,
+                source="Current skill-commander",
+            )
+            planner_state = self._planner_state_from_batch(
+                batch,
+                state,
+                batch_size=batch_size,
+                source="Current skill-commander",
+            )
+            lang = self._lang_from_batch(batch, batch_size=batch_size)
+        if self._uses_shared_interface_planner:
+            z = self.generator(
+                planner_state,
+                num_inference_steps=int(self.shared_flow_num_inference_steps),
+                inference_noise_std=float(self.shared_flow_inference_noise_std),
+                language=lang,
+            )
+        else:
+            z = self.generator(planner_state, lang)
         # initial_z mirrors z; it is only consumed by the (disabled) finetune path.
         return z, state, future_window, target, z
 

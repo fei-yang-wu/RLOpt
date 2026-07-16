@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 from rlopt.agent.ase import ASE, ASEConfig, ASERLOptConfig
+from rlopt.agent.causal_interface_planner import (
+    CausalInterfaceTransformerCategoricalPlanner,
+    CausalInterfaceTransformerFlowPlanner,
+)
 from rlopt.agent.fast_td3 import FastTD3, FastTD3RLOptConfig
 from rlopt.agent.gail import AMP, GAIL, AMPRLOptConfig, GAILRLOptConfig
 from rlopt.agent.hl_skill_diffsr import (
@@ -47,6 +51,8 @@ __all__ = [
     "AMPRLOptConfig",
     "ASEConfig",
     "ASERLOptConfig",
+    "CausalInterfaceTransformerCategoricalPlanner",
+    "CausalInterfaceTransformerFlowPlanner",
     "DiTLatentSkillCommander",
     "DiffusionSkillCommander",
     "FastSAC",

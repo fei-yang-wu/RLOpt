@@ -15,6 +15,9 @@ warnings.filterwarnings(
     append=False,
 )
 
+from rlopt.agent.causal_interface_planner import (  # noqa: E402
+    CausalInterfaceTransformerFlowPlanner,
+)
 from rlopt.agent.hl_skill_diffsr import (  # noqa: E402
     HighLevelSkillDiffSRConfig,
     HighLevelSkillDiffSRTrainer,
@@ -102,6 +105,48 @@ class _FakeMacroEnv:
         )
         return TensorDict({"hl": hl}, batch_size=[batch_size])
 
+    def sample_causal_planner_training_batch(
+        self,
+        batch_size: int,
+        horizon_steps: int,
+        split: str | None = None,
+        eval_fraction: float = 0.1,
+        split_seed: int = 0,
+        history_steps: int = 0,
+    ) -> TensorDict:
+        batch = self.sample_expert_macro_transition_batch(
+            batch_size=batch_size,
+            horizon_steps=horizon_steps,
+            split=split,
+            eval_fraction=eval_fraction,
+            split_seed=split_seed,
+            state_history_steps=history_steps,
+        )
+        state = batch.get(("hl", "state"))
+        history = batch.get(("hl", "state_history"))
+        if history is None:
+            history = state.unsqueeze(1)
+        planner = TensorDict(
+            {"state": state, "state_history": history}, batch_size=[batch_size]
+        )
+        batch.set("planner", planner)
+        return batch
+
+    def causal_planner_observation_spec(self, history_steps: int = 0) -> dict[str, Any]:
+        return {
+            "name": "fake_causal_robot_history",
+            "version": 1,
+            "feature_names": ["robot_state"],
+            "feature_widths": [self.state_dim],
+            "frame_dim": self.state_dim,
+            "history_steps": int(history_steps),
+            "history_frames": int(history_steps) + 1,
+            "flat_dim": (int(history_steps) + 1) * self.state_dim,
+            "history_order": "oldest_to_newest",
+            "reset_padding": "repeat_initial_observation",
+            "reference_features": [],
+        }
+
     def current_expert_macro_transition_batch(
         self,
         *,
@@ -129,10 +174,32 @@ class _FakeMacroEnv:
             state_history_steps=state_history_steps,
         )
 
+    def current_causal_planner_observation(
+        self,
+        *,
+        env_ids: torch.Tensor | None = None,
+        history_steps: int = 0,
+    ) -> TensorDict:
+        batch_size = 2 if env_ids is None else int(env_ids.numel())
+        gen = torch.Generator().manual_seed(9000 + self.calls)
+        history = torch.randn(
+            batch_size,
+            int(history_steps) + 1,
+            self.state_dim,
+            generator=gen,
+        )
+        planner = TensorDict(
+            {"state": history[:, -1], "state_history": history},
+            batch_size=[batch_size],
+        )
+        return TensorDict({"planner": planner}, batch_size=[batch_size])
+
     def expert_trajectory_motion_names(self) -> list[str]:
         return list(self.motion_names)
 
-    def expert_macro_feature_slices(self, horizon_steps: int) -> dict[str, tuple[int, int]]:
+    def expert_macro_feature_slices(
+        self, horizon_steps: int
+    ) -> dict[str, tuple[int, int]]:
         assert int(horizon_steps) == self.horizon_steps
         split = max(1, min(3, self.state_dim))
         return {
@@ -400,7 +467,6 @@ def test_checkpoint_roundtrips_generator(tmp_path) -> None:
         assert key in saved
 
 
-
 def test_no_language_history_flow_trainer_checkpoint_and_sampler(tmp_path) -> None:
     torch.manual_seed(16)
     env = _FakeMacroEnv(deterministic=False)
@@ -645,7 +711,7 @@ def test_state_feature_dropout_targets_named_slices(tmp_path) -> None:
             skill_ckpt,
             lang_table,
             state_feature_dropout_prob=1.0,
-            state_feature_dropout_terms=("expert_motion",),
+            state_feature_dropout_terms=("robot_state",),
             state_feature_dropout_mode="zero",
             state_feature_dropout_warmup_updates=2,
         ),
@@ -658,10 +724,11 @@ def test_state_feature_dropout_targets_named_slices(tmp_path) -> None:
 
     trainer.update = 2
     augmented, metrics = trainer._augment_state(state)
-    assert torch.count_nonzero(augmented[:, :3]).item() == 0
-    assert torch.allclose(augmented[:, 3:], torch.ones(4, env.state_dim - 3))
+    assert torch.count_nonzero(augmented).item() == 0
     assert metrics["state_feature_dropout/active_frac"] == pytest.approx(1.0)
-    assert metrics["state_feature_dropout/num_features"] == pytest.approx(3.0)
+    assert metrics["state_feature_dropout/num_features"] == pytest.approx(
+        float(env.state_dim)
+    )
 
 
 @pytest.mark.parametrize(
@@ -787,6 +854,12 @@ def test_frozen_commander_uses_achieved_state(tmp_path) -> None:
     gen_ckpt = tmp_path / "generator.pt"
     trainer.save_checkpoint(gen_ckpt)
 
+    def blocked_expert_getter(**_kwargs):
+        msg = "deployable inference must not read expert macro state"
+        raise AssertionError(msg)
+
+    env.current_expert_macro_transition_batch = blocked_expert_getter  # type: ignore[method-assign]
+
     sampler = FrozenSkillCommanderSampler(
         env=env,
         checkpoint_path=gen_ckpt,
@@ -797,9 +870,140 @@ def test_frozen_commander_uses_achieved_state(tmp_path) -> None:
         discover_env_method=_discover_direct_method,
         command_mode="z",
         use_achieved_state=True,
+        goal_name="motion_0",
         device="cpu",
     )
     assert sampler.use_achieved_state
     td = TensorDict({}, batch_size=[2])
     out = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
     assert out.shape == (2, 5)
+
+
+def test_frozen_commander_loads_shared_interface_planner(tmp_path) -> None:
+    env = _FakeMacroEnv(deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    planner = CausalInterfaceTransformerFlowPlanner(
+        state_dim=env.state_dim,
+        target_dim=5,
+        term_widths=(5,),
+        d_model=16,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=32,
+        patch_dim=4,
+        num_state_tokens=1,
+    )
+    checkpoint = {
+        "planner_config": planner.config_dict(),
+        "planner_state_dict": planner.state_dict(),
+        "target_spec": {
+            "interface": "latent_skill",
+            "term_names": ["z"],
+            "term_widths": [5],
+            "target_dim": 5,
+        },
+        "metadata": {
+            "flow_num_inference_steps": 2,
+            "flow_inference_noise_std": 0.0,
+            "sample_metadata": {
+                "state_history_steps": 0,
+                "planner_observation_spec": env.causal_planner_observation_spec(0),
+                "provenance": {"skill_checkpoint": str(skill_ckpt)},
+            },
+        },
+    }
+    planner_ckpt = tmp_path / "shared_planner.pt"
+    torch.save(checkpoint, planner_ckpt)
+
+    def blocked_expert_getter(**_kwargs):
+        msg = "shared deployable planner must not read expert state"
+        raise AssertionError(msg)
+
+    env.current_expert_macro_transition_batch = blocked_expert_getter  # type: ignore[method-assign]
+    sampler = FrozenSkillCommanderSampler(
+        env=env,
+        checkpoint_path=planner_ckpt,
+        language_embeddings_path="",
+        latent_dim=5,
+        latent_steps_min=env.horizon_steps,
+        latent_steps_max=env.horizon_steps,
+        horizon_steps=env.horizon_steps,
+        discover_env_method=_discover_direct_method,
+        command_mode="z",
+        use_achieved_state=True,
+        device="cpu",
+    )
+    td = TensorDict({}, batch_size=[2])
+    out = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+    assert out.shape == (2, 5)
+
+
+def test_frozen_shared_planner_uses_explicit_language_goal(tmp_path) -> None:
+    env = _FakeMacroEnv(deterministic=False)
+    skill_ckpt = _make_skill_checkpoint(tmp_path, env)
+    language_path = _make_language_table(tmp_path, env.motion_names, embed_dim=5)
+    planner = CausalInterfaceTransformerFlowPlanner(
+        state_dim=env.state_dim,
+        target_dim=5,
+        term_widths=(5,),
+        d_model=16,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=32,
+        patch_dim=4,
+        num_state_tokens=1,
+        language_dim=5,
+        num_language_tokens=1,
+    )
+    checkpoint = {
+        "planner_config": planner.config_dict(),
+        "planner_state_dict": planner.state_dict(),
+        "target_spec": {
+            "interface": "latent_skill",
+            "term_names": ["z"],
+            "term_widths": [5],
+            "target_dim": 5,
+        },
+        "metadata": {
+            "flow_num_inference_steps": 2,
+            "flow_inference_noise_std": 0.0,
+            "sample_metadata": {
+                "state_history_steps": 0,
+                "planner_observation_spec": env.causal_planner_observation_spec(0),
+                "language_conditioning": {
+                    "enabled": True,
+                    "embedding_dim": 5,
+                    "embedding_path": str(language_path),
+                },
+                "provenance": {"skill_checkpoint": str(skill_ckpt)},
+            },
+        },
+    }
+    planner_ckpt = tmp_path / "shared_language_planner.pt"
+    torch.save(checkpoint, planner_ckpt)
+
+    def blocked_expert_getter(**_kwargs):
+        msg = "language planner must not read expert state"
+        raise AssertionError(msg)
+
+    env.current_expert_macro_transition_batch = blocked_expert_getter  # type: ignore[method-assign]
+    sampler = FrozenSkillCommanderSampler(
+        env=env,
+        checkpoint_path=planner_ckpt,
+        language_embeddings_path=language_path,
+        latent_dim=5,
+        latent_steps_min=env.horizon_steps,
+        latent_steps_max=env.horizon_steps,
+        horizon_steps=env.horizon_steps,
+        discover_env_method=_discover_direct_method,
+        command_mode="z",
+        use_achieved_state=True,
+        goal_name=env.motion_names[0],
+        device="cpu",
+    )
+    td = TensorDict({}, batch_size=[2])
+    out = sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert out.shape == (2, 5)
+    assert sampler.condition_on_language
+    assert sampler.forced_language_embedding is not None
