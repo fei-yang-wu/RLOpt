@@ -363,7 +363,10 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
             msg = "patch_autoencoder failed to infer collector latents."
             raise RuntimeError(msg)
         latents = latents.to(self.agent.device).reshape(-1, self.agent._latent_dim)
-        if self._collector_latents is None or self._collector_latents.shape != latents.shape:
+        if (
+            self._collector_latents is None
+            or self._collector_latents.shape != latents.shape
+        ):
             self._collector_latents = latents.clone()
         else:
             self._collector_latents[renew_mask] = latents[renew_mask]
@@ -395,7 +398,9 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
             or self._collector_latents.shape[1] != command_dim
             or self._collector_latents.device != device
         ):
-            self._collector_latents = torch.zeros(batch_size, command_dim, device=device)
+            self._collector_latents = torch.zeros(
+                batch_size, command_dim, device=device
+            )
             self._collector_steps = torch.zeros(
                 batch_size, device=device, dtype=torch.long
             )
@@ -459,7 +464,7 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
         *,
         detach: bool,
     ) -> Tensor:
-        """Sample latent from the posterior distribution z \sim p(\cdot|s').
+        """Sample a latent from the posterior distribution conditioned on a patch.
             Patch here means a windows of expert transitions that centered at the current timestep.
 
         Args:
@@ -564,6 +569,298 @@ class PatchAutoencoderLatentLearner(BaseLatentLearner):
             "ipmd/latent_posterior_recon_mse": float(recon_loss.detach().item()),
             "ipmd/latent_posterior_recon_mae": float(recon_mae.detach().item()),
             "ipmd/latent_posterior_recon_max_abs": float(recon_max_abs.detach().item()),
+            "ipmd/latent_weight_decay": float(weight_decay.detach().item()),
+        }
+
+
+class FutureCVAELatentLearner(PatchAutoencoderLatentLearner):
+    """CVAE that compresses a future reference window into one held command.
+
+    The posterior reads ``posterior_input_keys`` (normally the current reference
+    plus a future window), while the learned prior reads ``prior_input_keys``
+    (normally the current reference only). The decoder reconstructs
+    ``reconstruction_target_keys`` from the prior features and sampled latent.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.posterior: GaussianLatentModel | None = None
+        self.prior: GaussianLatentModel | None = None
+        self.decoder = None
+        self.optimizer = None
+
+    def _prior_input_keys(self) -> list[BatchKey]:
+        assert self.agent is not None
+        keys = list(self.agent._prior_obs_keys)
+        if not keys:
+            msg = (
+                "future_cvae requires latent_learning.prior_input_keys so the "
+                "learned prior has an explicit current-reference input."
+            )
+            raise ValueError(msg)
+        return keys
+
+    def _target_keys(self) -> list[BatchKey]:
+        assert self.agent is not None
+        return list(self.agent._reconstruction_target_obs_keys)
+
+    def required_expert_batch_keys(self) -> list[BatchKey]:
+        return dedupe_keys(
+            [
+                *self._posterior_input_keys(),
+                *self._prior_input_keys(),
+                *self._target_keys(),
+            ]
+        )
+
+    def _features_from_td(
+        self,
+        td: TensorDict,
+        keys: list[BatchKey],
+        *,
+        detach: bool,
+    ) -> Tensor:
+        assert self.agent is not None
+        parts: list[Tensor] = []
+        for key in keys:
+            value = cast(Tensor, td.get(key)).to(self.agent.device)
+            value = value.detach() if detach else value
+            parts.append(value.reshape(value.shape[0], -1))
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
+    def _ensure_modules(self, input_dim: int | None = None) -> None:
+        del input_dim
+        assert self.agent is not None
+        cfg = self._config()
+        posterior_dim = sum(
+            self.agent._obs_feature_dims[key] for key in self._posterior_input_keys()
+        )
+        prior_dim = sum(
+            self.agent._obs_feature_dims[key] for key in self._prior_input_keys()
+        )
+        target_dim = sum(
+            self.agent._obs_feature_dims[key] for key in self._target_keys()
+        )
+        if self.posterior is None:
+            self.posterior = GaussianLatentModel(
+                input_dim=posterior_dim,
+                latent_dim=self.agent._latent_dim,
+                hidden_dims=list(cfg.encoder_hidden_dims),
+                activation=cfg.encoder_activation,
+                log_std_min=float(cfg.log_std_min),
+                log_std_max=float(cfg.log_std_max),
+            ).to(self.agent.device)
+        if self.prior is None:
+            self.prior = GaussianLatentModel(
+                input_dim=prior_dim,
+                latent_dim=self.agent._latent_dim,
+                hidden_dims=list(cfg.prior_hidden_dims),
+                activation=cfg.prior_activation,
+                log_std_min=float(cfg.log_std_min),
+                log_std_max=float(cfg.log_std_max),
+            ).to(self.agent.device)
+        if self.decoder is None:
+            self.decoder = LatentDecoder(
+                latent_dim=prior_dim + self.agent._latent_dim,
+                output_dim=target_dim,
+                hidden_dims=list(cfg.decoder_hidden_dims),
+                activation=cfg.decoder_activation,
+            ).to(self.agent.device)
+        if self.optimizer is None:
+            params = list(self.prior.parameters()) + list(self.decoder.parameters())
+            if not bool(cfg.freeze_encoder):
+                params = list(self.posterior.parameters()) + params
+            self.optimizer = torch.optim.Adam(params, lr=float(cfg.lr))
+
+    def initialize(self, agent: IPMD) -> None:
+        BaseLatentLearner.initialize(self, agent)
+        self._ensure_modules()
+
+    @staticmethod
+    def _sample(mean: Tensor, log_std: Tensor) -> Tensor:
+        return mean + torch.randn_like(mean) * log_std.exp()
+
+    @staticmethod
+    def _kl_divergence(
+        q_mean: Tensor,
+        q_log_std: Tensor,
+        p_mean: Tensor,
+        p_log_std: Tensor,
+    ) -> Tensor:
+        q_var = torch.exp(2.0 * q_log_std)
+        p_var = torch.exp(2.0 * p_log_std)
+        kl = 0.5 * (
+            2.0 * (p_log_std - q_log_std)
+            + (q_var + (q_mean - p_mean).pow(2)) / p_var
+            - 1.0
+        )
+        return kl.sum(dim=-1).mean()
+
+    def infer_batch_latents(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+        context: str,
+    ) -> Tensor | None:
+        del context
+        self._ensure_modules()
+        posterior_input = self._features_from_td(
+            batch,
+            self._posterior_input_keys(),
+            detach=detach,
+        )
+        assert self.posterior is not None
+        mean, _ = self.posterior(posterior_input)
+        return mean.detach() if detach else mean
+
+    def infer_expert_latents(
+        self,
+        expert_batch: TensorDict,
+        *,
+        detach: bool,
+    ) -> Tensor:
+        latent = self.infer_batch_latents(
+            expert_batch,
+            detach=detach,
+            context="future CVAE expert posterior",
+        )
+        if latent is None:
+            msg = "future_cvae failed to infer expert latents."
+            raise RuntimeError(msg)
+        return latent
+
+    def reconstruct_batch_features(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+        context: str,
+    ) -> Tensor | None:
+        del context
+        self._ensure_modules()
+        posterior_input = self._features_from_td(
+            batch,
+            self._posterior_input_keys(),
+            detach=detach,
+        )
+        prior_input = self._features_from_td(
+            batch,
+            self._prior_input_keys(),
+            detach=detach,
+        )
+        assert self.posterior is not None
+        assert self.decoder is not None
+        if detach:
+            with torch.no_grad():
+                mean, _ = self.posterior(posterior_input)
+                return self.decoder(torch.cat((prior_input, mean), dim=-1))
+        mean, _ = self.posterior(posterior_input)
+        return self.decoder(torch.cat((prior_input, mean), dim=-1))
+
+    def sample_expert_prior_latents(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        assert self.agent is not None
+        expert_batch = self.agent._next_expert_batch(
+            batch_size,
+            required_keys=self._prior_input_keys(),
+        )
+        prior_input = self._features_from_td(
+            expert_batch,
+            self._prior_input_keys(),
+            detach=True,
+        )
+        self._ensure_modules()
+        assert self.prior is not None
+        with torch.no_grad():
+            mean, log_std = self.prior(prior_input)
+            latents = self._sample(mean, log_std)
+        return latents.to(device=device, dtype=dtype)
+
+    def update(self, rollout_flat: TensorDict) -> dict[str, float]:
+        del rollout_flat
+        assert self.agent is not None
+        cfg = self._config()
+        if float(cfg.recon_coeff) <= 0.0 and float(cfg.kl_coeff) <= 0.0:
+            return {}
+        expert_td = self.agent._next_expert_batch(
+            required_keys=self.required_expert_batch_keys()
+        )
+        if expert_td.numel() <= 0:
+            return {}
+        self._ensure_modules()
+        assert self.posterior is not None
+        assert self.prior is not None
+        assert self.decoder is not None
+        assert self.optimizer is not None
+
+        posterior_input = self._features_from_td(
+            expert_td,
+            self._posterior_input_keys(),
+            detach=False,
+        )
+        prior_input = self._features_from_td(
+            expert_td,
+            self._prior_input_keys(),
+            detach=False,
+        )
+        target = self._features_from_td(
+            expert_td,
+            self._target_keys(),
+            detach=True,
+        )
+        if bool(cfg.freeze_encoder):
+            with torch.no_grad():
+                q_mean, q_log_std = self.posterior(posterior_input)
+            q_mean = q_mean.detach()
+            q_log_std = q_log_std.detach()
+        else:
+            q_mean, q_log_std = self.posterior(posterior_input)
+        p_mean, p_log_std = self.prior(prior_input)
+        latent = self._sample(q_mean, q_log_std)
+        prediction = self.decoder(torch.cat((prior_input, latent), dim=-1))
+
+        recon_loss = F.mse_loss(prediction, target)
+        kl_loss = self._kl_divergence(q_mean, q_log_std, p_mean, p_log_std)
+        weight_decay = torch.zeros((), device=self.agent.device)
+        if float(cfg.weight_decay_coeff) > 0.0:
+            modules: list[nn.Module] = [self.prior, self.decoder]
+            if not bool(cfg.freeze_encoder):
+                modules.insert(0, self.posterior)
+            for module in modules:
+                for param in module.parameters():
+                    if param.ndim >= 2:
+                        weight_decay = weight_decay + param.pow(2).mean()
+
+        total_loss = (
+            float(cfg.recon_coeff) * recon_loss
+            + float(cfg.kl_coeff) * kl_loss
+            + float(cfg.weight_decay_coeff) * weight_decay
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
+        if float(cfg.grad_clip_norm) > 0.0:
+            params: list[nn.Parameter] = list(self.prior.parameters()) + list(
+                self.decoder.parameters()
+            )
+            if not bool(cfg.freeze_encoder):
+                params = list(self.posterior.parameters()) + params
+            clip_grad_norm_(params, float(cfg.grad_clip_norm))
+        self.optimizer.step()
+
+        error = prediction.detach() - target
+        return {
+            "ipmd/latent_total_loss": float(total_loss.detach().item()),
+            "ipmd/latent_recon_loss": float(recon_loss.detach().item()),
+            "ipmd/latent_kl_loss": float(kl_loss.detach().item()),
+            "ipmd/latent_recon_mae": float(error.abs().mean().item()),
+            "ipmd/latent_posterior_std": float(q_log_std.exp().mean().detach().item()),
+            "ipmd/latent_prior_std": float(p_log_std.exp().mean().detach().item()),
             "ipmd/latent_weight_decay": float(weight_decay.detach().item()),
         }
 
@@ -1226,6 +1523,14 @@ class FSQQuantizer(nn.Module):
         code = (zhat * self._basis.to(zhat.device)).sum(dim=-1)
         return z_q, code, bounded
 
+    def indices_to_codes(self, code: Tensor) -> Tensor:
+        """Convert mixed-radix token IDs back to FSQ vectors."""
+        code = code.to(device=self.levels.device, dtype=torch.long)
+        levels_i = self._levels_i.to(code.device)
+        basis = self._basis.to(code.device)
+        indices = (code.unsqueeze(-1) // basis) % levels_i
+        return (indices - levels_i // 2).to(self.levels.dtype)
+
 
 class EMAVQQuantizer(nn.Module):
     """Standard VQ-VAE quantizer with EMA codebook updates + commitment loss."""
@@ -1628,6 +1933,18 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
             out["aux_loss"] = torch.zeros((), device=z_e.device)
         return out
 
+    def _quantize_for_inference(self, z_e: Tensor) -> dict[str, Tensor]:
+        """Quantize without stochastic Gumbel draws or EMA codebook mutation."""
+        module: nn.Module | None = self.fsq or self.vq or self.gumbel
+        was_training = module.training if module is not None else False
+        if module is not None:
+            module.eval()
+        try:
+            return self._quantize(z_e)
+        finally:
+            if module is not None:
+                module.train(was_training)
+
     def _project_to_code_latent(self, z_q: Tensor) -> Tensor:
         if self.code_to_latent is None:
             return z_q
@@ -1657,7 +1974,7 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
         if detach:
             with torch.no_grad():
                 z_e = self.encoder(features)
-                quant = self._quantize(z_e)
+                quant = self._quantize_for_inference(z_e)
                 return self._project_to_code_latent(quant["z_q"])
         z_e = self.encoder(features)
         quant = self._quantize(z_e)
@@ -1711,7 +2028,7 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
         if detach:
             with torch.no_grad():
                 z_e = self.encoder(features)
-                quant = self._quantize(z_e)
+                quant = self._quantize_for_inference(z_e)
                 return self.decoder(quant["z_q"])
         z_e = self.encoder(features)
         quant = self._quantize(z_e)
@@ -1952,13 +2269,221 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
         return 0
 
 
+class PerStepVQSequenceLatentLearner(PatchVQVAELatentLearner):
+    """Quantize every step in a reference segment and consume one token per step.
+
+    Unlike ``patch_vqvae``, this learner does not encode one flattened window
+    and hold one code. It reshapes every configured window term into an
+    explicit horizon, encodes each step independently, snapshots the whole
+    token packet at a command boundary, and publishes the next token at every
+    50 Hz control step.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._collector_packet: Tensor | None = None
+        self._collector_cursor: Tensor | None = None
+
+    def _horizon(self) -> int:
+        return int(self._config().token_sequence_horizon)
+
+    def _features_from_td(
+        self,
+        td: TensorDict,
+        *,
+        detach: bool,
+    ) -> Tensor:
+        assert self.agent is not None
+        horizon = self._horizon()
+        parts: list[Tensor] = []
+        for key in self._posterior_input_keys():
+            value = cast(Tensor, td.get(key)).to(self.agent.device)
+            value = value.detach() if detach else value
+            flat = value.reshape(value.shape[0], -1)
+            if flat.shape[-1] % horizon != 0:
+                msg = (
+                    "per_step_vq_sequence requires every posterior window width "
+                    f"to be divisible by token_sequence_horizon={horizon}, but "
+                    f"key {key!r} has width {flat.shape[-1]}."
+                )
+                raise ValueError(msg)
+            parts.append(flat.reshape(flat.shape[0], horizon, -1))
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
+    def initialize(self, agent: IPMD) -> None:
+        BaseLatentLearner.initialize(self, agent)
+        if self._phase_dim() != 0:
+            msg = (
+                "per_step_vq_sequence publishes a new token every control step "
+                "and requires command_phase_mode='none'."
+            )
+            raise ValueError(msg)
+        if self._quantizer_kind() == "identity":
+            msg = (
+                "per_step_vq_sequence requires a discrete quantizer; identity "
+                "does not produce planner token labels."
+            )
+            raise ValueError(msg)
+        horizon = self._horizon()
+        per_step_dim = 0
+        for key in self._posterior_input_keys():
+            window_dim = int(agent._obs_feature_dims[key])
+            if window_dim % horizon != 0:
+                msg = (
+                    f"Posterior key {key!r} width {window_dim} is not divisible "
+                    f"by token_sequence_horizon={horizon}."
+                )
+                raise ValueError(msg)
+            per_step_dim += window_dim // horizon
+        self._ensure_modules(per_step_dim)
+
+    def infer_token_packet(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+    ) -> tuple[Tensor, Tensor]:
+        """Return token IDs and their low-level command embeddings."""
+        features = self._features_from_td(batch, detach=detach)
+        self._ensure_modules(int(features.shape[-1]))
+        assert self.encoder is not None
+        if detach:
+            with torch.no_grad():
+                z_e = self.encoder(features)
+                quant = self._quantize_for_inference(z_e)
+                latents = self._project_to_code_latent(quant["z_q"])
+        else:
+            z_e = self.encoder(features)
+            quant = self._quantize(z_e)
+            latents = self._project_to_code_latent(quant["z_q"])
+        return quant["code"], latents
+
+    def decode_token_ids(self, code: Tensor) -> Tensor:
+        """Map categorical planner outputs to low-level command embeddings."""
+        kind = self._quantizer_kind()
+        if kind == "fsq":
+            assert self.fsq is not None
+            z_q = self.fsq.indices_to_codes(code)
+        elif kind == "vq_ema":
+            assert self.vq is not None
+            z_q = F.embedding(code.to(torch.long), self.vq.embedding)
+        elif kind == "gumbel":
+            assert self.gumbel is not None
+            z_q = self.gumbel.codebook(code.to(torch.long))
+        else:
+            msg = f"Cannot decode discrete token IDs for quantizer={kind!r}."
+            raise ValueError(msg)
+        return self._project_to_code_latent(z_q)
+
+    def infer_batch_latents(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+        context: str,
+    ) -> Tensor | None:
+        del context
+        _, packet = self.infer_token_packet(batch, detach=detach)
+        return packet[:, 0, :]
+
+    def infer_expert_latents(
+        self,
+        expert_batch: TensorDict,
+        *,
+        detach: bool,
+    ) -> Tensor:
+        latent = self.infer_batch_latents(
+            expert_batch,
+            detach=detach,
+            context="per-step token expert batch",
+        )
+        if latent is None:
+            msg = "per_step_vq_sequence failed to infer expert latents."
+            raise RuntimeError(msg)
+        return latent
+
+    def reconstruct_batch_features(
+        self,
+        batch: TensorDict,
+        *,
+        detach: bool,
+        context: str,
+    ) -> Tensor | None:
+        del context
+        features = self._features_from_td(batch, detach=detach)
+        self._ensure_modules(int(features.shape[-1]))
+        assert self.encoder is not None
+        assert self.decoder is not None
+        if detach:
+            with torch.no_grad():
+                z_e = self.encoder(features)
+                return self.decoder(self._quantize_for_inference(z_e)["z_q"])
+        z_e = self.encoder(features)
+        return self.decoder(self._quantize(z_e)["z_q"])
+
+    def infer_collector_latents(self, td: TensorDict) -> Tensor:
+        """Snapshot a token packet and publish one entry per control step."""
+        assert self.agent is not None
+        device = self.agent.device
+        batch_size = int(td.numel())
+        horizon = self._horizon()
+        latent_dim = self._code_latent_dim()
+        if batch_size <= 0:
+            return torch.empty(0, latent_dim, device=device)
+
+        if (
+            self._collector_packet is None
+            or self._collector_packet.shape != (batch_size, horizon, latent_dim)
+            or self._collector_packet.device != device
+        ):
+            self._collector_packet = torch.zeros(
+                batch_size,
+                horizon,
+                latent_dim,
+                device=device,
+            )
+            self._collector_cursor = torch.full(
+                (batch_size,),
+                horizon,
+                device=device,
+                dtype=torch.long,
+            )
+
+        assert self._collector_cursor is not None
+        done_mask = self._build_done_mask(td, batch_size=batch_size, device=device)
+        renew_mask = done_mask | (self._collector_cursor >= horizon)
+        if bool(renew_mask.any()):
+            _, packet = self.infer_token_packet(td, detach=True)
+            self._collector_packet[renew_mask] = packet[renew_mask]
+            self._collector_cursor[renew_mask] = 0
+
+        env_index = torch.arange(batch_size, device=device)
+        command = self._collector_packet[env_index, self._collector_cursor]
+        self._collector_cursor += 1
+        return command
+
+    def update(self, rollout_flat: TensorDict) -> dict[str, float]:
+        if float(self._config().action_recon_coeff) > 0.0:
+            msg = (
+                "per_step_vq_sequence does not yet support action reconstruction; "
+                "set action_recon_coeff=0."
+            )
+            raise ValueError(msg)
+        metrics = super().update(rollout_flat)
+        if metrics:
+            metrics["ipmd/token_sequence_horizon"] = float(self._horizon())
+        return metrics
+
+
 def _build_registry() -> dict[str, Callable[[], BaseLatentLearner]]:
     return {
         "patch_autoencoder": PatchAutoencoderLatentLearner,
+        "future_cvae": FutureCVAELatentLearner,
         "policy_kl_bottleneck": PolicyKLBottleneckLatentLearner,
         "policy_mlp_embedding": PolicyMLPEmbeddingLatentLearner,
         "fixed_projection": FixedProjectionLatentLearner,
         "patch_vqvae": PatchVQVAELatentLearner,
+        "per_step_vq_sequence": PerStepVQSequenceLatentLearner,
     }
 
 

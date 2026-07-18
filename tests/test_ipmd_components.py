@@ -317,7 +317,7 @@ def test_ipmd_bilinear_offline_pretrain_validates_config() -> None:
         batch_size=[batch_size],
     )
 
-    with pytest.raises(ValueError, match="offline_pretrain.batch_size"):
+    with pytest.raises(ValueError, match=r"offline_pretrain\.batch_size"):
         rlopt.IPMDBilinear(
             env,
             cfg,
@@ -1040,7 +1040,7 @@ def test_ipmd_grouped_reward_model_requires_state_only_inputs() -> None:
     cfg.ipmd.reward_input_type = "sas"
 
     env = rlopt.make_parallel_env(cfg)
-    with pytest.raises(ValueError, match="requires .*reward_input_type='s'"):
+    with pytest.raises(ValueError, match=r"requires .*reward_input_type='s'"):
         rlopt.IPMD(env, cfg, logger=None)
 
 
@@ -1306,6 +1306,168 @@ def test_ipmd_update_with_expert_data():
         value = loss_td[key]
         assert not torch.isnan(value).any(), f"NaN in {key}"
         assert not torch.isinf(value).any(), f"Inf in {key}"
+
+
+def test_ipmd_bc_pretrain_updates_skip_then_restore_ppo() -> None:
+    """BC pretraining should suppress PPO gradients only for its fixed prefix."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 4
+    cfg.compile.compile = False
+    cfg.ipmd.expert_batch_size = 4
+    _apply_nonlatent_obs_input_keys(cfg)
+    cfg.ipmd.bc_coef = 1.0
+    cfg.ipmd.bc_pretrain_updates = 1
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    batch_size = 4
+    policy_batch = TensorDict(
+        {
+            "observation": torch.randn(batch_size, obs_dim),
+            "action": torch.randn(batch_size, act_dim),
+            "action_log_prob": torch.zeros(batch_size),
+            ("next", "observation"): torch.randn(batch_size, obs_dim),
+            ("next", "reward"): torch.randn(batch_size, 1),
+            ("next", "done"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "terminated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "truncated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    with torch.no_grad():
+        policy_batch = agent.adv_module(policy_batch)
+    expert_batch = TensorDict(
+        {
+            "observation": torch.randn(batch_size, obs_dim),
+            "expert_action": torch.randn(batch_size, act_dim),
+        },
+        batch_size=[batch_size],
+    )
+    has_expert = torch.tensor(1.0, device=agent.device)
+
+    warmup_loss, _ = agent.update(
+        policy_batch.clone(), 0, expert_batch.clone(), has_expert
+    )
+    normal_loss, _ = agent.update(
+        policy_batch.clone(), 1, expert_batch.clone(), has_expert
+    )
+
+    assert warmup_loss["bc_pretrain_active"].item() == 1.0
+    assert normal_loss["bc_pretrain_active"].item() == 0.0
+    assert torch.isfinite(warmup_loss["loss_bc"])
+    assert torch.isfinite(normal_loss["loss_bc"])
+
+
+def test_ipmd_bc_pretrain_requires_positive_bc_coefficient() -> None:
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.bc_coef = 0.0
+    cfg.ipmd.bc_pretrain_updates = 1
+    with pytest.raises(
+        ValueError,
+        match=r"requires ipmd\.bc_coef > 0 or ipmd\.rollout_bc_coef > 0",
+    ):
+        cfg.ipmd.validate()
+
+
+def test_ipmd_rollout_bc_uses_live_policy_observations() -> None:
+    """Rollout BC should train on rollout states without an expert sampler."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 4
+    cfg.compile.compile = False
+    _apply_nonlatent_obs_input_keys(cfg)
+    cfg.ipmd.rollout_bc_coef = 1.0
+    cfg.ipmd.rollout_bc_action_key = ["policy_supervision", "expert_action"]
+    cfg.ipmd.bc_pretrain_updates = 1
+
+    env = rlopt.make_parallel_env(cfg)
+    action_spec = env.action_spec.clone()
+    spec = env.observation_spec.clone()
+    spec.set(("policy_supervision", "expert_action"), action_spec)
+    env.observation_spec = spec
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    batch_size = 4
+    policy_batch = TensorDict(
+        {
+            "observation": torch.randn(batch_size, obs_dim),
+            ("policy_supervision", "expert_action"): torch.tanh(
+                torch.randn(batch_size, act_dim)
+            ),
+            "action": torch.tanh(torch.randn(batch_size, act_dim)),
+            "action_log_prob": torch.zeros(batch_size),
+            ("next", "observation"): torch.randn(batch_size, obs_dim),
+            ("next", "reward"): torch.randn(batch_size, 1),
+            ("next", "done"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "terminated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "truncated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    with torch.no_grad():
+        policy_batch = agent.adv_module(policy_batch)
+    no_expert_batch = TensorDict({}, batch_size=[batch_size])
+    has_expert = torch.tensor(0.0, device=agent.device)
+
+    warmup_loss, _ = agent.update(policy_batch.clone(), 0, no_expert_batch, has_expert)
+    normal_loss, _ = agent.update(policy_batch.clone(), 1, no_expert_batch, has_expert)
+
+    assert agent._rollout_bc_action_key == (
+        "policy_supervision",
+        "expert_action",
+    )
+    assert warmup_loss["bc_pretrain_active"].item() == 1.0
+    assert normal_loss["bc_pretrain_active"].item() == 0.0
+    for key in (
+        "loss_rollout_bc",
+        "rollout_bc_nll",
+        "rollout_bc_policy_action_mae",
+        "rollout_bc_policy_action_rmse",
+    ):
+        assert torch.isfinite(warmup_loss[key])
+        assert torch.isfinite(normal_loss[key])
+    assert "loss_bc" not in warmup_loss
+
+
+def test_ipmd_rollout_bc_label_cannot_be_a_model_input() -> None:
+    """The rollout action label must remain outside every learned model input."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    _apply_nonlatent_obs_input_keys(cfg)
+    cfg.ipmd.rollout_bc_coef = 1.0
+    cfg.ipmd.rollout_bc_action_key = "expert_action"
+    cfg.policy.input_keys = ["observation", "expert_action"]
+
+    env = rlopt.make_parallel_env(cfg)
+    spec = env.observation_spec.clone()
+    spec.set("expert_action", env.action_spec.clone())
+    env.observation_spec = spec
+
+    with pytest.raises(ValueError, match="training-only label"):
+        rlopt.IPMD(env, cfg, logger=None)
 
 
 def test_ipmd_missing_sampler_raises() -> None:
@@ -1585,6 +1747,546 @@ def test_patch_vqvae_collector_holds_code_and_reports_phase() -> None:
     assert torch.allclose(cmd1[:, -2:], phase1)
     assert torch.allclose(cmd2[:, -2:], phase2)
     assert torch.allclose(cmd3[:, -2:], phase0)
+
+
+def test_future_cvae_trains_distinct_posterior_prior_and_future_target() -> None:
+    """Future CVAE should learn from explicit current and future feature groups."""
+    rlopt = _rlopt()
+    from rlopt.agent.imitation.latent_learning import (
+        FutureCVAELatentLearner,
+        build_latent_learner,
+    )
+
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 2
+    cfg.ipmd.latent_learning.method = "future_cvae"
+    cfg.ipmd.latent_learning.posterior_input_keys = ["current", "future"]
+    cfg.ipmd.latent_learning.prior_input_keys = ["current"]
+    cfg.ipmd.latent_learning.reconstruction_target_keys = ["future"]
+    cfg.ipmd.latent_learning.encoder_hidden_dims = [8]
+    cfg.ipmd.latent_learning.prior_hidden_dims = [8]
+    cfg.ipmd.latent_learning.decoder_hidden_dims = [8]
+    cfg.ipmd.latent_learning.recon_coeff = 1.0
+    cfg.ipmd.latent_learning.kl_coeff = 0.1
+    cfg.ipmd.latent_learning.posterior_command_period = 3
+    cfg.ipmd.validate()
+
+    expert_data = TensorDict(
+        {
+            "current": torch.randn(6, 2),
+            "future": torch.randn(6, 4),
+        },
+        batch_size=[6],
+    )
+
+    def _obs_features_from_td(td, keys, *, next_obs, detach):
+        assert next_obs is False
+        parts = []
+        for key in keys:
+            value = td.get(key)
+            value = value.detach() if detach else value
+            parts.append(value.reshape(value.shape[0], -1))
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
+    def _next_expert_batch(batch_size=6, *, required_keys):
+        return expert_data[:batch_size].select(*required_keys).clone()
+
+    fake_agent = SimpleNamespace(
+        config=cfg,
+        device=torch.device("cpu"),
+        _latent_dim=2,
+        _obs_feature_dims={"current": 2, "future": 4},
+        _posterior_obs_keys=["current", "future"],
+        _prior_obs_keys=["current"],
+        _reconstruction_target_obs_keys=["future"],
+        _obs_features_from_td=_obs_features_from_td,
+        _next_expert_batch=_next_expert_batch,
+    )
+    learner = build_latent_learner("future_cvae")
+    assert isinstance(learner, FutureCVAELatentLearner)
+    learner.initialize(fake_agent)
+
+    assert learner.required_expert_batch_keys() == ["current", "future"]
+    metrics = learner.update(TensorDict({}, batch_size=[0]))
+    assert metrics["ipmd/latent_recon_loss"] >= 0.0
+    assert metrics["ipmd/latent_kl_loss"] >= 0.0
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+
+    latents = learner.infer_expert_latents(expert_data, detach=True)
+    reconstruction = learner.reconstruct_batch_features(
+        expert_data,
+        detach=True,
+        context="test",
+    )
+    prior_samples = learner.sample_expert_prior_latents(
+        batch_size=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert latents.shape == (6, 2)
+    assert reconstruction is not None
+    assert reconstruction.shape == (6, 4)
+    assert prior_samples is not None
+    assert prior_samples.shape == (3, 2)
+
+
+def test_future_cvae_collector_holds_posterior_mean_for_command_period() -> None:
+    """The oracle CVAE command should refresh only at its configured boundary."""
+    rlopt = _rlopt()
+    from rlopt.agent.imitation.latent_learning import FutureCVAELatentLearner
+
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 2
+    cfg.ipmd.latent_learning.method = "future_cvae"
+    cfg.ipmd.latent_learning.posterior_input_keys = ["current", "future"]
+    cfg.ipmd.latent_learning.prior_input_keys = ["current"]
+    cfg.ipmd.latent_learning.reconstruction_target_keys = ["future"]
+    cfg.ipmd.latent_learning.posterior_command_period = 3
+    cfg.ipmd.validate()
+
+    def _obs_features_from_td(td, keys, *, next_obs, detach):
+        del next_obs
+        parts = [td.get(key).reshape(td.numel(), -1) for key in keys]
+        features = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        return features.detach() if detach else features
+
+    fake_agent = SimpleNamespace(
+        config=cfg,
+        device=torch.device("cpu"),
+        _latent_dim=2,
+        _obs_feature_dims={"current": 2, "future": 4},
+        _posterior_obs_keys=["current", "future"],
+        _prior_obs_keys=["current"],
+        _reconstruction_target_obs_keys=["future"],
+        _obs_features_from_td=_obs_features_from_td,
+    )
+    learner = FutureCVAELatentLearner()
+    learner.initialize(fake_agent)
+
+    class _CurrentAsMean(torch.nn.Module):
+        def forward(self, features):
+            mean = features[:, :2]
+            return mean, torch.zeros_like(mean)
+
+    learner.posterior = _CurrentAsMean()
+    td0 = TensorDict(
+        {"current": torch.tensor([[1.0, 2.0]]), "future": torch.zeros(1, 4)},
+        batch_size=[1],
+    )
+    td1 = TensorDict(
+        {"current": torch.tensor([[5.0, 6.0]]), "future": torch.ones(1, 4)},
+        batch_size=[1],
+    )
+
+    command0 = learner.infer_collector_latents(td0).clone()
+    command1 = learner.infer_collector_latents(td1).clone()
+    command2 = learner.infer_collector_latents(td1).clone()
+    command3 = learner.infer_collector_latents(td1).clone()
+
+    assert torch.allclose(command0, torch.tensor([[1.0, 2.0]]))
+    assert torch.allclose(command1, command0)
+    assert torch.allclose(command2, command0)
+    assert torch.allclose(command3, torch.tensor([[5.0, 6.0]]))
+
+
+def test_per_step_vq_sequence_consumes_one_token_per_control_step() -> None:
+    """A horizon packet should publish consecutive tokens, not one held code."""
+    rlopt = _rlopt()
+    from rlopt.agent.imitation.latent_learning import (
+        PerStepVQSequenceLatentLearner,
+    )
+
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 2
+    cfg.ipmd.latent_learning.method = "per_step_vq_sequence"
+    cfg.ipmd.latent_learning.quantizer = "fsq"
+    cfg.ipmd.latent_learning.fsq_levels = [3, 3]
+    cfg.ipmd.latent_learning.code_latent_dim = 2
+    cfg.ipmd.latent_learning.command_phase_mode = "none"
+    cfg.ipmd.latent_learning.token_sequence_horizon = 3
+    cfg.ipmd.latent_learning.posterior_input_keys = ["motion", "anchor"]
+    cfg.ipmd.validate()
+
+    fake_agent = SimpleNamespace(
+        config=cfg,
+        device=torch.device("cpu"),
+        _latent_dim=2,
+        _obs_feature_dims={"motion": 6, "anchor": 3},
+        _posterior_obs_keys=["motion", "anchor"],
+        _action_feature_dim=2,
+    )
+    learner = PerStepVQSequenceLatentLearner()
+    learner.initialize(fake_agent)
+
+    class _SelectTwo(torch.nn.Module):
+        def forward(self, features):
+            return features[..., :2]
+
+    learner.encoder = _SelectTwo()
+    td0 = TensorDict(
+        {
+            "motion": torch.tensor(
+                [
+                    [0.1, 0.2, 0.7, -0.4, -0.8, 0.9],
+                    [-0.3, 0.5, 0.6, 0.7, -0.2, -0.1],
+                ]
+            ),
+            "anchor": torch.zeros(2, 3),
+        },
+        batch_size=[2],
+    )
+    td1 = TensorDict(
+        {
+            "motion": torch.tensor(
+                [
+                    [-0.9, -0.7, -0.5, -0.3, -0.1, 0.1],
+                    [0.9, 0.7, 0.5, 0.3, 0.1, -0.1],
+                ]
+            ),
+            "anchor": torch.ones(2, 3),
+        },
+        batch_size=[2],
+    )
+
+    token_ids0, packet0 = learner.infer_token_packet(td0, detach=True)
+    token_ids1, packet1 = learner.infer_token_packet(td1, detach=True)
+    command0 = learner.infer_collector_latents(td0).clone()
+    command1 = learner.infer_collector_latents(td1).clone()
+    command2 = learner.infer_collector_latents(td1).clone()
+    command3 = learner.infer_collector_latents(td1).clone()
+
+    assert token_ids0.shape == (2, 3)
+    assert torch.allclose(learner.decode_token_ids(token_ids0), packet0)
+    assert torch.allclose(learner.decode_token_ids(token_ids1), packet1)
+    assert torch.allclose(command0, packet0[:, 0])
+    assert torch.allclose(command1, packet0[:, 1])
+    assert torch.allclose(command2, packet0[:, 2])
+    assert torch.allclose(command3, packet1[:, 0])
+
+
+def test_per_step_vq_sequence_reconstructs_per_step_features() -> None:
+    """The sequence VQ update should train on B by horizon by feature tensors."""
+    rlopt = _rlopt()
+    from rlopt.agent.imitation.latent_learning import (
+        PerStepVQSequenceLatentLearner,
+    )
+
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 2
+    cfg.ipmd.latent_learning.method = "per_step_vq_sequence"
+    cfg.ipmd.latent_learning.quantizer = "fsq"
+    cfg.ipmd.latent_learning.fsq_levels = [3, 3]
+    cfg.ipmd.latent_learning.code_latent_dim = 2
+    cfg.ipmd.latent_learning.token_sequence_horizon = 3
+    cfg.ipmd.latent_learning.posterior_input_keys = ["window"]
+    cfg.ipmd.latent_learning.encoder_hidden_dims = [8]
+    cfg.ipmd.latent_learning.decoder_hidden_dims = [8]
+    cfg.ipmd.latent_learning.recon_coeff = 1.0
+    cfg.ipmd.validate()
+
+    expert_data = TensorDict(
+        {"window": torch.randn(5, 9)},
+        batch_size=[5],
+    )
+
+    def _next_expert_batch(batch_size=5, *, required_keys):
+        return expert_data[:batch_size].select(*required_keys).clone()
+
+    fake_agent = SimpleNamespace(
+        config=cfg,
+        device=torch.device("cpu"),
+        _latent_dim=2,
+        _obs_feature_dims={"window": 9},
+        _posterior_obs_keys=["window"],
+        _action_feature_dim=2,
+        _next_expert_batch=_next_expert_batch,
+    )
+    learner = PerStepVQSequenceLatentLearner()
+    learner.initialize(fake_agent)
+    metrics = learner.update(TensorDict({}, batch_size=[0]))
+    reconstruction = learner.reconstruct_batch_features(
+        expert_data,
+        detach=True,
+        context="test",
+    )
+
+    assert metrics["ipmd/token_sequence_horizon"] == 3.0
+    assert metrics["ipmd/vqvae_recon_mse"] >= 0.0
+    assert reconstruction is not None
+    assert reconstruction.shape == (5, 3, 3)
+
+
+def test_causal_categorical_planner_uses_shared_transformer_backbone_settings() -> None:
+    """Discrete token planning should keep the continuous planner backbone size."""
+    from rlopt.agent.causal_interface_planner import (
+        CausalInterfaceTransformerCategoricalPlanner,
+        CausalInterfaceTransformerFlowPlanner,
+    )
+
+    common = {
+        "state_dim": 12,
+        "d_model": 16,
+        "num_layers": 2,
+        "num_heads": 4,
+        "feedforward_dim": 32,
+        "num_state_tokens": 2,
+        "dropout": 0.0,
+    }
+    categorical = CausalInterfaceTransformerCategoricalPlanner(
+        **common,
+        token_horizon=3,
+        codebook_size=7,
+    )
+    continuous = CausalInterfaceTransformerFlowPlanner(
+        **common,
+        target_dim=6,
+        patch_dim=2,
+    )
+    state = torch.randn(5, 12)
+    token_ids = torch.randint(0, 7, (5, 3))
+
+    logits = categorical.logits(state)
+    prediction = categorical(state)
+    loss = categorical.categorical_loss(state, token_ids)
+    categorical_config = categorical.config_dict()
+    continuous_config = continuous.config_dict()
+
+    assert logits.shape == (5, 3, 7)
+    assert prediction.shape == (5, 3)
+    assert torch.isfinite(loss)
+    for key in (
+        "state_dim",
+        "d_model",
+        "num_layers",
+        "num_heads",
+        "feedforward_dim",
+        "num_state_tokens",
+        "dropout",
+    ):
+        assert categorical_config[key] == continuous_config[key]
+
+
+def test_causal_continuous_planner_accepts_optional_language_token() -> None:
+    from rlopt.agent.causal_interface_planner import (
+        CausalInterfaceTransformerFlowPlanner,
+    )
+
+    planner = CausalInterfaceTransformerFlowPlanner(
+        state_dim=12,
+        target_dim=6,
+        d_model=16,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=32,
+        patch_dim=2,
+        num_state_tokens=2,
+        language_dim=5,
+        num_language_tokens=1,
+    )
+    state = torch.randn(4, 12)
+    language = torch.randn(4, 5)
+    target = torch.randn(4, 6)
+
+    prediction = planner(
+        state,
+        language=language,
+        num_inference_steps=2,
+    )
+    loss = planner.flow_matching_loss(state, target, language=language)
+    restored = CausalInterfaceTransformerFlowPlanner.from_config(planner.config_dict())
+    restored.load_state_dict(planner.state_dict())
+
+    assert prediction.shape == target.shape
+    assert torch.isfinite(loss)
+    assert restored.language_dim == 5
+    assert restored.num_language_tokens == 1
+    with pytest.raises(ValueError, match="requires a language embedding"):
+        planner(state, num_inference_steps=1)
+
+
+def test_frozen_token_planner_decodes_and_consumes_predicted_packet(tmp_path) -> None:
+    """Planner deployment should decode IDs once and consume the packet in order."""
+    from rlopt.agent.causal_interface_planner import (
+        CausalInterfaceTransformerCategoricalPlanner,
+        FrozenCategoricalTokenPlannerSampler,
+    )
+
+    planner = CausalInterfaceTransformerCategoricalPlanner(
+        state_dim=12,
+        token_horizon=3,
+        codebook_size=3,
+        d_model=12,
+        num_layers=1,
+        num_heads=3,
+        feedforward_dim=24,
+        num_state_tokens=1,
+    )
+    checkpoint_path = tmp_path / "token_planner.pt"
+    torch.save(
+        {
+            "planner_config": planner.config_dict(),
+            "planner_state_dict": planner.state_dict(),
+            "target_spec": {
+                "interface": "per_step_token_sequence",
+                "term_names": ["token_ids"],
+                "term_widths": [3],
+                "target_dim": 3,
+            },
+            "metadata": {
+                "target_encoding": {
+                    "kind": "categorical_sequence",
+                    "horizon": 3,
+                    "codebook_size": 3,
+                },
+                "planner_observation_spec": {
+                    "history_frames": 2,
+                    "frame_dim": 6,
+                    "flat_dim": 12,
+                },
+                "sample_metadata": {
+                    "state_history_steps": 1,
+                    "planner_observation_spec": {
+                        "history_frames": 2,
+                        "frame_dim": 6,
+                        "flat_dim": 12,
+                    },
+                },
+            },
+        },
+        checkpoint_path,
+    )
+
+    class _FakeEnv:
+        def __init__(self):
+            self.calls = 0
+
+        def causal_planner_observation_spec(self, *, history_steps):
+            assert history_steps == 1
+            return {"history_frames": 2, "frame_dim": 6, "flat_dim": 12}
+
+        def current_causal_planner_observation(self, *, env_ids, history_steps):
+            assert history_steps == 1
+            self.calls += 1
+            return TensorDict(
+                {("planner", "state_history"): torch.zeros(env_ids.numel(), 2, 6)},
+                batch_size=[env_ids.numel()],
+            )
+
+    env = _FakeEnv()
+    sampler = FrozenCategoricalTokenPlannerSampler(
+        env=env,
+        checkpoint_path=checkpoint_path,
+        decode_token_ids=lambda ids: torch.nn.functional.one_hot(
+            ids, num_classes=3
+        ).float(),
+        latent_dim=3,
+        discover_env_method=lambda obj, name: getattr(obj, name, None),
+        device="cpu",
+    )
+
+    class _FixedPacket(torch.nn.Module):
+        def forward(self, state):
+            return torch.tensor([0, 1, 2]).expand(state.shape[0], -1)
+
+    sampler.planner = _FixedPacket()
+    td = TensorDict({}, batch_size=[2])
+    commands = [
+        sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+        for _ in range(4)
+    ]
+
+    assert torch.equal(commands[0], torch.tensor([[1, 0, 0], [1, 0, 0]]).float())
+    assert torch.equal(commands[1], torch.tensor([[0, 1, 0], [0, 1, 0]]).float())
+    assert torch.equal(commands[2], torch.tensor([[0, 0, 1], [0, 0, 1]]).float())
+    assert torch.equal(commands[3], commands[0])
+    assert env.calls == 2
+
+
+def test_frozen_continuous_planner_holds_command_for_configured_period(
+    tmp_path,
+) -> None:
+    """Continuous planner deployment should renew only after the hold period."""
+    from rlopt.agent.causal_interface_planner import (
+        CausalInterfaceTransformerFlowPlanner,
+        FrozenContinuousInterfacePlannerSampler,
+    )
+
+    planner = CausalInterfaceTransformerFlowPlanner(
+        state_dim=12,
+        target_dim=3,
+        term_widths=(3,),
+        d_model=12,
+        num_layers=1,
+        num_heads=3,
+        feedforward_dim=24,
+        patch_dim=3,
+        num_state_tokens=1,
+    )
+    checkpoint_path = tmp_path / "continuous_planner.pt"
+    observation_spec = {"history_frames": 2, "frame_dim": 6, "flat_dim": 12}
+    torch.save(
+        {
+            "planner_config": planner.config_dict(),
+            "planner_state_dict": planner.state_dict(),
+            "target_spec": {
+                "interface": "future_cvae",
+                "term_names": ["z"],
+                "term_widths": [3],
+                "target_dim": 3,
+            },
+            "metadata": {
+                "flow_num_inference_steps": 2,
+                "flow_inference_noise_std": 0.0,
+                "planner_observation_spec": observation_spec,
+                "sample_metadata": {
+                    "state_history_steps": 1,
+                    "planner_interval_steps": 3,
+                    "planner_observation_spec": observation_spec,
+                },
+            },
+        },
+        checkpoint_path,
+    )
+
+    class _FakeEnv:
+        def __init__(self):
+            self.calls = 0
+
+        def causal_planner_observation_spec(self, *, history_steps):
+            assert history_steps == 1
+            return observation_spec
+
+        def current_causal_planner_observation(self, *, env_ids, history_steps):
+            assert history_steps == 1
+            self.calls += 1
+            return TensorDict(
+                {("planner", "state_history"): torch.zeros(env_ids.numel(), 2, 6)},
+                batch_size=[env_ids.numel()],
+            )
+
+    env = _FakeEnv()
+    sampler = FrozenContinuousInterfacePlannerSampler(
+        env=env,
+        checkpoint_path=checkpoint_path,
+        latent_dim=3,
+        discover_env_method=lambda obj, name: getattr(obj, name, None),
+        device="cpu",
+    )
+
+    class _FixedCommand(torch.nn.Module):
+        def forward(self, state, **_kwargs):
+            return torch.tensor([1.0, 2.0, 3.0]).expand(state.shape[0], -1)
+
+    sampler.planner = _FixedCommand()
+    td = TensorDict({}, batch_size=[2])
+    commands = [
+        sampler.sample_for_step(td, device=torch.device("cpu"), dtype=torch.float32)
+        for _ in range(4)
+    ]
+
+    expected = torch.tensor([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
+    assert all(torch.equal(command, expected) for command in commands)
+    assert env.calls == 2
 
 
 def test_ipmd_patch_autoencoder_uses_only_posterior_expert_keys() -> None:
