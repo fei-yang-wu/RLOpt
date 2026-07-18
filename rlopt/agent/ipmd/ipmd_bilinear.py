@@ -142,8 +142,14 @@ class BilinearSRConfig:
     g_hidden_dims: tuple[int, ...] = (512,)
     """Hidden layers for action encoder g(a)."""
 
+    f_hidden_dims: tuple[int, ...] = (512, 512)
+    """Hidden layers for legacy matrix-valued state encoder F(s)."""
+
     mu_hidden_dims: tuple[int, ...] = (512,)
     """Hidden layers for next-state encoder mu(s')."""
+
+    phi_parameterization: str = "concat"
+    """Phi parameterization: current "concat" or checkpoint-era "bilinear"."""
 
     feature_lr: float = 1e-4
     """Learning rate for the bilinear SR model."""
@@ -208,6 +214,29 @@ class BilinearSRConfig:
             "bilinear.feature_dim", self.feature_dim
         )
         self.embed_dim = require_positive_int("bilinear.embed_dim", self.embed_dim)
+        self.g_hidden_dims = tuple(
+            require_positive_int("bilinear.g_hidden_dims", dim)
+            for dim in self.g_hidden_dims
+        )
+        self.f_hidden_dims = tuple(
+            require_positive_int("bilinear.f_hidden_dims", dim)
+            for dim in self.f_hidden_dims
+        )
+        self.mu_hidden_dims = tuple(
+            require_positive_int("bilinear.mu_hidden_dims", dim)
+            for dim in self.mu_hidden_dims
+        )
+        self.phi_parameterization = str(self.phi_parameterization).strip().lower()
+        aliases = {"legacy": "bilinear", "f_matrix": "bilinear"}
+        self.phi_parameterization = aliases.get(
+            self.phi_parameterization, self.phi_parameterization
+        )
+        if self.phi_parameterization not in {"concat", "bilinear"}:
+            msg = (
+                "bilinear.phi_parameterization must be one of 'concat' or "
+                f"'bilinear', got {self.phi_parameterization!r}."
+            )
+            raise ValueError(msg)
         self.update_steps = _require_non_negative_int(
             "bilinear.update_steps", self.update_steps
         )
@@ -494,6 +523,8 @@ class IPMDBilinear(IPMD):
             "feature_dim": cfg.feature_dim,
             "embed_dim": cfg.embed_dim,
             "g_hidden_dims": cfg.g_hidden_dims,
+            "f_hidden_dims": cfg.f_hidden_dims,
+            "phi_parameterization": cfg.phi_parameterization,
             "mu_hidden_dims": cfg.mu_hidden_dims,
             "num_noises": cfg.num_noises,
             "use_ema_for_policy": cfg.use_ema_for_policy,
