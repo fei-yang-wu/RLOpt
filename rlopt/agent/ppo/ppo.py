@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar, cast
 
@@ -56,6 +57,18 @@ from rlopt.utils import get_activation_class, log_info
 PpoCfgT = TypeVar("PpoCfgT", bound="PPORLOptConfig")
 
 
+def _normalize_advantage_over_rollout(advantage: Tensor) -> Tensor:
+    """Normalize advantages over every rollout batch dimension once."""
+    reduce_dims = tuple(range(max(advantage.ndim - 1, 1)))
+    advantage_mean = advantage.mean(dim=reduce_dims, keepdim=True)
+    advantage_std = advantage.std(
+        dim=reduce_dims,
+        keepdim=True,
+        correction=1,
+    )
+    return (advantage - advantage_mean) / (advantage_std + 1.0e-8)
+
+
 class CatInputs(torch.nn.Module):
     """Concatenate multiple input tensors along the last dimension.
 
@@ -72,6 +85,99 @@ class CatInputs(torch.nn.Module):
         if len(inputs) == 1:
             return self.module(inputs[0])
         return self.module(torch.cat(inputs, dim=-1))
+
+
+class RunningMeanStdCatInputs(torch.nn.Module):
+    """Concatenate inputs and apply SONIC-style running normalization."""
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        feature_dim: int,
+        *,
+        epsilon: float = 1.0e-5,
+        clip: float = 5.0,
+        normalize_mask: Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        if feature_dim <= 0:
+            msg = "feature_dim must be positive."
+            raise ValueError(msg)
+        if epsilon <= 0.0:
+            msg = "epsilon must be positive."
+            raise ValueError(msg)
+        if clip <= 0.0:
+            msg = "clip must be positive."
+            raise ValueError(msg)
+        self.module = module
+        self.epsilon = float(epsilon)
+        self.clip = float(clip)
+        module_device = next(module.parameters(), torch.empty(0)).device
+        self.register_buffer(
+            "running_mean", torch.zeros(feature_dim, device=module_device)
+        )
+        self.register_buffer(
+            "running_var", torch.ones(feature_dim, device=module_device)
+        )
+        self.register_buffer(
+            "count", torch.ones((), dtype=torch.float32, device=module_device)
+        )
+        if normalize_mask is None:
+            self.normalize_mask: Tensor | None = None
+        else:
+            normalize_mask = normalize_mask.reshape(-1).to(torch.bool)
+            if normalize_mask.shape[0] != feature_dim:
+                msg = (
+                    "normalize_mask length "
+                    f"{normalize_mask.shape[0]} != feature_dim {feature_dim}."
+                )
+                raise ValueError(msg)
+            # All-True masks are equivalent to no mask; store None to skip the
+            # extra where() in forward.
+            if bool(normalize_mask.all()):
+                self.normalize_mask = None
+            else:
+                self.register_buffer("normalize_mask", normalize_mask.to(module_device))
+
+    def _concatenate(self, inputs: tuple[Tensor, ...]) -> Tensor:
+        if len(inputs) == 1:
+            return inputs[0]
+        return torch.cat(inputs, dim=-1)
+
+    @torch.no_grad()
+    def _update(self, value: Tensor) -> None:
+        flat = value.detach().reshape(-1, value.shape[-1]).to(torch.float32)
+        if flat.shape[0] == 0:
+            return
+        batch_mean = flat.mean(dim=0)
+        batch_var = flat.var(dim=0, correction=1 if flat.shape[0] > 1 else 0)
+        batch_count = float(flat.shape[0])
+        delta = batch_mean - self.running_mean
+        total_count = self.count + batch_count
+        new_mean = self.running_mean + delta * batch_count / total_count
+        mean_a = self.running_var * self.count
+        mean_b = batch_var * batch_count
+        second_moment = (
+            mean_a + mean_b + delta.square() * self.count * batch_count / total_count
+        )
+        self.running_mean.copy_(new_mean)
+        self.running_var.copy_(second_moment / total_count)
+        self.count.copy_(total_count)
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        value = self._concatenate(inputs)
+        normalized = (value - self.running_mean) / torch.sqrt(
+            self.running_var + self.epsilon
+        )
+        normalized = torch.clamp(normalized, -self.clip, self.clip)
+        if self.normalize_mask is not None:
+            # Excluded features (e.g. pretrained latent commands) pass through
+            # with their original scale and geometry.
+            normalized = torch.where(self.normalize_mask, normalized, value)
+        # Match SONIC: normalize with the prior statistics, then update them.
+        if self.training:
+            self._update(value)
+        return self.module(normalized)
 
 
 @dataclass
@@ -98,6 +204,9 @@ class PPOConfig:
 
     normalize_advantage: bool = True
     """Whether to normalize the advantage estimates."""
+
+    normalize_advantage_global: bool = False
+    """Normalize once over the complete rollout instead of per mini-batch."""
 
     log_std_init: float = 0.0
     """Initial value for the policy log standard deviation (log std)."""
@@ -243,6 +352,22 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         else:
             policy_mlp = policy_net
 
+        if getattr(self.config.policy, "normalize_input", False):
+            # SONIC-style running observation normalization for the actor.
+            # GaussianPolicyHead concatenates multi-key inputs before calling
+            # the base module, so the normalizer always receives one tensor.
+            policy_in_keys = self.config.policy.get_input_keys()
+            feature_dim = sum(
+                self.observation_feature_size(key) for key in policy_in_keys
+            )
+            policy_mlp = RunningMeanStdCatInputs(
+                policy_mlp,
+                feature_dim,
+                epsilon=self.config.policy.normalization_epsilon,
+                clip=self.config.policy.normalization_clip,
+                normalize_mask=self._input_normalize_mask(self.config.policy),
+            )
+
         net = GaussianPolicyHead(
             base=policy_mlp,
             action_dim=action_dim,
@@ -297,8 +422,41 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         # When multiple in_keys (concatenate_terms=False), TensorDictModule
         # passes each as a separate positional arg. MLP expects a single
         # tensor, so wrap it to concatenate first.
-        module = CatInputs(value_mlp) if len(in_keys) > 1 else value_mlp
+        if self.config.value_function.normalize_input:
+            feature_dim = sum(self.observation_feature_size(key) for key in in_keys)
+            module = RunningMeanStdCatInputs(
+                value_mlp,
+                feature_dim,
+                epsilon=self.config.value_function.normalization_epsilon,
+                clip=self.config.value_function.normalization_clip,
+                normalize_mask=self._input_normalize_mask(self.config.value_function),
+            )
+        else:
+            module = CatInputs(value_mlp) if len(in_keys) > 1 else value_mlp
         return ValueOperator(module=module, in_keys=in_keys)
+
+    def _input_normalize_mask(self, network_cfg) -> Tensor | None:
+        """Per-feature mask for running input normalization (True = normalize).
+
+        Keys listed in ``network_cfg.normalize_input_exclude_keys`` keep their
+        raw values (e.g. pretrained latent commands, sin/cos phases).
+        """
+        exclude = getattr(network_cfg, "normalize_input_exclude_keys", None)
+        if not exclude:
+            return None
+
+        def _as_key(key) -> tuple[str, ...]:
+            if isinstance(key, (list, tuple)):
+                return tuple(str(part) for part in key)
+            return (str(key),)
+
+        excluded_keys = {_as_key(key) for key in exclude}
+        mask_parts: list[Tensor] = []
+        for key in network_cfg.get_input_keys():
+            size = int(self.observation_feature_size(key))
+            keep = _as_key(key) not in excluded_keys
+            mask_parts.append(torch.full((size,), keep, dtype=torch.bool))
+        return torch.cat(mask_parts)
 
     def _construct_q_function(self) -> TensorDictModule:  # type: ignore[override]
         """PPO does not use a state-action value function explicitly.
@@ -355,7 +513,10 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             loss_critic_type=loss_config.loss_critic_type,
             entropy_coeff=ppo_config.entropy_coeff,
             critic_coeff=ppo_config.critic_coeff,
-            normalize_advantage=ppo_config.normalize_advantage,
+            normalize_advantage=(
+                ppo_config.normalize_advantage
+                and not ppo_config.normalize_advantage_global
+            ),
             clip_value=ppo_config.clip_value,
         )
 
@@ -579,13 +740,43 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
     def pre_iteration_compute(self, rollout: TensorDict) -> TensorDict:
         """Turn one rollout into the replay-buffer view consumed by minibatch updates."""
-        with torch.no_grad():
+        # SONIC keeps the model in rollout/eval mode while it computes values and
+        # returns, then enables running-statistics updates only for PPO
+        # minibatches.  TorchRL evaluates current/next values through ``vmap``;
+        # mutating normalizer buffers from that vmapped forward is invalid too.
+        with torch.no_grad(), self._freeze_value_normalizer_updates():
             rollout = self.adv_module(rollout)
+            if (
+                self.config.ppo.normalize_advantage
+                and self.config.ppo.normalize_advantage_global
+            ):
+                advantage = rollout.get("advantage")
+                rollout.set(
+                    "advantage",
+                    _normalize_advantage_over_rollout(advantage),
+                )
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
         self.data_buffer.extend(rollout.reshape(-1))
         return rollout
+
+    @contextmanager
+    def _freeze_value_normalizer_updates(self):
+        """Normalize critic inputs without updating statistics during GAE."""
+        normalizers = [
+            module
+            for module in self.value_function.modules()
+            if isinstance(module, RunningMeanStdCatInputs)
+        ]
+        training_states = [module.training for module in normalizers]
+        try:
+            for module in normalizers:
+                module.eval()
+            yield
+        finally:
+            for module, training in zip(normalizers, training_states, strict=True):
+                module.train(training)
 
     @property
     def _required_loss_metrics(self) -> list[str]:
@@ -673,10 +864,15 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             clip_epsilon = float(clip_attr.detach().item())
         else:
             clip_epsilon = float(metadata.base_clip_epsilon)
-        return {
+        metrics = {
             "train/lr": self.optim.param_groups[0]["lr"],
             "train/clip_epsilon": clip_epsilon,
         }
+        for group in self.optim.param_groups:
+            group_name = group.get("name")
+            if isinstance(group_name, str) and group_name:
+                metrics[f"train/{group_name}_lr"] = group["lr"]
+        return metrics
 
     def _build_timing_metrics(
         self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
@@ -756,11 +952,9 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self.collector.update_policy_weights_()
         self._refresh_progress_display(metadata, iteration)
 
-        if (
-            self._should_save_checkpoint(
-                frames_processed=metadata.frames_processed,
-                frames_in_iteration=iteration.frames,
-            )
+        if self._should_save_checkpoint(
+            frames_processed=metadata.frames_processed,
+            frames_in_iteration=iteration.frames,
         ):
             checkpoint_dir = self.log_dir / self.config.logger.save_path
             custom_save = getattr(self, "save", None)

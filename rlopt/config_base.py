@@ -397,6 +397,23 @@ class NetworkConfig:
     activation_fn: str = "elu"
     """Activation function."""
 
+    normalize_input: bool = False
+    """Normalize the concatenated network input with running mean and variance."""
+
+    normalization_epsilon: float = 1.0e-5
+    """Numerical epsilon used by running input normalization."""
+
+    normalization_clip: float = 5.0
+    """Absolute clamp applied after running input normalization."""
+
+    normalize_input_exclude_keys: list[ObsKey] = field(default_factory=list)
+    """Input keys passed through running input normalization unchanged.
+
+    Use for inputs whose scale and geometry are already meaningful, such as
+    pretrained latent commands or sin/cos phase features, so running
+    statistics never distort them.
+    """
+
     kwargs: dict[str, Any] = field(default_factory=dict)
     """Additional keyword arguments for the network."""
 
