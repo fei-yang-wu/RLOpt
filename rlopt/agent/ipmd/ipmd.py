@@ -47,6 +47,7 @@ from rlopt.agent.ppo.ppo import (
     PPOIterationData,
     PPORLOptConfig,
     PPOTrainingMetadata,
+    _normalize_advantage_over_rollout,
 )
 from rlopt.config_utils import (
     BatchKey,
@@ -574,8 +575,27 @@ class IPMDConfig(PPOConfig):
     demonstration observations.
     """
 
+    rollout_bc_loss_type: str = "nll"
+    """Loss used for live-state action supervision: ``"nll"`` or ``"mse"``.
+
+    ``"nll"`` preserves the probabilistic behavior-cloning objective. ``"mse"``
+    supervises the deterministic policy mean and is useful when matching an
+    action-reconstruction auxiliary objective independently of exploration std.
+    """
+
     rollout_bc_action_key: ObsKey = ("policy_supervision", "expert_action")
     """Rollout observation key containing the aligned expert action label."""
+
+    actor_learning_rate: float | None = None
+    """Optional actor-specific learning rate for PPO/IPMD.
+
+    When set together with ``critic_learning_rate``, the main optimizer uses
+    separate actor and critic parameter groups. The adaptive KL schedule updates
+    only the actor group, matching asymmetric actor/critic PPO recipes.
+    """
+
+    critic_learning_rate: float | None = None
+    """Optional critic-specific learning rate for PPO/IPMD."""
 
     def validate(self) -> None:
         self.command_source = normalize_ipmd_command_source(self.command_source)
@@ -852,6 +872,31 @@ class IPMDConfig(PPOConfig):
         require_non_negative("ipmd.env_reward_weight", self.env_reward_weight)
         require_non_negative("ipmd.bc_coef", self.bc_coef)
         require_non_negative("ipmd.rollout_bc_coef", self.rollout_bc_coef)
+        if self.actor_learning_rate is not None and self.actor_learning_rate <= 0.0:
+            msg = (
+                "ipmd.actor_learning_rate must be > 0 when configured, got "
+                f"{self.actor_learning_rate!r}."
+            )
+            raise ValueError(msg)
+        if self.critic_learning_rate is not None and self.critic_learning_rate <= 0.0:
+            msg = (
+                "ipmd.critic_learning_rate must be > 0 when configured, got "
+                f"{self.critic_learning_rate!r}."
+            )
+            raise ValueError(msg)
+        if (self.actor_learning_rate is None) != (self.critic_learning_rate is None):
+            msg = (
+                "ipmd.actor_learning_rate and ipmd.critic_learning_rate must be "
+                "configured together."
+            )
+            raise ValueError(msg)
+        self.rollout_bc_loss_type = str(self.rollout_bc_loss_type).strip().lower()
+        if self.rollout_bc_loss_type not in {"nll", "mse"}:
+            msg = (
+                "ipmd.rollout_bc_loss_type must be 'nll' or 'mse', got "
+                f"{self.rollout_bc_loss_type!r}."
+            )
+            raise ValueError(msg)
         self.rollout_bc_action_key = normalize_batch_key(self.rollout_bc_action_key)
         if int(self.bc_pretrain_updates) < 0:
             msg = (
@@ -1015,6 +1060,10 @@ class IPMD(PPO):
         self._reconstruction_target_obs_keys: list[ObsKey] = dedupe_keys(
             [normalize_batch_key(key) for key in target_keys]
         )
+        self._uses_internal_latent_learner = bool(
+            self._use_latent_command
+            and self._command_source not in ("hl_skill", "skill_commander")
+        )
         self._current_reference_obs_getter = None
 
         available_keys = set(env.observation_spec.keys(True))
@@ -1035,14 +1084,16 @@ class IPMD(PPO):
                 msg += self._latent_mode_hint()
                 raise ValueError(msg)
 
-        all_obs_keys = dedupe_keys(
-            self._policy_obs_keys
-            + self._value_obs_keys
-            + self._reward_obs_keys
-            + self._posterior_obs_keys
-            + self._prior_obs_keys
-            + self._reconstruction_target_obs_keys
+        all_obs_keys = list(
+            self._policy_obs_keys + self._value_obs_keys + self._reward_obs_keys
         )
+        if self._uses_internal_latent_learner:
+            all_obs_keys.extend(
+                self._posterior_obs_keys
+                + self._prior_obs_keys
+                + self._reconstruction_target_obs_keys
+            )
+        all_obs_keys = dedupe_keys(all_obs_keys)
         if (
             float(self.config.ipmd.rollout_bc_coef) > 0.0
             and self._rollout_bc_action_key in all_obs_keys
@@ -1166,10 +1217,7 @@ class IPMD(PPO):
         else:
             self._reward_out_fn = lambda r: r
 
-        if self._use_latent_command and self._command_source not in (
-            "hl_skill",
-            "skill_commander",
-        ):
+        if self._uses_internal_latent_learner:
             method = str(self.config.ipmd.latent_learning.method)
             self._latent_learner = build_latent_learner(method)
             self._latent_learner.initialize(self)
@@ -1765,7 +1813,33 @@ class IPMD(PPO):
         ):
             joint_params = list(self._latent_learner.joint_parameters())
 
+        split_actor_critic_lr = self.config.ipmd.actor_learning_rate is not None
+        if split_actor_critic_lr:
+            assert self.config.ipmd.critic_learning_rate is not None
+            policy_params = list(self.policy.parameters()) + joint_params
+            value_params = list(self.value_function.parameters())
+            optimizer_params: list[dict[str, Any]] = [
+                {
+                    "params": policy_params,
+                    "lr": float(self.config.ipmd.actor_learning_rate),
+                    "adaptive_lr": True,
+                    "lr_min": self.config.optim.min_lr,
+                    "lr_max": self.config.optim.max_lr,
+                    "name": "actor",
+                },
+                {
+                    "params": value_params,
+                    "lr": float(self.config.ipmd.critic_learning_rate),
+                    "adaptive_lr": False,
+                    "name": "critic",
+                },
+            ]
+        else:
+            optimizer_params = []
+
         if not hasattr(self, "reward_estimator"):
+            if split_actor_critic_lr:
+                return [optimizer_cls(optimizer_params, **optimizer_kwargs)]
             if not joint_params:
                 return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
             all_params = list(self.actor_critic.parameters()) + joint_params
@@ -1783,6 +1857,8 @@ class IPMD(PPO):
             self.reward_estimator.parameters(),
             **reward_optimizer_kwargs,
         )
+        if split_actor_critic_lr:
+            return [optimizer_cls(optimizer_params, **optimizer_kwargs)]
         return [optimizer_cls(policy_params, **optimizer_kwargs)]
 
     def _next_expert_batch(
@@ -2120,6 +2196,7 @@ class IPMD(PPO):
             "bc_policy_scale_mean",
             "loss_rollout_bc",
             "rollout_bc_nll",
+            "rollout_bc_mse",
             "rollout_bc_log_prob_mean",
             "rollout_bc_target_abs_mean",
             "rollout_bc_policy_action_abs_mean",
@@ -2370,14 +2447,21 @@ class IPMD(PPO):
         log_prob = dist.log_prob(target)
         log_prob = self._reduce_log_prob(log_prob, target)
         rollout_bc_nll = -log_prob.mean()
-        rollout_bc_loss = rollout_bc_nll * self._rollout_bc_coeff
-        rollout_bc_loss.backward()
-
         policy_action = dist.deterministic_sample
         error = policy_action - target
+        rollout_bc_mse = error.square().mean()
+        rollout_bc_objective = (
+            rollout_bc_mse
+            if self.config.ipmd.rollout_bc_loss_type == "mse"
+            else rollout_bc_nll
+        )
+        rollout_bc_loss = rollout_bc_objective * self._rollout_bc_coeff
+        rollout_bc_loss.backward()
+
         return {
             "loss_rollout_bc": rollout_bc_loss.detach(),
             "rollout_bc_nll": rollout_bc_nll.detach(),
+            "rollout_bc_mse": rollout_bc_mse.detach(),
             "rollout_bc_log_prob_mean": log_prob.detach().mean(),
             "rollout_bc_target_abs_mean": target.detach().abs().mean(),
             "rollout_bc_policy_action_abs_mean": policy_action.detach().abs().mean(),
@@ -2889,8 +2973,18 @@ class IPMD(PPO):
 
     def pre_iteration_compute(self, rollout: TensorDict) -> TensorDict:
         """Compute advantages."""
-        with torch.no_grad():
+        with torch.no_grad(), self._freeze_value_normalizer_updates():
             rollout = self.adv_module(rollout)
+
+            if (
+                self.config.ppo.normalize_advantage
+                and self.config.ppo.normalize_advantage_global
+            ):
+                advantage = rollout.get("advantage")
+                rollout.set(
+                    "advantage",
+                    _normalize_advantage_over_rollout(advantage),
+                )
 
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()

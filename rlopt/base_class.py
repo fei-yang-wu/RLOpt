@@ -1303,7 +1303,16 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         min_lr = getattr(schedule_cfg, "min_lr", None)
         max_lr = getattr(schedule_cfg, "max_lr", None)
 
-        lr = float(self.optim.param_groups[0]["lr"])
+        adaptive_groups = [
+            group
+            for group in self.optim.param_groups
+            if bool(group.get("adaptive_lr", True))
+        ]
+        if not adaptive_groups:
+            return
+
+        reference_group = adaptive_groups[0]
+        lr = float(reference_group["lr"])
         if kl_value > desired_kl * 2.0:
             lr /= factor
         elif kl_value < desired_kl / 2.0:
@@ -1311,13 +1320,23 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         else:
             return
 
-        if min_lr is not None:
-            lr = max(lr, float(min_lr))
-        if max_lr is not None:
-            lr = min(lr, float(max_lr))
+        reference_min_lr = reference_group.get("lr_min", min_lr)
+        reference_max_lr = reference_group.get("lr_max", max_lr)
+        if reference_min_lr is not None:
+            lr = max(lr, float(reference_min_lr))
+        if reference_max_lr is not None:
+            lr = min(lr, float(reference_max_lr))
 
-        for group in self.optim.param_groups:
-            group["lr"] = lr
+        scale = lr / float(reference_group["lr"])
+        for group in adaptive_groups:
+            group_lr = float(group["lr"]) * scale
+            group_min_lr = group.get("lr_min", min_lr)
+            group_max_lr = group.get("lr_max", max_lr)
+            if group_min_lr is not None:
+                group_lr = max(group_lr, float(group_min_lr))
+            if group_max_lr is not None:
+                group_lr = min(group_lr, float(group_max_lr))
+            group["lr"] = group_lr
 
     @abstractmethod
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
