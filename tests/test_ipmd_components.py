@@ -91,7 +91,7 @@ def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
     )
 
 
-def _make_env_reward_only_ipmd_agent():
+def _make_env_reward_only_ipmd_agent(*, split_actor_critic_lr: bool = False):
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
@@ -113,9 +113,92 @@ def _make_env_reward_only_ipmd_agent():
     cfg.ipmd.reward_grad_penalty_coeff = 0.0
     cfg.ipmd.bc_coef = 0.0
     cfg.ipmd.diversity_bonus_coeff = 0.0
+    if split_actor_critic_lr:
+        cfg.ipmd.actor_learning_rate = 2.0e-5
+        cfg.ipmd.critic_learning_rate = 1.0e-3
+        cfg.optim.scheduler = "adaptive"
+        cfg.optim.min_lr = 1.0e-5
+        cfg.optim.max_lr = 2.0e-4
 
     env = rlopt.make_parallel_env(cfg)
     return rlopt.IPMD(env, cfg, logger=None), env
+
+
+def test_ipmd_split_actor_critic_learning_rates_and_adaptation():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+        assert groups["critic"]["lr"] == pytest.approx(1.0e-3)
+
+        agent._maybe_adjust_lr(torch.tensor(1.0e-4), agent.config.optim)
+
+        assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
+        assert groups["critic"]["lr"] == pytest.approx(1.0e-3)
+    finally:
+        env.close()
+
+
+def test_ipmd_split_learning_rates_must_be_configured_together():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.actor_learning_rate = 2.0e-5
+    with pytest.raises(ValueError, match="must be configured together"):
+        cfg.ipmd.validate()
+
+
+def test_silu_activation_is_available():
+    from rlopt.utils import get_activation_class
+
+    assert get_activation_class("silu") is torch.nn.SiLU
+    assert get_activation_class("swish") is torch.nn.SiLU
+
+
+def test_sonic_running_mean_std_normalizes_concatenated_critic_input():
+    from rlopt.agent.ppo.ppo import RunningMeanStdCatInputs
+
+    normalizer = RunningMeanStdCatInputs(
+        torch.nn.Identity(),
+        feature_dim=2,
+        epsilon=1.0e-5,
+        clip=5.0,
+    )
+    first = torch.tensor([[1.0], [3.0]])
+    second = torch.tensor([[3.0], [7.0]])
+    output = normalizer(first, second)
+
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[1.0, 3.0], [3.0, 5.0]]),
+        atol=6.0e-5,
+        rtol=0.0,
+    )
+    assert normalizer.count.item() == pytest.approx(3.0)
+
+    running_mean = normalizer.running_mean.clone()
+    running_var = normalizer.running_var.clone()
+    normalizer.eval()
+    normalized = normalizer(torch.tensor([[2.0]]), torch.tensor([[5.0]]))
+    torch.testing.assert_close(
+        normalized,
+        (torch.tensor([[2.0, 5.0]]) - running_mean) / torch.sqrt(running_var + 1.0e-5),
+    )
+    torch.testing.assert_close(normalizer.running_mean, running_mean)
+    torch.testing.assert_close(normalizer.running_var, running_var)
+
+    vmapped = torch.vmap(normalizer)(torch.tensor([[[2.0, 5.0]], [[3.0, 7.0]]]))
+    assert vmapped.shape == (2, 1, 2)
+    torch.testing.assert_close(normalizer.running_mean, running_mean)
+    torch.testing.assert_close(normalizer.running_var, running_var)
+
+
+def test_sonic_advantage_normalization_uses_the_complete_rollout():
+    from rlopt.agent.ppo.ppo import _normalize_advantage_over_rollout
+
+    advantage = torch.arange(6, dtype=torch.float32).reshape(2, 3, 1)
+    normalized = _normalize_advantage_over_rollout(advantage)
+
+    torch.testing.assert_close(normalized.mean(dim=(0, 1)), torch.zeros(1))
+    torch.testing.assert_close(normalized.std(dim=(0, 1)), torch.ones(1))
 
 
 def _make_bilinear_offline_cfg():
@@ -1444,6 +1527,68 @@ def test_ipmd_rollout_bc_uses_live_policy_observations() -> None:
         assert torch.isfinite(warmup_loss[key])
         assert torch.isfinite(normal_loss[key])
     assert "loss_bc" not in warmup_loss
+
+
+def test_ipmd_rollout_bc_mse_supervises_policy_mean() -> None:
+    """MSE rollout BC should be independent of the policy exploration std."""
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 4
+    cfg.compile.compile = False
+    _apply_nonlatent_obs_input_keys(cfg)
+    cfg.ipmd.rollout_bc_coef = 0.01
+    cfg.ipmd.rollout_bc_loss_type = "mse"
+    cfg.ipmd.rollout_bc_action_key = ["policy_supervision", "expert_action"]
+
+    env = rlopt.make_parallel_env(cfg)
+    spec = env.observation_spec.clone()
+    spec.set(("policy_supervision", "expert_action"), env.action_spec.clone())
+    env.observation_spec = spec
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    batch = TensorDict(
+        {
+            "observation": torch.randn(4, obs_dim),
+            ("policy_supervision", "expert_action"): torch.randn(4, act_dim),
+            "action": torch.randn(4, act_dim),
+            "action_log_prob": torch.zeros(4),
+            ("next", "observation"): torch.randn(4, obs_dim),
+            ("next", "reward"): torch.randn(4, 1),
+            ("next", "done"): torch.zeros(4, 1, dtype=torch.bool),
+            ("next", "terminated"): torch.zeros(4, 1, dtype=torch.bool),
+            ("next", "truncated"): torch.zeros(4, 1, dtype=torch.bool),
+        },
+        batch_size=[4],
+    )
+    with torch.no_grad():
+        batch = agent.adv_module(batch)
+    loss, _ = agent.update(
+        batch,
+        0,
+        TensorDict({}, batch_size=[4]),
+        torch.tensor(0.0),
+    )
+
+    assert torch.isfinite(loss["rollout_bc_mse"])
+    assert torch.allclose(
+        loss["loss_rollout_bc"],
+        0.01 * loss["rollout_bc_mse"],
+    )
+
+
+def test_ipmd_rollout_bc_rejects_unknown_loss_type() -> None:
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.rollout_bc_loss_type = "cosine"
+    with pytest.raises(ValueError, match="rollout_bc_loss_type"):
+        cfg.ipmd.validate()
 
 
 def test_ipmd_rollout_bc_label_cannot_be_a_model_input() -> None:

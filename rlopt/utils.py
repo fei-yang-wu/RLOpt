@@ -585,6 +585,8 @@ def get_activation_class(activation_name: str) -> type[torch.nn.Module]:
         "elu": torch.nn.ELU,
         "tanh": torch.nn.Tanh,
         "gelu": torch.nn.GELU,
+        "silu": torch.nn.SiLU,
+        "swish": torch.nn.SiLU,
     }
     return activation_map.get(activation_name, torch.nn.ELU)
 
