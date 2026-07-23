@@ -41,17 +41,24 @@ class FSQQuantizer(nn.Module):
             msg = f"FSQ levels must each be >= 2, got {list(levels)!r}."
             raise ValueError(msg)
         self.register_buffer("_levels", levels_i)
-        self.register_buffer(
-            "_basis",
-            torch.cumprod(
+        # Exact Python-int product: torch int64 prod/cumprod silently wrap for
+        # large level sets (e.g. SONIC's 64 dims x 32 levels = 2^320).
+        self._codebook_size = math.prod(int(level) for level in levels)
+        # A flat scalar code index only exists when the product fits int64;
+        # otherwise forward() returns per-dim level indices instead (the same
+        # pooled-code convention the grouped categorical encoder uses).
+        self.flat_code_supported = self._codebook_size <= (1 << 62)
+        basis = torch.ones(levels_i.numel(), dtype=torch.long)
+        if self.flat_code_supported:
+            basis = torch.cumprod(
                 torch.cat([torch.ones(1, dtype=torch.long), levels_i[:-1]]), dim=0
-            ),
-        )
+            )
+        self.register_buffer("_basis", basis)
         self.code_dim = int(levels_i.numel())
 
     @property
     def codebook_size(self) -> int:
-        return int(self._levels.prod().item())
+        return self._codebook_size
 
     def _bound(self, z: Tensor) -> Tensor:
         levels = self._levels.to(z.dtype)
@@ -66,6 +73,8 @@ class FSQQuantizer(nn.Module):
         z_q = bounded + (rounded - bounded).detach()  # straight-through
         zhat = (rounded.long() + self._levels // 2).clamp(min=0)
         zhat = torch.minimum(zhat, self._levels - 1)
+        if not self.flat_code_supported:
+            return z_q, zhat
         code = (zhat * self._basis).sum(dim=-1)
         return z_q, code
 
@@ -526,7 +535,14 @@ class FSQSkillEncoder(_DiscreteSkillEncoder):
     def __init__(self, *, levels: tuple[int, ...] = (8, 8, 8, 5, 5), **base) -> None:
         super().__init__(raw_dim=len(levels), **base)
         self.fsq = FSQQuantizer(levels)
-        self.num_codes = self.fsq.codebook_size
+        # When the flat code index does not fit int64, per-dim level indices
+        # are the codes (pooled across dims by the usage metrics), so the
+        # usage-metric vocabulary is the largest per-dim level count.
+        self.num_codes = (
+            self.fsq.codebook_size
+            if self.fsq.flat_code_supported
+            else max(int(level) for level in levels)
+        )
         self.code_to_latent = nn.Linear(self.fsq.code_dim, base["z_dim"])
 
     def _quantize(self, z_e, **_):

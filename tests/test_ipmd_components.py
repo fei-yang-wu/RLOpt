@@ -201,6 +201,40 @@ def test_sonic_advantage_normalization_uses_the_complete_rollout():
     torch.testing.assert_close(normalized.std(dim=(0, 1)), torch.ones(1))
 
 
+def test_sonic_policy_gradient_preserves_held_rollout_command():
+    from rlopt.agent.imitation.latent_learning import held_command_policy_surrogate
+
+    stored = torch.randn(6, 66)
+    recomputed = torch.randn(6, 66, requires_grad=True)
+
+    surrogate = held_command_policy_surrogate(stored, recomputed)
+
+    torch.testing.assert_close(surrogate, stored, rtol=0.0, atol=0.0)
+    surrogate.square().sum().backward()
+    torch.testing.assert_close(recomputed.grad, 2.0 * stored)
+
+
+def test_sonic_policy_gradient_rejects_command_shape_mismatch():
+    from rlopt.agent.imitation.latent_learning import held_command_policy_surrogate
+
+    with pytest.raises(ValueError, match="matching shapes"):
+        held_command_policy_surrogate(torch.zeros(4, 66), torch.zeros(4, 64))
+
+
+def test_sonic_policy_gradient_only_recomputes_held_command_renewals():
+    from rlopt.agent.imitation.latent_learning import held_command_policy_surrogate
+
+    stored = torch.randn(6, 66)
+    renewal_mask = torch.tensor([True, False, False, True, False, False])
+    recomputed = torch.randn(2, 66, requires_grad=True)
+
+    surrogate = held_command_policy_surrogate(stored, recomputed, renewal_mask)
+
+    torch.testing.assert_close(surrogate, stored, rtol=0.0, atol=0.0)
+    surrogate.square().sum().backward()
+    torch.testing.assert_close(recomputed.grad, 2.0 * stored[renewal_mask])
+
+
 def _make_bilinear_offline_cfg():
     rlopt = _rlopt()
     cfg = rlopt.IPMDBilinearRLOptConfig()
