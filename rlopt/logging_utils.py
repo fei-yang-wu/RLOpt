@@ -35,7 +35,10 @@ __all__ = [
 ROOT_LOGGER_NAME = "rlopt"
 _CONSOLE_HANDLER_NAME = "rlopt.console"
 _FILE_HANDLER_NAME = "rlopt.file"
-_TIMESTAMP_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+_TIMESTAMP_DIR_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}"
+    r"(?:_[A-Za-z0-9][A-Za-z0-9._-]*)?$"
+)
 
 
 def resolve_log_level(level: str | int | None, *, default: int = logging.INFO) -> int:
@@ -183,7 +186,7 @@ def _slugify(value: Any, fallback: str) -> str:
 
 
 def _looks_like_run_dir(path: Path) -> bool:
-    """Return True when path already points to a timestamped run directory."""
+    """Return True for a timestamped run directory with an optional unique suffix."""
     return bool(_TIMESTAMP_DIR_PATTERN.fullmatch(path.name))
 
 

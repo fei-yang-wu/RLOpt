@@ -16,6 +16,51 @@ from rlopt.agent.imitation.utils import LatentEncoder
 from rlopt.config_utils import BatchKey, dedupe_keys
 from rlopt.utils import get_activation_class
 
+
+def held_command_policy_surrogate(
+    stored_command: Tensor,
+    recomputed_command: Tensor,
+    renewal_mask: Tensor | None = None,
+) -> Tensor:
+    """Keep the rollout command in the PPO forward pass while routing encoder PG.
+
+    Posterior commands may be held for several collector steps. Replacing them
+    with a freshly encoded command for every PPO transition changes the policy
+    input between collection and optimization. This straight-through surrogate
+    is exactly ``stored_command`` in value, while its gradient with respect to
+    ``recomputed_command`` is the identity.
+    """
+    if renewal_mask is None and stored_command.shape != recomputed_command.shape:
+        msg = (
+            "Held-command PPO surrogate requires matching shapes, got stored "
+            f"{tuple(stored_command.shape)} and recomputed "
+            f"{tuple(recomputed_command.shape)}."
+        )
+        raise ValueError(msg)
+    if renewal_mask is None:
+        return stored_command.detach() + (
+            recomputed_command - recomputed_command.detach()
+        )
+
+    expected_mask_shape = stored_command.shape[:-1]
+    if renewal_mask.shape != expected_mask_shape:
+        msg = (
+            "Held-command PPO renewal mask must match command batch shape, got "
+            f"mask {tuple(renewal_mask.shape)} and expected {tuple(expected_mask_shape)}."
+        )
+        raise ValueError(msg)
+    selected_shape = (int(renewal_mask.sum().item()), stored_command.shape[-1])
+    if recomputed_command.shape != selected_shape:
+        msg = (
+            "Held-command PPO recomputed renewal shape mismatch, got "
+            f"{tuple(recomputed_command.shape)} and expected {selected_shape}."
+        )
+        raise ValueError(msg)
+    gradient_delta = torch.zeros_like(stored_command)
+    gradient_delta[renewal_mask] = recomputed_command - recomputed_command.detach()
+    return stored_command.detach() + gradient_delta
+
+
 if TYPE_CHECKING:
     from rlopt.agent.ipmd.ipmd import IPMD
 

@@ -23,6 +23,7 @@ from rlopt.agent.imitation.latent_commands import LatentCommandController
 from rlopt.agent.imitation.latent_learning import (
     BaseLatentLearner,
     build_latent_learner,
+    held_command_policy_surrogate,
 )
 from rlopt.agent.ipmd.utils import (
     IPMD_COMMAND_SOURCES,
@@ -122,10 +123,13 @@ class IPMDLatentLearningConfig:
     """Weight decay coefficient for the latent learner parameters. """
 
     train_posterior_through_policy: bool = False
-    """If True, recompute the latent via the encoder during the PPO policy loss so that
-    policy-improvement gradients update the posterior encoder. Encoder parameters are added
-    to the main PPO optimizer. Combining this with recon_coeff > 0 updates the encoder from
-    both PPO and reconstruction simultaneously."""
+    """If True, route PPO policy gradients through a recomputed posterior latent.
+
+    The PPO forward value remains the exact command stored during rollout, including
+    multi-step holding and phase. The recomputed latent is used only as a straight-through
+    gradient path into the encoder. Encoder parameters are added to the main PPO optimizer.
+    Combining this with recon_coeff > 0 updates the encoder from both PPO and reconstruction.
+    """
 
     freeze_encoder: bool = False
     """If True, the reconstruction update steps only the decoder. The encoder forward in the
@@ -2298,20 +2302,48 @@ class IPMD(PPO):
 
     def _backward_ppo_terms(self, batch: TensorDict) -> TensorDict:
         """Backpropagate the PPO objective and return detached update metrics."""
+        posterior_pg_renew_frac: Tensor | None = None
         if (
             self._use_latent_command
             and self._latent_learner is not None
             and bool(self.config.ipmd.latent_learning.train_posterior_through_policy)
         ):
-            latents = self._latent_learner.infer_batch_latents(
-                batch,
-                detach=False,
-                context="ppo posterior latent",
+            stored_latents = batch.get(self._latent_key).reshape(
+                *batch.batch_size, self._latent_dim
             )
+            renewal_mask: Tensor | None = None
+            posterior_batch = batch
+            latent_cfg = self.config.ipmd.latent_learning
+            if (
+                str(latent_cfg.command_phase_mode) == "sin_cos"
+                and int(latent_cfg.code_period) > 1
+            ):
+                phase = stored_latents[..., -2:]
+                renewal_mask = (phase[..., 0].abs() <= 1.0e-5) & (
+                    phase[..., 1] >= 1.0 - 1.0e-5
+                )
+                posterior_pg_renew_frac = renewal_mask.float().mean()
+                posterior_batch = batch[renewal_mask]
+            latents = None
+            if posterior_batch.numel() > 0:
+                latents = self._latent_learner.infer_batch_latents(
+                    posterior_batch,
+                    detach=False,
+                    context="ppo posterior latent",
+                )
             if latents is not None:
+                recomputed_latents = latents.reshape(-1, self._latent_dim)
+                if renewal_mask is None:
+                    recomputed_latents = recomputed_latents.reshape(
+                        *batch.batch_size, self._latent_dim
+                    )
                 batch.set(
                     self._latent_key,
-                    latents.reshape(*batch.batch_size, self._latent_dim),
+                    held_command_policy_surrogate(
+                        stored_latents,
+                        recomputed_latents,
+                        renewal_mask,
+                    ),
                 )
         loss: TensorDict = self.loss_module(batch)
         extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
@@ -2322,6 +2354,11 @@ class IPMD(PPO):
             + extra_actor_loss
         ).backward()
         output_loss = loss.clone().detach_()
+        if posterior_pg_renew_frac is not None:
+            output_loss.set(
+                "posterior_pg_renew_frac",
+                posterior_pg_renew_frac.detach(),
+            )
         for key, value in extra_actor_metrics.items():
             output_loss.set(key, value.detach())
         return output_loss
