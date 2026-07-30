@@ -24,6 +24,7 @@ LATENT_MODES = (
     "gumbel_multicat",
     "gumbel",
     "fsq",
+    "sonic_fsq",
     "vq",
 )
 
@@ -550,6 +551,63 @@ class FSQSkillEncoder(_DiscreteSkillEncoder):
         return z_q, code, z_e.new_zeros(()), {}
 
 
+class SONICFSQSkillEncoder(_DiscreteSkillEncoder):
+    """SONIC-motivated FSQ bottleneck: the quantizer output *is* the command.
+
+    Two differences from :class:`FSQSkillEncoder`, both required for the
+    planner -> tracker interface to actually be quantized rather than merely
+    trained through a quantizer:
+
+    1. **Normalized codes.** Emits ``round(bound(z)) / (L // 2)``, so values land
+       on the lattice in ``[-1, 1]``. This matches the released SONIC token
+       space: every entry of ``gear_sonic``'s ``LATENT_INITIAL_MOTION_TOKEN`` is
+       an exact multiple of ``1/16 = 1/(32 // 2)``.
+    2. **No projection before the command boundary.** :class:`FSQSkillEncoder`
+       applies ``code_to_latent = nn.Linear(code_dim, z_dim)`` inside
+       ``_latent``, so the published command is a ``z_dim`` continuous vector and
+       every point in R^z_dim is admissible -- the interface is not quantized,
+       only the training was. Here ``code_to_latent`` is the identity and
+       ``z_dim == len(levels)``, so the tracker observes the lattice values
+       directly and its own first layer plays the role of SONIC's ``g1_dyn``
+       input projection.
+
+    :class:`FSQQuantizer` is reused unmodified: dividing its straight-through
+    output by a constant preserves the estimator -- the forward value becomes
+    ``rounded / half`` and the gradient is scaled by ``1 / half``.
+    """
+
+    def __init__(self, *, levels: tuple[int, ...] = (32,) * 64, **base) -> None:
+        z_dim = int(base["z_dim"])
+        if z_dim != len(levels):
+            msg = (
+                "sonic_fsq publishes the quantizer output directly, so z_dim must "
+                f"equal the number of FSQ dimensions: z_dim={z_dim}, "
+                f"len(levels)={len(levels)}."
+            )
+            raise ValueError(msg)
+        super().__init__(raw_dim=len(levels), **base)
+        self.fsq = FSQQuantizer(levels)
+        # Same pooled-code convention as FSQSkillEncoder: a flat code index only
+        # exists when the level product fits int64 (SONIC's 64 x 32 is 2^320).
+        self.num_codes = (
+            self.fsq.codebook_size
+            if self.fsq.flat_code_supported
+            else max(int(level) for level in levels)
+        )
+        # The command boundary sits at the quantizer output -- no learned map.
+        self.code_to_latent = nn.Identity()
+        self.register_buffer(
+            "_half_levels",
+            torch.tensor(
+                [max(int(level) // 2, 1) for level in levels], dtype=torch.float32
+            ),
+        )
+
+    def _quantize(self, z_e, **_):
+        z_q, code = self.fsq(z_e)
+        return z_q / self._half_levels.to(z_q.dtype), code, z_e.new_zeros(()), {}
+
+
 # --------------------------------------------------------------------------- #
 # Spec + factory.
 # --------------------------------------------------------------------------- #
@@ -568,6 +626,9 @@ class SkillLatentSpec:
     gumbel_tau_anneal_iters: int = 2000
     gumbel_hard: bool = True
     fsq_levels: tuple[int, ...] = (8, 8, 8, 5, 5)
+    # SONIC-matched token space: 64 dims x 32 levels ~= 320 bits per command,
+    # i.e. gear_sonic's tokens of shape (2, 32) at num_fsq_levels=32.
+    sonic_fsq_levels: tuple[int, ...] = (32,) * 64
     vq_codebook_size: int = 512
     vq_ema_decay: float = 0.99
     vq_dead_code_reset_iters: int = 0
@@ -623,6 +684,8 @@ def build_skill_encoder(
         )
     if mode == "fsq":
         return FSQSkillEncoder(levels=tuple(spec.fsq_levels), **base)
+    if mode == "sonic_fsq":
+        return SONICFSQSkillEncoder(levels=tuple(spec.sonic_fsq_levels), **base)
     if mode == "vq":
         return VQSkillEncoder(
             codebook_size=spec.vq_codebook_size,

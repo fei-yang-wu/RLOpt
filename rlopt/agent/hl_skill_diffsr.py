@@ -246,6 +246,11 @@ class HighLevelSkillDiffSRConfig:
     gumbel_tau_anneal_iters: int = 2000
     gumbel_hard: bool = True
     fsq_levels: tuple[int, ...] = (8, 8, 8, 5, 5)
+    # SONIC-matched token space: 64 dims x 32 levels ~= 320 bits per command,
+    # i.e. gear_sonic's tokens of shape (2, 32) at num_fsq_levels=32. Used only
+    # by latent_mode="sonic_fsq", which publishes the quantizer output directly
+    # and therefore requires z_dim == len(sonic_fsq_levels).
+    sonic_fsq_levels: tuple[int, ...] = (32,) * 64
     vq_codebook_size: int = 512
     vq_ema_decay: float = 0.99
     vq_dead_code_reset_iters: int = 0
@@ -346,6 +351,25 @@ class HighLevelSkillDiffSRConfig:
         if self.latent_mode == "fsq" and any(level < 2 for level in self.fsq_levels):
             msg = f"fsq_levels must each be >= 2, got {self.fsq_levels!r}."
             raise ValueError(msg)
+        self.sonic_fsq_levels = tuple(
+            _require_positive_int("sonic_fsq_levels", level)
+            for level in self.sonic_fsq_levels
+        )
+        if self.latent_mode == "sonic_fsq":
+            if any(level < 2 for level in self.sonic_fsq_levels):
+                msg = (
+                    "sonic_fsq_levels must each be >= 2, got "
+                    f"{self.sonic_fsq_levels!r}."
+                )
+                raise ValueError(msg)
+            if self.z_dim != len(self.sonic_fsq_levels):
+                msg = (
+                    "latent_mode='sonic_fsq' publishes the quantizer output as the "
+                    "command, so z_dim must equal len(sonic_fsq_levels): "
+                    f"z_dim={self.z_dim}, "
+                    f"len(sonic_fsq_levels)={len(self.sonic_fsq_levels)}."
+                )
+                raise ValueError(msg)
         self.vq_codebook_size = _require_positive_int(
             "vq_codebook_size", self.vq_codebook_size
         )
@@ -424,6 +448,7 @@ class HighLevelSkillDiffSRConfig:
             gumbel_tau_anneal_iters=self.gumbel_tau_anneal_iters,
             gumbel_hard=self.gumbel_hard,
             fsq_levels=tuple(self.fsq_levels),
+            sonic_fsq_levels=tuple(self.sonic_fsq_levels),
             vq_codebook_size=self.vq_codebook_size,
             vq_ema_decay=self.vq_ema_decay,
             vq_dead_code_reset_iters=self.vq_dead_code_reset_iters,
@@ -442,6 +467,7 @@ class HighLevelSkillDiffSRConfig:
             "diffsr_g_hidden_dims",
             "diffsr_mu_hidden_dims",
             "fsq_levels",
+            "sonic_fsq_levels",
             "commander_hidden_dims",
         }
         for key in tuple_fields:
