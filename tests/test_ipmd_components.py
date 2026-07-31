@@ -1425,6 +1425,80 @@ def test_ipmd_update_with_expert_data():
         assert not torch.isinf(value).any(), f"Inf in {key}"
 
 
+def test_ipmd_backward_ppo_terms_skips_latent_update_when_no_renewals() -> None:
+    """An all-False renewal mask must not reach the posterior latent learner.
+
+    Regression test: ``TensorDict.numel()`` is lower-bounded to 1 by design
+    (its own docstring notes an empty-shape stack still counts as 1 element),
+    so guarding on ``posterior_batch.numel() > 0`` can never detect an
+    empty-mask selection. Before the fix, a minibatch whose sin/cos phase
+    never hits the renewal condition crashed inside
+    ``_patch_features_from_td`` trying to reshape a 0-length tensor.
+    """
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 4
+    cfg.compile.compile = False
+    cfg.ipmd.reward_num_cells = (32, 32)
+    cfg.ipmd.expert_batch_size = 4
+    _apply_obs_input_keys(cfg)
+    cfg.ipmd.latent_learning.train_posterior_through_policy = True
+    cfg.ipmd.latent_learning.command_phase_mode = "sin_cos"
+    cfg.ipmd.latent_learning.code_period = 4
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    expert_data = create_synthetic_expert_data(env, num_transitions=50)
+    agent._set_test_expert_batch_sampler(_make_test_expert_sampler(expert_data))
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    batch_size = 4
+
+    observation = torch.randn(batch_size, obs_dim)
+    # latent_key == "observation" in this fixture; pin the phase (last two
+    # components) far from the renewal condition (phase ~= [0, 1]) for every
+    # row so the renewal mask is all-False.
+    observation[:, -2:] = torch.tensor([1.0, 0.0])
+
+    policy_batch = TensorDict(
+        {
+            "observation": observation,
+            "action": torch.randn(batch_size, act_dim),
+            "action_log_prob": torch.zeros(batch_size),
+            ("next", "observation"): torch.randn(batch_size, obs_dim),
+            ("next", "reward"): torch.randn(batch_size, 1),
+            ("next", "done"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "terminated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "truncated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    with torch.no_grad():
+        policy_batch = agent.adv_module(policy_batch)
+
+    num_network_updates = torch.zeros((), dtype=torch.int64, device=agent.device)
+    expert_batch = agent._next_expert_batch(batch_size=cfg.ipmd.expert_batch_size)
+    has_expert = torch.tensor(1.0, device=agent.device, dtype=torch.float32)
+    loss_td, _ = agent.update(
+        policy_batch, num_network_updates, expert_batch, has_expert
+    )
+
+    assert "loss_critic" in loss_td
+    assert "loss_objective" in loss_td
+    for key in tuple(loss_td.keys()):
+        value = loss_td[key]
+        assert not torch.isnan(value).any(), f"NaN in {key}"
+        assert not torch.isinf(value).any(), f"Inf in {key}"
+
+
 def test_ipmd_bc_pretrain_updates_skip_then_restore_ppo() -> None:
     """BC pretraining should suppress PPO gradients only for its fixed prefix."""
     rlopt = _rlopt()
