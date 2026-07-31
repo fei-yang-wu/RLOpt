@@ -183,6 +183,13 @@ class IPMDLatentLearningConfig:
     fsq_levels: list[int] = field(default_factory=lambda: [8, 8, 8, 5, 5])
     """Per-dimension level counts for FSQ. Effective codebook size = prod(levels)."""
 
+    fsq_normalize_codes: bool = False
+    """Divide FSQ lattice values by ``levels // 2`` before publication.
+
+    This preserves legacy reconstruction arms by default. Enable it for SONIC,
+    whose public token values live on a normalized lattice in [-1, 1].
+    """
+
     codebook_size: int = 512
     """Codebook size for ``vq_ema`` and ``gumbel`` quantizers."""
 
