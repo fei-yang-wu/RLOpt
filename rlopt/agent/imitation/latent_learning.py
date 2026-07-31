@@ -1527,22 +1527,33 @@ class FSQQuantizer(nn.Module):
             raise ValueError(msg)
         levels_i = torch.tensor([int(level) for level in levels], dtype=torch.long)
         levels_t = levels_i.to(torch.float32)
+        # Exact Python-int product: torch prod/cumprod silently overflow for
+        # SONIC's 64 coordinates x 32 levels (2**320).
+        self._codebook_size = math.prod(int(level) for level in levels)
+        self.flat_code_supported = self._codebook_size <= (1 << 62)
+        basis = torch.ones(levels_i.numel(), dtype=torch.long)
+        if self.flat_code_supported:
+            basis = torch.cumprod(
+                torch.cat([torch.ones(1, dtype=torch.long), levels_i[:-1]]),
+                dim=0,
+            )
         # Half range per dim: integer indices range over [-half, half] (with one extra
         # for even L).  We follow the canonical implementation.
         self.register_buffer("levels", levels_t)
         self.register_buffer("_levels_i", levels_i)
-        self.register_buffer(
-            "_basis",
-            torch.cumprod(
-                torch.cat([torch.ones(1), levels_t[:-1]]),
-                dim=0,
-            ).to(torch.long),
-        )
+        self.register_buffer("_basis", basis)
         self.code_dim = len(levels)
 
     @property
     def codebook_size(self) -> int:
-        return int(self.levels.prod().item())
+        return self._codebook_size
+
+    @property
+    def usage_vocab_size(self) -> int:
+        """Vocabulary used by pooled code-usage diagnostics."""
+        if self.flat_code_supported:
+            return self._codebook_size
+        return int(self._levels_i.max().item())
 
     def _bound(self, z: Tensor) -> Tensor:
         # Squash to [-1, 1] with extra slack so the rounded grid stays inside.
@@ -1565,15 +1576,29 @@ class FSQQuantizer(nn.Module):
         zhat = rounded.to(torch.long) + levels_i // 2
         zhat = zhat.clamp(min=0)
         zhat = torch.minimum(zhat, levels_i - 1)
-        code = (zhat * self._basis.to(zhat.device)).sum(dim=-1)
+        if self.flat_code_supported:
+            code = (zhat * self._basis.to(zhat.device)).sum(dim=-1)
+        else:
+            # A scalar mixed-radix index cannot fit int64. Preserve the exact
+            # per-coordinate indices, which is also SONIC's usable token form.
+            code = zhat
         return z_q, code, bounded
 
     def indices_to_codes(self, code: Tensor) -> Tensor:
-        """Convert mixed-radix token IDs back to FSQ vectors."""
+        """Convert flat or per-coordinate FSQ indices back to quantized values."""
         code = code.to(device=self.levels.device, dtype=torch.long)
         levels_i = self._levels_i.to(code.device)
-        basis = self._basis.to(code.device)
-        indices = (code.unsqueeze(-1) // basis) % levels_i
+        if self.flat_code_supported:
+            basis = self._basis.to(code.device)
+            indices = (code.unsqueeze(-1) // basis) % levels_i
+        else:
+            if code.shape[-1] != self.code_dim:
+                msg = (
+                    "Large FSQ spaces require per-coordinate indices with final "
+                    f"dimension {self.code_dim}, got {tuple(code.shape)}."
+                )
+                raise ValueError(msg)
+            indices = code
         return (indices - levels_i // 2).to(self.levels.dtype)
 
 
@@ -1948,6 +1973,9 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
         if kind == "fsq":
             assert self.fsq is not None
             z_q, code, _ = self.fsq(z_e)
+            if bool(self._config().fsq_normalize_codes):
+                half = (self.fsq.levels // 2).clamp(min=1).to(z_q.dtype)
+                z_q = z_q / half
             out["z_q"] = z_q
             out["code"] = code
             out["aux_loss"] = torch.zeros((), device=z_e.device)
@@ -2261,8 +2289,8 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
         # Code-usage diagnostics + dead-code revival.
         with torch.no_grad():
             code_flat = code.reshape(-1)
-            codebook_size = self._codebook_size()
-            usage_hist = torch.bincount(code_flat, minlength=codebook_size).float()
+            usage_vocab_size = self._code_usage_vocab_size()
+            usage_hist = torch.bincount(code_flat, minlength=usage_vocab_size).float()
             usage_prob = usage_hist / usage_hist.sum().clamp(min=1.0)
             perplexity = torch.exp(
                 -(usage_prob * (usage_prob.clamp(min=1e-12)).log()).sum()
@@ -2297,6 +2325,12 @@ class PatchVQVAELatentLearner(BaseLatentLearner):
         if self._quantizer_kind() == "gumbel":
             metrics["ipmd/vqvae_gumbel_tau"] = float(self._current_tau())
         return metrics
+
+    def _code_usage_vocab_size(self) -> int:
+        if self._quantizer_kind() == "fsq":
+            assert self.fsq is not None
+            return self.fsq.usage_vocab_size
+        return self._codebook_size()
 
     def _codebook_size(self) -> int:
         kind = self._quantizer_kind()
@@ -2409,6 +2443,9 @@ class PerStepVQSequenceLatentLearner(PatchVQVAELatentLearner):
         if kind == "fsq":
             assert self.fsq is not None
             z_q = self.fsq.indices_to_codes(code)
+            if bool(self._config().fsq_normalize_codes):
+                half = (self.fsq.levels // 2).clamp(min=1).to(z_q.dtype)
+                z_q = z_q / half
         elif kind == "vq_ema":
             assert self.vq is not None
             z_q = F.embedding(code.to(torch.long), self.vq.embedding)

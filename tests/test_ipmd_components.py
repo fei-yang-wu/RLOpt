@@ -1867,6 +1867,66 @@ def test_fsq_quantizer_uses_all_even_level_codes() -> None:
     assert torch.equal(torch.unique(code), torch.arange(8))
 
 
+def test_fsq_quantizer_large_space_uses_per_coordinate_indices() -> None:
+    """SONIC's 32**64 space must not overflow a flat int64 code."""
+    from rlopt.agent.imitation.latent_learning import FSQQuantizer
+
+    quantizer = FSQQuantizer([32] * 64)
+    z_e = torch.randn(4, 64)
+    z_q, code, _ = quantizer(z_e)
+
+    assert quantizer.codebook_size == 32**64
+    assert quantizer.usage_vocab_size == 32
+    assert quantizer.flat_code_supported is False
+    assert code.shape == (4, 64)
+    assert torch.equal(quantizer.indices_to_codes(code), z_q.detach())
+
+
+def test_patch_vqvae_large_normalized_fsq_updates_without_flat_code() -> None:
+    """The official 64x32 normalized posterior must train without overflow."""
+    rlopt = _rlopt()
+    from rlopt.agent.imitation.latent_learning import PatchVQVAELatentLearner
+
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 64
+    cfg.ipmd.latent_learning.method = "patch_vqvae"
+    cfg.ipmd.latent_learning.quantizer = "fsq"
+    cfg.ipmd.latent_learning.fsq_levels = [32] * 64
+    cfg.ipmd.latent_learning.fsq_normalize_codes = True
+    cfg.ipmd.latent_learning.code_latent_dim = 64
+    cfg.ipmd.latent_learning.posterior_input_keys = ["window"]
+    cfg.ipmd.latent_learning.encoder_hidden_dims = [16]
+    cfg.ipmd.latent_learning.decoder_hidden_dims = [16]
+    cfg.ipmd.latent_learning.recon_coeff = 0.01
+    cfg.ipmd.expert_batch_size = 4
+    cfg.ipmd.validate()
+
+    expert_data = TensorDict({"window": torch.randn(4, 30)}, batch_size=[4])
+
+    def _next_expert_batch(batch_size=4, *, required_keys):
+        return expert_data[:batch_size].select(*required_keys).clone()
+
+    fake_agent = SimpleNamespace(
+        config=cfg,
+        device=torch.device("cpu"),
+        _latent_dim=64,
+        _obs_feature_dims={"window": 30},
+        _posterior_obs_keys=["window"],
+        _action_feature_dim=2,
+        _next_expert_batch=_next_expert_batch,
+    )
+    learner = PatchVQVAELatentLearner()
+    learner.initialize(fake_agent)
+    command = learner.infer_batch_latents(expert_data, detach=True, context="test")
+    metrics = learner.update(TensorDict({}, batch_size=[0]))
+
+    assert command is not None
+    assert bool((command.abs() <= 1.0 + 1e-6).all())
+    assert torch.allclose(command * 16, (command * 16).round(), atol=1e-5)
+    assert metrics["ipmd/vqvae_codebook_size"] == float(32**64)
+    assert 0.0 <= metrics["ipmd/vqvae_dead_codes"] <= 32.0
+
+
 def test_patch_vqvae_collector_holds_code_and_reports_phase() -> None:
     """The collector hook should hold z_q while sin/cos phase advances."""
     rlopt = _rlopt()
