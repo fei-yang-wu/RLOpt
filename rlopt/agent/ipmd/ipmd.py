@@ -2332,7 +2332,11 @@ class IPMD(PPO):
                 posterior_pg_renew_frac = renewal_mask.float().mean()
                 posterior_batch = batch[renewal_mask]
             latents = None
-            if posterior_batch.numel() > 0:
+            # TensorDict.numel() is lower-bounded to 1 by design (its own
+            # docstring: "a stack of two tensordict with empty shape will
+            # have two elements"), so it can never observe an empty-mask
+            # selection here -- check the mask directly instead.
+            if renewal_mask is None or bool(renewal_mask.any()):
                 latents = self._latent_learner.infer_batch_latents(
                     posterior_batch,
                     detach=False,
