@@ -453,6 +453,9 @@ class TrainerConfig:
     log_interval: int = 10_000_000
     """Interval for logging."""
 
+    profile_iterations: bool = False
+    """Synchronize accelerators and report phase timings for every iteration."""
+
 
 @dataclass
 class RLOptConfig:

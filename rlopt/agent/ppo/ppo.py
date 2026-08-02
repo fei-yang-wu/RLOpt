@@ -714,10 +714,16 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self.actor_critic.eval()
         self.adv_module.eval()
 
+        phase_times: dict[str, float] = {}
         collect_start = time.perf_counter()
-        with timeit("collecting"):
+        with (
+            self._profile_iteration_phase(phase_times, "collect"),
+            timeit("collecting"),
+        ):
             rollout = next(run.collector_iter)
         collect_time = time.perf_counter() - collect_start
+        if "collect" in phase_times:
+            collect_time = phase_times["collect"]
 
         rollout_frames = rollout.numel()
         run.frames_processed += rollout_frames
@@ -728,6 +734,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             rollout=rollout,
             frames=rollout_frames,
             collect_time=collect_time,
+            phase_times=phase_times,
         )
 
     def prepare(
@@ -818,39 +825,45 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
         with timeit("training"):
             # Pre-iteration compute GAE, once per rollout
-            iteration.rollout = self.pre_iteration_compute(iteration.rollout)
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/advantage_and_buffer"
+            ):
+                iteration.rollout = self.pre_iteration_compute(iteration.rollout)
 
             # Run PPO epochs over the rollout
-            for epoch_idx in range(metadata.epochs_per_rollout):
-                # Run PPO epochs over the rollout
-                for batch_idx, batch in enumerate(self.data_buffer):
-                    kl_context = None
-                    if (self.config.optim.scheduler or "").lower() == "adaptive":
-                        kl_context = self._prepare_kl_context(
-                            batch, metadata.policy_operator
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/policy_updates"
+            ):
+                for epoch_idx in range(metadata.epochs_per_rollout):
+                    # Run PPO epochs over the rollout
+                    for batch_idx, batch in enumerate(self.data_buffer):
+                        kl_context = None
+                        if (self.config.optim.scheduler or "").lower() == "adaptive":
+                            kl_context = self._prepare_kl_context(
+                                batch, metadata.policy_operator
+                            )
+
+                        loss, metadata.updates_completed = self.update(
+                            batch, metadata.updates_completed
+                        )
+                        loss = loss.clone()
+
+                        if self.lr_scheduler and self.lr_scheduler_step == "update":
+                            self.lr_scheduler.step()
+                        if kl_context is not None:
+                            kl_approx = self._compute_kl_after_update(
+                                kl_context, metadata.policy_operator
+                            )
+                            if kl_approx is not None:
+                                loss.set("kl_approx", kl_approx.detach())
+                                self._maybe_adjust_lr(kl_approx, self.config.optim)
+
+                        losses[epoch_idx, batch_idx] = (
+                            self._select_reported_loss_metrics(loss)
                         )
 
-                    loss, metadata.updates_completed = self.update(
-                        batch, metadata.updates_completed
-                    )
-                    loss = loss.clone()
-
-                    if self.lr_scheduler and self.lr_scheduler_step == "update":
+                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
-                    if kl_context is not None:
-                        kl_approx = self._compute_kl_after_update(
-                            kl_context, metadata.policy_operator
-                        )
-                        if kl_approx is not None:
-                            loss.set("kl_approx", kl_approx.detach())
-                            self._maybe_adjust_lr(kl_approx, self.config.optim)
-
-                    losses[epoch_idx, batch_idx] = self._select_reported_loss_metrics(
-                        loss
-                    )
-
-                if self.lr_scheduler and self.lr_scheduler_step == "epoch":
-                    self.lr_scheduler.step()
 
         iteration.learn_time = time.perf_counter() - learn_start
         losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
@@ -980,13 +993,19 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 iteration = self.collect(metadata, iteration_idx)
 
                 # 2) Let the algorithm reshape rewards or attach extra data.
-                self.prepare(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "prepare"):
+                    self.prepare(iteration, metadata)
 
                 # 3) Run the shared learning phase over the prepared rollout.
-                self.iterate(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "learn"):
+                    self.iterate(iteration, metadata)
+                if "learn" in iteration.phase_times:
+                    iteration.learn_time = iteration.phase_times["learn"]
 
                 # 4) Log, refresh collector weights, and checkpoint if needed.
-                self.record(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "record"):
+                    self.record(iteration, metadata)
+                self._finish_iteration_profile(metadata, iteration)
         finally:
             metadata.progress_bar.close()  # type: ignore[attr-defined]
             self.collector.shutdown()
