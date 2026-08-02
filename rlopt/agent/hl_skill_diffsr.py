@@ -548,16 +548,16 @@ class FrozenHighLevelSkillCommandSampler:
             else self.latent_steps_max
         )
         self.device = _resolve_device(device, env)
-        self._current_macro_sampler = discover_env_method(
+        from rlopt.utils import require_env_method
+
+        self._current_macro_sampler = require_env_method(
             env,
             "current_expert_macro_transition_batch",
-        )
-        if self._current_macro_sampler is None:
-            msg = (
+            purpose=(
                 "command_source='hl_skill' requires the environment to expose "
-                "current_expert_macro_transition_batch(...)."
-            )
-            raise ValueError(msg)
+                "current_expert_macro_transition_batch(...)"
+            ),
+        )
         self._offline_macro_sampler = discover_env_method(
             env,
             "sample_expert_macro_transition_batch",
