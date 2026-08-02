@@ -203,26 +203,13 @@ class StreamingOfflineExpertSampler:
 
 
 def _discover_offline_mapper_params(env: object) -> dict[str, Any]:
-    stack: list[object] = [env]
-    visited: set[int] = set()
-    while stack:
-        current = stack.pop()
-        obj_id = id(current)
-        if obj_id in visited:
-            continue
-        visited.add(obj_id)
-        method = getattr(current, "get_offline_dataset_mapper_params", None)
-        if callable(method):
-            return dict(method())
-        for attr_name in ("base_env", "env", "_env", "unwrapped"):
-            next_obj = getattr(current, attr_name, None)
-            if next_obj is None:
-                continue
-            if isinstance(next_obj, list | tuple):
-                stack.extend(next_obj)
-            else:
-                stack.append(next_obj)
-    return {}
+    """Offline-dataset mapper parameters from the environment's interface."""
+    from rlopt.env_interface import resolve_imitation_interface, supports
+
+    interface = resolve_imitation_interface(env)
+    if not supports(interface, "offline_dataset_mapper_params"):
+        return {}
+    return dict(interface.offline_dataset_mapper_params())
 
 
 def build_offline_expert_sampler(

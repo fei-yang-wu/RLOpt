@@ -391,10 +391,13 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         return None
 
     def _auto_attach_env_expert_sampler(self) -> None:
-        """Attach ``sample_expert_batch`` from env wrappers when available."""
-        sampler = self._discover_env_method(self.env, "sample_expert_batch")
-        if sampler is None:
+        """Attach the environment's expert sampler when it offers one."""
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        interface = resolve_imitation_interface(self.env)
+        if not supports(interface, "sample_expert_batch"):
             return
+        sampler = interface.sample_expert_batch
 
         def _wrapped_sampler(
             batch_size: int, required_keys: list[str | tuple[str, ...]]

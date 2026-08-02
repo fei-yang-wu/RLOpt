@@ -548,19 +548,19 @@ class FrozenHighLevelSkillCommandSampler:
             else self.latent_steps_max
         )
         self.device = _resolve_device(device, env)
-        from rlopt.utils import require_env_method
+        from rlopt.env_interface import require_imitation_interface, supports
+        from rlopt.env_interface import resolve_imitation_interface
 
-        self._current_macro_sampler = require_env_method(
+        self._env_interface = resolve_imitation_interface(env)
+        self._current_macro_sampler = require_imitation_interface(
             env,
             "current_expert_macro_transition_batch",
-            purpose=(
-                "command_source='hl_skill' requires the environment to expose "
-                "current_expert_macro_transition_batch(...)"
-            ),
+            purpose="command_source='hl_skill' requires it but",
         )
-        self._offline_macro_sampler = discover_env_method(
-            env,
-            "sample_expert_macro_transition_batch",
+        self._offline_macro_sampler = (
+            self._env_interface.sample_expert_macro_transition_batch
+            if supports(self._env_interface, "sample_expert_macro_transition_batch")
+            else None
         )
         if self.finetune_enabled and self._offline_macro_sampler is None:
             msg = (
@@ -1179,10 +1179,13 @@ class HighLevelSkillDiffSRTrainer:
         *,
         split: str | None,
     ) -> TensorDictBase:
-        sampler = getattr(self.env, "sample_expert_macro_transition_batch", None)
-        if not callable(sampler):
-            msg = "env must expose sample_expert_macro_transition_batch(...)."
-            raise ValueError(msg)
+        from rlopt.env_interface import require_imitation_interface
+
+        sampler = require_imitation_interface(
+            self.env,
+            "sample_expert_macro_transition_batch",
+            purpose="Offline skill-encoder training requires it but",
+        )
         return sampler(
             batch_size=int(batch_size),
             horizon_steps=int(self.config.horizon_steps),
@@ -1207,9 +1210,12 @@ class HighLevelSkillDiffSRTrainer:
         )
 
     def _resolve_feature_slices(self) -> dict[str, tuple[int, int]]:
-        provider = getattr(self.env, "expert_macro_feature_slices", None)
-        if not callable(provider):
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        interface = resolve_imitation_interface(self.env)
+        if not supports(interface, "expert_macro_feature_slices"):
             return {}
+        provider = interface.expert_macro_feature_slices
         raw_slices = provider(horizon_steps=int(self.config.horizon_steps))
         if raw_slices is None:
             return {}

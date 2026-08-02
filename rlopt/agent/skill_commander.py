@@ -2185,15 +2185,13 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
         )
         self.device = _resolve_device(device, env)
 
-        self._current_macro_sampler = discover_env_method(
-            env, "current_expert_macro_transition_batch"
+        from rlopt.env_interface import require_imitation_interface
+
+        self._current_macro_sampler = require_imitation_interface(
+            env,
+            "current_expert_macro_transition_batch",
+            purpose="command_source='skill_commander' requires it but",
         )
-        if self._current_macro_sampler is None:
-            msg = (
-                "command_source='skill_commander' requires the environment to "
-                "expose current_expert_macro_transition_batch(...)."
-            )
-            raise ValueError(msg)
         # Closed-loop mode: condition the commander on robot-only causal history.
         self.use_achieved_state = bool(use_achieved_state)
         self._achieved_macro_sampler = discover_env_method(
@@ -2447,7 +2445,14 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             self.diffsr.requires_grad_(False)
 
         if self.condition_on_language:
-            names_provider = discover_env_method(env, "expert_trajectory_motion_names")
+            from rlopt.env_interface import resolve_imitation_interface, supports
+
+            _interface = resolve_imitation_interface(env)
+            names_provider = (
+                _interface.expert_trajectory_motion_names
+                if supports(_interface, "expert_trajectory_motion_names")
+                else None
+            )
             if names_provider is None:
                 msg = (
                     "command_source='skill_commander' requires the environment to "

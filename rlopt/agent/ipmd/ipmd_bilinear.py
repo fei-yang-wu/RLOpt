@@ -74,6 +74,13 @@ def _require_non_negative_int(name: str, value: int) -> int:
     return normalized
 
 
+def _env_offers_expert_batch(env: object) -> bool:
+    """Whether the environment exposes an expert-batch sampler."""
+    from rlopt.env_interface import resolve_imitation_interface, supports
+
+    return supports(resolve_imitation_interface(env), "sample_expert_batch")
+
+
 @dataclass
 class BilinearOfflinePretrainConfig:
     """Offline spectral-representation pretraining configuration."""
@@ -437,11 +444,12 @@ class IPMDBilinear(IPMD):
         if (
             offline_cfg.requires_offline_data()
             and not offline_dataset_enabled
-            and self._discover_env_method(env, "sample_expert_batch") is None
+            and not _env_offers_expert_batch(env)
         ):
             msg = (
-                "bilinear offline pretraining or policy BC requires "
-                "env.sample_expert_batch(...) or offline_dataset.enabled=True."
+                "bilinear offline pretraining or policy BC requires the "
+                "environment's sample_expert_batch capability or "
+                "offline_dataset.enabled=True."
             )
             raise ValueError(msg)
 
