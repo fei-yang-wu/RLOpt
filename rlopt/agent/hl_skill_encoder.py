@@ -352,6 +352,7 @@ class _DiscreteSkillEncoder(HighLevelSkillEncoder):
 
     code_to_latent: nn.Module
     num_codes: int = 0
+    report_flat_code_metrics: bool = True
 
     def _pre_quantize(self, raw: Tensor) -> Tensor:
         return raw
@@ -368,7 +369,7 @@ class _DiscreteSkillEncoder(HighLevelSkillEncoder):
             z_e, deterministic=deterministic, step=step
         )
         z = self.code_to_latent(z_q).reshape(*raw.shape[:-1], self.z_dim)
-        if 0 < self.num_codes <= 1 << 16:
+        if self.report_flat_code_metrics and 0 < self.num_codes <= 1 << 16:
             info = {**info, "perplexity": _perplexity(code.detach(), self.num_codes)}
         return z, reg, info
 
@@ -387,6 +388,8 @@ class _DiscreteSkillEncoder(HighLevelSkillEncoder):
 
 
 class MultiCategoricalSkillEncoder(_DiscreteSkillEncoder):
+    report_flat_code_metrics = False
+
     def __init__(self, *, groups: int = 8, categories: int = 32, **base) -> None:
         groups, categories = int(groups), int(categories)
         if base["z_dim"] % groups != 0:
@@ -422,6 +425,46 @@ class MultiCategoricalSkillEncoder(_DiscreteSkillEncoder):
         log_probs = torch.log_softmax(logits, dim=-1)
         kl = (probs * (log_probs + math.log(self.categories))).sum(-1).sum(-1).mean()
         return z_q, logits.argmax(dim=-1), kl, {}
+
+    @torch.no_grad()
+    def diversity_metrics(self, state, future_window):
+        logits = self._pre_quantize(self._raw(state, future_window))
+        z_q, codes, _, _ = self._quantize(
+            logits,
+            deterministic=True,
+            step=None,
+        )
+        z = self.code_to_latent(z_q).reshape(*logits.shape[:-2], self.z_dim)
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        conditional_entropy = -(probs * log_probs).sum(dim=-1).mean()
+
+        marginal_probs = probs.mean(dim=0)
+        marginal_entropy = (
+            -(marginal_probs * marginal_probs.clamp_min(1.0e-12).log())
+            .sum(dim=-1)
+            .mean()
+        )
+
+        group_code_usage = (
+            F.one_hot(
+                codes.reshape(-1, self.groups),
+                num_classes=self.categories,
+            )
+            .any(dim=0)
+            .to(dtype=z.dtype)
+            .mean(dim=-1)
+        )
+
+        return {
+            **self._z_diversity(z),
+            "marginal_entropy": marginal_entropy,
+            "conditional_entropy": conditional_entropy,
+            "group_code_usage_frac_mean": group_code_usage.mean(),
+            "group_code_usage_frac_min": group_code_usage.min(),
+            "group_code_usage_frac_max": group_code_usage.max(),
+        }
 
 
 class GumbelMultiCategoricalSkillEncoder(MultiCategoricalSkillEncoder):
