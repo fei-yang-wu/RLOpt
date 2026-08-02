@@ -1016,9 +1016,15 @@ class IPMDBilinear(IPMD):
         try:
             for iteration_idx in range(metadata.total_iterations):
                 iteration = self.collect(metadata, iteration_idx)
-                self.prepare(iteration, metadata)
-                self.iterate(iteration, metadata)
-                self.record(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "prepare"):
+                    self.prepare(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "learn"):
+                    self.iterate(iteration, metadata)
+                if "learn" in iteration.phase_times:
+                    iteration.learn_time = iteration.phase_times["learn"]
+                with self._profile_iteration_phase(iteration.phase_times, "record"):
+                    self.record(iteration, metadata)
+                self._finish_iteration_profile(metadata, iteration)
         finally:
             metadata.progress_bar.close()  # type: ignore[attr-defined]
             self.collector.shutdown()
@@ -1028,15 +1034,21 @@ class IPMDBilinear(IPMD):
         self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
     ) -> None:
         super().prepare(iteration, metadata)
-        self._store_transitions(iteration.rollout)
+        with self._profile_iteration_phase(
+            iteration.phase_times, "prepare/history_buffer"
+        ):
+            self._store_transitions(iteration.rollout)
 
     def iterate(
         self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
     ) -> None:
         super().iterate(iteration, metadata)
 
-        sr_metrics = self._train_sr_steps(self.config.bilinear.update_steps)
-        self.bilinear_rep.update_ema(self.config.bilinear.ema_tau)
+        with self._profile_iteration_phase(
+            iteration.phase_times, "learn/spectral_updates"
+        ):
+            sr_metrics = self._train_sr_steps(self.config.bilinear.update_steps)
+            self.bilinear_rep.update_ema(self.config.bilinear.ema_tau)
 
         for k, v in sr_metrics.items():
             self._pending_sr_metrics.setdefault(k, []).append(v)

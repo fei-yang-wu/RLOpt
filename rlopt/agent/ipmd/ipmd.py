@@ -3249,69 +3249,88 @@ class IPMD(PPO):
 
         with timeit("training"):
             rollout_flat = iteration.rollout.reshape(-1)
-            if self._latent_learner is not None:
-                learner_metrics = self._latent_learner.update(rollout_flat)
-                if learner_metrics:
-                    iteration.metrics.update(
-                        {f"train/{k}": v for k, v in learner_metrics.items()}
-                    )
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/latent_update"
+            ):
+                if self._latent_learner is not None:
+                    learner_metrics = self._latent_learner.update(rollout_flat)
+                    if learner_metrics:
+                        iteration.metrics.update(
+                            {f"train/{k}": v for k, v in learner_metrics.items()}
+                        )
 
-            reward_metrics = self._run_pre_policy_reward_updates(
-                rollout_flat,
-                metadata,
-            )
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/reward_updates"
+            ):
+                reward_metrics = self._run_pre_policy_reward_updates(
+                    rollout_flat,
+                    metadata,
+                )
             iteration.metrics.update(
                 {f"train/{key}": value.item() for key, value in reward_metrics.items()}
             )
-            iteration.metrics.update(self._prepare_rollout_rewards(iteration.rollout))
-            iteration.rollout = self.pre_iteration_compute(iteration.rollout)
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/reward_assignment"
+            ):
+                iteration.metrics.update(
+                    self._prepare_rollout_rewards(iteration.rollout)
+                )
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/advantage_and_buffer"
+            ):
+                iteration.rollout = self.pre_iteration_compute(iteration.rollout)
 
-            for epoch_idx in range(metadata.epochs_per_rollout):
-                for batch_idx, batch in enumerate(self.data_buffer):
-                    kl_context = None
-                    if (self.config.optim.scheduler or "").lower() == "adaptive":
-                        kl_context = self._prepare_kl_context(
-                            batch, metadata.policy_operator
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/policy_updates"
+            ):
+                for epoch_idx in range(metadata.epochs_per_rollout):
+                    for batch_idx, batch in enumerate(self.data_buffer):
+                        kl_context = None
+                        if (self.config.optim.scheduler or "").lower() == "adaptive":
+                            kl_context = self._prepare_kl_context(
+                                batch, metadata.policy_operator
+                            )
+
+                        needs_expert_batch = bool(self._bc_coeff > 0.0)
+                        if needs_expert_batch:
+                            expert_batch, has_expert = self._expert_batch_for_update(
+                                batch
+                            )
+                        else:
+                            expert_batch = TensorDict(
+                                {},
+                                batch_size=batch.batch_size,
+                                device=self.device,
+                            )
+                            has_expert = torch.zeros(
+                                (),
+                                device=self.device,
+                                dtype=torch.float32,
+                            )
+                        with timeit("training/update"):
+                            loss, metadata.updates_completed = self.update(
+                                batch,
+                                metadata.updates_completed,
+                                expert_batch,
+                                has_expert,
+                            )
+
+                        if self.lr_scheduler and self.lr_scheduler_step == "update":
+                            self.lr_scheduler.step()
+                        if kl_context is not None:
+                            kl_approx = self._compute_kl_after_update(
+                                kl_context, metadata.policy_operator
+                            )
+                            if kl_approx is not None:
+                                loss.set("kl_approx", kl_approx.detach())
+                                self._maybe_adjust_lr(kl_approx, self.config.optim)
+
+                        losses[epoch_idx, batch_idx] = (
+                            self._select_reported_loss_metrics(loss)
                         )
 
-                    needs_expert_batch = bool(self._bc_coeff > 0.0)
-                    if needs_expert_batch:
-                        expert_batch, has_expert = self._expert_batch_for_update(batch)
-                    else:
-                        expert_batch = TensorDict(
-                            {},
-                            batch_size=batch.batch_size,
-                            device=self.device,
-                        )
-                        has_expert = torch.zeros(
-                            (),
-                            device=self.device,
-                            dtype=torch.float32,
-                        )
-                    with timeit("training/update"):
-                        loss, metadata.updates_completed = self.update(
-                            batch,
-                            metadata.updates_completed,
-                            expert_batch,
-                            has_expert,
-                        )
-
-                    if self.lr_scheduler and self.lr_scheduler_step == "update":
+                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
-                    if kl_context is not None:
-                        kl_approx = self._compute_kl_after_update(
-                            kl_context, metadata.policy_operator
-                        )
-                        if kl_approx is not None:
-                            loss.set("kl_approx", kl_approx.detach())
-                            self._maybe_adjust_lr(kl_approx, self.config.optim)
-
-                    losses[epoch_idx, batch_idx] = self._select_reported_loss_metrics(
-                        loss
-                    )
-
-                if self.lr_scheduler and self.lr_scheduler_step == "epoch":
-                    self.lr_scheduler.step()
 
         iteration.learn_time = time.perf_counter() - learn_start
         losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])

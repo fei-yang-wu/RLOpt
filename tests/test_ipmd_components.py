@@ -1300,6 +1300,64 @@ def test_ipmd_iterate_updates_reward_before_reward_recompute_and_advantage() -> 
     assert order == ["reward_update", "reward_recompute", "advantage"]
 
 
+def test_iteration_profiler_accumulates_and_reports(monkeypatch) -> None:
+    """Opt-in iteration profiling should synchronize boundaries and emit metrics."""
+    _rlopt()
+    from rlopt.base_class import IterationData, TrainingMetadata
+
+    agent, _env = _make_env_reward_only_ipmd_agent()
+    assert agent.config.trainer is not None
+    agent.config.trainer.profile_iterations = True
+    sync_calls: list[None] = []
+    logged_metrics: dict[str, float] = {}
+    messages: list[str] = []
+
+    monkeypatch.setattr(
+        agent,
+        "_synchronize_profile_device",
+        lambda: sync_calls.append(None),
+    )
+    monkeypatch.setattr(
+        agent,
+        "log_metrics",
+        lambda metrics, **_kwargs: logged_metrics.update(metrics),
+    )
+
+    def _capture_message(message: str) -> None:
+        messages.append(message)
+
+    monkeypatch.setattr(agent.log, "info", _capture_message)
+
+    phase_times: dict[str, float] = {}
+    with agent._profile_iteration_phase(phase_times, "learn/policy_updates"):
+        pass
+    with agent._profile_iteration_phase(phase_times, "learn/policy_updates"):
+        pass
+    assert len(sync_calls) == 4
+    assert phase_times["learn/policy_updates"] >= 0.0
+
+    iteration = IterationData(
+        iteration_idx=0,
+        frames=8,
+        phase_times={
+            "collect": 0.4,
+            "prepare": 0.1,
+            "learn": 0.3,
+            "record": 0.2,
+            **phase_times,
+        },
+    )
+    metadata = TrainingMetadata(total_iterations=1, frames_processed=8)
+    agent._finish_iteration_profile(metadata, iteration)
+
+    assert logged_metrics["profile/total_s"] == pytest.approx(1.0)
+    assert logged_metrics["profile/frames_per_second"] == pytest.approx(8.0)
+    assert logged_metrics["profile/learn/policy_updates_s"] >= 0.0
+    assert messages
+    assert "iteration_profile | iter=1/1" in messages[0]
+    agent.collector.shutdown()
+
+
 def test_ipmd_reward_next_obs_requires_aligned_expert_transitions() -> None:
     """Reward next-state expert inputs should fail fast without aligned transitions."""
     rlopt = _rlopt()
