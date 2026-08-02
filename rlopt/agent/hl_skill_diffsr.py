@@ -132,6 +132,8 @@ def _build_diffsr(
         feature_dim=config.diffsr_feature_dim,
         embed_dim=config.diffsr_embed_dim,
         g_hidden_dims=config.diffsr_g_hidden_dims,
+        f_hidden_dims=config.diffsr_f_hidden_dims,
+        phi_parameterization=config.diffsr_phi_parameterization,
         mu_hidden_dims=config.diffsr_mu_hidden_dims,
         num_noises=config.diffsr_num_noises,
         use_ema_for_policy=False,
@@ -223,6 +225,13 @@ class HighLevelSkillDiffSRConfig:
     z_dim: int = 256
     diffsr_feature_dim: int = 128
     diffsr_embed_dim: int = 512
+    diffsr_phi_parameterization: str = "concat"
+    """phi(s, z) parameterization forwarded to the SR module.
+
+    "concat" is the simple-concat path; "bilinear" restores the legacy matrix
+    form g(z)^T F(s). Both are implemented by `BilinearSR.forward_phi`; this
+    field is what lets the pretrain entrypoint select between them, and its
+    default matches `BilinearSR`'s so omitting it changes nothing."""
     batch_size: int = 8192
     num_updates: int = 2000
     log_interval: int = 100
