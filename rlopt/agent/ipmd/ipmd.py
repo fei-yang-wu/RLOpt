@@ -2835,6 +2835,40 @@ class IPMD(PPO):
                 step=metadata.frames_processed,
             )
 
+    def _checkpoint_policy_state_dict(self) -> Mapping[str, Any]:
+        """Return the policy payload stored under ``policy_state_dict``."""
+        return self.policy.state_dict() if self.policy else {}
+
+    def _extra_checkpoint_state_dict(self) -> dict[str, Any]:
+        """Return algorithm-specific additions to an IPMD checkpoint."""
+        return {}
+
+    def _load_checkpoint_policy_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
+        """Restore the primary IPMD policy from one checkpoint."""
+        if self.policy and "policy_state_dict" in checkpoint:
+            self.policy.load_state_dict(checkpoint["policy_state_dict"])
+
+    def _restore_training_state_from_checkpoint(
+        self, checkpoint: Mapping[str, Any]
+    ) -> bool:
+        """Return whether auxiliary training state should be restored.
+
+        An ordinary IPMD agent may consume the student-primary policy from an
+        IPMD-L2T checkpoint for deployment. Its optimizer and privileged value
+        network do not have the same layout, so those states are intentionally
+        skipped. IPMD-L2T overrides this hook for exact training resume.
+        """
+        metadata = checkpoint.get("checkpoint_metadata")
+        return not (
+            isinstance(metadata, Mapping)
+            and metadata.get("algorithm") == "IPMD_L2T"
+            and metadata.get("primary_policy_role") == "student"
+        )
+
+    def _load_extra_checkpoint_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
+        """Restore algorithm-specific additions from an IPMD checkpoint."""
+        del checkpoint
+
     def save_model(
         self, path: str | Path | None = None, step: int | None = None
     ) -> None:
@@ -2858,8 +2892,8 @@ class IPMD(PPO):
             target_path = target_base / "model.pt"
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        data_to_save: dict[str, torch.Tensor | dict] = {
-            "policy_state_dict": (self.policy.state_dict() if self.policy else {}),
+        data_to_save: dict[str, Any] = {
+            "policy_state_dict": self._checkpoint_policy_state_dict(),
             "optimizer_state_dict": self.optim.state_dict(),
             "reward_estimator_state_dict": self.reward_estimator.state_dict(),
         }
@@ -2893,14 +2927,23 @@ class IPMD(PPO):
             and hasattr(self.env, "normalize_obs")
         ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
+        data_to_save.update(self._extra_checkpoint_state_dict())
 
         torch.save(data_to_save, target_path)
 
     def load_model(self, path: str) -> None:
         """Load PPO and reward-estimator state from a checkpoint."""
         data = torch.load(path, map_location=self.device)
-        if self.policy and "policy_state_dict" in data:
-            self.policy.load_state_dict(data["policy_state_dict"])  # type: ignore[arg-type]
+        self._load_checkpoint_policy_state_dict(data)
+        if not self._restore_training_state_from_checkpoint(data):
+            self._load_extra_checkpoint_state_dict(data)
+            if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
+                self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
+            self.log.info(
+                "Loaded student-primary IPMD-L2T policy for deployment; "
+                "skipped incompatible training state."
+            )
+            return
         if self.value_function and "value_state_dict" in data:
             self.value_function.load_state_dict(data["value_state_dict"])  # type: ignore[arg-type]
         if self.q_function and "q_state_dict" in data:
@@ -2940,6 +2983,7 @@ class IPMD(PPO):
             )
             if callable(load_checkpoint_state):
                 load_checkpoint_state(data["hl_skill_command_sampler_state_dict"])
+        self._load_extra_checkpoint_state_dict(data)
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
             self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
 
@@ -3323,7 +3367,9 @@ class IPMD(PPO):
                             )
                             if kl_approx is not None:
                                 loss.set("kl_approx", kl_approx.detach())
-                                self._maybe_adjust_lr(kl_approx, self.config.optim)
+                                self._record_kl_for_lr_adaptation(
+                                    kl_approx, self.config.optim
+                                )
 
                         losses[epoch_idx, batch_idx] = (
                             self._select_reported_loss_metrics(loss)
@@ -3331,6 +3377,10 @@ class IPMD(PPO):
 
                     if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
+
+                # One adaptive-LR step per iteration under
+                # optim.kl_adapt_step="iteration"; a no-op otherwise.
+                self._flush_kl_lr_adaptation(self.config.optim)
 
         iteration.learn_time = time.perf_counter() - learn_start
         losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])

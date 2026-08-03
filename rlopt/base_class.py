@@ -1372,6 +1372,46 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             return None
         return kl_approx
 
+    def _record_kl_for_lr_adaptation(
+        self, kl_approx: Tensor, schedule_cfg: Any
+    ) -> None:
+        """Route one minibatch's KL sample to the adaptive-LR rule.
+
+        Under ``optim.kl_adapt_step="update"`` this is a direct call and the
+        behaviour is exactly as before. Under ``"iteration"`` the sample is
+        buffered instead, and :meth:`_flush_kl_lr_adaptation` applies a single
+        bang-bang step per iteration on the mean.
+        """
+        mode = str(getattr(schedule_cfg, "kl_adapt_step", "update") or "update").lower()
+        if mode != "iteration":
+            self._maybe_adjust_lr(kl_approx, schedule_cfg)
+            return
+        kl_value = float(kl_approx.detach().mean().cpu().item())
+        if not np.isfinite(kl_value):
+            return
+        # Lazily created: concrete agents build a lot of state in __init__, and
+        # this only has to exist by the first update.
+        samples = getattr(self, "_kl_adapt_samples", None)
+        if samples is None:
+            samples = []
+            self._kl_adapt_samples = samples
+        samples.append(kl_value)
+
+    def _flush_kl_lr_adaptation(self, schedule_cfg: Any) -> None:
+        """Apply the buffered per-iteration adaptive-LR step, if any.
+
+        A no-op under ``kl_adapt_step="update"``, where the buffer never fills,
+        so it is safe to call unconditionally at the end of an update loop.
+        """
+        samples = getattr(self, "_kl_adapt_samples", None)
+        if not samples:
+            return
+        mean_kl = float(np.mean(samples))
+        samples.clear()
+        self._maybe_adjust_lr(
+            torch.as_tensor(mean_kl, dtype=torch.float32), schedule_cfg
+        )
+
     def _maybe_adjust_lr(self, kl_approx: Tensor, schedule_cfg: Any) -> None:
         schedule = (getattr(schedule_cfg, "scheduler", "") or "").lower()
         if schedule != "adaptive":
