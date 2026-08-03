@@ -139,6 +139,91 @@ def test_ipmd_split_actor_critic_learning_rates_and_adaptation():
         env.close()
 
 
+def test_kl_adapt_step_update_moves_lr_on_every_minibatch():
+    """The historical default: one bang-bang step per recorded KL sample."""
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert agent.config.optim.kl_adapt_step == "update"
+
+        for _ in range(2):
+            agent._record_kl_for_lr_adaptation(torch.tensor(1.0e-4), agent.config.optim)
+
+        # Two sub-target samples, two multiplications: 2e-5 -> 3e-5 -> 4.5e-5.
+        assert groups["actor"]["lr"] == pytest.approx(4.5e-5)
+
+        # Nothing was buffered, so a flush cannot move the LR again.
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(4.5e-5)
+    finally:
+        env.close()
+
+
+def test_kl_adapt_step_iteration_applies_exactly_one_step_per_flush():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.optim.kl_adapt_step = "iteration"
+
+        for _ in range(5):
+            agent._record_kl_for_lr_adaptation(torch.tensor(1.0e-4), agent.config.optim)
+        # Buffered, not applied: five minibatches must not move the LR five times.
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
+
+        # The buffer is consumed, so a second flush is a no-op.
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
+    finally:
+        env.close()
+
+
+def test_kl_adapt_step_iteration_uses_the_mean_not_each_sample():
+    """Samples that straddle the dead band average into it and cancel.
+
+    Under ``"update"`` the same pair would fire once (0.001 is below
+    ``desired_kl / 2``) and raise the LR; the point of ``"iteration"`` is that
+    the rule sees the iteration's mean KL instead.
+    """
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.optim.kl_adapt_step = "iteration"
+
+        for sample in (0.001, 0.019):  # mean 0.01 == desired_kl, inside the band
+            agent._record_kl_for_lr_adaptation(torch.tensor(sample), agent.config.optim)
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+    finally:
+        env.close()
+
+
+def test_kl_adapt_step_iteration_drops_non_finite_samples():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.optim.kl_adapt_step = "iteration"
+
+        agent._record_kl_for_lr_adaptation(
+            torch.tensor(float("nan")), agent.config.optim
+        )
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+
+        # A finite sample alongside the dropped one still adapts on its own.
+        agent._record_kl_for_lr_adaptation(
+            torch.tensor(float("inf")), agent.config.optim
+        )
+        agent._record_kl_for_lr_adaptation(torch.tensor(1.0e-4), agent.config.optim)
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
+    finally:
+        env.close()
+
+
 def test_ipmd_split_learning_rates_must_be_configured_together():
     cfg = _rlopt().IPMDRLOptConfig()
     cfg.ipmd.actor_learning_rate = 2.0e-5

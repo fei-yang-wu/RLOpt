@@ -464,9 +464,15 @@ class LoggingManager:
         except Exception:  # pragma: no cover - defensive
             pass
 
+        # TorchRL's get_logger routes the file-backed loggers to ``logger_name``
+        # and ignores the ``log_dir`` kwarg entirely, so passing the component
+        # name there scattered scalars into a ``./csv``-style directory beside
+        # the process CWD instead of the configured run directory. Only wandb
+        # reads log_dir/wandb_kwargs, so leave its argument alone.
+        file_backed = backend in ("csv", "tensorboard")
         return get_logger(
             backend,
-            logger_name=self.component.lower(),
+            logger_name=str(self.run_dir) if file_backed else self.component.lower(),
             experiment_name=exp_name,
             log_dir=str(self.run_dir),
             wandb_kwargs=wandb_kwargs,

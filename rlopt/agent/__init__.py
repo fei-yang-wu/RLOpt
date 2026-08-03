@@ -22,9 +22,12 @@ from rlopt.agent.hl_skill_encoder import (
 )
 from rlopt.agent.ipmd import (
     IPMD,
+    IPMDL2T,
     IPMDSR,
     IPMDBilinear,
     IPMDBilinearRLOptConfig,
+    IPMDL2TConfig,
+    IPMDL2TRLOptConfig,
     IPMDRLOptConfig,
     IPMDSRRLOptConfig,
 )
@@ -45,6 +48,7 @@ __all__ = [
     "ASE",
     "GAIL",
     "IPMD",
+    "IPMDL2T",
     "IPMDSR",
     "PPO",
     "SAC",
@@ -68,6 +72,8 @@ __all__ = [
     "HighLevelSkillEncoder",
     "IPMDBilinear",
     "IPMDBilinearRLOptConfig",
+    "IPMDL2TConfig",
+    "IPMDL2TRLOptConfig",
     "IPMDRLOptConfig",
     "IPMDSRRLOptConfig",
     "PPORLOptConfig",
