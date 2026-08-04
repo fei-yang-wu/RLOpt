@@ -323,9 +323,22 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
-        """Construct policy"""
-        # for PPO, we use a probabilistic actor
+        """Construct the configured PPO policy."""
         assert isinstance(self.config, PPORLOptConfig)
+        return self._construct_policy_from_config(self.config.policy, policy_net)
+
+    def _construct_policy_from_config(
+        self,
+        policy_config: NetworkConfig,
+        policy_net: torch.nn.Module | None = None,
+    ) -> TensorDictModule:
+        """Construct one Gaussian actor from an explicit network config.
+
+        Keeping this builder independent of ``config.policy`` lets asymmetric
+        algorithms create deployable actors with different observation keys
+        while preserving PPO's distribution, normalization, and action-spec
+        behavior exactly.
+        """
 
         action_spec = self.env.action_spec_unbatched  # type: ignore
         action_dim = int(action_spec.shape[-1])  # type: ignore[attr-defined]
@@ -343,29 +356,29 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         # Build policy network
         if policy_net is None:
             policy_mlp = MLP(
-                in_features=self.config.policy.input_dim,
-                activation_class=get_activation_class(self.config.policy.activation_fn),
+                in_features=policy_config.input_dim,
+                activation_class=get_activation_class(policy_config.activation_fn),
                 out_features=action_dim,
-                num_cells=list(self.config.policy.num_cells),
+                num_cells=list(policy_config.num_cells),
                 device=self.device,
             )
         else:
             policy_mlp = policy_net
 
-        if getattr(self.config.policy, "normalize_input", False):
+        if getattr(policy_config, "normalize_input", False):
             # SONIC-style running observation normalization for the actor.
             # GaussianPolicyHead concatenates multi-key inputs before calling
             # the base module, so the normalizer always receives one tensor.
-            policy_in_keys = self.config.policy.get_input_keys()
+            policy_in_keys = policy_config.get_input_keys()
             feature_dim = sum(
                 self.observation_feature_size(key) for key in policy_in_keys
             )
             policy_mlp = RunningMeanStdCatInputs(
                 policy_mlp,
                 feature_dim,
-                epsilon=self.config.policy.normalization_epsilon,
-                clip=self.config.policy.normalization_clip,
-                normalize_mask=self._input_normalize_mask(self.config.policy),
+                epsilon=policy_config.normalization_epsilon,
+                clip=policy_config.normalization_clip,
+                normalize_mask=self._input_normalize_mask(policy_config),
             )
 
         net = GaussianPolicyHead(
@@ -381,7 +394,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         # Wrap in TensorDictModule
         policy_td = TensorDictModule(
             module=net,
-            in_keys=self.config.policy.get_input_keys(),
+            in_keys=policy_config.get_input_keys(),
             out_keys=["loc", "scale"],
         )
 
@@ -714,10 +727,16 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self.actor_critic.eval()
         self.adv_module.eval()
 
+        phase_times: dict[str, float] = {}
         collect_start = time.perf_counter()
-        with timeit("collecting"):
+        with (
+            self._profile_iteration_phase(phase_times, "collect"),
+            timeit("collecting"),
+        ):
             rollout = next(run.collector_iter)
         collect_time = time.perf_counter() - collect_start
+        if "collect" in phase_times:
+            collect_time = phase_times["collect"]
 
         rollout_frames = rollout.numel()
         run.frames_processed += rollout_frames
@@ -728,6 +747,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             rollout=rollout,
             frames=rollout_frames,
             collect_time=collect_time,
+            phase_times=phase_times,
         )
 
     def prepare(
@@ -818,39 +838,51 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
         with timeit("training"):
             # Pre-iteration compute GAE, once per rollout
-            iteration.rollout = self.pre_iteration_compute(iteration.rollout)
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/advantage_and_buffer"
+            ):
+                iteration.rollout = self.pre_iteration_compute(iteration.rollout)
 
             # Run PPO epochs over the rollout
-            for epoch_idx in range(metadata.epochs_per_rollout):
-                # Run PPO epochs over the rollout
-                for batch_idx, batch in enumerate(self.data_buffer):
-                    kl_context = None
-                    if (self.config.optim.scheduler or "").lower() == "adaptive":
-                        kl_context = self._prepare_kl_context(
-                            batch, metadata.policy_operator
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/policy_updates"
+            ):
+                for epoch_idx in range(metadata.epochs_per_rollout):
+                    # Run PPO epochs over the rollout
+                    for batch_idx, batch in enumerate(self.data_buffer):
+                        kl_context = None
+                        if (self.config.optim.scheduler or "").lower() == "adaptive":
+                            kl_context = self._prepare_kl_context(
+                                batch, metadata.policy_operator
+                            )
+
+                        loss, metadata.updates_completed = self.update(
+                            batch, metadata.updates_completed
+                        )
+                        loss = loss.clone()
+
+                        if self.lr_scheduler and self.lr_scheduler_step == "update":
+                            self.lr_scheduler.step()
+                        if kl_context is not None:
+                            kl_approx = self._compute_kl_after_update(
+                                kl_context, metadata.policy_operator
+                            )
+                            if kl_approx is not None:
+                                loss.set("kl_approx", kl_approx.detach())
+                                self._record_kl_for_lr_adaptation(
+                                    kl_approx, self.config.optim
+                                )
+
+                        losses[epoch_idx, batch_idx] = (
+                            self._select_reported_loss_metrics(loss)
                         )
 
-                    loss, metadata.updates_completed = self.update(
-                        batch, metadata.updates_completed
-                    )
-                    loss = loss.clone()
-
-                    if self.lr_scheduler and self.lr_scheduler_step == "update":
+                    if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
-                    if kl_context is not None:
-                        kl_approx = self._compute_kl_after_update(
-                            kl_context, metadata.policy_operator
-                        )
-                        if kl_approx is not None:
-                            loss.set("kl_approx", kl_approx.detach())
-                            self._maybe_adjust_lr(kl_approx, self.config.optim)
 
-                    losses[epoch_idx, batch_idx] = self._select_reported_loss_metrics(
-                        loss
-                    )
-
-                if self.lr_scheduler and self.lr_scheduler_step == "epoch":
-                    self.lr_scheduler.step()
+                # One adaptive-LR step per iteration under
+                # optim.kl_adapt_step="iteration"; a no-op otherwise.
+                self._flush_kl_lr_adaptation(self.config.optim)
 
         iteration.learn_time = time.perf_counter() - learn_start
         losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
@@ -980,13 +1012,19 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 iteration = self.collect(metadata, iteration_idx)
 
                 # 2) Let the algorithm reshape rewards or attach extra data.
-                self.prepare(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "prepare"):
+                    self.prepare(iteration, metadata)
 
                 # 3) Run the shared learning phase over the prepared rollout.
-                self.iterate(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "learn"):
+                    self.iterate(iteration, metadata)
+                if "learn" in iteration.phase_times:
+                    iteration.learn_time = iteration.phase_times["learn"]
 
                 # 4) Log, refresh collector weights, and checkpoint if needed.
-                self.record(iteration, metadata)
+                with self._profile_iteration_phase(iteration.phase_times, "record"):
+                    self.record(iteration, metadata)
+                self._finish_iteration_profile(metadata, iteration)
         finally:
             metadata.progress_bar.close()  # type: ignore[attr-defined]
             self.collector.shutdown()

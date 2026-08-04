@@ -6,7 +6,8 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, TypeVar, cast
@@ -84,6 +85,8 @@ class IterationData:
     collect_time: float = 0.0
     # Time spent learning/logging after collection for this iteration.
     learn_time: float = 0.0
+    # Opt-in synchronized wall times for the named phases in this iteration.
+    phase_times: dict[str, float] = field(default_factory=dict)
     # Scalar metrics accumulated while handling this iteration.
     metrics: dict[str, Any] = field(default_factory=dict)
 
@@ -147,6 +150,82 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     """
 
     _FILE_SUMMARY_HEADER_INTERVAL = 20
+
+    def _iteration_profiling_enabled(self) -> bool:
+        """Whether synchronized per-iteration phase profiling is enabled."""
+        trainer = getattr(self.config, "trainer", None)
+        return bool(trainer and getattr(trainer, "profile_iterations", False))
+
+    def _synchronize_profile_device(self) -> None:
+        """Drain queued accelerator work at an opt-in profiling boundary."""
+        if not self._iteration_profiling_enabled() or not torch.cuda.is_available():
+            return
+        device = torch.device(self.device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    @contextmanager
+    def _profile_iteration_phase(
+        self,
+        phase_times: MutableMapping[str, float],
+        name: str,
+    ) -> Iterator[None]:
+        """Accumulate synchronized wall time for one named iteration phase."""
+        if not self._iteration_profiling_enabled():
+            yield
+            return
+
+        self._synchronize_profile_device()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._synchronize_profile_device()
+            elapsed = time.perf_counter() - start
+            phase_times[name] = phase_times.get(name, 0.0) + elapsed
+
+    def _finish_iteration_profile(
+        self,
+        metadata: TrainingMetadata,
+        iteration: IterationData,
+    ) -> None:
+        """Emit scalar and text summaries after all iteration phases complete."""
+        if not self._iteration_profiling_enabled():
+            return
+
+        top_level_names = ("collect", "prepare", "learn", "record")
+        total = sum(iteration.phase_times.get(name, 0.0) for name in top_level_names)
+        metrics = {
+            f"profile/{name}_s": value for name, value in iteration.phase_times.items()
+        }
+        metrics["profile/total_s"] = total
+        metrics["profile/frames_per_second"] = (
+            float(iteration.frames) / total if total > 0.0 else 0.0
+        )
+        self.log_metrics(
+            metrics,
+            step=metadata.frames_processed,
+            log_python=False,
+        )
+
+        top_level = " ".join(
+            f"{name}={iteration.phase_times.get(name, 0.0) * 1_000.0:.2f}ms"
+            for name in top_level_names
+        )
+        details = " ".join(
+            f"{name.split('/', maxsplit=1)[-1]}={elapsed * 1_000.0:.2f}ms"
+            for name, elapsed in iteration.phase_times.items()
+            if "/" in name
+        )
+        message = (
+            "iteration_profile | "
+            f"iter={iteration.iteration_idx + 1}/{metadata.total_iterations} | "
+            f"{top_level} total={total * 1_000.0:.2f}ms | "
+            f"fps={metrics['profile/frames_per_second']:.1f}"
+        )
+        if details:
+            message = f"{message} | detail: {details}"
+        self.log.info(message)
 
     def __init__(
         self,
@@ -391,10 +470,13 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         return None
 
     def _auto_attach_env_expert_sampler(self) -> None:
-        """Attach ``sample_expert_batch`` from env wrappers when available."""
-        sampler = self._discover_env_method(self.env, "sample_expert_batch")
-        if sampler is None:
+        """Attach the environment's expert sampler when it offers one."""
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        interface = resolve_imitation_interface(self.env)
+        if not supports(interface, "sample_expert_batch"):
             return
+        sampler = interface.sample_expert_batch
 
         def _wrapped_sampler(
             batch_size: int, required_keys: list[str | tuple[str, ...]]
@@ -1289,6 +1371,46 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         if not torch.isfinite(kl_approx):
             return None
         return kl_approx
+
+    def _record_kl_for_lr_adaptation(
+        self, kl_approx: Tensor, schedule_cfg: Any
+    ) -> None:
+        """Route one minibatch's KL sample to the adaptive-LR rule.
+
+        Under ``optim.kl_adapt_step="update"`` this is a direct call and the
+        behaviour is exactly as before. Under ``"iteration"`` the sample is
+        buffered instead, and :meth:`_flush_kl_lr_adaptation` applies a single
+        bang-bang step per iteration on the mean.
+        """
+        mode = str(getattr(schedule_cfg, "kl_adapt_step", "update") or "update").lower()
+        if mode != "iteration":
+            self._maybe_adjust_lr(kl_approx, schedule_cfg)
+            return
+        kl_value = float(kl_approx.detach().mean().cpu().item())
+        if not np.isfinite(kl_value):
+            return
+        # Lazily created: concrete agents build a lot of state in __init__, and
+        # this only has to exist by the first update.
+        samples = getattr(self, "_kl_adapt_samples", None)
+        if samples is None:
+            samples = []
+            self._kl_adapt_samples = samples
+        samples.append(kl_value)
+
+    def _flush_kl_lr_adaptation(self, schedule_cfg: Any) -> None:
+        """Apply the buffered per-iteration adaptive-LR step, if any.
+
+        A no-op under ``kl_adapt_step="update"``, where the buffer never fills,
+        so it is safe to call unconditionally at the end of an update loop.
+        """
+        samples = getattr(self, "_kl_adapt_samples", None)
+        if not samples:
+            return
+        mean_kl = float(np.mean(samples))
+        samples.clear()
+        self._maybe_adjust_lr(
+            torch.as_tensor(mean_kl, dtype=torch.float32), schedule_cfg
+        )
 
     def _maybe_adjust_lr(self, kl_approx: Tensor, schedule_cfg: Any) -> None:
         schedule = (getattr(schedule_cfg, "scheduler", "") or "").lower()

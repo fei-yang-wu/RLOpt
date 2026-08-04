@@ -274,6 +274,22 @@ class OptimizerConfig:
     lr_adaptation_factor: float = 1.5
     """Factor to scale LR up/down for adaptive schedule."""
 
+    kl_adapt_step: Literal["update", "iteration"] = "update"
+    """How often the adaptive-KL rule may change the learning rate.
+
+    ``"update"`` is the historical behaviour: the bang-bang rule fires after
+    every minibatch, so a rollout split into ``m`` minibatches over ``e`` epochs
+    moves the LR up to ``m * e`` times per iteration. At the geometries used for
+    G1 imitation that is 40-80 multiplicative steps per iteration, and the
+    measured log-LR ends up serially uncorrelated (lag-1 autocorrelation ~0 over
+    a 3.5B-frame run) -- a random walk inside the clamp band rather than a
+    controller with a fixed point.
+
+    ``"iteration"`` buffers the per-minibatch KL samples and applies exactly one
+    step per iteration on their mean, which is the regime the dead-band rule
+    actually assumes. Left at ``"update"`` so existing runs are unchanged.
+    """
+
     min_lr: float | None = 1e-6
     """Lower bound for adaptive learning rate. None disables clamping."""
 
@@ -452,6 +468,9 @@ class TrainerConfig:
 
     log_interval: int = 10_000_000
     """Interval for logging."""
+
+    profile_iterations: bool = False
+    """Synchronize accelerators and report phase timings for every iteration."""
 
 
 @dataclass

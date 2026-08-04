@@ -139,6 +139,91 @@ def test_ipmd_split_actor_critic_learning_rates_and_adaptation():
         env.close()
 
 
+def test_kl_adapt_step_update_moves_lr_on_every_minibatch():
+    """The historical default: one bang-bang step per recorded KL sample."""
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert agent.config.optim.kl_adapt_step == "update"
+
+        for _ in range(2):
+            agent._record_kl_for_lr_adaptation(torch.tensor(1.0e-4), agent.config.optim)
+
+        # Two sub-target samples, two multiplications: 2e-5 -> 3e-5 -> 4.5e-5.
+        assert groups["actor"]["lr"] == pytest.approx(4.5e-5)
+
+        # Nothing was buffered, so a flush cannot move the LR again.
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(4.5e-5)
+    finally:
+        env.close()
+
+
+def test_kl_adapt_step_iteration_applies_exactly_one_step_per_flush():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.optim.kl_adapt_step = "iteration"
+
+        for _ in range(5):
+            agent._record_kl_for_lr_adaptation(torch.tensor(1.0e-4), agent.config.optim)
+        # Buffered, not applied: five minibatches must not move the LR five times.
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
+
+        # The buffer is consumed, so a second flush is a no-op.
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
+    finally:
+        env.close()
+
+
+def test_kl_adapt_step_iteration_uses_the_mean_not_each_sample():
+    """Samples that straddle the dead band average into it and cancel.
+
+    Under ``"update"`` the same pair would fire once (0.001 is below
+    ``desired_kl / 2``) and raise the LR; the point of ``"iteration"`` is that
+    the rule sees the iteration's mean KL instead.
+    """
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.optim.kl_adapt_step = "iteration"
+
+        for sample in (0.001, 0.019):  # mean 0.01 == desired_kl, inside the band
+            agent._record_kl_for_lr_adaptation(torch.tensor(sample), agent.config.optim)
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+    finally:
+        env.close()
+
+
+def test_kl_adapt_step_iteration_drops_non_finite_samples():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.optim.kl_adapt_step = "iteration"
+
+        agent._record_kl_for_lr_adaptation(
+            torch.tensor(float("nan")), agent.config.optim
+        )
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+
+        # A finite sample alongside the dropped one still adapts on its own.
+        agent._record_kl_for_lr_adaptation(
+            torch.tensor(float("inf")), agent.config.optim
+        )
+        agent._record_kl_for_lr_adaptation(torch.tensor(1.0e-4), agent.config.optim)
+        agent._flush_kl_lr_adaptation(agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
+    finally:
+        env.close()
+
+
 def test_ipmd_split_learning_rates_must_be_configured_together():
     cfg = _rlopt().IPMDRLOptConfig()
     cfg.ipmd.actor_learning_rate = 2.0e-5
@@ -1300,6 +1385,64 @@ def test_ipmd_iterate_updates_reward_before_reward_recompute_and_advantage() -> 
     assert order == ["reward_update", "reward_recompute", "advantage"]
 
 
+def test_iteration_profiler_accumulates_and_reports(monkeypatch) -> None:
+    """Opt-in iteration profiling should synchronize boundaries and emit metrics."""
+    _rlopt()
+    from rlopt.base_class import IterationData, TrainingMetadata
+
+    agent, _env = _make_env_reward_only_ipmd_agent()
+    assert agent.config.trainer is not None
+    agent.config.trainer.profile_iterations = True
+    sync_calls: list[None] = []
+    logged_metrics: dict[str, float] = {}
+    messages: list[str] = []
+
+    monkeypatch.setattr(
+        agent,
+        "_synchronize_profile_device",
+        lambda: sync_calls.append(None),
+    )
+    monkeypatch.setattr(
+        agent,
+        "log_metrics",
+        lambda metrics, **_kwargs: logged_metrics.update(metrics),
+    )
+
+    def _capture_message(message: str) -> None:
+        messages.append(message)
+
+    monkeypatch.setattr(agent.log, "info", _capture_message)
+
+    phase_times: dict[str, float] = {}
+    with agent._profile_iteration_phase(phase_times, "learn/policy_updates"):
+        pass
+    with agent._profile_iteration_phase(phase_times, "learn/policy_updates"):
+        pass
+    assert len(sync_calls) == 4
+    assert phase_times["learn/policy_updates"] >= 0.0
+
+    iteration = IterationData(
+        iteration_idx=0,
+        frames=8,
+        phase_times={
+            "collect": 0.4,
+            "prepare": 0.1,
+            "learn": 0.3,
+            "record": 0.2,
+            **phase_times,
+        },
+    )
+    metadata = TrainingMetadata(total_iterations=1, frames_processed=8)
+    agent._finish_iteration_profile(metadata, iteration)
+
+    assert logged_metrics["profile/total_s"] == pytest.approx(1.0)
+    assert logged_metrics["profile/frames_per_second"] == pytest.approx(8.0)
+    assert logged_metrics["profile/learn/policy_updates_s"] >= 0.0
+    assert messages
+    assert "iteration_profile | iter=1/1" in messages[0]
+    agent.collector.shutdown()
+
+
 def test_ipmd_reward_next_obs_requires_aligned_expert_transitions() -> None:
     """Reward next-state expert inputs should fail fast without aligned transitions."""
     rlopt = _rlopt()
@@ -1419,6 +1562,80 @@ def test_ipmd_update_with_expert_data():
     assert "loss_reward_diff" not in loss_td
     assert "loss_reward_l2" not in loss_td
     # Check that losses are finite
+    for key in tuple(loss_td.keys()):
+        value = loss_td[key]
+        assert not torch.isnan(value).any(), f"NaN in {key}"
+        assert not torch.isinf(value).any(), f"Inf in {key}"
+
+
+def test_ipmd_backward_ppo_terms_skips_latent_update_when_no_renewals() -> None:
+    """An all-False renewal mask must not reach the posterior latent learner.
+
+    Regression test: ``TensorDict.numel()`` is lower-bounded to 1 by design
+    (its own docstring notes an empty-shape stack still counts as 1 element),
+    so guarding on ``posterior_batch.numel() > 0`` can never detect an
+    empty-mask selection. Before the fix, a minibatch whose sin/cos phase
+    never hits the renewal condition crashed inside
+    ``_patch_features_from_td`` trying to reshape a 0-length tensor.
+    """
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 4
+    cfg.compile.compile = False
+    cfg.ipmd.reward_num_cells = (32, 32)
+    cfg.ipmd.expert_batch_size = 4
+    _apply_obs_input_keys(cfg)
+    cfg.ipmd.latent_learning.train_posterior_through_policy = True
+    cfg.ipmd.latent_learning.command_phase_mode = "sin_cos"
+    cfg.ipmd.latent_learning.code_period = 4
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+
+    expert_data = create_synthetic_expert_data(env, num_transitions=50)
+    agent._set_test_expert_batch_sampler(_make_test_expert_sampler(expert_data))
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    act_dim = env.action_spec.shape[-1]
+    batch_size = 4
+
+    observation = torch.randn(batch_size, obs_dim)
+    # latent_key == "observation" in this fixture; pin the phase (last two
+    # components) far from the renewal condition (phase ~= [0, 1]) for every
+    # row so the renewal mask is all-False.
+    observation[:, -2:] = torch.tensor([1.0, 0.0])
+
+    policy_batch = TensorDict(
+        {
+            "observation": observation,
+            "action": torch.randn(batch_size, act_dim),
+            "action_log_prob": torch.zeros(batch_size),
+            ("next", "observation"): torch.randn(batch_size, obs_dim),
+            ("next", "reward"): torch.randn(batch_size, 1),
+            ("next", "done"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "terminated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+            ("next", "truncated"): torch.zeros(batch_size, 1, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    with torch.no_grad():
+        policy_batch = agent.adv_module(policy_batch)
+
+    num_network_updates = torch.zeros((), dtype=torch.int64, device=agent.device)
+    expert_batch = agent._next_expert_batch(batch_size=cfg.ipmd.expert_batch_size)
+    has_expert = torch.tensor(1.0, device=agent.device, dtype=torch.float32)
+    loss_td, _ = agent.update(
+        policy_batch, num_network_updates, expert_batch, has_expert
+    )
+
+    assert "loss_critic" in loss_td
+    assert "loss_objective" in loss_td
     for key in tuple(loss_td.keys()):
         value = loss_td[key]
         assert not torch.isnan(value).any(), f"NaN in {key}"
@@ -1865,6 +2082,66 @@ def test_fsq_quantizer_uses_all_even_level_codes() -> None:
     _, code, _ = quantizer(z_e)
 
     assert torch.equal(torch.unique(code), torch.arange(8))
+
+
+def test_fsq_quantizer_large_space_uses_per_coordinate_indices() -> None:
+    """SONIC's 32**64 space must not overflow a flat int64 code."""
+    from rlopt.agent.imitation.latent_learning import FSQQuantizer
+
+    quantizer = FSQQuantizer([32] * 64)
+    z_e = torch.randn(4, 64)
+    z_q, code, _ = quantizer(z_e)
+
+    assert quantizer.codebook_size == 32**64
+    assert quantizer.usage_vocab_size == 32
+    assert quantizer.flat_code_supported is False
+    assert code.shape == (4, 64)
+    assert torch.equal(quantizer.indices_to_codes(code), z_q.detach())
+
+
+def test_patch_vqvae_large_normalized_fsq_updates_without_flat_code() -> None:
+    """The official 64x32 normalized posterior must train without overflow."""
+    rlopt = _rlopt()
+    from rlopt.agent.imitation.latent_learning import PatchVQVAELatentLearner
+
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.ipmd.latent_dim = 64
+    cfg.ipmd.latent_learning.method = "patch_vqvae"
+    cfg.ipmd.latent_learning.quantizer = "fsq"
+    cfg.ipmd.latent_learning.fsq_levels = [32] * 64
+    cfg.ipmd.latent_learning.fsq_normalize_codes = True
+    cfg.ipmd.latent_learning.code_latent_dim = 64
+    cfg.ipmd.latent_learning.posterior_input_keys = ["window"]
+    cfg.ipmd.latent_learning.encoder_hidden_dims = [16]
+    cfg.ipmd.latent_learning.decoder_hidden_dims = [16]
+    cfg.ipmd.latent_learning.recon_coeff = 0.01
+    cfg.ipmd.expert_batch_size = 4
+    cfg.ipmd.validate()
+
+    expert_data = TensorDict({"window": torch.randn(4, 30)}, batch_size=[4])
+
+    def _next_expert_batch(batch_size=4, *, required_keys):
+        return expert_data[:batch_size].select(*required_keys).clone()
+
+    fake_agent = SimpleNamespace(
+        config=cfg,
+        device=torch.device("cpu"),
+        _latent_dim=64,
+        _obs_feature_dims={"window": 30},
+        _posterior_obs_keys=["window"],
+        _action_feature_dim=2,
+        _next_expert_batch=_next_expert_batch,
+    )
+    learner = PatchVQVAELatentLearner()
+    learner.initialize(fake_agent)
+    command = learner.infer_batch_latents(expert_data, detach=True, context="test")
+    metrics = learner.update(TensorDict({}, batch_size=[0]))
+
+    assert command is not None
+    assert bool((command.abs() <= 1.0 + 1e-6).all())
+    assert torch.allclose(command * 16, (command * 16).round(), atol=1e-5)
+    assert metrics["ipmd/vqvae_codebook_size"] == float(32**64)
+    assert 0.0 <= metrics["ipmd/vqvae_dead_codes"] <= 32.0
 
 
 def test_patch_vqvae_collector_holds_code_and_reports_phase() -> None:
