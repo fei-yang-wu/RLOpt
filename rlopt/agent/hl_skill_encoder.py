@@ -587,6 +587,12 @@ class FSQSkillEncoder(_DiscreteSkillEncoder):
             if self.fsq.flat_code_supported
             else max(int(level) for level in levels)
         )
+        # `perplexity` is a flat-codebook statistic. Without a flat index the
+        # codes are per-dimension level indices, so bincounting them pools
+        # every dimension into one histogram and the number means nothing --
+        # the same reason MultiCategoricalSkillEncoder opts out. SONIC's
+        # 64 x 32 lattice is 2^320 and always lands here.
+        self.report_flat_code_metrics = bool(self.fsq.flat_code_supported)
         self.code_to_latent = nn.Linear(self.fsq.code_dim, base["z_dim"])
 
     def _quantize(self, z_e, **_):
@@ -637,6 +643,12 @@ class SONICFSQSkillEncoder(_DiscreteSkillEncoder):
             if self.fsq.flat_code_supported
             else max(int(level) for level in levels)
         )
+        # `perplexity` is a flat-codebook statistic. Without a flat index the
+        # codes are per-dimension level indices, so bincounting them pools
+        # every dimension into one histogram and the number means nothing --
+        # the same reason MultiCategoricalSkillEncoder opts out. SONIC's
+        # 64 x 32 lattice is 2^320 and always lands here.
+        self.report_flat_code_metrics = bool(self.fsq.flat_code_supported)
         # The command boundary sits at the quantizer output -- no learned map.
         self.code_to_latent = nn.Identity()
         self.register_buffer(
