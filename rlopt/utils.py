@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import gymnasium as gym
 import numpy as np
@@ -634,6 +634,64 @@ def discover_env_method(env: object, method_name: str) -> Callable | None:
             else:
                 stack.append(next_obj)
     return None
+
+
+def require_env_method(env: object, method_name: str, *, purpose: str) -> Callable:
+    """Discover an env method, failing loudly when it is absent.
+
+    Same wrapper walk as :func:`discover_env_method`, but raises a
+    ``ValueError`` naming the missing capability and its purpose instead of
+    returning ``None`` -- use it where a method is a hard requirement of the
+    configured algorithm (e.g. ``command_source='hl_skill'`` needs
+    ``current_expert_macro_transition_batch``). Same exception contract as
+    the manual discovery + ``ValueError`` checks it replaces.
+    """
+    method = discover_env_method(env, method_name)
+    if method is None:
+        raise ValueError(
+            f"{purpose} {method_name}(...) is not exposed by the environment."
+        )
+    return method
+
+
+class ExpertProvider(Protocol):
+    """The expert-data surface RLOpt agents discover on imitation envs.
+
+    Typed discovery contract for the env methods used by the expert
+    samplers / latent-command pipelines. Implemented by the Isaac Lab
+    imitation envs (v2 and the frozen legacy env) and by any equivalent
+    environment; agents should resolve them with
+    :func:`discover_env_method` (optional) or :func:`require_env_method`
+    (mandatory) rather than importing the env class.
+    """
+
+    def sample_expert_batch(
+        self, batch_size: int, required_keys: Sequence[Any]
+    ) -> TensorDict | None: ...
+
+    def sample_expert_macro_transition_batch(
+        self,
+        batch_size: int,
+        horizon_steps: int,
+        split: str | None = None,
+        eval_fraction: float = 0.1,
+        split_seed: int = 0,
+        trajectory_ranks: Sequence[int] | Tensor | None = None,
+        state_history_steps: int = 0,
+    ) -> TensorDict: ...
+
+    def current_expert_macro_transition_batch(
+        self,
+        horizon_steps: int,
+        env_ids: Tensor | Sequence[int] | None = None,
+        state_history_steps: int = 0,
+    ) -> TensorDict: ...
+
+    def set_agent_latent_command(
+        self, latent_command: Tensor, env_ids: Tensor | None = None
+    ) -> None: ...
+
+    def expert_trajectory_motion_names(self) -> list[str]: ...
 
 
 def grad_penalty(

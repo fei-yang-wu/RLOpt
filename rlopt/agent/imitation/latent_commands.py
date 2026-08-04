@@ -164,7 +164,17 @@ class LatentCommandController:
             latent_steps_max=latent_steps_max,
         )
 
-        self._env_latent_setter = discover_env_method(env, "set_agent_latent_command")
+        # The agent publishes its latent through the environment's imitation
+        # interface; `discover_env_method` stays in the signature for the other
+        # discoveries its callers inject.
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        interface = resolve_imitation_interface(env)
+        self._env_latent_setter = (
+            interface.publish_actor_command
+            if supports(interface, "publish_actor_command")
+            else None
+        )
 
         available_keys = set(env.observation_spec.keys(True))
         if self.latent_key not in available_keys:

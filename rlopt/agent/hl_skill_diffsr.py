@@ -132,6 +132,8 @@ def _build_diffsr(
         feature_dim=config.diffsr_feature_dim,
         embed_dim=config.diffsr_embed_dim,
         g_hidden_dims=config.diffsr_g_hidden_dims,
+        f_hidden_dims=config.diffsr_f_hidden_dims,
+        phi_parameterization=config.diffsr_phi_parameterization,
         mu_hidden_dims=config.diffsr_mu_hidden_dims,
         num_noises=config.diffsr_num_noises,
         use_ema_for_policy=False,
@@ -223,6 +225,13 @@ class HighLevelSkillDiffSRConfig:
     z_dim: int = 256
     diffsr_feature_dim: int = 128
     diffsr_embed_dim: int = 512
+    diffsr_phi_parameterization: str = "concat"
+    """phi(s, z) parameterization forwarded to the SR module.
+
+    "concat" is the simple-concat path; "bilinear" restores the legacy matrix
+    form g(z)^T F(s). Both are implemented by `BilinearSR.forward_phi`; this
+    field is what lets the pretrain entrypoint select between them, and its
+    default matches `BilinearSR`'s so omitting it changes nothing."""
     batch_size: int = 8192
     num_updates: int = 2000
     log_interval: int = 100
@@ -246,6 +255,11 @@ class HighLevelSkillDiffSRConfig:
     gumbel_tau_anneal_iters: int = 2000
     gumbel_hard: bool = True
     fsq_levels: tuple[int, ...] = (8, 8, 8, 5, 5)
+    # SONIC-matched token space: 64 dims x 32 levels ~= 320 bits per command,
+    # i.e. gear_sonic's tokens of shape (2, 32) at num_fsq_levels=32. Used only
+    # by latent_mode="sonic_fsq", which publishes the quantizer output directly
+    # and therefore requires z_dim == len(sonic_fsq_levels).
+    sonic_fsq_levels: tuple[int, ...] = (32,) * 64
     vq_codebook_size: int = 512
     vq_ema_decay: float = 0.99
     vq_dead_code_reset_iters: int = 0
@@ -346,6 +360,25 @@ class HighLevelSkillDiffSRConfig:
         if self.latent_mode == "fsq" and any(level < 2 for level in self.fsq_levels):
             msg = f"fsq_levels must each be >= 2, got {self.fsq_levels!r}."
             raise ValueError(msg)
+        self.sonic_fsq_levels = tuple(
+            _require_positive_int("sonic_fsq_levels", level)
+            for level in self.sonic_fsq_levels
+        )
+        if self.latent_mode == "sonic_fsq":
+            if any(level < 2 for level in self.sonic_fsq_levels):
+                msg = (
+                    "sonic_fsq_levels must each be >= 2, got "
+                    f"{self.sonic_fsq_levels!r}."
+                )
+                raise ValueError(msg)
+            if self.z_dim != len(self.sonic_fsq_levels):
+                msg = (
+                    "latent_mode='sonic_fsq' publishes the quantizer output as the "
+                    "command, so z_dim must equal len(sonic_fsq_levels): "
+                    f"z_dim={self.z_dim}, "
+                    f"len(sonic_fsq_levels)={len(self.sonic_fsq_levels)}."
+                )
+                raise ValueError(msg)
         self.vq_codebook_size = _require_positive_int(
             "vq_codebook_size", self.vq_codebook_size
         )
@@ -424,6 +457,7 @@ class HighLevelSkillDiffSRConfig:
             gumbel_tau_anneal_iters=self.gumbel_tau_anneal_iters,
             gumbel_hard=self.gumbel_hard,
             fsq_levels=tuple(self.fsq_levels),
+            sonic_fsq_levels=tuple(self.sonic_fsq_levels),
             vq_codebook_size=self.vq_codebook_size,
             vq_ema_decay=self.vq_ema_decay,
             vq_dead_code_reset_iters=self.vq_dead_code_reset_iters,
@@ -442,6 +476,7 @@ class HighLevelSkillDiffSRConfig:
             "diffsr_g_hidden_dims",
             "diffsr_mu_hidden_dims",
             "fsq_levels",
+            "sonic_fsq_levels",
             "commander_hidden_dims",
         }
         for key in tuple_fields:
@@ -522,19 +557,19 @@ class FrozenHighLevelSkillCommandSampler:
             else self.latent_steps_max
         )
         self.device = _resolve_device(device, env)
-        self._current_macro_sampler = discover_env_method(
+        from rlopt.env_interface import require_imitation_interface, supports
+        from rlopt.env_interface import resolve_imitation_interface
+
+        self._env_interface = resolve_imitation_interface(env)
+        self._current_macro_sampler = require_imitation_interface(
             env,
             "current_expert_macro_transition_batch",
+            purpose="command_source='hl_skill' requires it but",
         )
-        if self._current_macro_sampler is None:
-            msg = (
-                "command_source='hl_skill' requires the environment to expose "
-                "current_expert_macro_transition_batch(...)."
-            )
-            raise ValueError(msg)
-        self._offline_macro_sampler = discover_env_method(
-            env,
-            "sample_expert_macro_transition_batch",
+        self._offline_macro_sampler = (
+            self._env_interface.sample_expert_macro_transition_batch
+            if supports(self._env_interface, "sample_expert_macro_transition_batch")
+            else None
         )
         if self.finetune_enabled and self._offline_macro_sampler is None:
             msg = (
@@ -1153,10 +1188,13 @@ class HighLevelSkillDiffSRTrainer:
         *,
         split: str | None,
     ) -> TensorDictBase:
-        sampler = getattr(self.env, "sample_expert_macro_transition_batch", None)
-        if not callable(sampler):
-            msg = "env must expose sample_expert_macro_transition_batch(...)."
-            raise ValueError(msg)
+        from rlopt.env_interface import require_imitation_interface
+
+        sampler = require_imitation_interface(
+            self.env,
+            "sample_expert_macro_transition_batch",
+            purpose="Offline skill-encoder training requires it but",
+        )
         return sampler(
             batch_size=int(batch_size),
             horizon_steps=int(self.config.horizon_steps),
@@ -1181,9 +1219,12 @@ class HighLevelSkillDiffSRTrainer:
         )
 
     def _resolve_feature_slices(self) -> dict[str, tuple[int, int]]:
-        provider = getattr(self.env, "expert_macro_feature_slices", None)
-        if not callable(provider):
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        interface = resolve_imitation_interface(self.env)
+        if not supports(interface, "expert_macro_feature_slices"):
             return {}
+        provider = interface.expert_macro_feature_slices
         raw_slices = provider(horizon_steps=int(self.config.horizon_steps))
         if raw_slices is None:
             return {}
