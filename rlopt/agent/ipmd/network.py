@@ -86,7 +86,10 @@ class ResidualMLPBlock(nn.Module):
 
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.ln = nn.LayerNorm(hidden_dim)
+        # Pre-normalization operates on the block input. Using ``hidden_dim``
+        # only works when adjacent widths happen to match and makes tapered
+        # ResidualMLPs fail before their projection layer.
+        self.ln = nn.LayerNorm(input_dim)
         self.activation = activation
         if input_dim != hidden_dim:
             self.residual = nn.Linear(input_dim, hidden_dim)

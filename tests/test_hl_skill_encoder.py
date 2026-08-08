@@ -9,10 +9,15 @@ qualified ``latent_skill`` oracle checkpoint depends on them.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from rlopt.agent.hl_skill_diffsr import HighLevelSkillDiffSRConfig
+from rlopt.agent.hl_skill_diffsr import (
+    FrozenHighLevelSkillCommandSampler,
+    HighLevelSkillDiffSRConfig,
+)
 from rlopt.agent.hl_skill_encoder import (
     FSQQuantizer,
     FSQSkillEncoder,
@@ -47,6 +52,20 @@ def _batch(batch_size: int = 8):
 
 def test_factory_builds_sonic_fsq_encoder():
     assert isinstance(_build(SONIC_LEVELS), SONICFSQSkillEncoder)
+
+
+def test_sonic_trunk_can_use_silu_without_layer_norm():
+    encoder = build_skill_encoder(
+        state_dim=STATE_DIM,
+        window_steps=WINDOW_STEPS,
+        z_dim=len(SONIC_LEVELS),
+        hidden_dims=(256, 128),
+        spec=SkillLatentSpec(latent_mode="sonic_fsq", sonic_fsq_levels=SONIC_LEVELS),
+        activation="silu",
+        layer_norm=False,
+    )
+    assert any(isinstance(module, torch.nn.SiLU) for module in encoder.net)
+    assert not any(isinstance(module, torch.nn.LayerNorm) for module in encoder.net)
 
 
 def test_command_width_equals_token_width():
@@ -168,9 +187,62 @@ def test_config_projects_levels_into_the_encoder_spec():
 
 
 def test_config_round_trips_through_dict():
-    restored = HighLevelSkillDiffSRConfig.from_dict(_config().to_dict())
+    restored = HighLevelSkillDiffSRConfig.from_dict(
+        _config(encoder_activation="silu", encoder_layer_norm=False).to_dict()
+    )
     assert restored.sonic_fsq_levels == SONIC_LEVELS
     assert restored.latent_mode == "sonic_fsq"
+    assert restored.encoder_activation == "silu"
+    assert restored.encoder_layer_norm is False
+
+
+def test_macro_frame_stride_round_trips_and_defaults_to_one():
+    """Stride is provenance: the checkpoint must carry the cadence its encoder
+    was pretrained on, and a checkpoint written before the field existed can
+    only have been consecutive."""
+    restored = HighLevelSkillDiffSRConfig.from_dict(
+        _config(macro_frame_stride=5).to_dict()
+    )
+    assert restored.macro_frame_stride == 5
+
+    legacy = _config().to_dict()
+    del legacy["macro_frame_stride"]
+    assert HighLevelSkillDiffSRConfig.from_dict(legacy).macro_frame_stride == 1
+
+
+def test_macro_frame_stride_rejects_zero():
+    with pytest.raises(ValueError, match="macro_frame_stride"):
+        _config(macro_frame_stride=0)
+
+
+def _stride_guard(*, checkpoint_stride: int, env_stride: int | None):
+    """The pairing guard alone, without building a whole frozen sampler."""
+    sampler = object.__new__(FrozenHighLevelSkillCommandSampler)
+    sampler.config = _config(macro_frame_stride=checkpoint_stride)
+    env = (
+        SimpleNamespace()
+        if env_stride is None
+        else SimpleNamespace(expert_macro_frame_stride=lambda: env_stride)
+    )
+    sampler._require_matching_macro_frame_stride(env)
+
+
+def test_stride_mismatch_is_refused_at_pairing():
+    """The macro state is 380 wide at every stride, so this is the ONLY place a
+    stride-1 encoder driven at stride 5 can be caught."""
+    with pytest.raises(ValueError, match="macro-window stride"):
+        _stride_guard(checkpoint_stride=5, env_stride=1)
+    with pytest.raises(ValueError, match="macro-window stride"):
+        _stride_guard(checkpoint_stride=1, env_stride=5)
+
+
+def test_matching_stride_and_pre_stride_env_are_accepted():
+    _stride_guard(checkpoint_stride=5, env_stride=5)
+    # An environment that does not publish a stride predates the field and can
+    # only be serving consecutive frames.
+    _stride_guard(checkpoint_stride=1, env_stride=None)
+    with pytest.raises(ValueError, match="macro-window stride"):
+        _stride_guard(checkpoint_stride=5, env_stride=None)
 
 
 def test_config_leaves_other_latent_modes_alone():
@@ -180,3 +252,47 @@ def test_config_leaves_other_latent_modes_alone():
     )
     config.validate()
     assert config.latent_spec().latent_mode == "fsq"
+
+
+@pytest.mark.parametrize(
+    ("objective", "expected_offsets"),
+    [
+        ("endpoint", (WINDOW_STEPS,)),
+        ("endpoint_delta", (WINDOW_STEPS,)),
+        ("state_occupancy", tuple(range(1, WINDOW_STEPS + 1))),
+        ("semimarkov_chain", tuple(range(1, WINDOW_STEPS + 1))),
+    ],
+)
+def test_transition_objective_default_offsets(objective, expected_offsets):
+    config = HighLevelSkillDiffSRConfig(
+        horizon_steps=WINDOW_STEPS,
+        transition_objective=objective,
+    )
+    config.validate()
+    assert config.transition_offsets == expected_offsets
+
+
+def test_transition_offsets_round_trip():
+    config = HighLevelSkillDiffSRConfig(
+        horizon_steps=WINDOW_STEPS,
+        transition_objective="semimarkov_chain",
+        transition_offsets=(2, 4, 6, 8, 10),
+    )
+    config.validate()
+    restored = HighLevelSkillDiffSRConfig.from_dict(config.to_dict())
+    assert restored.transition_objective == "semimarkov_chain"
+    assert restored.transition_offsets == (2, 4, 6, 8, 10)
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [(2, 2, 10), (4, 2, 10), (2, 4, 8), (2, 4, 12)],
+)
+def test_transition_offsets_reject_invalid_checkpoint_sets(offsets):
+    config = HighLevelSkillDiffSRConfig(
+        horizon_steps=WINDOW_STEPS,
+        transition_objective="state_occupancy",
+        transition_offsets=offsets,
+    )
+    with pytest.raises(ValueError, match="transition_offsets"):
+        config.validate()

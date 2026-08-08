@@ -75,6 +75,26 @@ def _normalize_encoder_window_mode(name: str, value: str) -> str:
     return normalized
 
 
+def _normalize_transition_objective(name: str, value: str) -> str:
+    normalized = str(value).strip().lower()
+    aliases = {
+        "occupancy": "state_occupancy",
+        "chain": "semimarkov_chain",
+        "delta": "endpoint_delta",
+    }
+    normalized = aliases.get(normalized, normalized)
+    choices = {
+        "endpoint",
+        "state_occupancy",
+        "semimarkov_chain",
+        "endpoint_delta",
+    }
+    if normalized not in choices:
+        msg = f"{name} must be one of {sorted(choices)}, got {value!r}."
+        raise ValueError(msg)
+    return normalized
+
+
 def _normalize_command_mode(value: str) -> str:
     normalized = str(value).strip().lower()
     aliases = {"fz": "phi", "z_fz": "z_phi"}
@@ -243,6 +263,37 @@ class HighLevelSkillDiffSRConfig:
     trajectory_split_seed: int = 0
     preflight_batch_size: int = 8
     encoder_window_mode: str = "full"
+    transition_objective: str = "endpoint"
+    """DiffSR factorization used to train the skill code.
+
+    ``endpoint`` preserves the original ``p(s[t+H] | s[t], z)`` loss.
+    ``state_occupancy`` samples one configured checkpoint ``h_k`` per row and
+    trains ``p(s[t+h_k] | s[t], z)`` without exposing ``h_k`` to the decoder,
+    making the learned density an option-conditioned state-occupancy mixture.
+    ``semimarkov_chain`` samples one adjacent checkpoint pair and trains
+    ``p(s[t+h_k] | s[t+h_{k-1}], z)`` with one code held across the chain.
+    ``endpoint_delta`` predicts ``s[t+H] - s[t]`` instead of absolute endpoint.
+    """
+    transition_offsets: tuple[int, ...] = ()
+    """Strictly increasing checkpoint offsets in ``[1, horizon_steps]``.
+
+    Empty means ``(horizon_steps,)`` for endpoint objectives and every step
+    ``1..horizon_steps`` for occupancy/chain objectives.
+    """
+    macro_frame_stride: int = 1
+    """Reference frames between consecutive macro-window slots at pretrain time.
+
+    Provenance, not a knob the trainer acts on: the environment owns the macro
+    cadence (``env.expert_macro_frame_stride``), and the pretrain entrypoint
+    copies its value here so the checkpoint carries it. 1 is the historical
+    consecutive-frame window; 5 is SONIC's released tokenizer cadence, where 10
+    slots span 0.9 s instead of 0.18 s and the endpoint target is ``s[t+50]``,
+    one stride past the last slot the encoder reads.
+    The macro state's width is identical either way, so a low-level run that
+    loads this encoder under a different stride is silently off-distribution
+    unless it compares this field -- which
+    :class:`FrozenHighLevelSkillCommandSampler` does.
+    """
     latent_mode: str = "deterministic"
     reg_coeff: float = 1.0e-3
     categorical_groups: int = 8
@@ -264,6 +315,8 @@ class HighLevelSkillDiffSRConfig:
     vq_ema_decay: float = 0.99
     vq_dead_code_reset_iters: int = 0
     encoder_hidden_dims: tuple[int, ...] = (1024, 512, 512)
+    encoder_activation: str = "mish"
+    encoder_layer_norm: bool = True
     diffsr_f_hidden_dims: tuple[int, ...] = (512, 512)
     diffsr_g_hidden_dims: tuple[int, ...] = (512,)
     diffsr_mu_hidden_dims: tuple[int, ...] = (512,)
@@ -290,6 +343,9 @@ class HighLevelSkillDiffSRConfig:
 
     def validate(self) -> None:
         self.horizon_steps = _require_positive_int("horizon_steps", self.horizon_steps)
+        self.macro_frame_stride = _require_positive_int(
+            "macro_frame_stride", self.macro_frame_stride
+        )
         self.z_dim = _require_positive_int("z_dim", self.z_dim)
         self.diffsr_feature_dim = _require_positive_int(
             "diffsr_feature_dim", self.diffsr_feature_dim
@@ -319,6 +375,46 @@ class HighLevelSkillDiffSRConfig:
         )
         if self.encoder_window_mode == "intermediate" and self.horizon_steps <= 1:
             msg = "encoder_window_mode='intermediate' requires horizon_steps > 1."
+            raise ValueError(msg)
+        self.transition_objective = _normalize_transition_objective(
+            "transition_objective", self.transition_objective
+        )
+        self.transition_offsets = tuple(
+            _require_positive_int("transition_offsets", offset)
+            for offset in self.transition_offsets
+        )
+        if not self.transition_offsets:
+            if self.transition_objective in {"endpoint", "endpoint_delta"}:
+                self.transition_offsets = (self.horizon_steps,)
+            else:
+                self.transition_offsets = tuple(range(1, self.horizon_steps + 1))
+        if tuple(sorted(set(self.transition_offsets))) != self.transition_offsets:
+            msg = (
+                "transition_offsets must be unique and strictly increasing, got "
+                f"{self.transition_offsets!r}."
+            )
+            raise ValueError(msg)
+        if self.transition_offsets[-1] > self.horizon_steps:
+            msg = (
+                "transition_offsets cannot exceed horizon_steps: "
+                f"{self.transition_offsets!r} vs {self.horizon_steps}."
+            )
+            raise ValueError(msg)
+        if self.transition_offsets[-1] != self.horizon_steps:
+            msg = (
+                "transition_offsets must include horizon_steps as the final "
+                f"checkpoint, got {self.transition_offsets!r} with "
+                f"horizon_steps={self.horizon_steps}."
+            )
+            raise ValueError(msg)
+        if self.transition_objective in {"endpoint", "endpoint_delta"} and (
+            self.transition_offsets != (self.horizon_steps,)
+        ):
+            msg = (
+                f"transition_objective={self.transition_objective!r} requires "
+                f"transition_offsets=({self.horizon_steps},), got "
+                f"{self.transition_offsets!r}."
+            )
             raise ValueError(msg)
         if self.latent_mode not in _LATENT_MODES:
             msg = (
@@ -387,6 +483,14 @@ class HighLevelSkillDiffSRConfig:
             _require_positive_int("encoder_hidden_dims", dim)
             for dim in self.encoder_hidden_dims
         )
+        self.encoder_activation = str(self.encoder_activation).strip().lower()
+        if self.encoder_activation not in {"elu", "mish", "relu", "silu"}:
+            msg = (
+                "encoder_activation must be one of ['elu', 'mish', 'relu', "
+                f"'silu'], got {self.encoder_activation!r}."
+            )
+            raise ValueError(msg)
+        self.encoder_layer_norm = bool(self.encoder_layer_norm)
         self.diffsr_f_hidden_dims = tuple(
             _require_positive_int("diffsr_f_hidden_dims", dim)
             for dim in self.diffsr_f_hidden_dims
@@ -478,6 +582,7 @@ class HighLevelSkillDiffSRConfig:
             "fsq_levels",
             "sonic_fsq_levels",
             "commander_hidden_dims",
+            "transition_offsets",
         }
         for key in tuple_fields:
             if key in kwargs:
@@ -584,6 +689,13 @@ class FrozenHighLevelSkillCommandSampler:
             weights_only=False,
         )
         self.config = HighLevelSkillDiffSRConfig.from_dict(checkpoint["config"])
+        if self.finetune_enabled and self.config.transition_objective != "endpoint":
+            msg = (
+                "Online skill-encoder finetuning currently supports only the "
+                "endpoint DiffSR objective; freeze this encoder or add the matching "
+                f"{self.config.transition_objective!r} online loss."
+            )
+            raise ValueError(msg)
         if (
             horizon_steps is not None
             and int(horizon_steps) != self.config.horizon_steps
@@ -593,6 +705,7 @@ class FrozenHighLevelSkillCommandSampler:
                 f"horizon_steps: {int(horizon_steps)} != {self.config.horizon_steps}."
             )
             raise ValueError(msg)
+        self._require_matching_macro_frame_stride(env)
         self.skill_z_dim = int(self.config.z_dim)
         self.command_code_dim = self._command_code_dim_for_mode()
         if (
@@ -628,6 +741,8 @@ class FrozenHighLevelSkillCommandSampler:
             z_dim=self.config.z_dim,
             hidden_dims=self.config.encoder_hidden_dims,
             spec=self.config.latent_spec(),
+            activation=self.config.encoder_activation,
+            layer_norm=self.config.encoder_layer_norm,
         ).to(self.device)
         self.skill_encoder.load_state_dict(state_dict)
 
@@ -637,6 +752,8 @@ class FrozenHighLevelSkillCommandSampler:
             z_dim=self.config.z_dim,
             hidden_dims=self.config.encoder_hidden_dims,
             spec=self.config.latent_spec(),
+            activation=self.config.encoder_activation,
+            layer_norm=self.config.encoder_layer_norm,
         ).to(self.device)
         self.initial_skill_encoder.load_state_dict(state_dict)
         self.initial_skill_encoder.eval()
@@ -713,6 +830,34 @@ class FrozenHighLevelSkillCommandSampler:
             )
             raise ValueError(msg)
         return input_dim // divisor
+
+    def _require_matching_macro_frame_stride(self, env: object) -> None:
+        """Refuse an encoder pretrained on a different macro-window cadence.
+
+        The macro state is the same width at every stride, so pairing a
+        stride-1 encoder with a stride-5 environment (or the reverse) produces
+        no shape error and no warning -- only a silently off-distribution
+        command. An environment that does not publish its stride is a pre-
+        stride surface, which can only be serving 1.
+        """
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        interface = resolve_imitation_interface(env)
+        if not supports(interface, "expert_macro_frame_stride"):
+            env_stride = 1
+        else:
+            env_stride = int(interface.expert_macro_frame_stride())
+        checkpoint_stride = int(self.config.macro_frame_stride)
+        if env_stride != checkpoint_stride:
+            msg = (
+                "Skill encoder macro-window stride does not match the "
+                f"environment: checkpoint was pretrained at stride "
+                f"{checkpoint_stride}, env.expert_macro_frame_stride is "
+                f"{env_stride}. The macro state is the same width at both, so "
+                "this cannot be detected downstream -- set the environment to "
+                "the encoder's stride or pretrain a new encoder."
+            )
+            raise ValueError(msg)
 
     def _command_code_dim_for_mode(self) -> int:
         if self.command_mode == "z":
@@ -1131,6 +1276,8 @@ class HighLevelSkillDiffSRTrainer:
             z_dim=self.config.z_dim,
             hidden_dims=self.config.encoder_hidden_dims,
             spec=self.config.latent_spec(),
+            activation=self.config.encoder_activation,
+            layer_norm=self.config.encoder_layer_norm,
         ).to(self.device)
         self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
             self.device
@@ -1268,6 +1415,138 @@ class HighLevelSkillDiffSRTrainer:
         zero_reward = torch.zeros(state.shape[0], 1, device=self.device)
         _, loss, _ = self.diffsr.compute_loss(state, z, target, zero_reward)
         return loss
+
+    def _objective_transition_at(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        offset_index: int,
+    ) -> tuple[Tensor, Tensor, int]:
+        """Build one transition factor for the configured skill objective."""
+        offsets = self.config.transition_offsets
+        index = int(offset_index)
+        if index < 0 or index >= len(offsets):
+            msg = f"offset_index must be in [0, {len(offsets)}), got {index}."
+            raise IndexError(msg)
+        offset = int(offsets[index])
+        target = future_window[:, offset - 1, :]
+        objective = self.config.transition_objective
+        if objective == "semimarkov_chain" and index > 0:
+            source = future_window[:, int(offsets[index - 1]) - 1, :]
+        else:
+            source = state
+        if objective == "endpoint_delta":
+            target = target - state
+        return source, target, offset
+
+    def _sample_objective_transition(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Sample one unbiased objective factor independently for each row."""
+        num_offsets = len(self.config.transition_offsets)
+        batch_size = int(state.shape[0])
+        if num_offsets == 1:
+            source, target, offset = self._objective_transition_at(
+                state, future_window, 0
+            )
+            selected_offsets = torch.full(
+                (batch_size,), offset, device=state.device, dtype=torch.long
+            )
+            return source, target, selected_offsets
+
+        sources: list[Tensor] = []
+        targets: list[Tensor] = []
+        for offset_index in range(num_offsets):
+            source, target, _ = self._objective_transition_at(
+                state, future_window, offset_index
+            )
+            sources.append(source)
+            targets.append(target)
+        source_stack = torch.stack(sources, dim=1)
+        target_stack = torch.stack(targets, dim=1)
+        selected_indices = torch.randint(
+            0, num_offsets, (batch_size,), device=state.device
+        )
+        row_indices = torch.arange(batch_size, device=state.device)
+        offset_values = torch.tensor(
+            self.config.transition_offsets, device=state.device, dtype=torch.long
+        )
+        return (
+            source_stack[row_indices, selected_indices],
+            target_stack[row_indices, selected_indices],
+            offset_values[selected_indices],
+        )
+
+    def _objective_eval_loss_metrics(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        z: Tensor,
+        zero_z: Tensor,
+        shuffled_z: Tensor,
+        *,
+        prefix: str,
+    ) -> dict[str, float]:
+        """Evaluate every checkpoint factor, then report their uniform mean."""
+        real_losses: list[float] = []
+        zero_losses: list[float] = []
+        shuffled_losses: list[float] = []
+        metrics: dict[str, float] = {}
+        for offset_index in range(len(self.config.transition_offsets)):
+            source, target, offset = self._objective_transition_at(
+                state, future_window, offset_index
+            )
+            real = float(self._diffsr_loss_for_z(source, z, target).item())
+            zero = float(self._diffsr_loss_for_z(source, zero_z, target).item())
+            shuffled = float(self._diffsr_loss_for_z(source, shuffled_z, target).item())
+            real_losses.append(real)
+            zero_losses.append(zero)
+            shuffled_losses.append(shuffled)
+            metrics.update(
+                {
+                    f"{prefix}/loss_real_z_eval_h{offset}": real,
+                    f"{prefix}/loss_zero_z_eval_h{offset}": zero,
+                    f"{prefix}/loss_shuffled_z_eval_h{offset}": shuffled,
+                }
+            )
+        metrics.update(
+            {
+                f"{prefix}/loss_real_z_eval": sum(real_losses) / len(real_losses),
+                f"{prefix}/loss_zero_z_eval": sum(zero_losses) / len(zero_losses),
+                f"{prefix}/loss_shuffled_z_eval": sum(shuffled_losses)
+                / len(shuffled_losses),
+            }
+        )
+        return metrics
+
+    def _objective_reconstruction_metrics(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        z: Tensor,
+        *,
+        prefix: str,
+    ) -> dict[str, float]:
+        """Sample each configured factor and keep old aggregate metric names."""
+        per_offset: list[dict[str, float]] = []
+        metrics: dict[str, float] = {}
+        for offset_index in range(len(self.config.transition_offsets)):
+            source, target, offset = self._objective_transition_at(
+                state, future_window, offset_index
+            )
+            current = self._sample_reconstruction_metrics(
+                source, z, target, prefix=prefix
+            )
+            per_offset.append(current)
+            for key, value in current.items():
+                suffix = key.removeprefix(f"{prefix}/")
+                metrics[f"{prefix}/{suffix}_h{offset}"] = value
+        if per_offset:
+            for key in per_offset[0]:
+                metrics[key] = sum(item[key] for item in per_offset) / len(per_offset)
+        return metrics
 
     @staticmethod
     def _metric_safe_feature_name(name: str) -> str:
@@ -1661,11 +1940,15 @@ class HighLevelSkillDiffSRTrainer:
             horizon_steps=int(self.config.horizon_steps),
             device=self.device,
         )
-        self.diffsr.update_obs_norm(target.detach())
+        del target
         # reg_loss is the per-method latent regularizer (L2 / KL / commitment / 0),
         # weighted uniformly by reg_coeff; info carries method-specific diagnostics.
         z, reg_loss, info = self._encode_skill(state, future_window, step=self.update)
-        diffsr_loss = self._diffsr_loss_for_z(state, z, target)
+        objective_state, objective_target, selected_offsets = (
+            self._sample_objective_transition(state, future_window)
+        )
+        self.diffsr.update_obs_norm(objective_target.detach())
+        diffsr_loss = self._diffsr_loss_for_z(objective_state, z, objective_target)
         z_norm_loss = z.pow(2).mean()
         loss = diffsr_loss + self.config.reg_coeff * reg_loss
 
@@ -1688,6 +1971,11 @@ class HighLevelSkillDiffSRTrainer:
                 "train/diffsr_loss": float(diffsr_loss.detach().item()),
                 "train/z_norm_loss": float(z_norm_loss.detach().item()),
                 "train/reg_loss": float(reg_loss.detach().item()),
+                "train/transition_offset_mean": float(
+                    selected_offsets.to(torch.float32).mean().item()
+                ),
+                "train/transition_offset_min": float(selected_offsets.min().item()),
+                "train/transition_offset_max": float(selected_offsets.max().item()),
                 **{f"train/{k}": float(v.item()) for k, v in info.items()},
             }
         )
@@ -1722,7 +2010,7 @@ class HighLevelSkillDiffSRTrainer:
         accum: dict[str, float] = {}
         for _ in range(num_batches):
             batch = self._sample_macro_batch(batch_size, split=split)
-            state, future_window, target = _validate_macro_batch(
+            state, future_window, _target = _validate_macro_batch(
                 batch,
                 batch_size=batch_size,
                 horizon_steps=int(self.config.horizon_steps),
@@ -1734,16 +2022,16 @@ class HighLevelSkillDiffSRTrainer:
                 shuffled_z = z[torch.randperm(z.shape[0], device=z.device)]
             else:
                 shuffled_z = z.clone()
-            real_loss = self._diffsr_loss_for_z(state, z, target)
-            zero_loss = self._diffsr_loss_for_z(state, zero_z, target)
-            shuffled_loss = self._diffsr_loss_for_z(state, shuffled_z, target)
             batch_metrics = self._z_diagnostics(z, prefix=prefix)
             batch_metrics.update(
-                {
-                    f"{prefix}/loss_real_z_eval": float(real_loss.item()),
-                    f"{prefix}/loss_zero_z_eval": float(zero_loss.item()),
-                    f"{prefix}/loss_shuffled_z_eval": float(shuffled_loss.item()),
-                }
+                self._objective_eval_loss_metrics(
+                    state,
+                    future_window,
+                    z,
+                    zero_z,
+                    shuffled_z,
+                    prefix=prefix,
+                )
             )
             # Per-method diversity / collapse diagnostics.
             diversity = self.skill_encoder.diversity_metrics(
@@ -1761,10 +2049,10 @@ class HighLevelSkillDiffSRTrainer:
                 )
             if include_reconstruction:
                 batch_metrics.update(
-                    self._sample_reconstruction_metrics(
+                    self._objective_reconstruction_metrics(
                         state,
+                        future_window,
                         z,
-                        target,
                         prefix=prefix,
                     )
                 )
@@ -1906,6 +2194,20 @@ class HighLevelSkillDiffSRTrainer:
             msg = (
                 "Checkpoint encoder_window_mode does not match trainer construction: "
                 f"{loaded_config.encoder_window_mode!r} != {self.config.encoder_window_mode!r}."
+            )
+            raise ValueError(msg)
+        if loaded_config.transition_objective != self.config.transition_objective:
+            msg = (
+                "Checkpoint transition_objective does not match trainer "
+                f"construction: {loaded_config.transition_objective!r} != "
+                f"{self.config.transition_objective!r}."
+            )
+            raise ValueError(msg)
+        if loaded_config.transition_offsets != self.config.transition_offsets:
+            msg = (
+                "Checkpoint transition_offsets do not match trainer construction: "
+                f"{loaded_config.transition_offsets!r} != "
+                f"{self.config.transition_offsets!r}."
             )
             raise ValueError(msg)
         self.config = loaded_config

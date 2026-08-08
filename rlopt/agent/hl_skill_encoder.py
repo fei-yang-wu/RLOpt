@@ -230,6 +230,8 @@ class HighLevelSkillEncoder(nn.Module, ABC):
         z_dim: int,
         hidden_dims: tuple[int, ...],
         raw_dim: int,
+        activation: str = "mish",
+        layer_norm: bool = True,
     ) -> None:
         super().__init__()
         self.state_dim = int(state_dim)
@@ -237,12 +239,26 @@ class HighLevelSkillEncoder(nn.Module, ABC):
         self.z_dim = int(z_dim)
         layers: list[nn.Module] = []
         prev = self.state_dim * (self.window_steps + 1)
+        activation_name = str(activation).strip().lower()
+        activation_types: dict[str, type[nn.Module]] = {
+            "elu": nn.ELU,
+            "mish": nn.Mish,
+            "relu": nn.ReLU,
+            "silu": nn.SiLU,
+        }
+        try:
+            activation_type = activation_types[activation_name]
+        except KeyError as error:
+            msg = (
+                "activation must be one of "
+                f"{sorted(activation_types)}, got {activation!r}."
+            )
+            raise ValueError(msg) from error
         for hidden in hidden_dims:
-            layers += [
-                nn.Linear(prev, int(hidden)),
-                nn.LayerNorm(int(hidden)),
-                nn.Mish(),
-            ]
+            layers.append(nn.Linear(prev, int(hidden)))
+            if layer_norm:
+                layers.append(nn.LayerNorm(int(hidden)))
+            layers.append(activation_type())
             prev = int(hidden)
         layers.append(nn.Linear(prev, int(raw_dim)))
         self.net = nn.Sequential(*layers)
@@ -696,12 +712,16 @@ def build_skill_encoder(
     z_dim: int,
     hidden_dims: tuple[int, ...],
     spec: SkillLatentSpec,
+    activation: str = "mish",
+    layer_norm: bool = True,
 ) -> HighLevelSkillEncoder:
     base = {
         "state_dim": state_dim,
         "window_steps": window_steps,
         "z_dim": z_dim,
         "hidden_dims": hidden_dims,
+        "activation": activation,
+        "layer_norm": layer_norm,
     }
     mode = spec.latent_mode
     if mode == "deterministic":

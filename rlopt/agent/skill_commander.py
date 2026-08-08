@@ -1404,6 +1404,8 @@ class SkillCommanderTrainer:
             z_dim=self.z_dim,
             hidden_dims=self.skill_config.encoder_hidden_dims,
             spec=self.skill_config.latent_spec(),
+            activation=self.skill_config.encoder_activation,
+            layer_norm=self.skill_config.encoder_layer_norm,
         ).to(self.device)
         self.skill_encoder.load_state_dict(skill_checkpoint["skill_encoder_state_dict"])
         self.skill_encoder.eval()
@@ -2287,6 +2289,24 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
                 "Configured hl_skill_horizon_steps does not match generator "
                 f"checkpoint horizon_steps: {int(horizon_steps)} != "
                 f"{self.config.horizon_steps}."
+            )
+            raise ValueError(msg)
+        # Same trap as the low level: the macro state has one width at every
+        # stride, so a commander deployed against a different cadence than its
+        # encoder was pretrained on fails silently, not loudly.
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        _interface = resolve_imitation_interface(env)
+        _env_stride = (
+            int(_interface.expert_macro_frame_stride())
+            if supports(_interface, "expert_macro_frame_stride")
+            else 1
+        )
+        if _env_stride != int(self.config.macro_frame_stride):
+            msg = (
+                "Skill encoder macro-window stride does not match the "
+                f"environment: checkpoint {int(self.config.macro_frame_stride)} "
+                f"!= env.expert_macro_frame_stride {_env_stride}."
             )
             raise ValueError(msg)
         self.skill_z_dim = int(self.config.z_dim)
