@@ -243,6 +243,79 @@ def _make_skill_checkpoint(
     return path
 
 
+def _make_transition_objective_trainer(
+    objective: str,
+    *,
+    offsets: tuple[int, ...],
+) -> HighLevelSkillDiffSRTrainer:
+    env = _FakeMacroEnv(state_dim=7, horizon_steps=4, deterministic=True)
+    config = HighLevelSkillDiffSRConfig(
+        horizon_steps=4,
+        transition_objective=objective,
+        transition_offsets=offsets,
+        z_dim=5,
+        diffsr_feature_dim=4,
+        diffsr_embed_dim=8,
+        batch_size=6,
+        num_updates=1,
+        log_interval=1,
+        eval_batches=1,
+        eval_batch_size=4,
+        preflight_batch_size=4,
+        encoder_hidden_dims=(16, 12),
+        diffsr_f_hidden_dims=(16,),
+        diffsr_g_hidden_dims=(16,),
+        diffsr_mu_hidden_dims=(16,),
+        diffsr_num_noises=2,
+        device="cpu",
+    )
+    return HighLevelSkillDiffSRTrainer(config, env)
+
+
+def test_state_occupancy_uses_start_state_for_every_checkpoint() -> None:
+    trainer = _make_transition_objective_trainer("state_occupancy", offsets=(2, 4))
+    state = torch.zeros(2, 7)
+    future = torch.arange(1, 5, dtype=torch.float32).reshape(1, 4, 1)
+    future = future.expand(2, 4, 7)
+    source, target, offset = trainer._objective_transition_at(state, future, 1)
+    assert offset == 4
+    assert torch.equal(source, state)
+    assert torch.equal(target, torch.full_like(state, 4.0))
+
+
+def test_semimarkov_chain_uses_previous_checkpoint_as_source() -> None:
+    trainer = _make_transition_objective_trainer("semimarkov_chain", offsets=(2, 4))
+    state = torch.zeros(2, 7)
+    future = torch.arange(1, 5, dtype=torch.float32).reshape(1, 4, 1)
+    future = future.expand(2, 4, 7)
+    source, target, offset = trainer._objective_transition_at(state, future, 1)
+    assert offset == 4
+    assert torch.equal(source, torch.full_like(state, 2.0))
+    assert torch.equal(target, torch.full_like(state, 4.0))
+
+
+def test_endpoint_delta_predicts_relative_outcome() -> None:
+    trainer = _make_transition_objective_trainer("endpoint_delta", offsets=(4,))
+    state = torch.full((2, 7), 1.5)
+    future = torch.full((2, 4, 7), 5.0)
+    source, target, offset = trainer._objective_transition_at(state, future, 0)
+    assert offset == 4
+    assert torch.equal(source, state)
+    assert torch.equal(target, torch.full_like(state, 3.5))
+
+
+@pytest.mark.parametrize("objective", ["state_occupancy", "semimarkov_chain"])
+def test_multicheckpoint_objective_train_step_reports_sampled_offsets(
+    objective: str,
+) -> None:
+    trainer = _make_transition_objective_trainer(objective, offsets=(2, 4))
+    metrics = trainer.train_step()
+    assert metrics["train/transition_offset_min"] in {2.0, 4.0}
+    assert metrics["train/transition_offset_max"] in {2.0, 4.0}
+    assert 2.0 <= metrics["train/transition_offset_mean"] <= 4.0
+    assert torch.isfinite(torch.tensor(metrics["train/loss"]))
+
+
 def _make_language_table(
     tmp_path: Path,
     names: list[str],

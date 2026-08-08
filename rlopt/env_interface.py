@@ -42,6 +42,7 @@ _WRAPPER_ATTRS = ("base_env", "env", "_env", "unwrapped")
 # Capability name -> the historical environment method it was called by.
 _LEGACY_METHOD_NAMES: dict[str, str] = {
     "sample_expert_batch": "sample_expert_batch",
+    "expert_macro_frame_stride": "expert_macro_frame_stride",
     "sample_expert_macro_transition_batch": "sample_expert_macro_transition_batch",
     "current_expert_macro_transition_batch": "current_expert_macro_transition_batch",
     "current_achieved_macro_transition_batch": "current_achieved_macro_transition_batch",
@@ -66,6 +67,16 @@ class ImitationEnvInterface(Protocol):
         self, batch_size: int, required_keys: Sequence[Any]
     ) -> TensorDict | None:
         """Expert transitions for the imitation/IRL losses."""
+        ...
+
+    def expert_macro_frame_stride(self) -> int:
+        """Reference frames between consecutive macro-window slots.
+
+        The macro state has the same width at every stride, so a skill encoder
+        paired with the wrong cadence cannot be caught by a shape check. An
+        environment that publishes this lets the consumer compare it against
+        the stride recorded in the encoder checkpoint.
+        """
         ...
 
     def sample_expert_macro_transition_batch(

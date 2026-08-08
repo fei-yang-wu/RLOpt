@@ -2830,5 +2830,16 @@ def test_ipmd_accepts_configured_posterior_keys_present_in_obs_spec() -> None:
     assert agent._posterior_obs_keys == [("policy", "observation")]
 
 
+def test_residual_mlp_supports_tapered_hidden_widths() -> None:
+    from rlopt.agent.ipmd.network import ResidualMLP
+
+    network = ResidualMLP(
+        input_dim=38,
+        output_dim=256,
+        hidden_dims=(1024, 1024, 512),
+    )
+    assert network(torch.randn(8, 38)).shape == (8, 256)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
