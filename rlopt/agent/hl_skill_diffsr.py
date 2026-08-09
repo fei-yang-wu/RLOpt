@@ -294,6 +294,21 @@ class HighLevelSkillDiffSRConfig:
     unless it compares this field -- which
     :class:`FrozenHighLevelSkillCommandSampler` does.
     """
+    macro_anchor_mode: str = "robot"
+    """Frame convention of the macro window at pretrain time.
+
+    Provenance, like ``macro_frame_stride``: the environment owns the
+    convention (``env.expert_macro_anchor_mode``) and the pretrain entrypoint
+    copies its value here so the checkpoint carries it. "robot" is the
+    historical split (expert-anchored pretrain, robot-anchored rollout);
+    "expert_heading" expresses both in the expert's slot-0 heading frame, so
+    pretrain and rollout encoder inputs match by construction. The width is
+    identical either way, so a low level that loads this encoder under a
+    different mode is silently off-distribution unless it compares this
+    field -- which :class:`FrozenHighLevelSkillCommandSampler` does. A
+    checkpoint written before the field existed reads back as "robot", which
+    is what it was.
+    """
     latent_mode: str = "deterministic"
     reg_coeff: float = 1.0e-3
     categorical_groups: int = 8
@@ -346,6 +361,12 @@ class HighLevelSkillDiffSRConfig:
         self.macro_frame_stride = _require_positive_int(
             "macro_frame_stride", self.macro_frame_stride
         )
+        if self.macro_anchor_mode not in ("robot", "expert_heading"):
+            msg = (
+                "macro_anchor_mode must be 'robot' or 'expert_heading', got "
+                f"{self.macro_anchor_mode!r}."
+            )
+            raise ValueError(msg)
         self.z_dim = _require_positive_int("z_dim", self.z_dim)
         self.diffsr_feature_dim = _require_positive_int(
             "diffsr_feature_dim", self.diffsr_feature_dim
@@ -706,6 +727,7 @@ class FrozenHighLevelSkillCommandSampler:
             )
             raise ValueError(msg)
         self._require_matching_macro_frame_stride(env)
+        self._require_matching_macro_anchor_mode(env)
         self.skill_z_dim = int(self.config.z_dim)
         self.command_code_dim = self._command_code_dim_for_mode()
         if (
@@ -856,6 +878,34 @@ class FrozenHighLevelSkillCommandSampler:
                 f"{env_stride}. The macro state is the same width at both, so "
                 "this cannot be detected downstream -- set the environment to "
                 "the encoder's stride or pretrain a new encoder."
+            )
+            raise ValueError(msg)
+
+    def _require_matching_macro_anchor_mode(self, env: object) -> None:
+        """Refuse an encoder pretrained under a different macro frame convention.
+
+        Same detection problem as the stride: the macro state has the same
+        width in the "robot" and "expert_heading" conventions, so pairing a
+        mismatched encoder produces no shape error -- only a silently
+        off-distribution command. An environment that does not publish its
+        mode is a pre-mode surface, which can only be serving "robot".
+        """
+        from rlopt.env_interface import resolve_imitation_interface, supports
+
+        interface = resolve_imitation_interface(env)
+        if not supports(interface, "expert_macro_anchor_mode"):
+            env_mode = "robot"
+        else:
+            env_mode = str(interface.expert_macro_anchor_mode())
+        checkpoint_mode = str(self.config.macro_anchor_mode)
+        if env_mode != checkpoint_mode:
+            msg = (
+                "Skill encoder macro-window anchor mode does not match the "
+                f"environment: checkpoint was pretrained under "
+                f"{checkpoint_mode!r}, env.expert_macro_anchor_mode is "
+                f"{env_mode!r}. The macro state is the same width in both, so "
+                "this cannot be detected downstream -- set the environment to "
+                "the encoder's mode or pretrain a new encoder."
             )
             raise ValueError(msg)
 

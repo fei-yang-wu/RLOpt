@@ -43,6 +43,7 @@ _WRAPPER_ATTRS = ("base_env", "env", "_env", "unwrapped")
 _LEGACY_METHOD_NAMES: dict[str, str] = {
     "sample_expert_batch": "sample_expert_batch",
     "expert_macro_frame_stride": "expert_macro_frame_stride",
+    "expert_macro_anchor_mode": "expert_macro_anchor_mode",
     "sample_expert_macro_transition_batch": "sample_expert_macro_transition_batch",
     "current_expert_macro_transition_batch": "current_expert_macro_transition_batch",
     "current_achieved_macro_transition_batch": "current_achieved_macro_transition_batch",
@@ -76,6 +77,17 @@ class ImitationEnvInterface(Protocol):
         paired with the wrong cadence cannot be caught by a shape check. An
         environment that publishes this lets the consumer compare it against
         the stride recorded in the encoder checkpoint.
+        """
+        ...
+
+    def expert_macro_anchor_mode(self) -> str:
+        """Frame convention of the macro window ("robot" or "expert_heading").
+
+        Same detection problem as the stride: the macro state has the same
+        width in every mode, so a skill encoder paired with the wrong frame
+        convention cannot be caught by a shape check. An environment that does
+        not publish this is a pre-mode surface, which can only be serving
+        "robot".
         """
         ...
 

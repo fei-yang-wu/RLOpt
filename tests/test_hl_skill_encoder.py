@@ -215,6 +215,56 @@ def test_macro_frame_stride_rejects_zero():
         _config(macro_frame_stride=0)
 
 
+def test_macro_anchor_mode_round_trips_and_defaults_to_robot():
+    """The anchor mode is provenance like the stride: a checkpoint written
+    before the field existed can only have used the historical robot-anchored
+    rollout convention."""
+    restored = HighLevelSkillDiffSRConfig.from_dict(
+        _config(macro_anchor_mode="expert_heading").to_dict()
+    )
+    assert restored.macro_anchor_mode == "expert_heading"
+
+    legacy = _config().to_dict()
+    del legacy["macro_anchor_mode"]
+    assert HighLevelSkillDiffSRConfig.from_dict(legacy).macro_anchor_mode == "robot"
+
+
+def test_macro_anchor_mode_rejects_unknown_values():
+    with pytest.raises(ValueError, match="macro_anchor_mode"):
+        _config(macro_anchor_mode="world")
+
+
+def _anchor_mode_guard(*, checkpoint_mode: str, env_mode: str | None):
+    """The anchor-mode pairing guard alone, without a whole frozen sampler."""
+    sampler = object.__new__(FrozenHighLevelSkillCommandSampler)
+    sampler.config = _config(macro_anchor_mode=checkpoint_mode)
+    env = (
+        SimpleNamespace()
+        if env_mode is None
+        else SimpleNamespace(expert_macro_anchor_mode=lambda: env_mode)
+    )
+    sampler._require_matching_macro_anchor_mode(env)
+
+
+def test_anchor_mode_mismatch_is_refused_at_pairing():
+    """The macro state is the same width in both modes, so this is the ONLY
+    place a robot-convention encoder driven under expert_heading (or the
+    reverse) can be caught."""
+    with pytest.raises(ValueError, match="anchor mode"):
+        _anchor_mode_guard(checkpoint_mode="expert_heading", env_mode="robot")
+    with pytest.raises(ValueError, match="anchor mode"):
+        _anchor_mode_guard(checkpoint_mode="robot", env_mode="expert_heading")
+
+
+def test_matching_anchor_mode_and_pre_mode_env_are_accepted():
+    _anchor_mode_guard(checkpoint_mode="expert_heading", env_mode="expert_heading")
+    # An environment that does not publish a mode predates the field and can
+    # only be serving the robot convention.
+    _anchor_mode_guard(checkpoint_mode="robot", env_mode=None)
+    with pytest.raises(ValueError, match="anchor mode"):
+        _anchor_mode_guard(checkpoint_mode="expert_heading", env_mode=None)
+
+
 def _stride_guard(*, checkpoint_stride: int, env_stride: int | None):
     """The pairing guard alone, without building a whole frozen sampler."""
     sampler = object.__new__(FrozenHighLevelSkillCommandSampler)

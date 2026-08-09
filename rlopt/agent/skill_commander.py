@@ -2309,6 +2309,19 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
                 f"!= env.expert_macro_frame_stride {_env_stride}."
             )
             raise ValueError(msg)
+        # The macro-window anchor mode has the same one-width-every-mode trap.
+        _env_anchor_mode = (
+            str(_interface.expert_macro_anchor_mode())
+            if supports(_interface, "expert_macro_anchor_mode")
+            else "robot"
+        )
+        if _env_anchor_mode != str(self.config.macro_anchor_mode):
+            msg = (
+                "Skill encoder macro-window anchor mode does not match the "
+                f"environment: checkpoint {str(self.config.macro_anchor_mode)!r} "
+                f"!= env.expert_macro_anchor_mode {_env_anchor_mode!r}."
+            )
+            raise ValueError(msg)
         self.skill_z_dim = int(self.config.z_dim)
         self.command_code_dim = self._command_code_dim_for_mode()
         if (
