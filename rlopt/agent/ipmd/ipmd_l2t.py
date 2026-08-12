@@ -40,7 +40,7 @@ class IPMDL2TConfig:
     """Deployable observation key receiving the mirrored teacher command."""
 
     def validate(self) -> None:
-        """Validate the fixed v1 distillation contract."""
+        """Validate the distillation contract."""
         if float(self.imitation_coeff) <= 0.0:
             msg = "ipmd_l2t.imitation_coeff must be positive."
             raise ValueError(msg)
@@ -76,7 +76,9 @@ class IPMDL2T(IPMD):
     ``config.policy`` is the privileged teacher. It must consume the exact
     value-function observation keys. ``config.ipmd_l2t.student_policy`` is the
     deployable student and is optimized only by behavior distillation from the
-    teacher action that actually controlled the environment.
+    teacher action that actually controlled the environment. In latent mode,
+    the generated command belongs to the student contract; the teacher can use
+    a different command view such as an explicit reference command.
     """
 
     config: IPMDL2TRLOptConfig
@@ -163,6 +165,16 @@ class IPMDL2T(IPMD):
                 f"{self._student_latent_key!r}."
             )
             raise ValueError(msg)
+        if config.ipmd.use_latent_command and (
+            normalize_batch_key(config.ipmd.latent_key) != self._student_latent_key
+        ):
+            msg = (
+                "IPMDL2T latent mode requires ipmd.latent_key and "
+                "ipmd_l2t.student_latent_key to identify the same student "
+                f"observation, got {config.ipmd.latent_key!r} and "
+                f"{config.ipmd_l2t.student_latent_key!r}."
+            )
+            raise ValueError(msg)
 
         super().__init__(
             env=env,
@@ -181,6 +193,10 @@ class IPMDL2T(IPMD):
         """Return the privileged policy used for rollout collection."""
         assert self.policy is not None
         return self.policy
+
+    def _latent_command_consumer_obs_keys(self) -> list[ObsKey]:
+        """Route latent-command validation to the deployable student."""
+        return self._student_obs_keys
 
     @property
     def deployment_policy(self):
@@ -243,21 +259,15 @@ class IPMDL2T(IPMD):
             self._parameter_monitor.append((f"student_policy.{name}", param))
 
     def _inject_latent_command(self, td: TensorDict) -> None:
-        """Generate one teacher command and mirror it exactly to the student."""
+        """Generate one command directly on the student's latent key."""
         super()._inject_latent_command(td)
         if not self._use_latent_command:
             return
-        teacher_latent = td.get(self._latent_key)
-        if not isinstance(teacher_latent, Tensor):
-            msg = (
-                f"IPMDL2T expected a Tensor at teacher latent key {self._latent_key!r}."
-            )
-            raise RuntimeError(msg)
-        td.set(self._student_latent_key, teacher_latent)
         student_latent = td.get(self._student_latent_key)
-        if not torch.equal(teacher_latent, student_latent):
+        if not isinstance(student_latent, Tensor):
             msg = (
-                "IPMDL2T teacher and student latent commands must be tensor-identical."
+                "IPMDL2T expected a Tensor at student latent key "
+                f"{self._student_latent_key!r}."
             )
             raise RuntimeError(msg)
 
