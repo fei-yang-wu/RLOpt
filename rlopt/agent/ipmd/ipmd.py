@@ -988,6 +988,15 @@ class IPMD(PPO):
     def _normalize_command_source(command_source: str) -> str:
         return normalize_ipmd_command_source(command_source)
 
+    def _latent_command_consumer_obs_keys(self) -> list[ObsKey]:
+        """Return the observation keys of the policy that consumes the latent.
+
+        Ordinary IPMD publishes the latent to its main policy. Asymmetric
+        variants can override this hook when another policy consumes the same
+        command while the main rollout policy uses a different command view.
+        """
+        return self._policy_obs_keys
+
     def __init__(
         self,
         env,
@@ -1087,10 +1096,12 @@ class IPMD(PPO):
                 )
                 msg += self._latent_mode_hint()
                 raise ValueError(msg)
-            if self._latent_key not in self._policy_obs_keys:
+            latent_consumer_keys = self._latent_command_consumer_obs_keys()
+            if self._latent_key not in latent_consumer_keys:
                 msg = (
-                    "IPMD use_latent_command=True requires the policy input keys to "
-                    f"contain {self._latent_key!r}."
+                    "IPMD use_latent_command=True requires the latent-command "
+                    "consumer input keys to contain "
+                    f"{self._latent_key!r}, got {latent_consumer_keys!r}."
                 )
                 msg += self._latent_mode_hint()
                 raise ValueError(msg)
