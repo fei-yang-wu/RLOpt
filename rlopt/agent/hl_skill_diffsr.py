@@ -302,8 +302,11 @@ class HighLevelSkillDiffSRConfig:
     copies its value here so the checkpoint carries it. "robot" is the
     historical split (expert-anchored pretrain, robot-anchored rollout);
     "expert_heading" expresses both in the expert's slot-0 heading frame, so
-    pretrain and rollout encoder inputs match by construction. The width is
-    identical either way, so a low level that loads this encoder under a
+    pretrain and rollout encoder inputs match by construction;
+    "robot_heading" is SONIC v1.1's convention -- rollout anchors at the LIVE
+    robot's heading (yaw-only) frame, pretrain keeps the expert slot-0 heading
+    frame because offline data has no robot. The width is
+    identical in every mode, so a low level that loads this encoder under a
     different mode is silently off-distribution unless it compares this
     field -- which :class:`FrozenHighLevelSkillCommandSampler` does. A
     checkpoint written before the field existed reads back as "robot", which
@@ -361,10 +364,14 @@ class HighLevelSkillDiffSRConfig:
         self.macro_frame_stride = _require_positive_int(
             "macro_frame_stride", self.macro_frame_stride
         )
-        if self.macro_anchor_mode not in ("robot", "expert_heading"):
+        if self.macro_anchor_mode not in (
+            "robot",
+            "expert_heading",
+            "robot_heading",
+        ):
             msg = (
-                "macro_anchor_mode must be 'robot' or 'expert_heading', got "
-                f"{self.macro_anchor_mode!r}."
+                "macro_anchor_mode must be 'robot', 'expert_heading' or "
+                f"'robot_heading', got {self.macro_anchor_mode!r}."
             )
             raise ValueError(msg)
         self.z_dim = _require_positive_int("z_dim", self.z_dim)
@@ -885,7 +892,8 @@ class FrozenHighLevelSkillCommandSampler:
         """Refuse an encoder pretrained under a different macro frame convention.
 
         Same detection problem as the stride: the macro state has the same
-        width in the "robot" and "expert_heading" conventions, so pairing a
+        width in the "robot", "expert_heading" and "robot_heading"
+        conventions, so pairing a
         mismatched encoder produces no shape error -- only a silently
         off-distribution command. An environment that does not publish its
         mode is a pre-mode surface, which can only be serving "robot".
