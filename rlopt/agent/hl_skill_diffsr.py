@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import time
@@ -81,6 +82,7 @@ def _normalize_transition_objective(name: str, value: str) -> str:
         "occupancy": "state_occupancy",
         "chain": "semimarkov_chain",
         "delta": "endpoint_delta",
+        "jepa": "jepa_ntp",
     }
     normalized = aliases.get(normalized, normalized)
     choices = {
@@ -88,6 +90,7 @@ def _normalize_transition_objective(name: str, value: str) -> str:
         "state_occupancy",
         "semimarkov_chain",
         "endpoint_delta",
+        "jepa_ntp",
     }
     if normalized not in choices:
         msg = f"{name} must be one of {sorted(choices)}, got {value!r}."
@@ -131,6 +134,65 @@ def _encoder_window_steps(config: HighLevelSkillDiffSRConfig) -> int:
     if config.encoder_window_mode == "intermediate":
         return int(config.horizon_steps) - 1
     return int(config.horizon_steps)
+
+
+_ROOT_QPOS_FRAME_DIM = 38  # qpos(29) + anchor_pos_b(3) + anchor_ori_b(6)
+
+
+def _rot6d_to_matrix(rot6d: Tensor) -> Tensor:
+    """6D rotation (two raw columns) -> 3x3 matrix, Gram-Schmidt."""
+    a1, a2 = rot6d[..., 0:3], rot6d[..., 3:6]
+    b1 = torch.nn.functional.normalize(a1, dim=-1)
+    b2 = torch.nn.functional.normalize(
+        a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1
+    )
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack([b1, b2, b3], dim=-1)
+
+
+def _reanchor_heading_frames(frames: Tensor, anchor: Tensor) -> Tensor:
+    """Re-express ``root_qpos`` frames in ``anchor``'s heading frame.
+
+    Both are already expressed in some common heading frame (the sampled
+    window's own slot-0 heading anchor). The next-chunk target must instead be
+    what the encoder would see with the NEXT chunk's state as its anchor:
+    yaw-only rotation, xy-only origin, exactly the ``expert_heading`` /
+    ``robot_heading`` pretrain convention. Joint angles are frame-invariant;
+    only the anchor pos/ori block transforms. Heading composition is exact
+    here because the outer frame is itself yaw-only, so yaw components add.
+    """
+    if frames.shape[-1] != _ROOT_QPOS_FRAME_DIM:
+        msg = (
+            "heading re-anchoring needs the 38-wide root_qpos frame, got "
+            f"{int(frames.shape[-1])}."
+        )
+        raise ValueError(msg)
+    rotation = _rot6d_to_matrix(anchor[..., 32:38])
+    yaw = torch.atan2(rotation[..., 1, 0], rotation[..., 0, 0])
+    cos, sin = torch.cos(yaw), torch.sin(yaw)
+    zeros = torch.zeros_like(cos)
+    ones = torch.ones_like(cos)
+    # R_yaw^T, applied from the left to positions and rotations.
+    yaw_t = torch.stack(
+        [
+            torch.stack([cos, sin, zeros], dim=-1),
+            torch.stack([-sin, cos, zeros], dim=-1),
+            torch.stack([zeros, zeros, ones], dim=-1),
+        ],
+        dim=-2,
+    )
+    origin = anchor[..., 29:32].clone()
+    origin[..., 2] = 0.0  # xy-only origin: absolute height survives
+    while yaw_t.dim() < frames.dim() + 1:
+        yaw_t = yaw_t.unsqueeze(-3)
+        origin = origin.unsqueeze(-2)
+    position = torch.einsum(
+        "...ij,...j->...i", yaw_t, frames[..., 29:32] - origin
+    )
+    rotations = _rot6d_to_matrix(frames[..., 32:38])
+    rotated = yaw_t @ rotations
+    ori6d = torch.cat([rotated[..., :, 0], rotated[..., :, 1]], dim=-1)
+    return torch.cat([frames[..., :29], position, ori6d], dim=-1)
 
 
 def _encoder_input_window(
@@ -274,6 +336,12 @@ class HighLevelSkillDiffSRConfig:
     ``p(s[t+h_k] | s[t+h_{k-1}], z)`` with one code held across the chain.
     ``endpoint_delta`` predicts ``s[t+H] - s[t]`` instead of absolute endpoint.
     """
+    jepa_tau: float = 0.1
+    """InfoNCE temperature for the ``jepa_ntp`` objective."""
+    jepa_ema_momentum: float = 0.996
+    """EMA momentum of the ``jepa_ntp`` target encoder."""
+    jepa_energy_dim: int = 256
+    """Width of the bilinear (spectral) energy factorization g(.)^T f(.)."""
     transition_offsets: tuple[int, ...] = ()
     """Strictly increasing checkpoint offsets in ``[1, horizon_steps]``.
 
@@ -1353,6 +1421,50 @@ class HighLevelSkillDiffSRTrainer:
         )
         self.update = 0
 
+        # Chunk-wise next-token prediction with a JEPA-style EMA target and a
+        # bilinear (spectral) energy head. The encoder's chunk token is the
+        # "token"; the objective predicts the NEXT chunk's target-encoder token
+        # from the current one and scores the pair with the low-rank energy
+        # E(z, z') = g(pred(z))^T f(z'), trained as symmetric InfoNCE over
+        # in-batch negatives. The DiffSR heads stay constructed but unused.
+        self.jepa_target_encoder: nn.Module | None = None
+        self.jepa_predictor: nn.Module | None = None
+        self.jepa_g: nn.Module | None = None
+        self.jepa_f: nn.Module | None = None
+        if self.config.transition_objective == "jepa_ntp":
+            if int(self.state_dim) != _ROOT_QPOS_FRAME_DIM:
+                msg = (
+                    "jepa_ntp re-anchors the next chunk in heading frame and "
+                    "needs the 38-wide root_qpos macro state, got "
+                    f"{int(self.state_dim)}."
+                )
+                raise ValueError(msg)
+            self.jepa_target_encoder = copy.deepcopy(self.skill_encoder)
+            for parameter in self.jepa_target_encoder.parameters():
+                parameter.requires_grad_(False)
+            z_dim = int(self.config.z_dim)
+            energy_dim = int(self.config.jepa_energy_dim)
+            self.jepa_predictor = nn.Sequential(
+                nn.Linear(z_dim, 512), nn.SiLU(), nn.Linear(512, 512), nn.SiLU(),
+                nn.Linear(512, z_dim),
+            ).to(self.device)
+            self.jepa_g = nn.Sequential(
+                nn.Linear(z_dim, 512), nn.SiLU(), nn.Linear(512, energy_dim)
+            ).to(self.device)
+            self.jepa_f = nn.Sequential(
+                nn.Linear(z_dim, 512), nn.SiLU(), nn.Linear(512, energy_dim)
+            ).to(self.device)
+            self.optimizer.add_param_group(
+                {
+                    "params": [
+                        *self.jepa_predictor.parameters(),
+                        *self.jepa_g.parameters(),
+                        *self.jepa_f.parameters(),
+                    ],
+                    "lr": self.config.encoder_lr,
+                }
+            )
+
         # Optional co-trained skill commander (System-1 planner). BC'd to the
         # encoder's z (detached) from current state + language goal.
         self.commander: nn.Module | None = None
@@ -1986,7 +2098,103 @@ class HighLevelSkillDiffSRTrainer:
             self.commander.train()
         return metrics
 
+    def _jepa_train_step(self) -> dict[str, float]:
+        assert self.jepa_target_encoder is not None
+        assert self.jepa_predictor is not None
+        assert self.jepa_g is not None and self.jepa_f is not None
+        self.skill_encoder.train()
+        horizon = int(self.config.horizon_steps)
+        from rlopt.env_interface import require_imitation_interface
+
+        sampler = require_imitation_interface(
+            self.env,
+            "sample_expert_macro_transition_batch",
+            purpose="Offline skill-encoder training requires it but",
+        )
+        # One draw of TWO adjacent chunks: the window spans 2H frames, chunk 1
+        # is the sampled state plus frames 1..H, chunk 2 is frame H-1 (its
+        # state, = s_{t+H}) plus frames H+1..2H. Both are expressed in chunk
+        # 1's heading anchor; chunk 2 is re-anchored onto its own state below,
+        # which is exactly what the encoder would see one publication later.
+        batch = sampler(
+            batch_size=int(self.config.batch_size),
+            horizon_steps=2 * horizon,
+            split=self.config.train_split,
+            eval_fraction=float(self.config.eval_trajectory_fraction),
+            split_seed=int(self.config.trajectory_split_seed),
+        )
+        state, window, _ = _validate_macro_batch(
+            batch,
+            batch_size=int(self.config.batch_size),
+            horizon_steps=2 * horizon,
+            device=self.device,
+        )
+        chunk1_window = window[:, :horizon]
+        chunk2_anchor = window[:, horizon - 1]
+        chunk2_state = _reanchor_heading_frames(chunk2_anchor, chunk2_anchor)
+        chunk2_window = _reanchor_heading_frames(
+            window[:, horizon : 2 * horizon], chunk2_anchor
+        )
+        z1, reg_loss, info = self.skill_encoder.encode(
+            state, _encoder_input_window(self.config, chunk1_window), step=self.update
+        )
+        with torch.no_grad():
+            self.jepa_target_encoder.eval()
+            z2, _, _ = self.jepa_target_encoder.encode(
+                chunk2_state,
+                _encoder_input_window(self.config, chunk2_window),
+                deterministic=True,
+            )
+        logits = (
+            self.jepa_g(self.jepa_predictor(z1)) @ self.jepa_f(z2).T
+        ) / float(self.config.jepa_tau)
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        infonce = 0.5 * (
+            F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+        )
+        loss = infonce + self.config.reg_coeff * reg_loss
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        metrics = self._z_diagnostics(z1.detach(), prefix="train")
+        if self.config.grad_clip_norm is not None:
+            params = [
+                *self.skill_encoder.parameters(),
+                *self.jepa_predictor.parameters(),
+                *self.jepa_g.parameters(),
+                *self.jepa_f.parameters(),
+            ]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params, max_norm=float(self.config.grad_clip_norm)
+            )
+            metrics["train/grad_norm"] = float(grad_norm.item())
+        self.optimizer.step()
+        momentum = float(self.config.jepa_ema_momentum)
+        with torch.no_grad():
+            for target, online in zip(
+                self.jepa_target_encoder.parameters(),
+                self.skill_encoder.parameters(),
+                strict=True,
+            ):
+                target.mul_(momentum).add_(online, alpha=1.0 - momentum)
+        self.skill_encoder.on_after_train_step(self.update)
+        self.update += 1
+        with torch.no_grad():
+            accuracy = (logits.argmax(dim=1) == labels).float().mean()
+        metrics.update(
+            {
+                "train/loss": float(loss.detach().item()),
+                "train/jepa_infonce": float(infonce.detach().item()),
+                "train/jepa_ntp_accuracy": float(accuracy.item()),
+                "train/reg_loss": float(reg_loss.detach().item()),
+                **{f"train/{k}": float(v.item()) for k, v in info.items()},
+            }
+        )
+        return metrics
+
     def train_step(self) -> dict[str, float]:
+        if self.config.transition_objective == "jepa_ntp":
+            return self._jepa_train_step()
         self.skill_encoder.train()
         self.diffsr.train()
         batch = self._sample_macro_batch(
@@ -2182,7 +2390,7 @@ class HighLevelSkillDiffSRTrainer:
         feature_norm_state = (
             obs_norm.state_dict() if isinstance(obs_norm, nn.Module) else {}
         )
-        return {
+        checkpoint = {
             "skill_encoder_state_dict": self.skill_encoder.state_dict(),
             "diffsr_state_dict": self.diffsr.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -2190,6 +2398,16 @@ class HighLevelSkillDiffSRTrainer:
             "update": int(self.update),
             "feature_normalization_state_dict": feature_norm_state,
         }
+        if self.jepa_predictor is not None:
+            # Deployment reads only the encoder; these are for resume and for
+            # post-hoc inspection of the energy landscape.
+            checkpoint["jepa_state_dict"] = {
+                "target_encoder": self.jepa_target_encoder.state_dict(),  # type: ignore[union-attr]
+                "predictor": self.jepa_predictor.state_dict(),
+                "g": self.jepa_g.state_dict(),  # type: ignore[union-attr]
+                "f": self.jepa_f.state_dict(),  # type: ignore[union-attr]
+            }
+        return checkpoint
 
     def save_checkpoint(self, path: str | Path) -> None:
         target = Path(path)
