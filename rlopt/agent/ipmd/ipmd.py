@@ -345,6 +345,12 @@ class IPMDConfig(PPOConfig):
     """Enable online policy-gradient finetuning for command_source='hl_skill'."""
 
     hl_skill_pg_coeff: float = 0.05
+    # Weight of the DiffSR endpoint loss on ACHIEVED windows sampled from the
+    # environment's raw-pose ring (env.achieved_ring_capacity > 0). 0 disables.
+    # This is the no-policy-gradient online-dynamics path: the encoder learns
+    # the transition structure of what the robot actually does, through the
+    # same objective and window convention as its expert pretraining.
+    hl_skill_achieved_coeff: float = 0.0
     """Weight on the second-pass PPO actor objective for the high-level skill encoder."""
 
     hl_skill_offline_diffsr_coeff: float = 1.0
@@ -1273,6 +1279,7 @@ class IPMD(PPO):
                     self.config.ipmd.hl_skill_offline_diffsr_coeff
                 ),
                 anchor_coeff=float(self.config.ipmd.hl_skill_anchor_coeff),
+                achieved_coeff=float(self.config.ipmd.hl_skill_achieved_coeff),
                 z_norm_coeff=self.config.ipmd.hl_skill_z_norm_coeff,
                 lr=float(self.config.ipmd.hl_skill_lr),
                 grad_clip_norm=self.config.ipmd.hl_skill_grad_clip_norm,
@@ -2228,6 +2235,7 @@ class IPMD(PPO):
             "hl_skill_total_loss",
             "hl_skill_pg_loss",
             "hl_skill_diffsr_loss",
+            "hl_skill_achieved_loss",
             "hl_skill_anchor_loss",
             "hl_skill_z_norm_loss",
             "hl_skill_grad_norm",
@@ -2440,6 +2448,11 @@ class IPMD(PPO):
             else:
                 grad_norm = torch.zeros((), device=self.device)
             optimizer.step()
+            # After the step, never before: a JEPA target encoder is an EMA of
+            # the ONLINE encoder, so it must see the post-step weights.
+            after_step = getattr(sampler, "on_after_finetune_step", None)
+            if callable(after_step):
+                after_step()
             sampler.finetune_updates = int(getattr(sampler, "finetune_updates", 0)) + 1
         finally:
             for param, requires_grad in zip(
@@ -2939,12 +2952,25 @@ class IPMD(PPO):
         ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
         data_to_save.update(self._extra_checkpoint_state_dict())
+        # Global frame count for walltime-segmented resume. `step` is
+        # metadata.frames_processed, which init_metadata already seeds with the
+        # restored offset, so this is cumulative across segments -- the next
+        # segment reads it and continues the SAME budget instead of restarting.
+        if step is not None:
+            data_to_save["cumulative_env_frames"] = int(step)
 
         torch.save(data_to_save, target_path)
 
     def load_model(self, path: str) -> None:
         """Load PPO and reward-estimator state from a checkpoint."""
         data = torch.load(path, map_location=self.device)
+        # Continue the global frame budget on resume. Pre-2026-08-16
+        # checkpoints lack the key; their filename step is segment-local, so
+        # it is deliberately NOT used as a fallback -- treating a local step
+        # as global would silently shrink the remaining budget.
+        resume_frames = data.get("cumulative_env_frames")
+        if resume_frames is not None:
+            self._resume_frame_offset = int(resume_frames)
         self._load_checkpoint_policy_state_dict(data)
         if not self._restore_training_state_from_checkpoint(data):
             self._load_extra_checkpoint_state_dict(data)

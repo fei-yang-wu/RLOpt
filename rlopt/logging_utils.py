@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
@@ -188,6 +189,22 @@ def _slugify(value: Any, fallback: str) -> str:
 def _looks_like_run_dir(path: Path) -> bool:
     """Return True for a timestamped run directory with an optional unique suffix."""
     return bool(_TIMESTAMP_DIR_PATTERN.fullmatch(path.name))
+
+
+def _build_wandb_identity(exp_name: Any, run_dir: Path) -> tuple[str, list[str]]:
+    """Return the W&B run name and tags for one training run.
+
+    The W&B name is the configured functional name (for example
+    ``fsq64-hold10-s0``). The generated run-directory name stays available as
+    a ``logdir:...`` tag so a run can always be tied back to its local logs.
+    """
+    tags = [
+        tag.strip()
+        for tag in os.environ.get("WANDB_TAGS", "").split(",")
+        if tag.strip()
+    ]
+    tags.append(f"logdir:{run_dir.name}")
+    return str(exp_name), tags
 
 
 def _build_console_handler(cfg: RLOptConfig, level: int) -> logging.Handler | None:
@@ -447,9 +464,15 @@ class LoggingManager:
         if backend in (None, ""):
             return None
 
-        exp_name = generate_exp_name(
-            self.component.upper(), f"{self._config.logger.exp_name}"
-        )
+        # ``generate_exp_name`` is only the TorchRL-internal experiment id.
+        # The visible W&B name is set below from ``logger.exp_name`` so it stays
+        # stable when a walltime-segmented chain resumes the same W&B run.
+        if os.environ.get("WANDB_RUN_ID"):
+            exp_name = f"{self.component.upper()}_{self._config.logger.exp_name}"
+        else:
+            exp_name = generate_exp_name(
+                self.component.upper(), f"{self._config.logger.exp_name}"
+            )
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         wandb_kwargs = {
@@ -458,6 +481,23 @@ class LoggingManager:
             "group": self._config.logger.group_name,
             "dir": str(self.run_dir),
         }
+        if backend == "wandb":
+            run_name, run_tags = _build_wandb_identity(
+                self._config.logger.exp_name, self.run_dir
+            )
+            wandb_kwargs["name"] = run_name
+            wandb_kwargs["tags"] = run_tags
+        # Walltime-segmented chains: WANDB_RUN_ID (stable per arm) plus
+        # WANDB_RESUME=allow makes every segment append to ONE W&B run instead
+        # of opening a fresh run that restarts the x-axis. Safe because resumed
+        # segments log at the global frame step (init_metadata seeds
+        # frames_processed from the checkpoint), so steps stay monotonic across
+        # segments. Left entirely to the environment so interactive runs keep
+        # today's one-run-per-launch behavior.
+        run_id = os.environ.get("WANDB_RUN_ID")
+        if run_id:
+            wandb_kwargs["id"] = run_id
+            wandb_kwargs["resume"] = os.environ.get("WANDB_RESUME", "allow")
 
         try:  # noqa: SIM105
             wandb_kwargs["config"] = asdict(self._config)  # type: ignore[assignment]

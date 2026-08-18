@@ -67,3 +67,27 @@ def test_jepa_objective_is_registered_with_alias() -> None:
         _normalize_transition_objective("transition_objective", "jepa_ntp")
         == "jepa_ntp"
     )
+
+
+def test_sigreg_discriminates_gaussian_from_collapse_and_blowup() -> None:
+    from rlopt.agent.hl_skill_diffsr import _sigreg_epps_pulley
+
+    torch.manual_seed(0)
+    gaussian = torch.randn(4096, 64)
+    collapsed = torch.zeros(4096, 64)
+    blown_up = torch.randn(4096, 64) * 40.0
+    good = float(_sigreg_epps_pulley(gaussian, 64))
+    bad_collapse = float(_sigreg_epps_pulley(collapsed, 64))
+    bad_scale = float(_sigreg_epps_pulley(blown_up, 64))
+    assert good < 1e-3
+    assert bad_collapse > 10 * good
+    assert bad_scale > 10 * good
+
+
+def test_sigreg_is_differentiable() -> None:
+    from rlopt.agent.hl_skill_diffsr import _sigreg_epps_pulley
+
+    z = torch.randn(256, 64, requires_grad=True)
+    loss = _sigreg_epps_pulley(z * 3.0, 32)
+    loss.backward()
+    assert z.grad is not None and torch.isfinite(z.grad).all()
