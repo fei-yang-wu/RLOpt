@@ -1655,13 +1655,26 @@ class FrozenHighLevelSkillCommandSampler:
         assert self._codes is not None
         assert self._latent_steps is not None
         assert self._active_macro_ids is not None
-        renew_mask = self._done_mask(
-            td,
-            batch_size=batch_size,
-            device=device,
-        ) | (self._latent_steps <= 0)
-        if bool(renew_mask.any()):
-            env_ids = torch.nonzero(renew_mask, as_tuple=False).reshape(-1)
+        # Hold-1 fast path: every environment renews every step, so the
+        # data-dependent mask is always all-true. Skipping it avoids two
+        # host synchronizations (`bool(mask.any())` and `nonzero`) inside
+        # every policy forward -- collection and learn alike. Values are
+        # identical to the masked path.
+        always_renew = self.latent_steps_min == 1 and self.latent_steps_max == 1
+        if always_renew:
+            renew = True
+            env_ids = torch.arange(batch_size, device=device)
+        else:
+            renew_mask = self._done_mask(
+                td,
+                batch_size=batch_size,
+                device=device,
+            ) | (self._latent_steps <= 0)
+            renew = bool(renew_mask.any())
+            env_ids = (
+                torch.nonzero(renew_mask, as_tuple=False).reshape(-1) if renew else None
+            )
+        if renew:
             z, state, future_window, target, initial_z = (
                 self._encode_current_macro_batch(env_ids.to(self.device))
             )
