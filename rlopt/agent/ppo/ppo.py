@@ -697,20 +697,40 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         )
 
         self.collector = cast(Collector, self.collector)
+        # Walltime-segmented resume: a checkpoint records the GLOBAL frame
+        # count, load_model stores it here, and the loop continues from that
+        # offset instead of restarting the budget. total_frames stays the full
+        # target for every segment -- a segment ends either by reaching it or
+        # by the scheduler's walltime, never by a shrunken per-segment budget.
+        resume_offset = max(0, int(getattr(self, "_resume_frame_offset", 0)))
+        frames_per_batch = int(cfg.collector.frames_per_batch)
+        remaining_frames = max(0, int(cfg.collector.total_frames) - resume_offset)
+        remaining_iterations = min(
+            len(self.collector),
+            -(-remaining_frames // frames_per_batch),
+        )
+        if resume_offset:
+            self.log.info(
+                "Resuming the frame budget at %d/%d (%d iterations remain).",
+                resume_offset,
+                int(cfg.collector.total_frames),
+                remaining_iterations,
+            )
         return PPOTrainingMetadata(
             collector_iter=iter(self._collector_iter()),
-            total_iterations=len(self.collector),
+            total_iterations=remaining_iterations,
             policy_operator=self.actor_critic.get_policy_operator(),
             progress_bar=tqdm(
                 total=cfg.collector.total_frames,
+                initial=resume_offset,
                 disable=not progress_bar_enabled or not sys.stdout.isatty(),
                 dynamic_ncols=True,
             ),
             progress_bar_enabled=progress_bar_enabled,
             log_interval_frames=log_interval_frames,
-            next_log_frame=log_interval_frames,
-            next_file_log_frame=log_interval_frames,
-            frames_processed=0,
+            next_log_frame=resume_offset + log_interval_frames,
+            next_file_log_frame=resume_offset + log_interval_frames,
+            frames_processed=resume_offset,
             updates_completed=torch.zeros((), dtype=torch.int64, device=self.device),
             minibatches_per_epoch=num_mini_batches,
             epochs_per_rollout=cfg.loss.epochs,
@@ -1025,6 +1045,21 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 with self._profile_iteration_phase(iteration.phase_times, "record"):
                     self.record(iteration, metadata)
                 self._finish_iteration_profile(metadata, iteration)
+        except KeyboardInterrupt:
+            # Walltime/SIGTERM (or a real Ctrl+C): persist the current state so
+            # a chained segment resumes from HERE rather than from the last
+            # save_interval boundary. Saved with the global frame step, same
+            # naming as periodic checkpoints.
+            if int(getattr(self, "config", None).save_interval or 0) > 0:
+                self.log.info(
+                    "Interrupted at frame %d; writing a final resume checkpoint.",
+                    int(metadata.frames_processed),
+                )
+                self.save_model(
+                    path=self.log_dir / self.config.logger.save_path,
+                    step=int(metadata.frames_processed),
+                )
+            raise
         finally:
             metadata.progress_bar.close()  # type: ignore[attr-defined]
             self.collector.shutdown()
