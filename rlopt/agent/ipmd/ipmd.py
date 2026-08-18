@@ -1824,11 +1824,35 @@ class IPMD(PPO):
         return net
 
     def _compile_components(self) -> None:
-        """Compile reward estimator and update method with torch.compile (if enabled)."""
+        """Compile the loss forward and GAE with torch.compile (if enabled).
+
+        Deliberately narrower than PPO's blanket ``torch.compile(self.update)``:
+        IPMD's ``update()`` interleaves optimizer stepping and host-side
+        bookkeeping (``.item()``), which force Dynamo graph breaks. Compiling
+        ``loss_module`` captures the actor+critic forward that autograd then
+        differentiates; ``adv_module`` covers the GAE scan. The reward
+        estimator is compiled only when reward updates are actually enabled.
+
+        Measured 2026-08-18 on the tuned G1 recipe (8,192 envs, RTX PRO
+        6000): the loss step is GEMM-bound, so the win is small and comes
+        from GAE (80 -> 57 ms); ``update/ppo_terms`` moves ~1%. ``max-autotune``
+        ties ``default`` and its CUDA-graphs variant crashes on latent-sampler
+        tensor reuse -- use ``max-autotune-no-cudagraphs`` if autotuning.
+        """
         if not self.config.compile.compile:
             return
-        super()._compile_components()
-        self.reward_estimator = torch.compile(self.reward_estimator)
+        if not hasattr(self, "adv_module"):
+            # Base-class __init__ calls this hook before PPO.__init__ has
+            # built the advantage module; the second call compiles.
+            return
+        if getattr(self, "_components_compiled", False):
+            return
+        compile_mode = self.config.compile.compile_mode or "default"
+        self.loss_module = torch.compile(self.loss_module, mode=compile_mode)
+        self.adv_module = torch.compile(self.adv_module, mode=compile_mode)
+        if self._reward_update_enabled:
+            self.reward_estimator = torch.compile(self.reward_estimator)
+        self._components_compiled = True
 
     def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
