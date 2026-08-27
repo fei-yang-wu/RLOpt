@@ -91,6 +91,7 @@ def _normalize_transition_objective(name: str, value: str) -> str:
         "semimarkov_chain",
         "endpoint_delta",
         "jepa_ntp",
+        "reconstruction",
     }
     if normalized not in choices:
         msg = f"{name} must be one of {sorted(choices)}, got {value!r}."
@@ -136,6 +137,37 @@ def _encoder_window_steps(config: HighLevelSkillDiffSRConfig) -> int:
     return int(config.horizon_steps)
 
 
+class _WindowReconstructionDecoder(nn.Module):
+    """Decode a skill code into the exact window visible to the encoder."""
+
+    def __init__(
+        self,
+        *,
+        z_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...],
+        activation: str,
+    ) -> None:
+        super().__init__()
+        activation_types: dict[str, type[nn.Module]] = {
+            "elu": nn.ELU,
+            "mish": nn.Mish,
+            "relu": nn.ReLU,
+            "silu": nn.SiLU,
+        }
+        activation_type = activation_types[str(activation)]
+        layers: list[nn.Module] = []
+        previous_dim = int(z_dim)
+        for hidden_dim in hidden_dims:
+            layers.extend((nn.Linear(previous_dim, int(hidden_dim)), activation_type()))
+            previous_dim = int(hidden_dim)
+        layers.append(nn.Linear(previous_dim, int(output_dim)))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.network(z)
+
+
 _ROOT_QPOS_FRAME_DIM = 38  # qpos(29) + anchor_pos_b(3) + anchor_ori_b(6)
 
 
@@ -150,6 +182,9 @@ def _rot6d_to_matrix(rot6d: Tensor) -> Tensor:
     return torch.stack([b1, b2, b3], dim=-1)
 
 
+_FULL_BODY_FRAME_DIM = 67
+
+
 def _reanchor_heading_frames(frames: Tensor, anchor: Tensor) -> Tensor:
     """Re-express ``root_qpos`` frames in ``anchor``'s heading frame.
 
@@ -161,13 +196,18 @@ def _reanchor_heading_frames(frames: Tensor, anchor: Tensor) -> Tensor:
     only the anchor pos/ori block transforms. Heading composition is exact
     here because the outer frame is itself yaw-only, so yaw components add.
     """
-    if frames.shape[-1] != _ROOT_QPOS_FRAME_DIM:
+    width = int(frames.shape[-1])
+    if width not in (_ROOT_QPOS_FRAME_DIM, _FULL_BODY_FRAME_DIM):
         msg = (
-            "heading re-anchoring needs the 38-wide root_qpos frame, got "
-            f"{int(frames.shape[-1])}."
+            "heading re-anchoring needs the 38-wide root_qpos or 67-wide "
+            f"full_body frame, got {width}."
         )
         raise ValueError(msg)
-    rotation = _rot6d_to_matrix(anchor[..., 32:38])
+    # Invariant prefix: joint qpos (root_qpos) or joint qpos+qvel (full_body).
+    # Joint velocities are frame-invariant under a yaw re-anchor; only the
+    # trailing anchor pos(3) + rot6d(6) block transforms.
+    inv = width - 9
+    rotation = _rot6d_to_matrix(anchor[..., inv + 3 : inv + 9])
     yaw = torch.atan2(rotation[..., 1, 0], rotation[..., 0, 0])
     cos, sin = torch.cos(yaw), torch.sin(yaw)
     zeros = torch.zeros_like(cos)
@@ -181,16 +221,18 @@ def _reanchor_heading_frames(frames: Tensor, anchor: Tensor) -> Tensor:
         ],
         dim=-2,
     )
-    origin = anchor[..., 29:32].clone()
+    origin = anchor[..., inv : inv + 3].clone()
     origin[..., 2] = 0.0  # xy-only origin: absolute height survives
     while yaw_t.dim() < frames.dim() + 1:
         yaw_t = yaw_t.unsqueeze(-3)
         origin = origin.unsqueeze(-2)
-    position = torch.einsum("...ij,...j->...i", yaw_t, frames[..., 29:32] - origin)
-    rotations = _rot6d_to_matrix(frames[..., 32:38])
+    position = torch.einsum(
+        "...ij,...j->...i", yaw_t, frames[..., inv : inv + 3] - origin
+    )
+    rotations = _rot6d_to_matrix(frames[..., inv + 3 : inv + 9])
     rotated = yaw_t @ rotations
     ori6d = torch.cat([rotated[..., :, 0], rotated[..., :, 1]], dim=-1)
-    return torch.cat([frames[..., :29], position, ori6d], dim=-1)
+    return torch.cat([frames[..., :inv], position, ori6d], dim=-1)
 
 
 def _sigreg_epps_pulley(z: Tensor, num_sketches: int) -> Tensor:
@@ -228,12 +270,16 @@ def _encoder_input_window(
 
 
 def _build_diffsr(
-    config: HighLevelSkillDiffSRConfig, state_dim: int, device: torch.device
+    config: HighLevelSkillDiffSRConfig,
+    state_dim: int,
+    device: torch.device,
+    *,
+    next_obs_dim: int | None = None,
 ) -> BilinearSR:
     return build_bilinear_sr(
         "diffsr",
         obs_dim=state_dim,
-        next_obs_dim=state_dim,
+        next_obs_dim=int(next_obs_dim) if next_obs_dim is not None else state_dim,
         action_dim=config.z_dim,
         feature_dim=config.diffsr_feature_dim,
         embed_dim=config.diffsr_embed_dim,
@@ -359,7 +405,22 @@ class HighLevelSkillDiffSRConfig:
     ``semimarkov_chain`` samples one adjacent checkpoint pair and trains
     ``p(s[t+h_k] | s[t+h_{k-1}], z)`` with one code held across the chain.
     ``endpoint_delta`` predicts ``s[t+H] - s[t]`` instead of absolute endpoint.
+    ``reconstruction`` decodes the exact state window visible to the encoder
+    from ``z``. It uses the same offline pretrain and frozen rollout path as
+    the DiffSR objectives, so it is a controlled objective ablation.
     """
+    reconstruction_target: str = "input_window"
+    """What the ``reconstruction`` decoder reproduces from ``z``.
+
+    ``input_window``: the exact state window visible to the encoder (state plus
+    the encoder-mode slice of the future window). Purely local — nothing ties
+    the code to where the motion ends up.
+    ``endpoint``: the macro state one horizon later (``hl/target``) only. A
+    deterministic MSE endpoint regression, the non-denoising partner of the
+    ``endpoint`` DiffSR objective.
+    ``full_window``: the state plus every future-window slot including the
+    endpoint, regardless of ``encoder_window_mode`` — the encoder still never
+    sees the endpoint, so the decoder must predict it."""
     jepa_loss: str = "sigreg"
     """Anti-collapse mechanism for ``jepa_ntp``.
 
@@ -373,6 +434,43 @@ class HighLevelSkillDiffSRConfig:
     ``infonce``: bilinear spectral energy over in-batch negatives."""
     jepa_sigreg_coeff: float = 1.0
     """Weight of the SIGReg term against the prediction MSE."""
+    jepa_ntp_head: str = "mlp"
+    """Estimator for the next-chunk prediction term of ``sigreg_ebm``.
+
+    ``mlp``: the deterministic 3-layer predictor with an MSE toward the target
+    token — the conditional MEAN of the next token (the measured hub recipe).
+    ``diff_token``: a second DiffSR diffusion head models the next token
+    GENERATIVELY, p(z_next | s_t, z_t); it replaces the MSE at the same
+    ``jepa_ntp_coeff`` slot. The target still comes from the (EMA/stopgrad)
+    target encoder.
+    ``diff_chunk``: the diffusion head models the next chunk's H raw frames
+    p(x_{t+H+1:t+2H} | s_t, z_t), flattened, in the EXECUTED chunk's heading
+    frame so the cross-chunk displacement (the drift information) stays in
+    the target. Every target is data — with this head the objective carries
+    no self-target and therefore no EMA dependence in the loss.
+    ``diff_pair``: the diffusion head models the next chunk's anchor state
+    and its token JOINTLY, p(s_{t+H}, z_next | s_t, z_t) over the
+    concatenated (state_dim + z_dim) target — the joint captures the
+    correlation between where the robot lands and what the next command is,
+    which separate heads cannot.
+    Every diffusion head is pretrain-only and requires
+    ``jepa_loss='sigreg_ebm'`` and ``jepa_context_chunks=0``."""
+    jepa_ntp_chunk_anchor: str = "executed"
+    """Heading frame of the ``diff_chunk`` target.
+
+    ``executed``: the next chunk's frames stay in the EXECUTED chunk's slot-0
+    frame, so the cross-chunk displacement (drift) is part of the target.
+    ``next``: the frames are re-anchored onto s_{t+H}'s own heading frame —
+    exactly what the encoder would see one publication later — which erases
+    the displacement and asks only "what does the next chunk look like in its
+    own frame". Only read by ``jepa_ntp_head='diff_chunk'``."""
+    jepa_ntp_coeff: float = 1.0
+    """Weight of the chunk-NTP prediction MSE inside ``sigreg_ebm``.
+
+    ``0`` drops the predictor from the loss entirely: the objective becomes
+    DiffSR endpoint grounding + SIGReg on the chunk token — the chunk-wise
+    non-JEPA cell of the mechanism ablation. The predictor still exists and
+    its copy-gate metrics still log; it just receives no gradient."""
     jepa_sigreg_sketches: int = 64
     """Random 1-D projection directions per step for SIGReg."""
     jepa_tau: float = 0.1
@@ -381,6 +479,26 @@ class HighLevelSkillDiffSRConfig:
     """EMA momentum of the ``jepa_ntp`` target encoder."""
     jepa_energy_dim: int = 256
     """Width of the bilinear (spectral) energy factorization g(.)^T f(.)."""
+    jepa_context_chunks: int = 0
+    """Preceding chunks the predictor conditions on (``jepa_ntp`` only).
+
+    ``0``: the chunk PAIR — predict chunk t+1's token from chunk t's alone.
+    ``1``: the chunk TRIPLET (wiki/skill-encoder-jepa-plan.md phase 2): encode
+    the preceding chunk too, and predict chunk t+1's token from
+    ``cat(z[t-1], z[t])``. The predictor becomes a dynamics model in the code
+    space, with the option-view state (the previous code) made explicit."""
+    jepa_target_encoder_mode: str = "ema"
+    """Where the next chunk's target token comes from (``jepa_ntp`` only).
+
+    ``ema``: a momentum copy of the encoder (standard JEPA machinery).
+    ``online``: the ONE online encoder on both sides, no EMA copy and no
+    stop-gradient — the LeJEPA shape, where SIGReg alone carries the
+    anti-collapse burden.
+    ``stopgrad``: the ONE online encoder on both sides with a stop-gradient
+    on the target branch, no EMA copy — the SimSiam-style asymmetry-only
+    cell. Separates the EMA trick's asymmetry (which blocks the
+    co-adaptation shortcut) from its lag. Offline pretraining only: online
+    finetuning of a non-``ema`` checkpoint is refused."""
     transition_offsets: tuple[int, ...] = ()
     """Strictly increasing checkpoint offsets in ``[1, horizon_steps]``.
 
@@ -519,7 +637,11 @@ class HighLevelSkillDiffSRConfig:
             for offset in self.transition_offsets
         )
         if not self.transition_offsets:
-            if self.transition_objective in {"endpoint", "endpoint_delta"}:
+            if self.transition_objective in {
+                "endpoint",
+                "endpoint_delta",
+                "reconstruction",
+            }:
                 self.transition_offsets = (self.horizon_steps,)
             else:
                 self.transition_offsets = tuple(range(1, self.horizon_steps + 1))
@@ -542,9 +664,11 @@ class HighLevelSkillDiffSRConfig:
                 f"horizon_steps={self.horizon_steps}."
             )
             raise ValueError(msg)
-        if self.transition_objective in {"endpoint", "endpoint_delta"} and (
-            self.transition_offsets != (self.horizon_steps,)
-        ):
+        if self.transition_objective in {
+            "endpoint",
+            "endpoint_delta",
+            "reconstruction",
+        } and self.transition_offsets != (self.horizon_steps,):
             msg = (
                 f"transition_objective={self.transition_objective!r} requires "
                 f"transition_offsets=({self.horizon_steps},), got "
@@ -653,6 +777,64 @@ class HighLevelSkillDiffSRConfig:
         self.reconstruction_norm_eps = _require_positive_float(
             "reconstruction_norm_eps", self.reconstruction_norm_eps
         )
+        self.reconstruction_target = str(self.reconstruction_target).strip().lower()
+        if self.reconstruction_target not in {
+            "input_window",
+            "endpoint",
+            "full_window",
+        }:
+            msg = (
+                "reconstruction_target must be 'input_window', 'endpoint', or "
+                f"'full_window', got {self.reconstruction_target!r}."
+            )
+            raise ValueError(msg)
+        self.jepa_context_chunks = int(self.jepa_context_chunks)
+        if self.jepa_context_chunks not in (0, 1):
+            msg = (
+                "jepa_context_chunks must be 0 (chunk pair) or 1 (chunk "
+                f"triplet), got {self.jepa_context_chunks}."
+            )
+            raise ValueError(msg)
+        self.jepa_ntp_coeff = _require_non_negative_float(
+            "jepa_ntp_coeff", self.jepa_ntp_coeff
+        )
+        self.jepa_ntp_head = str(self.jepa_ntp_head).strip().lower()
+        self.jepa_ntp_chunk_anchor = str(self.jepa_ntp_chunk_anchor).strip().lower()
+        if self.jepa_ntp_chunk_anchor not in {"executed", "next"}:
+            msg = (
+                "jepa_ntp_chunk_anchor must be 'executed' or 'next', got "
+                f"{self.jepa_ntp_chunk_anchor!r}."
+            )
+            raise ValueError(msg)
+        if self.jepa_ntp_head not in {"mlp", "diff_token", "diff_chunk", "diff_pair"}:
+            msg = (
+                "jepa_ntp_head must be 'mlp', 'diff_token', 'diff_chunk' or "
+                f"'diff_pair', got {self.jepa_ntp_head!r}."
+            )
+            raise ValueError(msg)
+        if self.jepa_ntp_head != "mlp":
+            if self.jepa_loss != "sigreg_ebm":
+                msg = (
+                    "jepa_ntp_head="
+                    f"{self.jepa_ntp_head!r} requires jepa_loss='sigreg_ebm'; "
+                    f"got {self.jepa_loss!r}."
+                )
+                raise ValueError(msg)
+            if int(self.jepa_context_chunks) != 0:
+                msg = (
+                    "The diffusion NTP heads support only the chunk pair "
+                    f"(jepa_context_chunks=0), got {self.jepa_context_chunks}."
+                )
+                raise ValueError(msg)
+        self.jepa_target_encoder_mode = (
+            str(self.jepa_target_encoder_mode).strip().lower()
+        )
+        if self.jepa_target_encoder_mode not in {"ema", "online", "stopgrad"}:
+            msg = (
+                "jepa_target_encoder_mode must be 'ema', 'online' or "
+                f"'stopgrad', got {self.jepa_target_encoder_mode!r}."
+            )
+            raise ValueError(msg)
         self.diffsr_state_output_init_std = _require_non_negative_float(
             "diffsr_state_output_init_std", self.diffsr_state_output_init_std
         )
@@ -749,6 +931,7 @@ class FrozenHighLevelSkillCommandSampler:
         command_phase_mode: str = "none",
         code_latent_dim: int | None = None,
         phase_period: int | None = None,
+        phase_source: str = "hold",
         command_mode: str = "z",
         device: torch.device | str | None = None,
         finetune_enabled: bool = False,
@@ -798,6 +981,19 @@ class FrozenHighLevelSkillCommandSampler:
             if phase_period is not None
             else self.latent_steps_max
         )
+        self.phase_source = str(phase_source).strip().lower()
+        if self.phase_source not in {"hold", "episode"}:
+            msg = f"phase_source must be 'hold' or 'episode', got {phase_source!r}."
+            raise ValueError(msg)
+        if self.phase_source == "episode" and self.latent_steps_max > 1:
+            # The posterior update detects code renewal by the phase value, and
+            # an episode clock no longer marks renewals. Live phase exists for
+            # hold 1, where the hold clock is constant and renewal is every step.
+            msg = (
+                "phase_source='episode' requires latent_steps_max == 1, got "
+                f"{self.latent_steps_max}."
+            )
+            raise ValueError(msg)
         self.device = _resolve_device(device, env)
         from rlopt.env_interface import require_imitation_interface, supports
         from rlopt.env_interface import resolve_imitation_interface
@@ -956,6 +1152,7 @@ class FrozenHighLevelSkillCommandSampler:
 
         self._codes: Tensor | None = None
         self._latent_steps: Tensor | None = None
+        self._episode_steps: Tensor | None = None
         self._active_macro_ids: Tensor | None = None
         self._cache_state_chunks: list[Tensor] = []
         self._cache_future_window_chunks: list[Tensor] = []
@@ -1173,6 +1370,8 @@ class FrozenHighLevelSkillCommandSampler:
         self._next_macro_id = 0
         if self._latent_steps is not None:
             self._latent_steps.zero_()
+        if self._episode_steps is not None:
+            self._episode_steps.zero_()
         if self._active_macro_ids is not None:
             self._active_macro_ids.fill_(-1)
 
@@ -1282,6 +1481,19 @@ class FrozenHighLevelSkillCommandSampler:
                 "non-jepa run."
             )
             raise ValueError(msg)
+        if (
+            str(self.config.jepa_target_encoder_mode) != "ema"
+            or int(self.config.jepa_context_chunks) != 0
+            or str(getattr(self.config, "jepa_ntp_head", "mlp")) != "mlp"
+        ):
+            msg = (
+                "Online jepa_ntp finetuning supports only the chunk-pair EMA "
+                "recipe; this checkpoint was pretrained with "
+                f"jepa_target_encoder_mode="
+                f"{self.config.jepa_target_encoder_mode!r}, "
+                f"jepa_context_chunks={self.config.jepa_context_chunks}."
+            )
+            raise ValueError(msg)
         z_dim = int(self.config.z_dim)
         energy_dim = int(self.config.jepa_energy_dim)
         self.jepa_target_encoder = copy.deepcopy(self.skill_encoder)
@@ -1364,9 +1576,14 @@ class FrozenHighLevelSkillCommandSampler:
             state, _encoder_input_window(self.config, chunk1_window)
         )
         with torch.no_grad():
-            assert self.jepa_target_encoder is not None
-            self.jepa_target_encoder.eval()
-            z2, _, _ = self.jepa_target_encoder.encode(
+            if str(self.config.jepa_target_encoder_mode) == "ema":
+                assert self.jepa_target_encoder is not None
+                self.jepa_target_encoder.eval()
+                target_encoder = self.jepa_target_encoder
+            else:
+                # online / stopgrad: the ONE online encoder is the target.
+                target_encoder = self.skill_encoder
+            z2, _, _ = target_encoder.encode(
                 chunk2_state,
                 _encoder_input_window(self.config, chunk2_window),
                 deterministic=True,
@@ -1396,7 +1613,9 @@ class FrozenHighLevelSkillCommandSampler:
                 z1, num_sketches=int(self.config.jepa_sigreg_sketches)
             )
             objective = (
-                diffsr_loss + ntp + float(self.config.jepa_sigreg_coeff) * sigreg
+                diffsr_loss
+                + float(self.config.jepa_ntp_coeff) * ntp
+                + float(self.config.jepa_sigreg_coeff) * sigreg
             )
             metrics["hl_skill_jepa_ntp"] = ntp.detach()
             metrics["hl_skill_jepa_sigreg"] = sigreg.detach()
@@ -1645,6 +1864,9 @@ class FrozenHighLevelSkillCommandSampler:
             self._latent_steps = torch.zeros(
                 batch_size, device=device, dtype=torch.long
             )
+            self._episode_steps = torch.zeros(
+                batch_size, device=device, dtype=torch.long
+            )
             self._active_macro_ids = torch.full(
                 (batch_size,),
                 -1,
@@ -1702,8 +1924,26 @@ class FrozenHighLevelSkillCommandSampler:
                     macro_ids,
                 )
 
-        phase = (self.phase_period - self._latent_steps).clamp(min=0).to(torch.float32)
-        phase = phase / float(self.phase_period)
+        if self.phase_source == "episode":
+            # Live clock for hold 1, where the hold-derived phase is constant:
+            # steps since reset modulo phase_period. Tensor ops only, so the
+            # hold-1 fast path above keeps its no-host-sync property.
+            assert self._episode_steps is not None
+            done_mask = self._done_mask(td, batch_size=batch_size, device=device)
+            self._episode_steps = torch.where(
+                done_mask,
+                torch.zeros_like(self._episode_steps),
+                self._episode_steps,
+            )
+            phase = torch.remainder(self._episode_steps, self.phase_period).to(
+                torch.float32
+            ) / float(self.phase_period)
+            self._episode_steps = self._episode_steps + 1
+        else:
+            phase = (
+                (self.phase_period - self._latent_steps).clamp(min=0).to(torch.float32)
+            )
+            phase = phase / float(self.phase_period)
         latents = self._append_command_phase(self._codes, phase)
         if self.finetune_enabled:
             td.set(
@@ -1726,7 +1966,7 @@ class HighLevelSkillDiffSRTrainState:
 
 
 class HighLevelSkillDiffSRTrainer:
-    """Offline trainer for high-level skill encoders with a DiffSR objective."""
+    """Offline trainer for high-level skill encoders and controlled objectives."""
 
     def __init__(self, config: HighLevelSkillDiffSRConfig, env: object) -> None:
         self.config = config
@@ -1756,14 +1996,42 @@ class HighLevelSkillDiffSRTrainer:
             self.device
         )
         self._initialize_diffsr_state_output()
-        self.optimizer = torch.optim.AdamW(
-            [
+        self.reconstruction_decoder: nn.Module | None = None
+        optimizer_groups: list[dict[str, Any]] = [
+            {
+                "params": self.skill_encoder.parameters(),
+                "lr": self.config.encoder_lr,
+            }
+        ]
+        if self.config.transition_objective == "reconstruction":
+            if self.config.reconstruction_target == "endpoint":
+                reconstruction_output_dim = self.state_dim
+            elif self.config.reconstruction_target == "full_window":
+                reconstruction_output_dim = self.state_dim * (
+                    int(self.config.horizon_steps) + 1
+                )
+            else:
+                reconstruction_output_dim = self.state_dim * (
+                    self.encoder_window_steps + 1
+                )
+            self.reconstruction_decoder = _WindowReconstructionDecoder(
+                z_dim=self.config.z_dim,
+                output_dim=reconstruction_output_dim,
+                hidden_dims=tuple(reversed(self.config.encoder_hidden_dims)),
+                activation=self.config.encoder_activation,
+            ).to(self.device)
+            optimizer_groups.append(
                 {
-                    "params": self.skill_encoder.parameters(),
+                    "params": self.reconstruction_decoder.parameters(),
                     "lr": self.config.encoder_lr,
-                },
-                {"params": self.diffsr.parameters(), "lr": self.config.diffsr_lr},
-            ],
+                }
+            )
+        else:
+            optimizer_groups.append(
+                {"params": self.diffsr.parameters(), "lr": self.config.diffsr_lr}
+            )
+        self.optimizer = torch.optim.AdamW(
+            optimizer_groups,
             weight_decay=self.config.weight_decay,
         )
         self.update = 0
@@ -1776,6 +2044,7 @@ class HighLevelSkillDiffSRTrainer:
         # in-batch negatives. The DiffSR heads stay constructed but unused.
         self.jepa_target_encoder: nn.Module | None = None
         self.jepa_predictor: nn.Module | None = None
+        self.jepa_ntp_diffsr: BilinearSR | None = None
         self.jepa_g: nn.Module | None = None
         self.jepa_f: nn.Module | None = None
         if self.config.transition_objective == "jepa_ntp":
@@ -1785,20 +2054,26 @@ class HighLevelSkillDiffSRTrainer:
                     f"got {self.config.jepa_loss!r}."
                 )
                 raise ValueError(msg)
-            if int(self.state_dim) != _ROOT_QPOS_FRAME_DIM:
+            if int(self.state_dim) not in (
+                _ROOT_QPOS_FRAME_DIM,
+                _FULL_BODY_FRAME_DIM,
+            ):
                 msg = (
                     "jepa_ntp re-anchors the next chunk in heading frame and "
-                    "needs the 38-wide root_qpos macro state, got "
-                    f"{int(self.state_dim)}."
+                    "needs the 38-wide root_qpos or 67-wide full_body macro "
+                    f"state, got {int(self.state_dim)}."
                 )
                 raise ValueError(msg)
-            self.jepa_target_encoder = copy.deepcopy(self.skill_encoder)
-            for parameter in self.jepa_target_encoder.parameters():
-                parameter.requires_grad_(False)
+            if str(self.config.jepa_target_encoder_mode) == "ema":
+                self.jepa_target_encoder = copy.deepcopy(self.skill_encoder)
+                for parameter in self.jepa_target_encoder.parameters():
+                    parameter.requires_grad_(False)
+            # online mode: the ONE encoder serves both sides; no copy exists.
             z_dim = int(self.config.z_dim)
             energy_dim = int(self.config.jepa_energy_dim)
+            predictor_in = z_dim * (1 + int(self.config.jepa_context_chunks))
             self.jepa_predictor = nn.Sequential(
-                nn.Linear(z_dim, 512),
+                nn.Linear(predictor_in, 512),
                 nn.SiLU(),
                 nn.Linear(512, 512),
                 nn.SiLU(),
@@ -1810,12 +2085,36 @@ class HighLevelSkillDiffSRTrainer:
             self.jepa_f = nn.Sequential(
                 nn.Linear(z_dim, 512), nn.SiLU(), nn.Linear(512, energy_dim)
             ).to(self.device)
+            if str(self.config.jepa_ntp_head) != "mlp":
+                # Generative next-chunk head: a second DiffSR whose denoising
+                # target is the next TOKEN (diff_token, z_dim wide) or the
+                # next chunk's H raw frames (diff_chunk, H*state_dim wide).
+                head_name = str(self.config.jepa_ntp_head)
+                if head_name == "diff_token":
+                    ntp_target_dim = z_dim
+                elif head_name == "diff_pair":
+                    ntp_target_dim = int(self.state_dim) + z_dim
+                else:  # diff_chunk
+                    ntp_target_dim = int(self.config.horizon_steps) * int(
+                        self.state_dim
+                    )
+                self.jepa_ntp_diffsr = _build_diffsr(
+                    self.config,
+                    self.state_dim,
+                    self.device,
+                    next_obs_dim=ntp_target_dim,
+                ).to(self.device)
             self.optimizer.add_param_group(
                 {
                     "params": [
                         *self.jepa_predictor.parameters(),
                         *self.jepa_g.parameters(),
                         *self.jepa_f.parameters(),
+                        *(
+                            self.jepa_ntp_diffsr.parameters()
+                            if self.jepa_ntp_diffsr is not None
+                            else []
+                        ),
                     ],
                     "lr": self.config.encoder_lr,
                 }
@@ -1844,6 +2143,48 @@ class HighLevelSkillDiffSRTrainer:
             deterministic=deterministic,
             step=step,
         )
+
+    def _reconstruction_target(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        endpoint: Tensor,
+    ) -> Tensor:
+        if self.config.reconstruction_target == "endpoint":
+            return endpoint
+        if self.config.reconstruction_target == "full_window":
+            return torch.cat((state, future_window.reshape(state.shape[0], -1)), dim=-1)
+        encoder_window = _encoder_input_window(self.config, future_window)
+        return torch.cat((state, encoder_window.reshape(state.shape[0], -1)), dim=-1)
+
+    def _reconstruction_eval_metrics(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        endpoint: Tensor,
+        z: Tensor,
+        *,
+        prefix: str,
+    ) -> dict[str, float]:
+        assert self.reconstruction_decoder is not None
+        target = self._reconstruction_target(state, future_window, endpoint)
+        prediction = self.reconstruction_decoder(z)
+        zero_prediction = self.reconstruction_decoder(torch.zeros_like(z))
+        shuffled_z = (
+            z[torch.randperm(z.shape[0], device=z.device)] if int(z.shape[0]) > 1 else z
+        )
+        shuffled_prediction = self.reconstruction_decoder(shuffled_z)
+        error = prediction - target
+        return {
+            f"{prefix}/reconstruction_loss_eval": float(error.pow(2).mean().item()),
+            f"{prefix}/reconstruction_mae_eval": float(error.abs().mean().item()),
+            f"{prefix}/reconstruction_loss_zero_z_eval": float(
+                F.mse_loss(zero_prediction, target).item()
+            ),
+            f"{prefix}/reconstruction_loss_shuffled_z_eval": float(
+                F.mse_loss(shuffled_prediction, target).item()
+            ),
+        }
 
     def _initialize_diffsr_state_output(self) -> None:
         init_std = float(self.config.diffsr_state_output_init_std)
@@ -1940,6 +2281,13 @@ class HighLevelSkillDiffSRTrainer:
     def _diffsr_loss_for_z(self, state: Tensor, z: Tensor, target: Tensor) -> Tensor:
         zero_reward = torch.zeros(state.shape[0], 1, device=self.device)
         _, loss, _ = self.diffsr.compute_loss(state, z, target, zero_reward)
+        return loss
+
+    def _ntp_diffsr_loss(self, state: Tensor, z: Tensor, target: Tensor) -> Tensor:
+        """Denoising loss of the generative next-chunk head (never the mean MSE)."""
+        assert self.jepa_ntp_diffsr is not None
+        zero_reward = torch.zeros(state.shape[0], 1, device=self.device)
+        _, loss, _ = self.jepa_ntp_diffsr.compute_loss(state, z, target, zero_reward)
         return loss
 
     def _objective_transition_at(
@@ -2455,9 +2803,12 @@ class HighLevelSkillDiffSRTrainer:
         return metrics
 
     def _jepa_train_step(self) -> dict[str, float]:
-        assert self.jepa_target_encoder is not None
         assert self.jepa_predictor is not None
         assert self.jepa_g is not None and self.jepa_f is not None
+        ema_mode = str(self.config.jepa_target_encoder_mode) == "ema"
+        if ema_mode:
+            assert self.jepa_target_encoder is not None
+        context = int(self.config.jepa_context_chunks)
         self.skill_encoder.train()
         horizon = int(self.config.horizon_steps)
         from rlopt.env_interface import require_imitation_interface
@@ -2467,14 +2818,18 @@ class HighLevelSkillDiffSRTrainer:
             "sample_expert_macro_transition_batch",
             purpose="Offline skill-encoder training requires it but",
         )
-        # One draw of TWO adjacent chunks: the window spans 2H frames, chunk 1
-        # is the sampled state plus frames 1..H, chunk 2 is frame H-1 (its
-        # state, = s_{t+H}) plus frames H+1..2H. Both are expressed in chunk
-        # 1's heading anchor; chunk 2 is re-anchored onto its own state below,
-        # which is exactly what the encoder would see one publication later.
+        # One draw of (2 + context) adjacent TILED chunks. At context=0 the
+        # window spans 2H frames: the executed chunk is the sampled state plus
+        # frames 1..H, the target chunk is frame H-1 (its state, = s_{t+H})
+        # plus frames H+1..2H, re-anchored onto its own state -- exactly what
+        # the encoder sees one publication later. At context=1 the window
+        # spans 3H frames, the SAME construction yields chunks 0/1/2, and the
+        # predictor reads cat(z0, z1): the option-view dynamics model of
+        # wiki/skill-encoder-jepa-plan.md phase 2.
+        total_chunks = 2 + context
         batch = sampler(
             batch_size=int(self.config.batch_size),
-            horizon_steps=2 * horizon,
+            horizon_steps=total_chunks * horizon,
             split=self.config.train_split,
             eval_fraction=float(self.config.eval_trajectory_fraction),
             split_seed=int(self.config.trajectory_split_seed),
@@ -2482,42 +2837,122 @@ class HighLevelSkillDiffSRTrainer:
         state, window, _ = _validate_macro_batch(
             batch,
             batch_size=int(self.config.batch_size),
-            horizon_steps=2 * horizon,
+            horizon_steps=total_chunks * horizon,
             device=self.device,
         )
-        chunk1_window = window[:, :horizon]
-        chunk2_anchor = window[:, horizon - 1]
-        chunk2_state = _reanchor_heading_frames(chunk2_anchor, chunk2_anchor)
-        chunk2_window = _reanchor_heading_frames(
-            window[:, horizon : 2 * horizon], chunk2_anchor
-        )
-        z1, reg_loss, info = self.skill_encoder.encode(
-            state, _encoder_input_window(self.config, chunk1_window), step=self.update
-        )
-        with torch.no_grad():
-            self.jepa_target_encoder.eval()
-            z2, _, _ = self.jepa_target_encoder.encode(
-                chunk2_state,
-                _encoder_input_window(self.config, chunk2_window),
-                deterministic=True,
+
+        def chunk_at(index: int) -> tuple[Tensor, Tensor]:
+            """Chunk ``index`` (state, window), anchored on its own state."""
+            if index == 0:
+                return state, window[:, :horizon]
+            anchor = window[:, index * horizon - 1]
+            return (
+                _reanchor_heading_frames(anchor, anchor),
+                _reanchor_heading_frames(
+                    window[:, index * horizon : (index + 1) * horizon], anchor
+                ),
             )
-        prediction = self.jepa_predictor(z1)
+
+        exec_state, exec_window = chunk_at(context)
+        target_state, target_window = chunk_at(context + 1)
+        z1, reg_loss, info = self.skill_encoder.encode(
+            exec_state,
+            _encoder_input_window(self.config, exec_window),
+            step=self.update,
+        )
+        if ema_mode:
+            with torch.no_grad():
+                self.jepa_target_encoder.eval()  # type: ignore[union-attr]
+                z2, _, _ = self.jepa_target_encoder.encode(  # type: ignore[union-attr]
+                    target_state,
+                    _encoder_input_window(self.config, target_window),
+                    deterministic=True,
+                )
+        elif str(self.config.jepa_target_encoder_mode) == "stopgrad":
+            # SimSiam-style asymmetry without lag: same online encoder, target
+            # branch detached. Prediction cannot co-adapt the target, but the
+            # target tracks the online weights with zero delay.
+            with torch.no_grad():
+                z2, _, _ = self.skill_encoder.encode(
+                    target_state,
+                    _encoder_input_window(self.config, target_window),
+                    deterministic=True,
+                )
+        else:
+            # LeJEPA shape: the ONE online encoder on both sides, gradients
+            # flowing through both; SIGReg carries the anti-collapse burden.
+            z2, _, _ = self.skill_encoder.encode(
+                target_state,
+                _encoder_input_window(self.config, target_window),
+                step=self.update,
+            )
+        if context > 0:
+            context_state, context_window = chunk_at(0)
+            z_context, _, _ = self.skill_encoder.encode(
+                context_state,
+                _encoder_input_window(self.config, context_window),
+                step=self.update,
+            )
+            predictor_input = torch.cat((z_context, z1), dim=-1)
+        else:
+            predictor_input = z1
+        prediction = self.jepa_predictor(predictor_input)
+        # Gate metric for the triplet program: the predicted next token must
+        # beat copy-the-previous-token on these TILED chunks, else the
+        # dynamics model is vacuous. Logged in every mode.
+        with torch.no_grad():
+            copy_mse = F.mse_loss(z1.detach(), z2.detach())
+            pred_mse = F.mse_loss(prediction.detach(), z2.detach())
         if self.config.jepa_loss == "sigreg_ebm":
             # Ours: chunk-wise NTP grounded by the DiffSR spectral EBM. The
             # bilinear factorization phi(s, z) = g(z)^T F(s) keeps the token
             # predictive OF THE STATE TRANSITION (the energy grounding), the
             # predictor keeps it predictable ONE CHUNK AHEAD, and SIGReg holds
             # the token distribution isotropic-Gaussian so neither term can
-            # collapse it. Endpoint target = the chunk boundary s_{t+H},
-            # exactly the standard endpoint objective on chunk 1.
-            endpoint = window[:, horizon - 1]
+            # collapse it. Endpoint target = the executed chunk's boundary
+            # s_{t+H}, in the executed chunk's own anchor -- exactly the
+            # standard endpoint objective on that chunk.
+            boundary = window[:, (context + 1) * horizon - 1]
+            if context > 0:
+                endpoint = _reanchor_heading_frames(
+                    boundary, window[:, context * horizon - 1]
+                )
+            else:
+                endpoint = boundary
             self.diffsr.update_obs_norm(endpoint.detach())
-            diffsr_loss = self._diffsr_loss_for_z(state, z1, endpoint)
-            ntp = F.mse_loss(prediction, z2)
+            diffsr_loss = self._diffsr_loss_for_z(exec_state, z1, endpoint)
+            head = str(self.config.jepa_ntp_head)
+            if head == "diff_token":
+                ntp_target = z2.detach()
+                self.jepa_ntp_diffsr.update_obs_norm(ntp_target)  # type: ignore[union-attr]
+                ntp = self._ntp_diffsr_loss(exec_state, z1, ntp_target)
+            elif head == "diff_chunk":
+                if str(self.config.jepa_ntp_chunk_anchor) == "next":
+                    # Re-anchored onto s_{t+H}'s own heading frame — what the
+                    # encoder sees one publication later; displacement erased.
+                    # target_window was built by chunk_at(context + 1) above.
+                    ntp_target = target_window.reshape(z1.shape[0], -1)
+                else:
+                    # EXECUTED chunk's slot-0 frame: the cross-chunk
+                    # displacement (drift) stays in the target. context==0 is
+                    # enforced by validate().
+                    ntp_target = window[:, horizon : 2 * horizon].reshape(
+                        z1.shape[0], -1
+                    )
+                self.jepa_ntp_diffsr.update_obs_norm(ntp_target.detach())  # type: ignore[union-attr]
+                ntp = self._ntp_diffsr_loss(exec_state, z1, ntp_target.detach())
+            elif head == "diff_pair":
+                # Joint next (state, token): the endpoint in the executed
+                # chunk's frame concatenated with the target encoder's token.
+                ntp_target = torch.cat([endpoint, z2], dim=-1).detach()
+                self.jepa_ntp_diffsr.update_obs_norm(ntp_target)  # type: ignore[union-attr]
+                ntp = self._ntp_diffsr_loss(exec_state, z1, ntp_target)
+            else:
+                ntp = F.mse_loss(prediction, z2)
             sigreg = _sigreg_epps_pulley(
                 z1, num_sketches=int(self.config.jepa_sigreg_sketches)
             )
-            objective = diffsr_loss + ntp
+            objective = diffsr_loss + float(self.config.jepa_ntp_coeff) * ntp
             loss = (
                 objective
                 + float(self.config.jepa_sigreg_coeff) * sigreg
@@ -2544,7 +2979,7 @@ class HighLevelSkillDiffSRTrainer:
                 # though nothing is trained contrastively.
                 logits = -torch.cdist(prediction, z2)
         else:
-            logits = (self.jepa_g(self.jepa_predictor(z1)) @ self.jepa_f(z2).T) / float(
+            logits = (self.jepa_g(prediction) @ self.jepa_f(z2).T) / float(
                 self.config.jepa_tau
             )
             labels_ce = torch.arange(logits.shape[0], device=logits.device)
@@ -2566,20 +3001,26 @@ class HighLevelSkillDiffSRTrainer:
                 *self.jepa_f.parameters(),
                 # sigreg_ebm trains the DiffSR heads too; harmless otherwise.
                 *self.diffsr.parameters(),
+                *(
+                    self.jepa_ntp_diffsr.parameters()
+                    if self.jepa_ntp_diffsr is not None
+                    else []
+                ),
             ]
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 params, max_norm=float(self.config.grad_clip_norm)
             )
             metrics["train/grad_norm"] = float(grad_norm.item())
         self.optimizer.step()
-        momentum = float(self.config.jepa_ema_momentum)
-        with torch.no_grad():
-            for target, online in zip(
-                self.jepa_target_encoder.parameters(),
-                self.skill_encoder.parameters(),
-                strict=True,
-            ):
-                target.mul_(momentum).add_(online, alpha=1.0 - momentum)
+        if ema_mode:
+            momentum = float(self.config.jepa_ema_momentum)
+            with torch.no_grad():
+                for target, online in zip(
+                    self.jepa_target_encoder.parameters(),  # type: ignore[union-attr]
+                    self.skill_encoder.parameters(),
+                    strict=True,
+                ):
+                    target.mul_(momentum).add_(online, alpha=1.0 - momentum)
         self.skill_encoder.on_after_train_step(self.update)
         self.update += 1
         with torch.no_grad():
@@ -2591,6 +3032,13 @@ class HighLevelSkillDiffSRTrainer:
                 "train/jepa_objective": float(objective.detach().item()),
                 "train/jepa_sigreg": float(sigreg.detach().item()),
                 "train/jepa_ntp_accuracy": float(accuracy.item()),
+                # The phase-2 gate pair: prediction must beat copying the
+                # previous token. ratio < 1 passes.
+                "train/jepa_copy_mse": float(copy_mse.item()),
+                "train/jepa_pred_mse": float(pred_mse.item()),
+                "train/jepa_pred_over_copy": float(
+                    (pred_mse / copy_mse.clamp_min(1.0e-12)).item()
+                ),
                 "train/reg_loss": float(reg_loss.detach().item()),
                 **{f"train/{k}": float(v.item()) for k, v in info.items()},
             }
@@ -2600,6 +3048,8 @@ class HighLevelSkillDiffSRTrainer:
     def train_step(self) -> dict[str, float]:
         if self.config.transition_objective == "jepa_ntp":
             return self._jepa_train_step()
+        if self.config.transition_objective == "reconstruction":
+            return self._reconstruction_train_step()
         self.skill_encoder.train()
         self.diffsr.train()
         batch = self._sample_macro_batch(
@@ -2654,6 +3104,56 @@ class HighLevelSkillDiffSRTrainer:
             metrics.update(self._commander_train_step(batch, state, z))
         return metrics
 
+    def _reconstruction_train_step(self) -> dict[str, float]:
+        assert self.reconstruction_decoder is not None
+        self.skill_encoder.train()
+        self.reconstruction_decoder.train()
+        batch = self._sample_macro_batch(
+            self.config.batch_size, split=self.config.train_split
+        )
+        state, future_window, endpoint = _validate_macro_batch(
+            batch,
+            batch_size=self.config.batch_size,
+            horizon_steps=int(self.config.horizon_steps),
+            device=self.device,
+        )
+        z, reg_loss, info = self._encode_skill(state, future_window, step=self.update)
+        target = self._reconstruction_target(state, future_window, endpoint)
+        prediction = self.reconstruction_decoder(z)
+        reconstruction_loss = F.mse_loss(prediction, target)
+        loss = reconstruction_loss + self.config.reg_coeff * reg_loss
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        metrics = self._z_diagnostics(z.detach(), prefix="train")
+        if self.config.grad_clip_norm is not None:
+            parameters = [
+                *self.skill_encoder.parameters(),
+                *self.reconstruction_decoder.parameters(),
+            ]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters,
+                max_norm=float(self.config.grad_clip_norm),
+            )
+            metrics["train/grad_norm"] = float(grad_norm.item())
+        self.optimizer.step()
+        self.skill_encoder.on_after_train_step(self.update)
+        self.update += 1
+        error = prediction.detach() - target
+        metrics.update(
+            {
+                "train/loss": float(loss.detach().item()),
+                "train/reconstruction_loss": float(reconstruction_loss.detach().item()),
+                "train/reconstruction_mae": float(error.abs().mean().item()),
+                "train/reconstruction_max_abs": float(error.abs().max().item()),
+                "train/reg_loss": float(reg_loss.detach().item()),
+                **{f"train/{key}": float(value.item()) for key, value in info.items()},
+            }
+        )
+        if self.commander is not None:
+            metrics.update(self._commander_train_step(batch, state, z))
+        return metrics
+
     @torch.no_grad()
     def evaluate(
         self,
@@ -2676,8 +3176,15 @@ class HighLevelSkillDiffSRTrainer:
 
         encoder_was_training = self.skill_encoder.training
         diffsr_was_training = self.diffsr.training
+        reconstruction_was_training = (
+            self.reconstruction_decoder.training
+            if self.reconstruction_decoder is not None
+            else False
+        )
         self.skill_encoder.eval()
         self.diffsr.eval()
+        if self.reconstruction_decoder is not None:
+            self.reconstruction_decoder.eval()
         accum: dict[str, float] = {}
         for _ in range(num_batches):
             batch = self._sample_macro_batch(batch_size, split=split)
@@ -2694,16 +3201,27 @@ class HighLevelSkillDiffSRTrainer:
             else:
                 shuffled_z = z.clone()
             batch_metrics = self._z_diagnostics(z, prefix=prefix)
-            batch_metrics.update(
-                self._objective_eval_loss_metrics(
-                    state,
-                    future_window,
-                    z,
-                    zero_z,
-                    shuffled_z,
-                    prefix=prefix,
+            if self.reconstruction_decoder is not None:
+                batch_metrics.update(
+                    self._reconstruction_eval_metrics(
+                        state,
+                        future_window,
+                        _target,
+                        z,
+                        prefix=prefix,
+                    )
                 )
-            )
+            else:
+                batch_metrics.update(
+                    self._objective_eval_loss_metrics(
+                        state,
+                        future_window,
+                        z,
+                        zero_z,
+                        shuffled_z,
+                        prefix=prefix,
+                    )
+                )
             # Per-method diversity / collapse diagnostics.
             diversity = self.skill_encoder.diversity_metrics(
                 state, _encoder_input_window(self.config, future_window)
@@ -2718,7 +3236,7 @@ class HighLevelSkillDiffSRTrainer:
                 batch_metrics.update(
                     self._commander_eval_metrics(batch, state, z, prefix=prefix)
                 )
-            if include_reconstruction:
+            if include_reconstruction and self.reconstruction_decoder is None:
                 batch_metrics.update(
                     self._objective_reconstruction_metrics(
                         state,
@@ -2735,6 +3253,8 @@ class HighLevelSkillDiffSRTrainer:
             self.skill_encoder.train()
         if diffsr_was_training:
             self.diffsr.train()
+        if reconstruction_was_training and self.reconstruction_decoder is not None:
+            self.reconstruction_decoder.train()
         return accum
 
     def train(
@@ -2765,7 +3285,12 @@ class HighLevelSkillDiffSRTrainer:
                         include_reconstruction=reconstruction_eval,
                     )
                 )
-                eval_loss = metrics.get("train/loss_real_z_eval")
+                eval_metric = (
+                    "train/reconstruction_loss_eval"
+                    if self.reconstruction_decoder is not None
+                    else "train/loss_real_z_eval"
+                )
+                eval_loss = metrics.get(eval_metric)
                 if (
                     best_path is not None
                     and eval_loss is not None
@@ -2805,13 +3330,23 @@ class HighLevelSkillDiffSRTrainer:
         }
         if self.jepa_predictor is not None:
             # Deployment reads only the encoder; these are for resume and for
-            # post-hoc inspection of the energy landscape.
-            checkpoint["jepa_state_dict"] = {
-                "target_encoder": self.jepa_target_encoder.state_dict(),  # type: ignore[union-attr]
+            # post-hoc inspection of the energy landscape. online-mode runs
+            # have no target encoder and their checkpoints refuse online
+            # finetuning, so the missing key is safe.
+            jepa_state: dict[str, Any] = {
                 "predictor": self.jepa_predictor.state_dict(),
                 "g": self.jepa_g.state_dict(),  # type: ignore[union-attr]
                 "f": self.jepa_f.state_dict(),  # type: ignore[union-attr]
             }
+            if self.jepa_target_encoder is not None:
+                jepa_state["target_encoder"] = self.jepa_target_encoder.state_dict()
+            if self.jepa_ntp_diffsr is not None:
+                jepa_state["ntp_diffsr"] = self.jepa_ntp_diffsr.state_dict()
+            checkpoint["jepa_state_dict"] = jepa_state
+        if self.reconstruction_decoder is not None:
+            checkpoint["reconstruction_decoder_state_dict"] = (
+                self.reconstruction_decoder.state_dict()
+            )
         return checkpoint
 
     def save_checkpoint(self, path: str | Path) -> None:
@@ -2916,6 +3451,12 @@ class HighLevelSkillDiffSRTrainer:
         self.encoder_window_steps = _encoder_window_steps(self.config)
         self.skill_encoder.load_state_dict(checkpoint["skill_encoder_state_dict"])
         self.diffsr.load_state_dict(checkpoint["diffsr_state_dict"])
+        if self.reconstruction_decoder is not None:
+            decoder_state = checkpoint.get("reconstruction_decoder_state_dict")
+            if decoder_state is None:
+                msg = "Reconstruction checkpoint has no reconstruction decoder state."
+                raise ValueError(msg)
+            self.reconstruction_decoder.load_state_dict(decoder_state)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         feature_norm_state = checkpoint.get("feature_normalization_state_dict")
         obs_norm = getattr(self.diffsr, "obs_norm", None)

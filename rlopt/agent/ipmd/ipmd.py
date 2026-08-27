@@ -180,6 +180,18 @@ class IPMDLatentLearningConfig:
     - ``"sin_cos"``: append ``sin(phase), cos(phase)`` within the current hold.
     """
 
+    command_phase_source: str = "hold"
+    """What drives the ``sin_cos`` phase clock.
+
+    - ``"hold"``: position within the current code hold. Informationally dead
+      at ``code_period=1``, where it pins to a constant.
+    - ``"episode"``: env steps since reset modulo ``command_phase_period`` — a
+      live clock for hold-1 interfaces. Requires ``latent_steps_max == 1``.
+    """
+
+    command_phase_period: int = 0
+    """Phase clock period in env steps. ``0`` uses ``code_period``."""
+
     fsq_levels: list[int] = field(default_factory=lambda: [8, 8, 8, 5, 5])
     """Per-dimension level counts for FSQ. Effective codebook size = prod(levels)."""
 
@@ -259,6 +271,21 @@ class IPMDLatentLearningConfig:
             msg = (
                 "ipmd.latent_learning.command_phase_mode must be 'none' or "
                 f"'sin_cos', got {self.command_phase_mode!r}."
+            )
+            raise ValueError(msg)
+
+        self.command_phase_source = str(self.command_phase_source).strip().lower()
+        if self.command_phase_source not in {"hold", "episode"}:
+            msg = (
+                "ipmd.latent_learning.command_phase_source must be 'hold' or "
+                f"'episode', got {self.command_phase_source!r}."
+            )
+            raise ValueError(msg)
+        self.command_phase_period = int(self.command_phase_period or 0)
+        if self.command_phase_period < 0:
+            msg = (
+                "ipmd.latent_learning.command_phase_period must be >= 0, got "
+                f"{self.command_phase_period}."
             )
             raise ValueError(msg)
 
@@ -955,6 +982,15 @@ class IPMDRLOptConfig(PPORLOptConfig):
     ipmd: IPMDConfig = field(default_factory=IPMDConfig)
     """IPMD configuration."""
 
+    abort_on_nonfinite: bool = True
+    """Stop the run the first time a rollout metric or policy weight is not
+    finite.
+
+    A NaN policy keeps training at full speed and silently poisons every later
+    checkpoint; two chains lost about a day each that way (2026-08-23 fsq64,
+    2026-08-24 emastack) before eval caught it. Set false only to reproduce
+    such a failure on purpose."""
+
 
 @dataclass(frozen=True)
 class GroupedRewardHeadSpec:
@@ -1269,7 +1305,11 @@ class IPMD(PPO):
                     self.config.ipmd.latent_learning.command_phase_mode
                 ),
                 code_latent_dim=self.config.ipmd.latent_learning.code_latent_dim,
-                phase_period=int(self.config.ipmd.latent_learning.code_period),
+                phase_period=int(
+                    self.config.ipmd.latent_learning.command_phase_period
+                    or self.config.ipmd.latent_learning.code_period
+                ),
+                phase_source=str(self.config.ipmd.latent_learning.command_phase_source),
                 command_mode=str(self.config.ipmd.hl_skill_command_mode),
                 discover_env_method=self._discover_env_method,
                 device=self._get_device(self.config.device),
@@ -1318,6 +1358,13 @@ class IPMD(PPO):
                     self.config.ipmd.skill_commander_diffusion_inference_noise_std
                 )
 
+            if str(self.config.ipmd.latent_learning.command_phase_source) != "hold":
+                msg = (
+                    "command_phase_source='episode' is only wired into the "
+                    "hl_skill command sampler; the skill-commander path still "
+                    "uses the hold clock."
+                )
+                raise ValueError(msg)
             self._hl_skill_command_sampler = FrozenSkillCommanderSampler(
                 env=self.env,
                 checkpoint_path=str(self.config.ipmd.skill_commander_checkpoint_path),
@@ -2858,6 +2905,8 @@ class IPMD(PPO):
                 }
             )
 
+        self._abort_on_nonfinite(iteration, metadata)
+
         iteration.metrics.update(self._build_control_metrics(metadata))
         iteration.metrics.update(self._build_timing_metrics(iteration, metadata))
         self._record_env_metrics(iteration)
@@ -2882,6 +2931,53 @@ class IPMD(PPO):
                 path=self.log_dir / self.config.logger.save_path,
                 step=metadata.frames_processed,
             )
+
+    # Watchdog keys: the first quantities to turn non-finite when a rollout
+    # produces NaN. Checked every iteration because a NaN policy keeps training
+    # at full speed and every later checkpoint is unusable -- two chains
+    # (2026-08-23 fsq64, 2026-08-24 emastack) each burned about a day before
+    # anyone noticed. Losses are excluded on purpose: an optimizer can recover
+    # a single bad update, but a non-finite reward or policy parameter cannot.
+    _NONFINITE_WATCH_KEYS: tuple[str, ...] = (
+        "train/step_reward_mean",
+        "episode/return",
+    )
+
+    def _abort_on_nonfinite(
+        self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
+    ) -> None:
+        """Raise as soon as training goes non-finite, before writing a checkpoint.
+
+        Set ``agent.abort_on_nonfinite=false`` to downgrade this to a warning.
+        """
+        offenders = [
+            key
+            for key in self._NONFINITE_WATCH_KEYS
+            if key in iteration.metrics
+            and not math.isfinite(float(iteration.metrics[key]))
+        ]
+        if not offenders:
+            bad_params = [
+                name
+                for name, tensor in (
+                    self.policy.named_parameters() if self.policy else ()
+                )
+                if not torch.isfinite(tensor).all()
+            ]
+            if bad_params:
+                offenders = [f"policy:{bad_params[0]}"]
+        if not offenders:
+            return
+        message = (
+            "Training went non-finite at "
+            f"{metadata.frames_processed} cumulative frames: {offenders}. "
+            "Every later checkpoint would be unusable; aborting so the chain "
+            "can resume from the last good checkpoint."
+        )
+        if not bool(getattr(self.config, "abort_on_nonfinite", True)):
+            self.log.error("%s (abort_on_nonfinite=false, continuing)", message)
+            return
+        raise RuntimeError(message)
 
     def _checkpoint_policy_state_dict(self) -> Mapping[str, Any]:
         """Return the policy payload stored under ``policy_state_dict``."""
