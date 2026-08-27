@@ -309,6 +309,7 @@ def test_config_leaves_other_latent_modes_alone():
     [
         ("endpoint", (WINDOW_STEPS,)),
         ("endpoint_delta", (WINDOW_STEPS,)),
+        ("reconstruction", (WINDOW_STEPS,)),
         ("state_occupancy", tuple(range(1, WINDOW_STEPS + 1))),
         ("semimarkov_chain", tuple(range(1, WINDOW_STEPS + 1))),
     ],

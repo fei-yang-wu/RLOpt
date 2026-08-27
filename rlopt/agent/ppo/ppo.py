@@ -702,7 +702,14 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         # offset instead of restarting the budget. total_frames stays the full
         # target for every segment -- a segment ends either by reaching it or
         # by the scheduler's walltime, never by a shrunken per-segment budget.
-        resume_offset = max(0, int(getattr(self, "_resume_frame_offset", 0)))
+        resume_offset = int(getattr(self, "_resume_frame_offset", 0))
+        if resume_offset <= 0:
+            # Checkpoints from before 2026-08-16 have no cumulative_env_frames
+            # key, so load_model leaves the offset unset; the launcher may then
+            # supply the known global count explicitly. A checkpoint value
+            # always wins over the config one.
+            resume_offset = int(getattr(cfg.collector, "initial_frame_offset", 0) or 0)
+        resume_offset = max(0, resume_offset)
         frames_per_batch = int(cfg.collector.frames_per_batch)
         remaining_frames = max(0, int(cfg.collector.total_frames) - resume_offset)
         remaining_iterations = min(

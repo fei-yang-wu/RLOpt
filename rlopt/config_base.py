@@ -54,6 +54,13 @@ class CollectorConfig:
     no_cuda_sync: bool = False
     """Whether to disable CUDA synchronization in the collector. This can improve performance but may lead to less accurate timing measurements."""
 
+    initial_frame_offset: int = 0
+    """Global frames already trained before this run, for resuming a checkpoint
+    that predates the ``cumulative_env_frames`` key (pre-2026-08-16). Seeds the
+    resume offset so ``total_frames`` stays the global budget and metrics log at
+    the global frame step. A ``cumulative_env_frames`` value found in the loaded
+    checkpoint always wins over this."""
+
 
 @dataclass
 class ReplayBufferConfig:

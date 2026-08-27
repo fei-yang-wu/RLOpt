@@ -2185,6 +2185,10 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
             if phase_period is not None
             else self.latent_steps_max
         )
+        # The commander path publishes on the hold clock only; the episode
+        # clock (phase_source='episode') exists only on the hl_skill sampler.
+        self.phase_source = "hold"
+        self._episode_steps = None
         self.device = _resolve_device(device, env)
 
         from rlopt.env_interface import require_imitation_interface

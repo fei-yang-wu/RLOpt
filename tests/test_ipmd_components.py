@@ -2843,3 +2843,35 @@ def test_residual_mlp_supports_tapered_hidden_widths() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# non-finite watchdog (2026-08-24)
+# ---------------------------------------------------------------------------
+
+
+def test_nonfinite_watchdog_flags_only_bad_metrics() -> None:
+    """The watchdog's key set and finiteness test, without building a trainer."""
+    import math
+
+    from rlopt.agent.ipmd.ipmd import IPMD
+
+    keys = IPMD._NONFINITE_WATCH_KEYS
+    assert "train/step_reward_mean" in keys
+    assert "episode/return" in keys
+    # A loss going non-finite for one update is recoverable and must NOT be a
+    # watch key; a non-finite reward or return is not.
+    assert "train/loss_objective" not in keys
+
+    healthy = {"train/step_reward_mean": 0.25, "episode/return": 46.5}
+    dead = {"train/step_reward_mean": float("nan"), "episode/return": -0.7}
+    assert [k for k in keys if k in healthy and not math.isfinite(healthy[k])] == []
+    assert [k for k in keys if k in dead and not math.isfinite(dead[k])] == [
+        "train/step_reward_mean"
+    ]
+
+
+def test_abort_on_nonfinite_defaults_true() -> None:
+    from rlopt.agent.ipmd.ipmd import IPMDRLOptConfig
+
+    assert IPMDRLOptConfig().abort_on_nonfinite is True
