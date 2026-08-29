@@ -1008,29 +1008,49 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
-        if int(self.config.ppo.rnn_hidden_size) > 0:
-            # Keep [env, T] sequences intact for BPTT. The collector for a
-            # batched env yields [env, T]; if a source ever yields [T, env],
-            # normalize it here rather than silently transposing time.
-            num_envs = int(self.env.batch_size[0])
-            seq_rollout = rollout
-            if int(seq_rollout.batch_size[0]) != num_envs:
-                if (
-                    seq_rollout.batch_dims >= 2
-                    and int(seq_rollout.batch_size[1]) == num_envs
-                ):
-                    seq_rollout = seq_rollout.transpose(0, 1)
-                else:
-                    msg = (
-                        "Recurrent PPO expected a rollout with the env "
-                        f"dimension first (num_envs={num_envs}), got batch "
-                        f"size {tuple(seq_rollout.batch_size)}."
-                    )
-                    raise RuntimeError(msg)
-            self.data_buffer.extend(seq_rollout)
-        else:
-            self.data_buffer.extend(rollout.reshape(-1))
+        self.data_buffer.extend(self._rollout_for_buffer(rollout))
         return rollout
+
+    def _rollout_for_buffer(self, rollout: TensorDict) -> TensorDict:
+        """Shape a rollout for the data buffer.
+
+        Feed-forward: flat rows (the classic shuffled PPO minibatch).
+        Recurrent (``ppo.rnn_hidden_size > 0``): [env, T] sequences, so
+        mini-batches sampled along the env dimension carry real time order
+        for BPTT. A flat rollout is reshaped back — ``reshape(-1)`` of an
+        [env, T] tensordict is env-major, so the round trip is exact. EVERY
+        extend site must route through this helper: IPMD's own extends
+        bypassed the sequence path on 2026-08-29 and the mismatched buffer
+        (16k-sequence capacity fed 393k flat rows) destroyed the first
+        ``lstm`` arm in under 0.3B frames.
+        """
+        if int(self.config.ppo.rnn_hidden_size) <= 0:
+            return rollout if rollout.batch_dims == 1 else rollout.reshape(-1)
+        num_envs = int(self.env.batch_size[0])
+        if rollout.batch_dims == 1:
+            total = int(rollout.batch_size[0])
+            if total % num_envs != 0:
+                msg = (
+                    f"Recurrent PPO cannot reshape a flat rollout of {total} "
+                    f"rows into sequences of {num_envs} environments."
+                )
+                raise RuntimeError(msg)
+            return rollout.reshape(num_envs, total // num_envs)
+        seq_rollout = rollout
+        if int(seq_rollout.batch_size[0]) != num_envs:
+            if (
+                seq_rollout.batch_dims >= 2
+                and int(seq_rollout.batch_size[1]) == num_envs
+            ):
+                seq_rollout = seq_rollout.transpose(0, 1)
+            else:
+                msg = (
+                    "Recurrent PPO expected a rollout with the env dimension "
+                    f"first (num_envs={num_envs}), got batch size "
+                    f"{tuple(seq_rollout.batch_size)}."
+                )
+                raise RuntimeError(msg)
+        return seq_rollout
 
     @contextmanager
     def _freeze_value_normalizer_updates(self):
