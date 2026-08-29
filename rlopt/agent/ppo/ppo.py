@@ -15,6 +15,7 @@ from tensordict import TensorDict
 from tensordict.nn import (
     InteractionType,
     TensorDictModule,
+    TensorDictSequential,
 )
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
@@ -220,6 +221,47 @@ class PPOConfig:
     log_std_max: float = 2.0
     """Maximum log standard deviation (when clipping is enabled)."""
 
+    lcp_coeff: float = 0.0
+    """Lipschitz-constrained-policy gradient penalty coefficient.
+
+    Adds ``lcp_coeff * mean(||d loc / d obs||^2)`` to the actor loss — the
+    soft Lipschitz constraint of arXiv:2410.11825, computed with the
+    vector-Jacobian ones-trick on the policy MEAN (the ``loc`` head; the
+    sampled action and ``scale`` are untouched). ``0`` (default) skips the
+    extra forward/backward entirely and reproduces every existing arm.
+    """
+
+    lcp_batch_cap: int = 65536
+    """Rows of the mini-batch the LCP penalty is computed on.
+
+    The penalty needs ``create_graph=True`` through the actor, whose memory
+    scales with the rows it sees; a production mini-batch (300k+ rows) does
+    not fit. The first ``lcp_batch_cap`` rows of the mini-batch are an
+    unbiased-enough sample because the collector interleaves environments.
+    """
+
+    rnn_hidden_size: int = 0
+    """LSTM hidden size for a recurrent ACTOR. ``0`` (default) keeps the
+    plain MLP actor and changes nothing.
+
+    When positive, the actor becomes normalize/concat -> ``LSTMModule`` ->
+    MLP head, the environment gains ``InitTracker`` and the LSTM's
+    ``TensorDictPrimer`` (so the collector carries recurrent states across
+    steps and zero-fills them on reset), and PPO mini-batches become
+    time-contiguous ``[env, T]`` sequences instead of shuffled flat rows.
+    TorchRL loss modules run their forward under ``set_recurrent_mode(True)``,
+    so the sequence batches give true BPTT over the rollout window with
+    ``is_init`` resetting the hidden state at episode boundaries. The critic
+    stays a plain MLP, so GAE is untouched.
+
+    NOTE: the pre-existing ``PPORecurrent`` class pairs an LSTM with the
+    flat shuffled mini-batches; in recurrent mode those rows are treated as
+    one arbitrary sequence. Prefer this flag.
+    """
+
+    rnn_num_layers: int = 1
+    """Number of LSTM layers when ``rnn_hidden_size > 0``."""
+
 
 @dataclass
 class PPORLOptConfig(RLOptConfig):
@@ -353,6 +395,14 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             distribution_class = IndependentNormal
             distribution_kwargs = {}
 
+        if int(self.config.ppo.rnn_hidden_size) > 0 and policy_net is None:
+            return self._construct_recurrent_policy_from_config(
+                policy_config,
+                action_dim=action_dim,
+                distribution_class=distribution_class,
+                distribution_kwargs=distribution_kwargs,
+            )
+
         # Build policy network
         if policy_net is None:
             policy_mlp = MLP(
@@ -399,6 +449,111 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         )
 
         # Add probabilistic sampling of the actions
+        return ProbabilisticActor(
+            policy_td,
+            in_keys=["loc", "scale"],
+            spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
+            distribution_class=distribution_class,
+            distribution_kwargs=distribution_kwargs,
+            return_log_prob=True,
+            default_interaction_type=ExplorationType.RANDOM,
+        )
+
+    def _construct_recurrent_policy_from_config(
+        self,
+        policy_config: NetworkConfig,
+        *,
+        action_dim: int,
+        distribution_class: type,
+        distribution_kwargs: dict,
+    ) -> TensorDictModule:
+        """Build the LSTM actor: normalize/concat -> LSTMModule -> MLP head.
+
+        The critic stays feed-forward. The LSTM's primer and ``InitTracker``
+        are attached to ``self.env`` here — the policy is constructed before
+        the collector, so the collector sees the transformed env.
+        """
+        hidden_size = int(self.config.ppo.rnn_hidden_size)
+        num_layers = int(self.config.ppo.rnn_num_layers)
+        policy_in_keys = list(policy_config.get_input_keys())
+        feature_dim = sum(self.observation_feature_size(key) for key in policy_in_keys)
+
+        class _CatInputs(torch.nn.Module):
+            def forward(self, *inputs: Tensor) -> Tensor:
+                if len(inputs) == 1:
+                    return inputs[0]
+                return torch.cat(inputs, dim=-1)
+
+        if getattr(policy_config, "normalize_input", False):
+            pre_module: torch.nn.Module = RunningMeanStdCatInputs(
+                torch.nn.Identity(),
+                feature_dim,
+                epsilon=policy_config.normalization_epsilon,
+                clip=policy_config.normalization_clip,
+                normalize_mask=self._input_normalize_mask(policy_config),
+            ).to(self.device)
+        else:
+            pre_module = _CatInputs()
+        pre = TensorDictModule(
+            module=pre_module,
+            in_keys=policy_in_keys,
+            out_keys=["_actor_features"],
+        )
+        lstm = LSTMModule(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            device=self.device,
+            in_key="_actor_features",
+            out_key="_actor_rnn",
+        )
+        self._actor_lstm = lstm
+        head_mlp = MLP(
+            in_features=hidden_size,
+            activation_class=get_activation_class(policy_config.activation_fn),
+            out_features=action_dim,
+            num_cells=list(policy_config.num_cells),
+            device=self.device,
+        )
+        head = GaussianPolicyHead(
+            base=head_mlp,
+            action_dim=action_dim,
+            log_std_init=self.config.ppo.log_std_init,
+            log_std_min=self.config.ppo.log_std_min,
+            log_std_max=self.config.ppo.log_std_max,
+            clip_log_std=self.config.ppo.clip_log_std,
+            device=self.device,
+        )
+        post = TensorDictModule(
+            module=head,
+            in_keys=["_actor_rnn"],
+            out_keys=["loc", "scale"],
+        )
+        policy_td = TensorDictSequential(pre, lstm, post)
+
+        # Env plumbing: InitTracker for episode boundaries, the primer so the
+        # collector knows the recurrent-state specs. Guard against double
+        # attachment when an asymmetric algorithm builds a second actor.
+        if not getattr(self, "_recurrent_transforms_attached", False):
+            env = PPORecurrent.add_required_transforms(self.env)
+            primer = lstm.make_tensordict_primer()
+            if hasattr(env, "append_transform"):
+                env.append_transform(primer)
+            elif hasattr(env, "transform") and env.transform is not None:
+                if isinstance(env.transform, Compose):
+                    env.transform.append(primer)
+                else:
+                    env.transform = Compose(env.transform, primer)
+            else:
+                msg = (
+                    "ppo.rnn_hidden_size > 0 requires an env that accepts "
+                    "transforms (TransformedEnv); got "
+                    f"{type(self.env).__name__}."
+                )
+                raise TypeError(msg)
+            self.env = env
+            self._recurrent_transforms_attached = True
+
         return ProbabilisticActor(
             policy_td,
             in_keys=["loc", "scale"],
@@ -560,6 +715,24 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         sampler = (
             SamplerWithoutReplacement()
         )  # Removed True parameter to match ppo_mujoco.py
+        if int(cfg.ppo.rnn_hidden_size) > 0:
+            # Recurrent actor: the buffer stores whole per-env rollout
+            # sequences and samples along the ENV dimension, so every
+            # mini-batch is [env_rows, T] and BPTT sees real time order.
+            # mini_batch_size stays in FRAMES; it converts to env rows here.
+            num_envs = int(self.env.batch_size[0])
+            seq_len = max(1, int(cfg.collector.frames_per_batch) // num_envs)
+            env_rows = max(1, int(cfg.loss.mini_batch_size) // seq_len)
+            return TensorDictReplayBuffer(
+                storage=LazyTensorStorage(
+                    num_envs,
+                    compilable=cfg.compile.compile,  # type: ignore
+                    device=self.device,
+                ),
+                sampler=sampler,
+                batch_size=env_rows,
+                compilable=cfg.compile.compile,
+            )
         return TensorDictReplayBuffer(
             storage=LazyTensorStorage(
                 cfg.collector.frames_per_batch,
@@ -629,8 +802,38 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
     def _extra_actor_loss(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
         """Return actor-only auxiliary losses added on top of the PPO objective."""
-        del batch
-        return torch.zeros((), device=self.device), {}
+        return self._lcp_penalty(batch)
+
+    def _lcp_penalty(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
+        """Soft Lipschitz constraint on the policy mean (arXiv:2410.11825).
+
+        ``lcp_coeff * mean_over_rows(sum_over_obs (d sum(loc) / d obs)^2)``,
+        the vector-Jacobian ones-trick surrogate for the Jacobian norm. Runs
+        a second actor forward on a leaf copy of the observations, so the PPO
+        objective's graph is untouched.
+        """
+        coeff = float(self.config.ppo.lcp_coeff)
+        if coeff <= 0.0:
+            return torch.zeros((), device=self.device), {}
+        policy_op = self.actor_critic.get_policy_operator()
+        obs_keys = [key for key in policy_op.in_keys if key not in ("loc", "scale")]
+        cap = max(1, int(self.config.ppo.lcp_batch_cap))
+        rows = min(int(batch.batch_size[0]), cap)
+        sub = batch[:rows].select(*obs_keys).clone()
+        grad_inputs: list[Tensor] = []
+        for key in obs_keys:
+            leaf = sub.get(key).detach().requires_grad_(True)
+            sub.set(key, leaf)
+            grad_inputs.append(leaf)
+        with torch.enable_grad():
+            loc = policy_op(sub).get("loc")
+            grads = torch.autograd.grad(
+                outputs=loc.sum(),
+                inputs=grad_inputs,
+                create_graph=True,
+            )
+            penalty = sum(g.pow(2).sum(dim=-1) for g in grads).mean()
+        return coeff * penalty, {"loss_lcp_penalty": penalty.detach()}
 
     def update(
         self, batch: TensorDict, num_network_updates: int
@@ -805,7 +1008,28 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
-        self.data_buffer.extend(rollout.reshape(-1))
+        if int(self.config.ppo.rnn_hidden_size) > 0:
+            # Keep [env, T] sequences intact for BPTT. The collector for a
+            # batched env yields [env, T]; if a source ever yields [T, env],
+            # normalize it here rather than silently transposing time.
+            num_envs = int(self.env.batch_size[0])
+            seq_rollout = rollout
+            if int(seq_rollout.batch_size[0]) != num_envs:
+                if (
+                    seq_rollout.batch_dims >= 2
+                    and int(seq_rollout.batch_size[1]) == num_envs
+                ):
+                    seq_rollout = seq_rollout.transpose(0, 1)
+                else:
+                    msg = (
+                        "Recurrent PPO expected a rollout with the env "
+                        f"dimension first (num_envs={num_envs}), got batch "
+                        f"size {tuple(seq_rollout.batch_size)}."
+                    )
+                    raise RuntimeError(msg)
+            self.data_buffer.extend(seq_rollout)
+        else:
+            self.data_buffer.extend(rollout.reshape(-1))
         return rollout
 
     @contextmanager
