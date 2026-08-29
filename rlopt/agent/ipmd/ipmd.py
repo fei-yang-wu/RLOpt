@@ -2207,8 +2207,9 @@ class IPMD(PPO):
         return torch.zeros((), device=latent_pred.device, dtype=latent_pred.dtype)
 
     def _extra_actor_loss(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
-        del batch
-        return torch.zeros((), device=self.device), {}
+        # The PPO base carries the LCP gradient penalty (ppo.lcp_coeff);
+        # inert at the default 0.0.
+        return super()._extra_actor_loss(batch)
 
     def _refresh_grad_clip_params(self) -> None:
         """Refresh the cached optimizer parameter list used for grad clipping."""
