@@ -3239,7 +3239,7 @@ class IPMD(PPO):
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
-        self.data_buffer.extend(rollout.reshape(-1))
+        self.data_buffer.extend(self._rollout_for_buffer(rollout))
         return rollout
 
     def _set_reward_policy_condition_from_batch(
@@ -3344,7 +3344,9 @@ class IPMD(PPO):
             else int(updates_completed)
         )
         self.data_buffer.empty()
-        self.data_buffer.extend(rollout_flat)
+        # Route through the shaping helper: with a recurrent actor the buffer
+        # stores [env, T] sequences and a flat extend silently corrupts it.
+        self.data_buffer.extend(self._rollout_for_buffer(rollout_flat))
         try:
             for _epoch_idx in range(metadata.epochs_per_rollout):
                 for batch in self.data_buffer:
