@@ -2875,3 +2875,134 @@ def test_abort_on_nonfinite_defaults_true() -> None:
     from rlopt.agent.ipmd.ipmd import IPMDRLOptConfig
 
     assert IPMDRLOptConfig().abort_on_nonfinite is True
+
+
+# ---------------------------------------------------------------------------
+# Affine phi parameterization (linear-closure arm)
+# ---------------------------------------------------------------------------
+
+
+def _affine_sr(parameterization: str, *, seed: int = 0):
+    """Small fp64 DiffSR module for exact affinity arithmetic."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    torch.manual_seed(seed)
+    module = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=3,
+        feature_dim=6,
+        embed_dim=7,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        phi_parameterization=parameterization,
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+    return module.double()
+
+
+# Weights sum to one but are not all positive, so the assertion covers the
+# affine offset as well as linearity.
+_AFFINE_WEIGHTS = (0.7, -0.4, 0.7)
+
+
+def _combine(tensors, weights):
+    out = torch.zeros_like(tensors[0])
+    for tensor, weight in zip(tensors, weights, strict=True):
+        out = out + weight * tensor
+    return out
+
+
+def test_affine_phi_is_affine_in_action() -> None:
+    """phi(s, sum w_i z_i) == sum w_i phi(s, z_i) when the weights sum to 1."""
+    module = _affine_sr("affine")
+    torch.manual_seed(1)
+    s = torch.randn(4, 5, dtype=torch.float64)
+    zs = [torch.randn(4, 3, dtype=torch.float64) for _ in _AFFINE_WEIGHTS]
+
+    mixed = module.forward_phi(s, _combine(zs, _AFFINE_WEIGHTS))
+    combined = _combine([module.forward_phi(s, z) for z in zs], _AFFINE_WEIGHTS)
+
+    torch.testing.assert_close(mixed, combined, atol=1e-10, rtol=0.0)
+
+
+def test_affine_eps_prediction_is_affine_in_action() -> None:
+    """The denoising prediction inherits the affinity, so the learned score
+    field of p(next | s, z) is affine in z at every diffusion time."""
+    module = _affine_sr("affine")
+    torch.manual_seed(2)
+    s = torch.randn(4, 5, dtype=torch.float64)
+    zs = [torch.randn(4, 3, dtype=torch.float64) for _ in _AFFINE_WEIGHTS]
+    # mu carries the noisy sample and the diffusion time and never sees z, so
+    # holding it fixed is the exact statement of the claim. It is passed in
+    # because PositionalFeature casts its input to float32.
+    z_mu = torch.randn(4, module.feature_dim, module.next_obs_dim, dtype=torch.float64)
+
+    mixed = module.forward_eps(s=s, a=_combine(zs, _AFFINE_WEIGHTS), z_mu=z_mu)
+    combined = _combine(
+        [module.forward_eps(s=s, a=z, z_mu=z_mu) for z in zs], _AFFINE_WEIGHTS
+    )
+
+    torch.testing.assert_close(mixed, combined, atol=1e-9, rtol=0.0)
+
+
+def test_bilinear_phi_is_not_affine_in_action() -> None:
+    """Negative control: the nonlinear g of 'bilinear' breaks the identity, so
+    a wrong action_net cannot pass the affinity tests silently."""
+    module = _affine_sr("bilinear")
+    torch.manual_seed(1)
+    s = torch.randn(4, 5, dtype=torch.float64)
+    zs = [torch.randn(4, 3, dtype=torch.float64) for _ in _AFFINE_WEIGHTS]
+
+    mixed = module.forward_phi(s, _combine(zs, _AFFINE_WEIGHTS))
+    combined = _combine([module.forward_phi(s, z) for z in zs], _AFFINE_WEIGHTS)
+
+    assert not torch.allclose(mixed, combined, atol=1e-6)
+
+
+def test_affine_parameterization_structure_and_state_dict_roundtrip() -> None:
+    from rlopt.agent.ipmd.network import ResidualMLP
+
+    affine = _affine_sr("affine")
+    bilinear = _affine_sr("bilinear")
+
+    assert isinstance(affine.action_net, torch.nn.Linear)
+    assert affine.action_net.bias is not None
+    assert isinstance(bilinear.action_net, ResidualMLP)
+    # Both factorized paths keep the matrix-valued F(s).
+    assert affine._matrix_f
+    assert bilinear._matrix_f
+    assert not _affine_sr("concat")._matrix_f
+
+    # A checkpoint written by one affine module restores into another.
+    restored = _affine_sr("affine", seed=99)
+    restored.load_state_dict(affine.state_dict())
+    torch.manual_seed(3)
+    s = torch.randn(2, 5, dtype=torch.float64)
+    z = torch.randn(2, 3, dtype=torch.float64)
+    torch.testing.assert_close(
+        restored.forward_phi(s, z), affine.forward_phi(s, z), atol=1e-12, rtol=0.0
+    )
+
+
+def test_unknown_phi_parameterization_is_rejected() -> None:
+    with pytest.raises(ValueError, match="phi_parameterization"):
+        _affine_sr("linear")
+
+
+def test_skill_config_accepts_affine_parameterization() -> None:
+    _rlopt()
+    from rlopt.agent.hl_skill_diffsr import HighLevelSkillDiffSRConfig
+
+    config = HighLevelSkillDiffSRConfig(diffsr_phi_parameterization="affine")
+    config.validate()
+    assert (
+        HighLevelSkillDiffSRConfig.from_dict(
+            config.to_dict()
+        ).diffsr_phi_parameterization
+        == "affine"
+    )
