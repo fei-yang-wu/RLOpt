@@ -70,6 +70,19 @@ class BilinearSR(ABC, nn.Module):
     phi(s, a) = g(a)^T F(s), with g(a) in R^{embed_dim} and
     F(s) in R^{embed_dim x feature_dim}. Subclasses implement mu and
     compute_loss for different SR objectives.
+
+    ``phi_parameterization`` selects how phi mixes state and action:
+
+    - ``concat``: phi = phi_net([F(s); g(a)]), the default. No bilinear
+      algebra survives the MLP.
+    - ``bilinear``: the factorization above with a nonlinear g.
+    - ``affine``: the factorization above with g(a) = A a + b a single
+      linear layer, which makes phi affine in the action. Combinations of
+      actions then combine their phi exactly:
+      phi(s, sum_i w_i a_i) = sum_i w_i phi(s, a_i) when sum_i w_i = 1.
+      For a skill latent z this makes the learned score field affine in z,
+      so an interpolated latent grounds to the geometric mixture of the
+      endpoint conditionals.
     """
 
     def __init__(
@@ -97,15 +110,19 @@ class BilinearSR(ABC, nn.Module):
         self.phi_parameterization = aliases.get(
             self.phi_parameterization, self.phi_parameterization
         )
-        if self.phi_parameterization not in {"concat", "bilinear"}:
+        if self.phi_parameterization not in {"concat", "bilinear", "affine"}:
             msg = (
-                "phi_parameterization must be one of 'concat' or 'bilinear' "
-                f"(aliases: 'legacy', 'f_matrix'), got {phi_parameterization!r}."
+                "phi_parameterization must be one of 'concat', 'bilinear', or "
+                f"'affine' (aliases: 'legacy', 'f_matrix'), got "
+                f"{phi_parameterization!r}."
             )
             raise ValueError(msg)
+        # Both factorized parameterizations need a matrix-valued F(s); they
+        # differ only in g. Derived, never serialized.
+        self._matrix_f = self.phi_parameterization in {"bilinear", "affine"}
 
         # --- Shared phi components ---
-        if self.phi_parameterization == "bilinear":
+        if self._matrix_f:
             # Checkpoint-era parameterization: F(s) is matrix-valued and the
             # policy consumes F(s) z. Kept for backwards-compatible evaluation.
             self.state_net = ResidualMLP(
@@ -121,12 +138,19 @@ class BilinearSR(ABC, nn.Module):
                 hidden_dims=g_hidden_dims,
                 activation=nn.Mish(),
             )
-        self.action_net = ResidualMLP(
-            input_dim=action_dim,
-            output_dim=embed_dim,
-            hidden_dims=g_hidden_dims,
-            activation=nn.Mish(),
-        )
+        self.action_net: nn.Module
+        if self.phi_parameterization == "affine":
+            # g(a) = A a + b. The bias is the action-independent component of
+            # the transition operator; the columns of A are the patterns each
+            # action coordinate weights.
+            self.action_net = nn.Linear(action_dim, embed_dim, bias=True)
+        else:
+            self.action_net = ResidualMLP(
+                input_dim=action_dim,
+                output_dim=embed_dim,
+                hidden_dims=g_hidden_dims,
+                activation=nn.Mish(),
+            )
 
         self.phi_net: ResidualMLP | None = None
         if self.phi_parameterization == "concat":
@@ -155,7 +179,7 @@ class BilinearSR(ABC, nn.Module):
         return net(s).reshape(-1, self.embed_dim, self.feature_dim)
 
     def encode_state(self, s: Tensor) -> Tensor:
-        if self.phi_parameterization == "bilinear":
+        if self._matrix_f:
             return self._F(s)
         return self.state_net(s)
 
@@ -165,11 +189,11 @@ class BilinearSR(ABC, nn.Module):
     def forward_phi(self, s: Tensor, a: Tensor) -> Tensor:
         """phi(s, a) = (1/sqrt(E)) * g(a)^T F(s) -> (B, feature_dim).
 
-        F(s) and g(a) are both tanh-bounded; the 1/sqrt(embed_dim) factor
-        keeps the bilinear inner product in sigmoid's linear regime, mirroring
-        scaled dot-product attention.
+        The 1/sqrt(embed_dim) factor keeps the inner product at unit scale,
+        mirroring scaled dot-product attention. Under 'affine', g is a single
+        linear layer, so phi is affine in a.
         """
-        if self.phi_parameterization == "bilinear":
+        if self._matrix_f:
             f_s = self._F(s)
             g_a = self.encode_action(a)
             return torch.einsum("be,bef->bf", g_a, f_s) / math.sqrt(
@@ -200,7 +224,7 @@ class BilinearSR(ABC, nn.Module):
         *,
         include_raw_state: bool = True,
     ) -> Tensor:
-        if self.phi_parameterization == "bilinear":
+        if self._matrix_f:
             f_s = self._F(s, use_ema=True).detach()
             component1 = torch.einsum("bef,bf->be", f_s, z)
         else:
