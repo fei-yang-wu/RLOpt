@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from rlopt.agent.hl_skill_diffsr import (
+    HighLevelSkillDiffSRConfig,
+    _encoder_input_window,
+    _encoder_window_steps,
+    _normalize_encoder_window_mode,
     _normalize_transition_objective,
     _reanchor_heading_frames,
     _rot6d_to_matrix,
@@ -50,15 +55,19 @@ def test_reanchor_batched_window_is_rigid() -> None:
     before = torch.linalg.vector_norm(frame_a[29:32] - frame_b[29:32])
     after = torch.linalg.vector_norm(out[0, 0, 29:32] - out[0, 1, 29:32])
     assert torch.allclose(before, after, atol=1e-5)
+
     # Relative yaw between the two frames is also unchanged.
     def yaw_of(frame: torch.Tensor) -> float:
         rotation = _rot6d_to_matrix(frame[32:38])
         return math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
 
-    assert abs(
-        (yaw_of(frame_a) - yaw_of(frame_b))
-        - (yaw_of(out[0, 0]) - yaw_of(out[0, 1]))
-    ) < 1e-5
+    assert (
+        abs(
+            (yaw_of(frame_a) - yaw_of(frame_b))
+            - (yaw_of(out[0, 0]) - yaw_of(out[0, 1]))
+        )
+        < 1e-5
+    )
 
 
 def test_jepa_objective_is_registered_with_alias() -> None:
@@ -82,6 +91,47 @@ def test_sigreg_discriminates_gaussian_from_collapse_and_blowup() -> None:
     assert good < 1e-3
     assert bad_collapse > 10 * good
     assert bad_scale > 10 * good
+
+
+def test_encoder_window_mode_accepts_suffix() -> None:
+    assert _normalize_encoder_window_mode("m", "suffix3") == "suffix3"
+    assert _normalize_encoder_window_mode("m", " SUFFIX2 ") == "suffix2"
+    for bad in ("suffix0", "suffix", "suffix-1", "prefix2"):
+        with pytest.raises(ValueError, match="must be"):
+            _normalize_encoder_window_mode("m", bad)
+
+
+def test_suffix_window_slices_intermediate_tail() -> None:
+    config = HighLevelSkillDiffSRConfig(horizon_steps=10, encoder_window_mode="suffix2")
+    config.validate()
+    assert _encoder_window_steps(config) == 2
+    future_window = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
+    # Intermediate window is slots 0..8 (s_{t+1..t+9}); suffix2 keeps its last
+    # two slots (s_{t+8}, s_{t+9}) and never the endpoint slot 9 (s_{t+10}).
+    out = _encoder_input_window(config, future_window)
+    assert out.shape == (1, 2, 1)
+    assert out.flatten().tolist() == [7.0, 8.0]
+
+    intermediate = HighLevelSkillDiffSRConfig(
+        horizon_steps=10, encoder_window_mode="intermediate"
+    )
+    intermediate.validate()
+    suffix9 = HighLevelSkillDiffSRConfig(
+        horizon_steps=10, encoder_window_mode="suffix9"
+    )
+    suffix9.validate()
+    assert torch.equal(
+        _encoder_input_window(suffix9, future_window),
+        _encoder_input_window(intermediate, future_window),
+    )
+
+
+def test_suffix_window_rejects_endpoint_reach() -> None:
+    config = HighLevelSkillDiffSRConfig(
+        horizon_steps=10, encoder_window_mode="suffix10"
+    )
+    with pytest.raises(ValueError, match="suffix"):
+        config.validate()
 
 
 def test_sigreg_is_differentiable() -> None:
