@@ -641,6 +641,19 @@ class IPMDConfig(PPOConfig):
     critic_learning_rate: float | None = None
     """Optional critic-specific learning rate for PPO/IPMD."""
 
+    critic_lr_schedule: str = "constant"
+    """Decay shape for the critic group: ``"constant"``, ``"linear"`` or ``"cosine"``.
+
+    The adaptive KL rule owns the ACTOR group only (``adaptive_lr=True``), so the
+    critic learning rate is otherwise fixed for the whole run. A non-constant
+    schedule interpolates ``critic_learning_rate`` -> ``critic_lr_final`` on
+    cumulative environment frames, not on the in-segment iteration counter, so a
+    walltime-chained resume continues the decay instead of restarting it.
+    """
+
+    critic_lr_final: float | None = None
+    """End-of-budget critic learning rate. Required when the schedule is not constant."""
+
     def validate(self) -> None:
         self.command_source = normalize_ipmd_command_source(self.command_source)
         self.reward_model_type = normalize_ipmd_reward_model_type(
@@ -934,6 +947,29 @@ class IPMDConfig(PPOConfig):
                 "configured together."
             )
             raise ValueError(msg)
+        self.critic_lr_schedule = str(self.critic_lr_schedule).strip().lower()
+        if self.critic_lr_schedule not in {"constant", "linear", "cosine"}:
+            msg = (
+                "ipmd.critic_lr_schedule must be 'constant', 'linear' or "
+                f"'cosine', got {self.critic_lr_schedule!r}."
+            )
+            raise ValueError(msg)
+        if self.critic_lr_schedule != "constant":
+            if self.critic_learning_rate is None:
+                msg = (
+                    "ipmd.critic_lr_schedule="
+                    f"{self.critic_lr_schedule!r} requires ipmd.critic_learning_rate "
+                    "(the schedule drives the named critic parameter group, which "
+                    "only exists under split actor/critic learning rates)."
+                )
+                raise ValueError(msg)
+            if self.critic_lr_final is None or self.critic_lr_final <= 0.0:
+                msg = (
+                    "ipmd.critic_lr_final must be > 0 when "
+                    f"ipmd.critic_lr_schedule={self.critic_lr_schedule!r}, got "
+                    f"{self.critic_lr_final!r}."
+                )
+                raise ValueError(msg)
         self.rollout_bc_loss_type = str(self.rollout_bc_loss_type).strip().lower()
         if self.rollout_bc_loss_type not in {"nll", "mse"}:
             msg = (
@@ -1916,8 +1952,25 @@ class IPMD(PPO):
         split_actor_critic_lr = self.config.ipmd.actor_learning_rate is not None
         if split_actor_critic_lr:
             assert self.config.ipmd.critic_learning_rate is not None
-            policy_params = list(self.policy.parameters()) + joint_params
+            # The exploration std is a bare nn.Parameter, so AdamW's decoupled
+            # weight decay would pull it toward log_std=0, i.e. sigma toward
+            # 1.0 rad -- against the anneal that carries this recipe. Give it
+            # its own group at weight_decay=0 so optim.weight_decay can be
+            # tuned on the networks alone. The group stays adaptive, so the KL
+            # rule scales it with the rest of the actor.
+            log_std_params = [
+                param
+                for name, param in self.policy.named_parameters()
+                if "log_std" in name
+            ]
+            log_std_ids = {id(param) for param in log_std_params}
+            policy_params = [
+                param
+                for param in list(self.policy.parameters()) + joint_params
+                if id(param) not in log_std_ids
+            ]
             value_params = list(self.value_function.parameters())
+            weight_decay = float(self.config.optim.weight_decay)
             optimizer_params: list[dict[str, Any]] = [
                 {
                     "params": policy_params,
@@ -1925,15 +1978,29 @@ class IPMD(PPO):
                     "adaptive_lr": True,
                     "lr_min": self.config.optim.min_lr,
                     "lr_max": self.config.optim.max_lr,
+                    "weight_decay": weight_decay,
                     "name": "actor",
                 },
                 {
                     "params": value_params,
                     "lr": float(self.config.ipmd.critic_learning_rate),
                     "adaptive_lr": False,
+                    "weight_decay": weight_decay,
                     "name": "critic",
                 },
             ]
+            if log_std_params:
+                optimizer_params.append(
+                    {
+                        "params": log_std_params,
+                        "lr": float(self.config.ipmd.actor_learning_rate),
+                        "adaptive_lr": True,
+                        "lr_min": self.config.optim.min_lr,
+                        "lr_max": self.config.optim.max_lr,
+                        "weight_decay": 0.0,
+                        "name": "actor_log_std",
+                    }
+                )
         else:
             optimizer_params = []
 
@@ -3435,6 +3502,37 @@ class IPMD(PPO):
         """Reward preparation runs in iterate() after pre-PPO reward updates."""
         return
 
+    def _apply_critic_lr_schedule(self, metadata: PPOTrainingMetadata) -> None:
+        """Set the critic group's learning rate for this iteration.
+
+        A no-op under ``ipmd.critic_lr_schedule="constant"``. Progress is
+        cumulative environment frames over the configured frame budget --
+        ``metadata.frames_processed`` is seeded with the resume offset, so a
+        walltime-chained segment continues the decay where the previous one
+        stopped instead of restarting at ``critic_learning_rate``.
+        """
+        schedule = str(self.config.ipmd.critic_lr_schedule)
+        if schedule == "constant":
+            return
+        start = self.config.ipmd.critic_learning_rate
+        end = self.config.ipmd.critic_lr_final
+        if start is None or end is None:
+            return
+        total_frames = float(self.config.collector.total_frames)
+        if total_frames <= 0.0:
+            return
+        progress = float(metadata.frames_processed) / total_frames
+        progress = min(max(progress, 0.0), 1.0)
+        start = float(start)
+        end = float(end)
+        if schedule == "linear":
+            lr = start + (end - start) * progress
+        else:  # cosine
+            lr = end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
+        for group in self.optim.param_groups:
+            if group.get("name") == "critic":
+                group["lr"] = lr
+
     def iterate(
         self,
         iteration: PPOIterationData,
@@ -3446,6 +3544,7 @@ class IPMD(PPO):
         )
         learn_start = time.perf_counter()
 
+        self._apply_critic_lr_schedule(metadata)
         self.data_buffer.empty()
         self.actor_critic.train()
         self.adv_module.train()

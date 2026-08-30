@@ -91,7 +91,9 @@ def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
     )
 
 
-def _make_env_reward_only_ipmd_agent(*, split_actor_critic_lr: bool = False):
+def _make_env_reward_only_ipmd_agent(
+    *, split_actor_critic_lr: bool = False, weight_decay: float = 0.0
+):
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
@@ -113,6 +115,7 @@ def _make_env_reward_only_ipmd_agent(*, split_actor_critic_lr: bool = False):
     cfg.ipmd.reward_grad_penalty_coeff = 0.0
     cfg.ipmd.bc_coef = 0.0
     cfg.ipmd.diversity_bonus_coeff = 0.0
+    cfg.optim.weight_decay = weight_decay
     if split_actor_critic_lr:
         cfg.ipmd.actor_learning_rate = 2.0e-5
         cfg.ipmd.critic_learning_rate = 1.0e-3
@@ -222,6 +225,111 @@ def test_kl_adapt_step_iteration_drops_non_finite_samples():
         assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
     finally:
         env.close()
+
+
+def test_ipmd_log_std_is_excluded_from_weight_decay():
+    """AdamW decay on log_std would drag sigma toward 1.0 rad, against the anneal."""
+    agent, env = _make_env_reward_only_ipmd_agent(
+        split_actor_critic_lr=True, weight_decay=1.0e-2
+    )
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert groups["actor"]["weight_decay"] == pytest.approx(1.0e-2)
+        assert groups["critic"]["weight_decay"] == pytest.approx(1.0e-2)
+        assert groups["actor_log_std"]["weight_decay"] == 0.0
+
+        log_std_ids = {
+            id(param)
+            for name, param in agent.policy.named_parameters()
+            if "log_std" in name
+        }
+        assert log_std_ids
+        assert {id(p) for p in groups["actor_log_std"]["params"]} == log_std_ids
+        assert not log_std_ids & {id(p) for p in groups["actor"]["params"]}
+
+        # The KL rule still owns it: it scales with the rest of the actor.
+        agent._maybe_adjust_lr(torch.tensor(1.0e-4), agent.config.optim)
+        assert groups["actor_log_std"]["lr"] == pytest.approx(groups["actor"]["lr"])
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_linear_interpolates_on_cumulative_frames():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.ipmd.critic_lr_schedule = "linear"
+        agent.config.ipmd.critic_lr_final = 1.0e-5
+        agent.config.collector.total_frames = 100
+
+        for frames, expected in ((0, 1.0e-3), (50, 5.05e-4), (100, 1.0e-5)):
+            agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=frames))
+            assert groups["critic"]["lr"] == pytest.approx(expected)
+
+        # Past the budget the schedule clamps instead of running below the floor.
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=1000))
+        assert groups["critic"]["lr"] == pytest.approx(1.0e-5)
+
+        # A resume mid-budget continues the decay; it does not restart at the top.
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=75))
+        assert groups["critic"]["lr"] == pytest.approx(2.575e-4)
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_leaves_the_actor_group_alone():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.ipmd.critic_lr_schedule = "cosine"
+        agent.config.ipmd.critic_lr_final = 1.0e-5
+        agent.config.collector.total_frames = 100
+
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=50))
+
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+        # Cosine midpoint of [1e-3, 1e-5].
+        assert groups["critic"]["lr"] == pytest.approx(5.05e-4)
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_constant_is_a_no_op():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert agent.config.ipmd.critic_lr_schedule == "constant"
+        agent.config.collector.total_frames = 100
+
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=100))
+
+        assert groups["critic"]["lr"] == pytest.approx(1.0e-3)
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_requires_a_final_rate():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.actor_learning_rate = 2.0e-5
+    cfg.ipmd.critic_learning_rate = 1.0e-3
+    cfg.ipmd.critic_lr_schedule = "linear"
+    with pytest.raises(ValueError, match=r"ipmd\.critic_lr_final must be > 0"):
+        cfg.ipmd.validate()
+
+
+def test_critic_lr_schedule_requires_split_learning_rates():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.critic_lr_schedule = "linear"
+    cfg.ipmd.critic_lr_final = 1.0e-5
+    with pytest.raises(ValueError, match=r"requires ipmd\.critic_learning_rate"):
+        cfg.ipmd.validate()
+
+
+def test_critic_lr_schedule_rejects_an_unknown_shape():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.critic_lr_schedule = "exponential"
+    with pytest.raises(ValueError, match="must be 'constant', 'linear' or 'cosine'"):
+        cfg.ipmd.validate()
 
 
 def test_ipmd_split_learning_rates_must_be_configured_together():
