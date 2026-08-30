@@ -529,3 +529,74 @@ def test_diff_chunk_next_anchor_trains_and_validates() -> None:
     )
     metrics = trainer.train_step()
     assert math.isfinite(metrics["train/loss"])
+
+
+def test_diff_chunk_boundary_next_span_merged_head(tmp_path: Path) -> None:
+    # Validation: unknown span refused; boundary_next needs the executed anchor.
+    with pytest.raises(ValueError, match="jepa_ntp_chunk_span"):
+        _diff_head_config("diff_chunk", jepa_ntp_chunk_span="whole").validate()
+    with pytest.raises(ValueError, match="executed"):
+        _diff_head_config(
+            "diff_chunk",
+            jepa_ntp_chunk_span="boundary_next",
+            jepa_ntp_chunk_anchor="next",
+        ).validate()
+    with pytest.raises(ValueError, match="jepa_endpoint_coeff"):
+        _diff_head_config("diff_chunk", jepa_endpoint_coeff=-1.0).validate()
+    # The merged-head cell: H+1 frames in the target, endpoint term dropped.
+    torch.manual_seed(0)
+    trainer = HighLevelSkillDiffSRTrainer(
+        _diff_head_config(
+            "diff_chunk",
+            jepa_ntp_chunk_span="boundary_next",
+            jepa_endpoint_coeff=0.0,
+        ),
+        _FakeEnv(),
+    )
+    assert trainer.jepa_ntp_diffsr is not None
+    assert trainer.jepa_ntp_diffsr.next_obs_dim == (HORIZON + 1) * STATE_DIM
+    metrics = trainer.train_step()
+    assert math.isfinite(metrics["train/loss"])
+    # At coeff 0 the endpoint head must receive no gradient.
+    assert all(
+        parameter.grad is None or not parameter.grad.abs().any()
+        for parameter in trainer.diffsr.parameters()
+    )
+    # The checkpoint still carries the (untrained) endpoint head.
+    path = tmp_path / "merged.pt"
+    trainer.save_checkpoint(path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert "diffsr_state_dict" in payload
+    assert "ntp_diffsr" in payload["jepa_state_dict"]
+
+
+def test_additive_token_pred_next_to_diff_chunk() -> None:
+    # Guard: the additive MSE under the mlp head would double-count.
+    with pytest.raises(ValueError, match="double-count"):
+        _jepa_config(
+            jepa_loss="sigreg_ebm", jepa_token_pred_coeff=1.0
+        ).validate()
+    with pytest.raises(ValueError, match="jepa_token_pred_coeff"):
+        _diff_head_config("diff_chunk", jepa_token_pred_coeff=-0.5).validate()
+    # The additive cell: chunk head + EMA-token MSE, both in the loss. The
+    # mlp predictor must now receive gradient (it is loss-bearing again).
+    torch.manual_seed(0)
+    trainer = HighLevelSkillDiffSRTrainer(
+        _diff_head_config("diff_chunk", jepa_token_pred_coeff=1.0), _FakeEnv()
+    )
+    metrics = trainer.train_step()
+    assert math.isfinite(metrics["train/loss"])
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().any()
+        for parameter in trainer.jepa_predictor.parameters()
+    )
+    # Default 0 keeps the predictor gradient-free next to a diffusion head.
+    torch.manual_seed(0)
+    baseline = HighLevelSkillDiffSRTrainer(
+        _diff_head_config("diff_chunk"), _FakeEnv()
+    )
+    baseline.train_step()
+    assert all(
+        parameter.grad is None or not parameter.grad.abs().any()
+        for parameter in baseline.jepa_predictor.parameters()
+    )

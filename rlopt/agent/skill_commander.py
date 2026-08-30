@@ -43,6 +43,8 @@ from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
     HighLevelSkillDiffSRConfig,
     _build_diffsr,
+    _encoder_input_window,
+    _encoder_window_steps,
     _jsonable,
     _normalize_command_mode,
     _normalize_split_value,
@@ -1471,14 +1473,10 @@ class SkillCommanderTrainer:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _encoder_window_steps(self) -> int:
-        if self.skill_config.encoder_window_mode == "intermediate":
-            return int(self.skill_config.horizon_steps) - 1
-        return int(self.skill_config.horizon_steps)
+        return _encoder_window_steps(self.skill_config)
 
     def _encoder_input_window(self, future_window: Tensor) -> Tensor:
-        if self.skill_config.encoder_window_mode == "intermediate":
-            return future_window[:, :-1, :]
-        return future_window
+        return _encoder_input_window(self.skill_config, future_window)
 
     def _expert_trajectory_motion_names(self) -> list[str]:
         provider = getattr(self.env, "expert_trajectory_motion_names", None)

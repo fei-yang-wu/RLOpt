@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
@@ -70,10 +71,23 @@ def _normalize_split_value(name: str, value: str | None) -> str | None:
 
 def _normalize_encoder_window_mode(name: str, value: str) -> str:
     normalized = str(value).strip().lower()
-    if normalized not in {"full", "intermediate"}:
-        msg = f"{name} must be one of 'full' or 'intermediate', got {value!r}."
-        raise ValueError(msg)
-    return normalized
+    if normalized in {"full", "intermediate"}:
+        return normalized
+    if _encoder_window_suffix_steps(normalized) is not None:
+        return normalized
+    msg = (
+        f"{name} must be 'full', 'intermediate', or 'suffix<N>' (N >= 1), "
+        f"got {value!r}."
+    )
+    raise ValueError(msg)
+
+
+def _encoder_window_suffix_steps(mode: str) -> int | None:
+    """Return N for a ``suffix<N>`` window mode, else None."""
+    match = re.fullmatch(r"suffix([1-9]\d*)", str(mode))
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _normalize_transition_objective(name: str, value: str) -> str:
@@ -134,6 +148,9 @@ def _resolve_device(device: torch.device | str | None, env: object) -> torch.dev
 def _encoder_window_steps(config: HighLevelSkillDiffSRConfig) -> int:
     if config.encoder_window_mode == "intermediate":
         return int(config.horizon_steps) - 1
+    suffix = _encoder_window_suffix_steps(config.encoder_window_mode)
+    if suffix is not None:
+        return suffix
     return int(config.horizon_steps)
 
 
@@ -266,6 +283,13 @@ def _encoder_input_window(
 ) -> Tensor:
     if config.encoder_window_mode == "intermediate":
         return future_window[:, :-1, :]
+    suffix = _encoder_window_suffix_steps(config.encoder_window_mode)
+    if suffix is not None:
+        # Last ``suffix`` slots of the INTERMEDIATE window: the endpoint stays
+        # hidden, exactly as in 'intermediate', and only the near-boundary
+        # frames remain visible. suffix N < H-1 ablates the early/mid window;
+        # suffix N = H-1 equals 'intermediate' by construction.
+        return future_window[:, -(suffix + 1) : -1, :]
     return future_window
 
 
@@ -381,9 +405,13 @@ class HighLevelSkillDiffSRConfig:
     """phi(s, z) parameterization forwarded to the SR module.
 
     "concat" is the simple-concat path; "bilinear" restores the legacy matrix
-    form g(z)^T F(s). Both are implemented by `BilinearSR.forward_phi`; this
-    field is what lets the pretrain entrypoint select between them, and its
-    default matches `BilinearSR`'s so omitting it changes nothing."""
+    form g(z)^T F(s); "affine" is the same matrix form with g(z) = A z + b a
+    single linear layer, which makes phi -- and therefore the diffusion score
+    field of p(next | s, z) -- affine in z. All three are implemented by
+    `BilinearSR.forward_phi`; this field is what lets the pretrain entrypoint
+    select between them, and its default matches `BilinearSR`'s so omitting it
+    changes nothing. The value is stored in the checkpoint config, so a loaded
+    encoder rebuilds the same parameterization."""
     batch_size: int = 8192
     num_updates: int = 2000
     log_interval: int = 100
@@ -464,6 +492,26 @@ class HighLevelSkillDiffSRConfig:
     exactly what the encoder would see one publication later — which erases
     the displacement and asks only "what does the next chunk look like in its
     own frame". Only read by ``jepa_ntp_head='diff_chunk'``."""
+    jepa_ntp_chunk_span: str = "next"
+    """Frames the ``diff_chunk`` head denoises.
+
+    ``next``: the next chunk's H frames, ``s[t+H+1 .. t+2H]`` (the measured
+    round-4 recipe).
+    ``boundary_next``: the executed chunk's boundary plus the next chunk,
+    ``s[t+H .. t+2H]`` (H+1 frames) — one head covering both diffusion
+    targets, for the merged-head cell where ``jepa_endpoint_coeff=0`` drops
+    the separate endpoint term. Requires ``jepa_ntp_chunk_anchor='executed'``
+    (the boundary frame is defined in the executed chunk's own frame; a
+    re-anchored boundary would be the identity slot). Only read by
+    ``jepa_ntp_head='diff_chunk'``."""
+    jepa_endpoint_coeff: float = 1.0
+    """Weight of the endpoint DiffSR term inside ``sigreg_ebm``.
+
+    ``0`` drops ``p(s[t+H] | s[t], z)`` from the loss. The endpoint head is
+    still built and serialized, so the checkpoint contract is unchanged; its
+    weights simply receive no gradient. Meant for the merged-head cell
+    (``jepa_ntp_chunk_span='boundary_next'``), where the boundary frame lives
+    inside the chunk head's target instead."""
     jepa_ntp_coeff: float = 1.0
     """Weight of the chunk-NTP prediction MSE inside ``sigreg_ebm``.
 
@@ -471,6 +519,16 @@ class HighLevelSkillDiffSRConfig:
     DiffSR endpoint grounding + SIGReg on the chunk token — the chunk-wise
     non-JEPA cell of the mechanism ablation. The predictor still exists and
     its copy-gate metrics still log; it just receives no gradient."""
+    jepa_token_pred_coeff: float = 0.0
+    """Weight of the mlp token-prediction MSE ``||P(z1) - z2||^2`` ADDED
+    alongside a diffusion NTP head inside ``sigreg_ebm``.
+
+    ``0`` (default) reproduces every existing arm exactly. Positive requires a
+    diffusion ``jepa_ntp_head`` — under the mlp head that MSE already IS the
+    NTP term (``jepa_ntp_coeff``), and a second copy would double-count it.
+    The additive cell asks whether the EMA-lagged latent-dynamics term (owns
+    global drift in the mechanism square) STACKS with chunk generation (whose
+    G win comes from drift kept in the data target), or substitutes for it."""
     jepa_sigreg_sketches: int = 64
     """Random 1-D projection directions per step for SIGReg."""
     jepa_tau: float = 0.1
@@ -628,6 +686,15 @@ class HighLevelSkillDiffSRConfig:
         )
         if self.encoder_window_mode == "intermediate" and self.horizon_steps <= 1:
             msg = "encoder_window_mode='intermediate' requires horizon_steps > 1."
+            raise ValueError(msg)
+        window_suffix = _encoder_window_suffix_steps(self.encoder_window_mode)
+        if window_suffix is not None and window_suffix > self.horizon_steps - 1:
+            msg = (
+                f"encoder_window_mode='suffix{window_suffix}' needs "
+                f"suffix <= horizon_steps - 1 (= {self.horizon_steps - 1}): the "
+                "suffix is taken from the intermediate window, which excludes "
+                "the endpoint."
+            )
             raise ValueError(msg)
         self.transition_objective = _normalize_transition_objective(
             "transition_objective", self.transition_objective
@@ -804,6 +871,37 @@ class HighLevelSkillDiffSRConfig:
             msg = (
                 "jepa_ntp_chunk_anchor must be 'executed' or 'next', got "
                 f"{self.jepa_ntp_chunk_anchor!r}."
+            )
+            raise ValueError(msg)
+        self.jepa_ntp_chunk_span = str(self.jepa_ntp_chunk_span).strip().lower()
+        if self.jepa_ntp_chunk_span not in {"next", "boundary_next"}:
+            msg = (
+                "jepa_ntp_chunk_span must be 'next' or 'boundary_next', got "
+                f"{self.jepa_ntp_chunk_span!r}."
+            )
+            raise ValueError(msg)
+        if (
+            self.jepa_ntp_chunk_span == "boundary_next"
+            and self.jepa_ntp_chunk_anchor != "executed"
+        ):
+            msg = (
+                "jepa_ntp_chunk_span='boundary_next' requires "
+                "jepa_ntp_chunk_anchor='executed': the boundary frame is "
+                "defined in the executed chunk's own frame."
+            )
+            raise ValueError(msg)
+        self.jepa_endpoint_coeff = _require_non_negative_float(
+            "jepa_endpoint_coeff", self.jepa_endpoint_coeff
+        )
+        self.jepa_token_pred_coeff = _require_non_negative_float(
+            "jepa_token_pred_coeff", self.jepa_token_pred_coeff
+        )
+        if self.jepa_token_pred_coeff > 0 and self.jepa_ntp_head == "mlp":
+            msg = (
+                "jepa_token_pred_coeff > 0 requires a diffusion jepa_ntp_head: "
+                "under the mlp head the token-prediction MSE already is the "
+                "NTP term (jepa_ntp_coeff), and a second copy would "
+                "double-count it."
             )
             raise ValueError(msg)
         if self.jepa_ntp_head not in {"mlp", "diff_token", "diff_chunk", "diff_pair"}:
@@ -2095,9 +2193,10 @@ class HighLevelSkillDiffSRTrainer:
                 elif head_name == "diff_pair":
                     ntp_target_dim = int(self.state_dim) + z_dim
                 else:  # diff_chunk
-                    ntp_target_dim = int(self.config.horizon_steps) * int(
-                        self.state_dim
-                    )
+                    span_steps = int(self.config.horizon_steps)
+                    if str(self.config.jepa_ntp_chunk_span) == "boundary_next":
+                        span_steps += 1
+                    ntp_target_dim = span_steps * int(self.state_dim)
                 self.jepa_ntp_diffsr = _build_diffsr(
                     self.config,
                     self.state_dim,
@@ -2935,8 +3034,16 @@ class HighLevelSkillDiffSRTrainer:
                 else:
                     # EXECUTED chunk's slot-0 frame: the cross-chunk
                     # displacement (drift) stays in the target. context==0 is
-                    # enforced by validate().
-                    ntp_target = window[:, horizon : 2 * horizon].reshape(
+                    # enforced by validate(). 'boundary_next' widens the slice
+                    # by one slot to include the executed chunk's boundary
+                    # s[t+H] — the merged-head cell, where the separate
+                    # endpoint term is dropped via jepa_endpoint_coeff=0.
+                    span_start = (
+                        horizon - 1
+                        if str(self.config.jepa_ntp_chunk_span) == "boundary_next"
+                        else horizon
+                    )
+                    ntp_target = window[:, span_start : 2 * horizon].reshape(
                         z1.shape[0], -1
                     )
                 self.jepa_ntp_diffsr.update_obs_norm(ntp_target.detach())  # type: ignore[union-attr]
@@ -2952,12 +3059,29 @@ class HighLevelSkillDiffSRTrainer:
             sigreg = _sigreg_epps_pulley(
                 z1, num_sketches=int(self.config.jepa_sigreg_sketches)
             )
-            objective = diffsr_loss + float(self.config.jepa_ntp_coeff) * ntp
+            objective = (
+                float(self.config.jepa_endpoint_coeff) * diffsr_loss
+                + float(self.config.jepa_ntp_coeff) * ntp
+            )
+            if float(self.config.jepa_token_pred_coeff) > 0:
+                # Additive EMA-trick term next to a diffusion head: the mlp
+                # predictor's MSE toward the target encoder's token. z2 is
+                # gradient-free here (EMA/stopgrad guard in validate is the
+                # mlp double-count check; the target mode is unrestricted).
+                objective = objective + float(
+                    self.config.jepa_token_pred_coeff
+                ) * F.mse_loss(prediction, z2)
             loss = (
                 objective
                 + float(self.config.jepa_sigreg_coeff) * sigreg
                 + self.config.reg_coeff * reg_loss
             )
+            # The endpoint and NTP terms merged into jepa_objective are the two
+            # axes of the window-usage question; log them separately too.
+            term_metrics = {
+                "train/jepa_endpoint_loss": float(diffsr_loss.detach().item()),
+                "train/jepa_ntp_loss": float(ntp.detach().item()),
+            }
             with torch.no_grad():
                 logits = -torch.cdist(prediction, z2)
         elif self.config.jepa_loss == "sigreg":
@@ -2974,6 +3098,7 @@ class HighLevelSkillDiffSRTrainer:
                 + float(self.config.jepa_sigreg_coeff) * sigreg
                 + self.config.reg_coeff * reg_loss
             )
+            term_metrics = {}
             with torch.no_grad():
                 # Batch NTP retrieval accuracy as a scale-free diagnostic even
                 # though nothing is trained contrastively.
@@ -2989,6 +3114,7 @@ class HighLevelSkillDiffSRTrainer:
             )
             sigreg = torch.zeros((), device=z1.device)
             loss = objective + self.config.reg_coeff * reg_loss
+            term_metrics = {}
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -3040,6 +3166,7 @@ class HighLevelSkillDiffSRTrainer:
                     (pred_mse / copy_mse.clamp_min(1.0e-12)).item()
                 ),
                 "train/reg_loss": float(reg_loss.detach().item()),
+                **term_metrics,
                 **{f"train/{k}": float(v.item()) for k, v in info.items()},
             }
         )
@@ -3155,6 +3282,106 @@ class HighLevelSkillDiffSRTrainer:
         return metrics
 
     @torch.no_grad()
+    @torch.no_grad()
+    def _jepa_eval_term_metrics(
+        self, *, batch_size: int, split: str | None, prefix: str
+    ) -> dict[str, float]:
+        """Endpoint and NTP losses of the sigreg_ebm objective on ``split``.
+
+        Mirrors the ``_jepa_train_step`` target construction (context 0 only)
+        without gradient or normalizer updates, so pretrain arms that differ
+        only in ``encoder_window_mode`` compare on one matched eval metric.
+        Returns {} for configurations it does not cover.
+        """
+        if (
+            self.config.transition_objective != "jepa_ntp"
+            or str(self.config.jepa_loss) != "sigreg_ebm"
+            or int(self.config.jepa_context_chunks) != 0
+        ):
+            return {}
+        horizon = int(self.config.horizon_steps)
+        from rlopt.env_interface import require_imitation_interface
+
+        sampler = require_imitation_interface(
+            self.env,
+            "sample_expert_macro_transition_batch",
+            purpose="jepa eval term metrics require it but",
+        )
+        batch = sampler(
+            batch_size=int(batch_size),
+            horizon_steps=2 * horizon,
+            split=split,
+            eval_fraction=float(self.config.eval_trajectory_fraction),
+            split_seed=int(self.config.trajectory_split_seed),
+        )
+        state, window, _ = _validate_macro_batch(
+            batch,
+            batch_size=int(batch_size),
+            horizon_steps=2 * horizon,
+            device=self.device,
+        )
+        z1, *_ = self.skill_encoder.encode(
+            state,
+            _encoder_input_window(self.config, window[:, :horizon]),
+            deterministic=True,
+        )
+        endpoint = window[:, horizon - 1]
+        endpoint_loss = self._diffsr_loss_for_z(state, z1, endpoint)
+
+        def _target_token() -> Tensor:
+            anchor = window[:, horizon - 1]
+            target_state = _reanchor_heading_frames(anchor, anchor)
+            target_window = _reanchor_heading_frames(
+                window[:, horizon : 2 * horizon], anchor
+            )
+            encoder = (
+                self.jepa_target_encoder
+                if str(self.config.jepa_target_encoder_mode) == "ema"
+                and self.jepa_target_encoder is not None
+                else self.skill_encoder
+            )
+            was_training = encoder.training
+            encoder.eval()
+            token, *_ = encoder.encode(
+                target_state,
+                _encoder_input_window(self.config, target_window),
+                deterministic=True,
+            )
+            if was_training:
+                encoder.train()
+            return token
+
+        head = str(self.config.jepa_ntp_head)
+        if head == "diff_chunk":
+            if str(self.config.jepa_ntp_chunk_anchor) == "next":
+                anchor = window[:, horizon - 1]
+                ntp_target = _reanchor_heading_frames(
+                    window[:, horizon : 2 * horizon], anchor
+                ).reshape(z1.shape[0], -1)
+            else:
+                span_start = (
+                    horizon - 1
+                    if str(self.config.jepa_ntp_chunk_span) == "boundary_next"
+                    else horizon
+                )
+                ntp_target = window[:, span_start : 2 * horizon].reshape(
+                    z1.shape[0], -1
+                )
+            ntp_loss = self._ntp_diffsr_loss(state, z1, ntp_target)
+        elif head == "diff_token":
+            ntp_loss = self._ntp_diffsr_loss(state, z1, _target_token())
+        elif head == "diff_pair":
+            ntp_loss = self._ntp_diffsr_loss(
+                state, z1, torch.cat([endpoint, _target_token()], dim=-1)
+            )
+        else:
+            assert self.jepa_predictor is not None
+            ntp_loss = F.mse_loss(self.jepa_predictor(z1), _target_token())
+        return {
+            f"{prefix}/jepa_endpoint_loss_eval": float(endpoint_loss.item()),
+            f"{prefix}/jepa_ntp_loss_eval": float(ntp_loss.item()),
+        }
+
     def evaluate(
         self,
         *,
@@ -3222,6 +3449,11 @@ class HighLevelSkillDiffSRTrainer:
                         prefix=prefix,
                     )
                 )
+            batch_metrics.update(
+                self._jepa_eval_term_metrics(
+                    batch_size=batch_size, split=split, prefix=prefix
+                )
+            )
             # Per-method diversity / collapse diagnostics.
             diversity = self.skill_encoder.diversity_metrics(
                 state, _encoder_input_window(self.config, future_window)
