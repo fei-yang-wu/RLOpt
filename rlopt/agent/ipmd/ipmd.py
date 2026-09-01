@@ -3149,6 +3149,39 @@ class IPMD(PPO):
 
         torch.save(data_to_save, target_path)
 
+    def _load_optimizer_state_dict(self, state_dict: Any) -> None:
+        """Restore optimizer state, tolerating a param-group-count change.
+
+        `torch.optim.Optimizer.load_state_dict` requires the saved and live
+        param groups to match one for one. Any change to how the actor's
+        parameters are split into groups therefore makes every earlier
+        checkpoint unloadable -- for evaluation as well as for resume, even
+        though evaluation needs no optimizer state at all and the policy is
+        already restored by the time this runs.
+
+        A mismatch is reported and skipped rather than raised. The optimizer
+        then starts from its fresh state: for evaluation that is exactly
+        right, and for a resume it means losing the moment estimates, which
+        the log says out loud because it changes the first updates after the
+        restore.
+        """
+        groups = (
+            state_dict.get("param_groups") if isinstance(state_dict, dict) else None
+        )
+        saved_groups = len(groups) if groups is not None else None
+        live_groups = len(self.optim.param_groups)
+        if saved_groups is not None and saved_groups != live_groups:
+            self.log.warning(
+                "Checkpoint optimizer has %d param group(s) but this optimizer "
+                "has %d; skipping the optimizer restore. Evaluation is "
+                "unaffected (the policy is already loaded); a training resume "
+                "continues with fresh optimizer moments.",
+                saved_groups,
+                live_groups,
+            )
+            return
+        self.optim.load_state_dict(state_dict)
+
     def load_model(self, path: str) -> None:
         """Load PPO and reward-estimator state from a checkpoint."""
         data = torch.load(path, map_location=self.device)
@@ -3174,7 +3207,7 @@ class IPMD(PPO):
         if self.q_function and "q_state_dict" in data:
             self.q_function.load_state_dict(data["q_state_dict"])  # type: ignore[arg-type]
         if "optimizer_state_dict" in data:
-            self.optim.load_state_dict(data["optimizer_state_dict"])  # type: ignore[arg-type]
+            self._load_optimizer_state_dict(data["optimizer_state_dict"])
         if "reward_estimator_state_dict" in data:
             self.reward_estimator.load_state_dict(
                 data["reward_estimator_state_dict"]  # type: ignore[arg-type]

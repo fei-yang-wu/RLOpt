@@ -141,3 +141,121 @@ def test_sigreg_is_differentiable() -> None:
     loss = _sigreg_epps_pulley(z * 3.0, 32)
     loss.backward()
     assert z.grad is not None and torch.isfinite(z.grad).all()
+
+
+def _stub_trainer(config):
+    """Minimal carrier for the sampling helper (no env, no Isaac)."""
+    from rlopt.agent.hl_skill_diffsr import HighLevelSkillDiffSRTrainer
+
+    class _Stub:
+        _sample_jepa_window = HighLevelSkillDiffSRTrainer._sample_jepa_window
+
+        def __init__(self, cfg):
+            self.config = cfg
+            self.device = torch.device("cpu")
+
+    return _Stub(config)
+
+
+def _index_sampler(cursor=100, width=3, record=None):
+    """Fake macro sampler whose every feature value IS the frame's index.
+
+    Mirrors the data plane: with ``state_history_steps=k`` the sequence spans
+    ``[cursor-k, cursor+horizon]``, ``state`` is the cursor, and the history
+    block ends AT the cursor.
+    """
+    from tensordict import TensorDict
+
+    def sampler(
+        *,
+        batch_size,
+        horizon_steps,
+        split,
+        eval_fraction,
+        split_seed,
+        state_history_steps=0,
+    ):
+        if record is not None:
+            record.append(
+                {
+                    "horizon_steps": horizon_steps,
+                    "state_history_steps": state_history_steps,
+                }
+            )
+        idx = torch.arange(cursor - state_history_steps, cursor + horizon_steps + 1)
+        seq = idx.to(torch.float32)[None, :, None].expand(batch_size, -1, width)
+        payload = {
+            "state": seq[:, state_history_steps],
+            "future_window": seq[:, state_history_steps + 1 :],
+            "target": seq[:, -1],
+        }
+        if state_history_steps > 0:
+            payload["state_history"] = seq[:, : state_history_steps + 1]
+        return TensorDict(
+            {"hl": TensorDict(payload, batch_size=[batch_size])},
+            batch_size=[batch_size],
+        )
+
+    return sampler
+
+
+def _cfg(**kw):
+    base = dict(
+        horizon_steps=10,
+        encoder_window_mode="intermediate",
+        transition_objective="jepa_ntp",
+        jepa_loss="sigreg_ebm",
+        jepa_ntp_head="diff_chunk",
+        z_dim=8,
+    )
+    base.update(kw)
+    config = HighLevelSkillDiffSRConfig(**base)
+    config.validate()
+    return config
+
+
+def test_history_zero_leaves_the_source_as_the_state() -> None:
+    trainer = _stub_trainer(_cfg())
+    calls = []
+    state, window, source = trainer._sample_jepa_window(
+        _index_sampler(record=calls), batch_size=2, chunk_steps=20, split="train"
+    )
+    # Unchanged sampling contract: no history requested, 2H window.
+    assert calls == [{"horizon_steps": 20, "state_history_steps": 0}]
+    assert torch.equal(source, state)
+    assert state[0, 0].item() == 100.0
+    assert window.shape[1] == 20 and window[0, 0, 0].item() == 101.0
+
+
+def test_current_anchor_sources_the_past_and_leaves_the_window_alone() -> None:
+    trainer = _stub_trainer(_cfg(source_history_steps=10, source_anchor="current"))
+    calls = []
+    state, window, source = trainer._sample_jepa_window(
+        _index_sampler(record=calls), batch_size=2, chunk_steps=20, split="train"
+    )
+    assert calls == [{"horizon_steps": 20, "state_history_steps": 10}]
+    # The encoder's view is identical to the history-free run.
+    assert state[0, 0].item() == 100.0
+    assert window.shape[1] == 20 and window[0, 0, 0].item() == 101.0
+    # phi's source is s[t-10..t]: 11 frames ending AT the current state.
+    assert source.shape == (2, 11 * 3)
+    frames = source.reshape(2, 11, 3)[0, :, 0]
+    assert frames.tolist() == [float(v) for v in range(90, 101)]
+
+
+def test_past_start_anchor_shifts_the_cursor_and_never_reanchors() -> None:
+    trainer = _stub_trainer(_cfg(source_history_steps=10, source_anchor="past_start"))
+    calls = []
+    state, window, source = trainer._sample_jepa_window(
+        _index_sampler(record=calls), batch_size=2, chunk_steps=20, split="train"
+    )
+    # ONE longer window, no history request: slot 0 is already the oldest past
+    # frame, so the anchor is where we want it and nothing is re-anchored.
+    assert calls == [{"horizon_steps": 30, "state_history_steps": 0}]
+    # The sampled cursor is relabeled as t-10, so s_t sits 10 frames later.
+    assert state[0, 0].item() == 110.0
+    assert window.shape[1] == 20 and window[0, 0, 0].item() == 111.0
+    frames = source.reshape(2, 11, 3)[0, :, 0]
+    assert frames.tolist() == [float(v) for v in range(100, 111)]
+    # The source ends at s_t in both anchor modes; only the frame differs.
+    assert frames[-1].item() == state[0, 0].item()
