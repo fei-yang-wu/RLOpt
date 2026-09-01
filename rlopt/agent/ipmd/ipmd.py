@@ -654,8 +654,40 @@ class IPMDConfig(PPOConfig):
     critic_lr_final: float | None = None
     """End-of-budget critic learning rate. Required when the schedule is not constant."""
 
+    first_layer_bias_lr_scale: float = 1.0
+    """Learning-rate multiplier for the FIRST linear layer's bias, actor and critic.
+
+    ``1.0`` (default) changes nothing. Any other value moves each network's
+    first-layer bias into its own parameter group at ``scale x`` the parent
+    group's learning rate: ``actor_first_bias`` (adaptive with the actor, so the
+    KL rule keeps the ratio; ``lr_min``/``lr_max`` scaled to match) and
+    ``critic_first_bias`` (follows ``critic_lr_schedule``). Weight decay is the
+    parent group's. Requires split actor/critic learning rates.
+
+    Why this knob exists (2026-09-01): a constant input channel (the hold-1
+    sin/cos phase pair, which is ``(0, 1)`` on every step) has a weight column
+    whose gradient equals the bias gradient, so under Adam the effective
+    first-layer bias moves at exactly twice the rate. This scale reproduces
+    that effect without the channel, to test whether it is what separates the
+    64-D hold-1 arms that train from those that stall.
+    """
+
     def validate(self) -> None:
         self.command_source = normalize_ipmd_command_source(self.command_source)
+        self.first_layer_bias_lr_scale = float(self.first_layer_bias_lr_scale)
+        if self.first_layer_bias_lr_scale <= 0.0:
+            msg = (
+                "ipmd.first_layer_bias_lr_scale must be > 0, got "
+                f"{self.first_layer_bias_lr_scale}."
+            )
+            raise ValueError(msg)
+        if self.first_layer_bias_lr_scale != 1.0 and self.actor_learning_rate is None:
+            msg = (
+                "ipmd.first_layer_bias_lr_scale != 1 requires split actor/critic "
+                "learning rates (ipmd.actor_learning_rate and "
+                "ipmd.critic_learning_rate)."
+            )
+            raise ValueError(msg)
         self.reward_model_type = normalize_ipmd_reward_model_type(
             self.reward_model_type
         )
@@ -1046,6 +1078,20 @@ class GroupedRewardOutput:
     head_rewards: dict[str, Tensor]
     head_logits: dict[str, Tensor]
     head_inputs: dict[str, Tensor]
+
+
+def _first_linear_bias(module: torch.nn.Module) -> torch.nn.Parameter:
+    """The bias of the first ``nn.Linear`` in ``module.modules()`` order.
+
+    Wrappers (TensorDictModule, the running-mean-std input normalizer) register
+    no linear layers, so the first one met is the first hidden layer of the
+    MLP.
+    """
+    for sub in module.modules():
+        if isinstance(sub, torch.nn.Linear) and sub.bias is not None:
+            return sub.bias
+    msg = "first_layer_bias_lr_scale: no nn.Linear with a bias found in the module."
+    raise ValueError(msg)
 
 
 class IPMD(PPO):
@@ -1999,6 +2045,42 @@ class IPMD(PPO):
                         "lr_max": self.config.optim.max_lr,
                         "weight_decay": 0.0,
                         "name": "actor_log_std",
+                    }
+                )
+            bias_scale = float(self.config.ipmd.first_layer_bias_lr_scale)
+            if bias_scale != 1.0:
+                actor_bias = _first_linear_bias(self.policy)
+                critic_bias = _first_linear_bias(self.value_function)
+                actor_bias_id = id(actor_bias)
+                critic_bias_id = id(critic_bias)
+                optimizer_params[0]["params"] = [
+                    p for p in policy_params if id(p) != actor_bias_id
+                ]
+                optimizer_params[1]["params"] = [
+                    p for p in value_params if id(p) != critic_bias_id
+                ]
+
+                def _scaled(value: float | None) -> float | None:
+                    return None if value is None else float(value) * bias_scale
+
+                optimizer_params.append(
+                    {
+                        "params": [actor_bias],
+                        "lr": float(self.config.ipmd.actor_learning_rate) * bias_scale,
+                        "adaptive_lr": True,
+                        "lr_min": _scaled(self.config.optim.min_lr),
+                        "lr_max": _scaled(self.config.optim.max_lr),
+                        "weight_decay": weight_decay,
+                        "name": "actor_first_bias",
+                    }
+                )
+                optimizer_params.append(
+                    {
+                        "params": [critic_bias],
+                        "lr": float(self.config.ipmd.critic_learning_rate) * bias_scale,
+                        "adaptive_lr": False,
+                        "weight_decay": weight_decay,
+                        "name": "critic_first_bias",
                     }
                 )
         else:
@@ -3562,9 +3644,12 @@ class IPMD(PPO):
             lr = start + (end - start) * progress
         else:  # cosine
             lr = end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
+        bias_scale = float(self.config.ipmd.first_layer_bias_lr_scale)
         for group in self.optim.param_groups:
             if group.get("name") == "critic":
                 group["lr"] = lr
+            elif group.get("name") == "critic_first_bias":
+                group["lr"] = lr * bias_scale
 
     def iterate(
         self,
