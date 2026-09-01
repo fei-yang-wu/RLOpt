@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import warnings
 from functools import lru_cache
 from types import SimpleNamespace
@@ -250,6 +251,38 @@ def test_ipmd_log_std_is_excluded_from_weight_decay():
         # The KL rule still owns it: it scales with the rest of the actor.
         agent._maybe_adjust_lr(torch.tensor(1.0e-4), agent.config.optim)
         assert groups["actor_log_std"]["lr"] == pytest.approx(groups["actor"]["lr"])
+    finally:
+        env.close()
+
+
+def test_optimizer_restore_survives_a_param_group_count_change():
+    """Splitting log_std into its own group must not void earlier checkpoints.
+
+    Every checkpoint written before that split stores two param groups. A
+    strict `Optimizer.load_state_dict` raises on the count, which blocked
+    evaluation of the whole back catalogue on 2026-08-30 -- and evaluation
+    needs no optimizer state at all.
+    """
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        live = agent.optim.state_dict()
+        assert len(live["param_groups"]) == 3
+
+        # A pre-split checkpoint: actor and critic only, log_std folded in.
+        legacy = copy.deepcopy(live)
+        legacy["param_groups"] = legacy["param_groups"][:2]
+
+        agent._load_optimizer_state_dict(legacy)
+
+        # Skipped, not applied, and the live optimizer is still usable.
+        assert len(agent.optim.param_groups) == 3
+
+        # A matching state dict still restores normally.
+        agent.optim.param_groups[0]["lr"] = 1.234e-4
+        restored = copy.deepcopy(agent.optim.state_dict())
+        agent.optim.param_groups[0]["lr"] = 9.9e-9
+        agent._load_optimizer_state_dict(restored)
+        assert agent.optim.param_groups[0]["lr"] == pytest.approx(1.234e-4)
     finally:
         env.close()
 

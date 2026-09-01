@@ -33,6 +33,14 @@ def _require_positive_int(name: str, value: int) -> int:
     return normalized
 
 
+def _require_non_negative_int(name: str, value: int) -> int:
+    normalized = int(value)
+    if normalized < 0:
+        msg = f"{name} must be >= 0, got {value!r}."
+        raise ValueError(msg)
+    return normalized
+
+
 def _require_positive_float(name: str, value: float) -> float:
     normalized = float(value)
     if not math.isfinite(normalized) or normalized <= 0.0:
@@ -293,6 +301,11 @@ def _encoder_input_window(
     return future_window
 
 
+def _source_window_steps(config: HighLevelSkillDiffSRConfig) -> int:
+    """Frames phi conditions on: the current state plus its past chunk."""
+    return int(config.source_history_steps) + 1
+
+
 def _build_diffsr(
     config: HighLevelSkillDiffSRConfig,
     state_dim: int,
@@ -300,9 +313,11 @@ def _build_diffsr(
     *,
     next_obs_dim: int | None = None,
 ) -> BilinearSR:
+    # phi's source widens with the past chunk; obs_norm normalizes the TARGET
+    # (`next_obs_dim`), so a wider source does not disturb it.
     return build_bilinear_sr(
         "diffsr",
-        obs_dim=state_dim,
+        obs_dim=state_dim * _source_window_steps(config),
         next_obs_dim=int(next_obs_dim) if next_obs_dim is not None else state_dim,
         action_dim=config.z_dim,
         feature_dim=config.diffsr_feature_dim,
@@ -317,6 +332,38 @@ def _build_diffsr(
         x_max=config.diffsr_x_max,
         device=device,
     )
+
+
+def _macro_batch_state_history(
+    batch: TensorDictBase,
+    *,
+    batch_size: int,
+    history_steps: int,
+    state_dim: int,
+    device: torch.device,
+) -> Tensor:
+    """Materialize ``hl/state_history`` as ``[B, history_steps + 1, state_dim]``.
+
+    The sampler emits this only when it is asked for a nonzero
+    ``state_history_steps``, and its last slot IS ``s_t``. Frames are already in
+    ``s_t``'s heading frame, so the past reads as negative displacement.
+    """
+    state_history = batch.get(("hl", "state_history"))
+    if state_history is None:
+        msg = (
+            "Expert macro batch is missing hl/state_history. The sampler emits "
+            "it only when called with state_history_steps > 0."
+        )
+        raise ValueError(msg)
+    state_history = cast(Tensor, state_history).to(device=device, dtype=torch.float32)
+    expected = (int(batch_size), int(history_steps) + 1, int(state_dim))
+    if tuple(state_history.shape) != expected:
+        msg = (
+            f"hl/state_history shape mismatch: expected {expected}, "
+            f"got {tuple(state_history.shape)}."
+        )
+        raise ValueError(msg)
+    return state_history
 
 
 def _validate_macro_batch(
@@ -423,6 +470,35 @@ class HighLevelSkillDiffSRConfig:
     trajectory_split_seed: int = 0
     preflight_batch_size: int = 8
     encoder_window_mode: str = "full"
+    source_history_steps: int = 0
+    """Past frames added to phi's conditioning, on top of the current state.
+
+    ``0`` reproduces every existing arm: phi conditions on ``s_t`` alone. The
+    macro state is ``root_qpos`` and carries no velocities, so a single frame
+    cannot express which way the motion is already going; a past chunk supplies
+    that. phi's source width becomes ``(source_history_steps + 1) * state_dim``.
+
+    phi, g and mu are pretrain-only heads, so this does not change the deployed
+    command: the tracker still receives ``z`` from the encoder.
+    """
+    source_anchor: str = "current"
+    """Heading frame of the whole sampled window when a past chunk is used.
+
+    ``current``: anchor on ``s_t``. The past reads as NEGATIVE displacement --
+    where the motion came from, expressed in where it is now. The encoder's
+    state and future window are byte-identical to a ``source_history_steps=0``
+    run, so the encoder stays comparable with existing checkpoints.
+
+    ``past_start``: anchor on the OLDEST past frame ``s[t-history]``, making
+    ``s[t-history] .. s[t+H]`` one macro window anchored at its first slot.
+    Displacement is positive throughout and ``s_t`` is no longer canonical, so
+    the ENCODER's input distribution changes and its ``z`` is not comparable
+    with encoders trained under ``current``. A tracker cannot bind such an
+    encoder until the frozen command sampler can anchor on the robot's heading
+    ``history`` steps ago; today it anchors on the live heading only.
+
+    Read only when ``source_history_steps > 0``.
+    """
     transition_objective: str = "endpoint"
     """DiffSR factorization used to train the skill code.
 
@@ -686,6 +762,37 @@ class HighLevelSkillDiffSRConfig:
         )
         if self.encoder_window_mode == "intermediate" and self.horizon_steps <= 1:
             msg = "encoder_window_mode='intermediate' requires horizon_steps > 1."
+            raise ValueError(msg)
+        self.source_history_steps = _require_non_negative_int(
+            "source_history_steps", self.source_history_steps
+        )
+        self.source_anchor = str(self.source_anchor).strip().lower()
+        if self.source_anchor not in {"current", "past_start"}:
+            msg = (
+                "source_anchor must be 'current' or 'past_start', got "
+                f"{self.source_anchor!r}."
+            )
+            raise ValueError(msg)
+        if self.source_anchor == "past_start" and self.source_history_steps < 1:
+            msg = (
+                "source_anchor='past_start' requires source_history_steps >= 1: "
+                "with no past chunk there is no earlier frame to anchor on."
+            )
+            raise ValueError(msg)
+        if self.source_history_steps > 0 and self.transition_objective != "jepa_ntp":
+            msg = (
+                "source_history_steps > 0 is implemented for "
+                "transition_objective='jepa_ntp' only, got "
+                f"{self.transition_objective!r}."
+            )
+            raise ValueError(msg)
+        if self.source_history_steps > 0 and int(self.jepa_context_chunks) != 0:
+            msg = (
+                "source_history_steps > 0 requires jepa_context_chunks=0: the "
+                "past chunk and the triplet's preceding chunk are two different "
+                "ways to give the model history, and their interaction is "
+                "untested."
+            )
             raise ValueError(msg)
         window_suffix = _encoder_window_suffix_steps(self.encoder_window_mode)
         if window_suffix is not None and window_suffix > self.horizon_steps - 1:
@@ -2461,8 +2568,15 @@ class HighLevelSkillDiffSRTrainer:
         shuffled_z: Tensor,
         *,
         prefix: str,
+        source_override: Tensor | None = None,
     ) -> dict[str, float]:
-        """Evaluate every checkpoint factor, then report their uniform mean."""
+        """Evaluate every checkpoint factor, then report their uniform mean.
+
+        ``source_override`` replaces phi's conditioning with the flattened past
+        chunk when the arm was trained with ``source_history_steps > 0``; phi's
+        input width is derived from that setting, so the single-frame source
+        would not even be the right shape.
+        """
         real_losses: list[float] = []
         zero_losses: list[float] = []
         shuffled_losses: list[float] = []
@@ -2471,6 +2585,8 @@ class HighLevelSkillDiffSRTrainer:
             source, target, offset = self._objective_transition_at(
                 state, future_window, offset_index
             )
+            if source_override is not None:
+                source = source_override
             real = float(self._diffsr_loss_for_z(source, z, target).item())
             zero = float(self._diffsr_loss_for_z(source, zero_z, target).item())
             shuffled = float(self._diffsr_loss_for_z(source, shuffled_z, target).item())
@@ -2901,6 +3017,74 @@ class HighLevelSkillDiffSRTrainer:
             self.commander.train()
         return metrics
 
+    def _sample_jepa_window(
+        self,
+        sampler: Callable[..., TensorDictBase],
+        *,
+        batch_size: int,
+        chunk_steps: int,
+        split: str | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Draw one jepa window and phi's conditioning source.
+
+        Returns ``(state, window, source)`` where ``state`` is ``s_t``,
+        ``window`` is ``s[t+1 .. t+chunk_steps]`` and ``source`` is what phi
+        conditions on, flattened to ``[batch, (history + 1) * state_dim]``.
+        With ``source_history_steps=0`` the source IS the state, which
+        reproduces every existing arm exactly.
+
+        Neither history mode re-anchors anything. ``current`` takes the data
+        plane's own past chunk, which is already expressed in ``s_t``'s heading
+        frame because the sampler anchors at ``center_index=past_steps``.
+        ``past_start`` instead draws ONE longer window and relabels the sampled
+        cursor as ``t - history``, so slot 0 is the oldest past frame and the
+        whole span shares that anchor by construction.
+        """
+        history = int(self.config.source_history_steps)
+        if history > 0 and str(self.config.source_anchor) == "past_start":
+            span = history + int(chunk_steps)
+            batch = sampler(
+                batch_size=batch_size,
+                horizon_steps=span,
+                split=split,
+                eval_fraction=float(self.config.eval_trajectory_fraction),
+                split_seed=int(self.config.trajectory_split_seed),
+            )
+            anchor_state, anchor_window, _ = _validate_macro_batch(
+                batch,
+                batch_size=batch_size,
+                horizon_steps=span,
+                device=self.device,
+            )
+            sequence = torch.cat([anchor_state.unsqueeze(1), anchor_window], dim=1)
+            source = sequence[:, : history + 1].reshape(batch_size, -1)
+            return sequence[:, history], sequence[:, history + 1 :], source
+
+        batch = sampler(
+            batch_size=batch_size,
+            horizon_steps=int(chunk_steps),
+            split=split,
+            eval_fraction=float(self.config.eval_trajectory_fraction),
+            split_seed=int(self.config.trajectory_split_seed),
+            **({"state_history_steps": history} if history > 0 else {}),
+        )
+        state, window, _ = _validate_macro_batch(
+            batch,
+            batch_size=batch_size,
+            horizon_steps=int(chunk_steps),
+            device=self.device,
+        )
+        if history == 0:
+            return state, window, state
+        state_history = _macro_batch_state_history(
+            batch,
+            batch_size=batch_size,
+            history_steps=history,
+            state_dim=int(state.shape[-1]),
+            device=self.device,
+        )
+        return state, window, state_history.reshape(batch_size, -1)
+
     def _jepa_train_step(self) -> dict[str, float]:
         assert self.jepa_predictor is not None
         assert self.jepa_g is not None and self.jepa_f is not None
@@ -2926,18 +3110,11 @@ class HighLevelSkillDiffSRTrainer:
         # predictor reads cat(z0, z1): the option-view dynamics model of
         # wiki/skill-encoder-jepa-plan.md phase 2.
         total_chunks = 2 + context
-        batch = sampler(
+        state, window, source = self._sample_jepa_window(
+            sampler,
             batch_size=int(self.config.batch_size),
-            horizon_steps=total_chunks * horizon,
+            chunk_steps=total_chunks * horizon,
             split=self.config.train_split,
-            eval_fraction=float(self.config.eval_trajectory_fraction),
-            split_seed=int(self.config.trajectory_split_seed),
-        )
-        state, window, _ = _validate_macro_batch(
-            batch,
-            batch_size=int(self.config.batch_size),
-            horizon_steps=total_chunks * horizon,
-            device=self.device,
         )
 
         def chunk_at(index: int) -> tuple[Tensor, Tensor]:
@@ -2954,6 +3131,12 @@ class HighLevelSkillDiffSRTrainer:
 
         exec_state, exec_window = chunk_at(context)
         target_state, target_window = chunk_at(context + 1)
+        # phi's conditioning. Identical to exec_state unless a past chunk was
+        # requested; validate() pins context=0 in that case, so `source` always
+        # belongs to the executed chunk.
+        exec_source = (
+            source if int(self.config.source_history_steps) > 0 else exec_state
+        )
         z1, reg_loss, info = self.skill_encoder.encode(
             exec_state,
             _encoder_input_window(self.config, exec_window),
@@ -3019,12 +3202,12 @@ class HighLevelSkillDiffSRTrainer:
             else:
                 endpoint = boundary
             self.diffsr.update_obs_norm(endpoint.detach())
-            diffsr_loss = self._diffsr_loss_for_z(exec_state, z1, endpoint)
+            diffsr_loss = self._diffsr_loss_for_z(exec_source, z1, endpoint)
             head = str(self.config.jepa_ntp_head)
             if head == "diff_token":
                 ntp_target = z2.detach()
                 self.jepa_ntp_diffsr.update_obs_norm(ntp_target)  # type: ignore[union-attr]
-                ntp = self._ntp_diffsr_loss(exec_state, z1, ntp_target)
+                ntp = self._ntp_diffsr_loss(exec_source, z1, ntp_target)
             elif head == "diff_chunk":
                 if str(self.config.jepa_ntp_chunk_anchor) == "next":
                     # Re-anchored onto s_{t+H}'s own heading frame — what the
@@ -3047,13 +3230,13 @@ class HighLevelSkillDiffSRTrainer:
                         z1.shape[0], -1
                     )
                 self.jepa_ntp_diffsr.update_obs_norm(ntp_target.detach())  # type: ignore[union-attr]
-                ntp = self._ntp_diffsr_loss(exec_state, z1, ntp_target.detach())
+                ntp = self._ntp_diffsr_loss(exec_source, z1, ntp_target.detach())
             elif head == "diff_pair":
                 # Joint next (state, token): the endpoint in the executed
                 # chunk's frame concatenated with the target encoder's token.
                 ntp_target = torch.cat([endpoint, z2], dim=-1).detach()
                 self.jepa_ntp_diffsr.update_obs_norm(ntp_target)  # type: ignore[union-attr]
-                ntp = self._ntp_diffsr_loss(exec_state, z1, ntp_target)
+                ntp = self._ntp_diffsr_loss(exec_source, z1, ntp_target)
             else:
                 ntp = F.mse_loss(prediction, z2)
             sigreg = _sigreg_epps_pulley(
@@ -3282,7 +3465,6 @@ class HighLevelSkillDiffSRTrainer:
         return metrics
 
     @torch.no_grad()
-    @torch.no_grad()
     def _jepa_eval_term_metrics(
         self, *, batch_size: int, split: str | None, prefix: str
     ) -> dict[str, float]:
@@ -3292,6 +3474,12 @@ class HighLevelSkillDiffSRTrainer:
         without gradient or normalizer updates, so pretrain arms that differ
         only in ``encoder_window_mode`` compare on one matched eval metric.
         Returns {} for configurations it does not cover.
+
+        Each term is also evaluated with the batch-shuffled code, and the pair
+        is reported as ``*_z_explained``: ``1 - real / shuffled``, the fraction
+        of the head's loss that knowing THIS window's code removes. That ratio
+        is dimensionless, so it stays comparable when ``horizon_steps`` changes
+        the width of the chunk target and moves the raw losses wholesale.
         """
         if (
             self.config.transition_objective != "jepa_ntp"
@@ -3307,26 +3495,26 @@ class HighLevelSkillDiffSRTrainer:
             "sample_expert_macro_transition_batch",
             purpose="jepa eval term metrics require it but",
         )
-        batch = sampler(
+        state, window, source = self._sample_jepa_window(
+            sampler,
             batch_size=int(batch_size),
-            horizon_steps=2 * horizon,
+            chunk_steps=2 * horizon,
             split=split,
-            eval_fraction=float(self.config.eval_trajectory_fraction),
-            split_seed=int(self.config.trajectory_split_seed),
-        )
-        state, window, _ = _validate_macro_batch(
-            batch,
-            batch_size=int(batch_size),
-            horizon_steps=2 * horizon,
-            device=self.device,
         )
         z1, *_ = self.skill_encoder.encode(
             state,
             _encoder_input_window(self.config, window[:, :horizon]),
             deterministic=True,
         )
+        # Control code: the same codes, paired with the wrong windows. It keeps
+        # the code distribution identical and destroys only the pairing.
+        if int(z1.shape[0]) > 1:
+            z_shuffled = z1[torch.randperm(z1.shape[0], device=z1.device)]
+        else:
+            z_shuffled = z1.clone()
         endpoint = window[:, horizon - 1]
-        endpoint_loss = self._diffsr_loss_for_z(state, z1, endpoint)
+        endpoint_loss = self._diffsr_loss_for_z(source, z1, endpoint)
+        endpoint_shuffled = self._diffsr_loss_for_z(source, z_shuffled, endpoint)
 
         def _target_token() -> Tensor:
             anchor = window[:, horizon - 1]
@@ -3367,19 +3555,40 @@ class HighLevelSkillDiffSRTrainer:
                 ntp_target = window[:, span_start : 2 * horizon].reshape(
                     z1.shape[0], -1
                 )
-            ntp_loss = self._ntp_diffsr_loss(state, z1, ntp_target)
+            ntp_loss = self._ntp_diffsr_loss(source, z1, ntp_target)
+            ntp_shuffled = self._ntp_diffsr_loss(source, z_shuffled, ntp_target)
         elif head == "diff_token":
-            ntp_loss = self._ntp_diffsr_loss(state, z1, _target_token())
+            token = _target_token()
+            ntp_loss = self._ntp_diffsr_loss(source, z1, token)
+            ntp_shuffled = self._ntp_diffsr_loss(source, z_shuffled, token)
         elif head == "diff_pair":
-            ntp_loss = self._ntp_diffsr_loss(
-                state, z1, torch.cat([endpoint, _target_token()], dim=-1)
-            )
+            pair = torch.cat([endpoint, _target_token()], dim=-1)
+            ntp_loss = self._ntp_diffsr_loss(source, z1, pair)
+            ntp_shuffled = self._ntp_diffsr_loss(source, z_shuffled, pair)
         else:
             assert self.jepa_predictor is not None
-            ntp_loss = F.mse_loss(self.jepa_predictor(z1), _target_token())
+            token = _target_token()
+            ntp_loss = F.mse_loss(self.jepa_predictor(z1), token)
+            ntp_shuffled = F.mse_loss(self.jepa_predictor(z_shuffled), token)
+
+        def _explained(real: Tensor, shuffled: Tensor) -> float:
+            """Fraction of the control loss that the true code removes."""
+            control = float(shuffled.item())
+            if abs(control) < 1e-12:
+                return 0.0
+            return 1.0 - float(real.item()) / control
+
         return {
             f"{prefix}/jepa_endpoint_loss_eval": float(endpoint_loss.item()),
+            f"{prefix}/jepa_endpoint_loss_shuffled_eval": float(
+                endpoint_shuffled.item()
+            ),
+            f"{prefix}/jepa_endpoint_z_explained": _explained(
+                endpoint_loss, endpoint_shuffled
+            ),
             f"{prefix}/jepa_ntp_loss_eval": float(ntp_loss.item()),
+            f"{prefix}/jepa_ntp_loss_shuffled_eval": float(ntp_shuffled.item()),
+            f"{prefix}/jepa_ntp_z_explained": _explained(ntp_loss, ntp_shuffled),
         }
 
     def evaluate(
@@ -3412,15 +3621,40 @@ class HighLevelSkillDiffSRTrainer:
         self.diffsr.eval()
         if self.reconstruction_decoder is not None:
             self.reconstruction_decoder.eval()
+        history = int(self.config.source_history_steps)
         accum: dict[str, float] = {}
         for _ in range(num_batches):
-            batch = self._sample_macro_batch(batch_size, split=split)
-            state, future_window, _target = _validate_macro_batch(
-                batch,
-                batch_size=batch_size,
-                horizon_steps=int(self.config.horizon_steps),
-                device=self.device,
-            )
+            batch: TensorDictBase | None
+            eval_source: Tensor | None
+            if history > 0:
+                # phi conditions on a past chunk, and under
+                # source_anchor='past_start' the encoder's own input is anchored
+                # on the oldest past frame. Sampling through the shared helper
+                # keeps this evaluation on the SAME geometry the arm trains on;
+                # the plain macro batch would score the encoder off-distribution.
+                from rlopt.env_interface import require_imitation_interface
+
+                sampler = require_imitation_interface(
+                    self.env,
+                    "sample_expert_macro_transition_batch",
+                    purpose="Offline skill-encoder evaluation requires it but",
+                )
+                state, future_window, eval_source = self._sample_jepa_window(
+                    sampler,
+                    batch_size=batch_size,
+                    chunk_steps=int(self.config.horizon_steps),
+                    split=split,
+                )
+                batch, _target = None, future_window[:, -1]
+            else:
+                batch = self._sample_macro_batch(batch_size, split=split)
+                state, future_window, _target = _validate_macro_batch(
+                    batch,
+                    batch_size=batch_size,
+                    horizon_steps=int(self.config.horizon_steps),
+                    device=self.device,
+                )
+                eval_source = None
             z, *_ = self._encode_skill(state, future_window, deterministic=True)
             zero_z = torch.zeros_like(z)
             if int(z.shape[0]) > 1:
@@ -3447,6 +3681,7 @@ class HighLevelSkillDiffSRTrainer:
                         zero_z,
                         shuffled_z,
                         prefix=prefix,
+                        source_override=eval_source,
                     )
                 )
             batch_metrics.update(
@@ -3464,7 +3699,7 @@ class HighLevelSkillDiffSRTrainer:
                     for key, value in diversity.items()
                 }
             )
-            if self.commander is not None:
+            if self.commander is not None and batch is not None:
                 batch_metrics.update(
                     self._commander_eval_metrics(batch, state, z, prefix=prefix)
                 )
@@ -3663,6 +3898,20 @@ class HighLevelSkillDiffSRTrainer:
             msg = (
                 "Checkpoint encoder_window_mode does not match trainer construction: "
                 f"{loaded_config.encoder_window_mode!r} != {self.config.encoder_window_mode!r}."
+            )
+            raise ValueError(msg)
+        if loaded_config.source_history_steps != self.config.source_history_steps:
+            msg = (
+                "Checkpoint source_history_steps does not match trainer "
+                f"construction: {loaded_config.source_history_steps} != "
+                f"{self.config.source_history_steps}. phi's input width is "
+                "derived from it, so the restore would be silently wrong."
+            )
+            raise ValueError(msg)
+        if loaded_config.source_anchor != self.config.source_anchor:
+            msg = (
+                "Checkpoint source_anchor does not match trainer construction: "
+                f"{loaded_config.source_anchor!r} != {self.config.source_anchor!r}."
             )
             raise ValueError(msg)
         if loaded_config.transition_objective != self.config.transition_objective:
