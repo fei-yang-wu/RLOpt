@@ -93,7 +93,10 @@ def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
 
 
 def _make_env_reward_only_ipmd_agent(
-    *, split_actor_critic_lr: bool = False, weight_decay: float = 0.0
+    *,
+    split_actor_critic_lr: bool = False,
+    weight_decay: float = 0.0,
+    first_layer_bias_lr_scale: float = 1.0,
 ):
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
@@ -123,6 +126,7 @@ def _make_env_reward_only_ipmd_agent(
         cfg.optim.scheduler = "adaptive"
         cfg.optim.min_lr = 1.0e-5
         cfg.optim.max_lr = 2.0e-4
+    cfg.ipmd.first_layer_bias_lr_scale = first_layer_bias_lr_scale
 
     env = rlopt.make_parallel_env(cfg)
     return rlopt.IPMD(env, cfg, logger=None), env
@@ -3147,3 +3151,64 @@ def test_skill_config_accepts_affine_parameterization() -> None:
         ).diffsr_phi_parameterization
         == "affine"
     )
+
+
+def test_first_layer_bias_lr_scale_splits_both_biases_and_keeps_the_ratio():
+    """The first-layer biases get their own groups at scale x the parent lr."""
+    agent, env = _make_env_reward_only_ipmd_agent(
+        split_actor_critic_lr=True, first_layer_bias_lr_scale=2.0
+    )
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert set(groups) == {
+            "actor",
+            "critic",
+            "actor_log_std",
+            "actor_first_bias",
+            "critic_first_bias",
+        }
+        actor_bias = groups["actor_first_bias"]["params"]
+        critic_bias = groups["critic_first_bias"]["params"]
+        assert len(actor_bias) == 1
+        assert len(critic_bias) == 1
+        # The first hidden layer's bias, by name, and removed from the parents.
+        policy_names = {id(p): n for n, p in agent.policy.named_parameters()}
+        value_names = {id(p): n for n, p in agent.value_function.named_parameters()}
+        assert policy_names[id(actor_bias[0])].endswith("0.bias")
+        assert value_names[id(critic_bias[0])].endswith("0.bias")
+        assert all(id(p) != id(actor_bias[0]) for p in groups["actor"]["params"])
+        assert all(id(p) != id(critic_bias[0]) for p in groups["critic"]["params"])
+        # Every parameter is still optimized exactly once.
+        n_opt = sum(len(g["params"]) for g in agent.optim.param_groups)
+        n_all = len(list(agent.policy.parameters())) + len(
+            list(agent.value_function.parameters())
+        )
+        assert n_opt == n_all
+
+        assert groups["actor_first_bias"]["lr"] == pytest.approx(4.0e-5)
+        assert groups["critic_first_bias"]["lr"] == pytest.approx(2.0e-3)
+        assert groups["actor_first_bias"]["lr_max"] == pytest.approx(4.0e-4)
+
+        # The KL rule scales the actor and its bias group together.
+        agent._maybe_adjust_lr(torch.tensor(1.0), agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5 / 1.5)
+        assert groups["actor_first_bias"]["lr"] == pytest.approx(4.0e-5 / 1.5)
+
+        # The critic schedule carries the critic bias group at the same ratio.
+        agent.config.ipmd.critic_lr_schedule = "linear"
+        agent.config.ipmd.critic_lr_final = 1.0e-5
+        agent.config.collector.total_frames = 100
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=50))
+        assert groups["critic"]["lr"] == pytest.approx(5.05e-4)
+        assert groups["critic_first_bias"]["lr"] == pytest.approx(2 * 5.05e-4)
+    finally:
+        env.close()
+
+
+def test_first_layer_bias_lr_scale_default_is_inert():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        names = {group["name"] for group in agent.optim.param_groups}
+        assert names == {"actor", "critic", "actor_log_std"}
+    finally:
+        env.close()
