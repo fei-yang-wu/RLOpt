@@ -334,6 +334,22 @@ def _build_diffsr(
     )
 
 
+def _jepa_ntp_target_dim(config: HighLevelSkillDiffSRConfig, state_dim: int) -> int:
+    """Return the denoising target width for a JEPA DiffSR head."""
+    head = str(config.jepa_ntp_head)
+    if head == "diff_token":
+        return int(config.z_dim)
+    if head == "diff_pair":
+        return int(state_dim) + int(config.z_dim)
+    if head == "diff_chunk":
+        span_steps = int(config.horizon_steps)
+        if str(config.jepa_ntp_chunk_span) == "boundary_next":
+            span_steps += 1
+        return span_steps * int(state_dim)
+    msg = f"JEPA head {head!r} is not a DiffSR head."
+    raise ValueError(msg)
+
+
 def _macro_batch_state_history(
     batch: TensorDictBase,
     *,
@@ -1227,6 +1243,15 @@ class FrozenHighLevelSkillCommandSampler:
             weights_only=False,
         )
         self.config = HighLevelSkillDiffSRConfig.from_dict(checkpoint["config"])
+        if self.config.source_anchor != "current":
+            raise ValueError(
+                "Live skill commands require source_anchor='current'; "
+                "a past_start checkpoint needs a delayed heading anchor."
+            )
+        if self.finetune_enabled and self.config.source_history_steps > 0:
+            raise ValueError(
+                "Online finetuning with source_history_steps > 0 is not supported."
+            )
         if self.finetune_enabled and self.config.transition_objective not in (
             "endpoint",
             "jepa_ntp",
@@ -1323,6 +1348,40 @@ class FrozenHighLevelSkillCommandSampler:
         ):
             obs_norm.load_state_dict(feature_norm_state)
 
+        # A merged JEPA checkpoint trains phi in its next-token prediction
+        # DiffSR head. Its endpoint DiffSR can be present but receive zero
+        # objective weight. Non-z command modes must therefore restore the
+        # trained head instead of silently publishing the endpoint head.
+        self.command_diffsr = self.diffsr
+        if (
+            self.command_mode != "z"
+            and self.config.transition_objective == "jepa_ntp"
+            and float(self.config.jepa_endpoint_coeff) == 0.0
+            and str(self.config.jepa_ntp_head) != "mlp"
+        ):
+            if (
+                self.config.jepa_loss != "sigreg_ebm"
+                or float(self.config.jepa_ntp_coeff) <= 0.0
+            ):
+                raise ValueError("The checkpoint has no trained DiffSR command head.")
+            jepa_state = checkpoint.get("jepa_state_dict")
+            ntp_state = jepa_state.get("ntp_diffsr") if jepa_state else None
+            if ntp_state is None:
+                msg = (
+                    "Non-z commands from a JEPA DiffSR checkpoint require "
+                    "jepa_state_dict['ntp_diffsr']; the trained phi head is missing."
+                )
+                raise ValueError(msg)
+            self.command_diffsr = _build_diffsr(
+                self.config,
+                self.state_dim,
+                self.device,
+                next_obs_dim=_jepa_ntp_target_dim(self.config, self.state_dim),
+            ).to(self.device)
+            self.command_diffsr.load_state_dict(ntp_state)
+            self.command_diffsr.eval()
+            self.command_diffsr.requires_grad_(False)
+
         self.z_norm_coeff = (
             _require_non_negative_float("z_norm_coeff", z_norm_coeff)
             if z_norm_coeff is not None
@@ -1360,6 +1419,7 @@ class FrozenHighLevelSkillCommandSampler:
         self._episode_steps: Tensor | None = None
         self._active_macro_ids: Tensor | None = None
         self._cache_state_chunks: list[Tensor] = []
+        self._current_command_source: Tensor | None = None
         self._cache_future_window_chunks: list[Tensor] = []
         self._cache_target_chunks: list[Tensor] = []
         self._cache_initial_z_chunks: list[Tensor] = []
@@ -1520,10 +1580,10 @@ class FrozenHighLevelSkillCommandSampler:
             source="Offline expert",
         )
 
-    def _command_code_from_state_z(self, state: Tensor, z: Tensor) -> Tensor:
+    def _command_code_from_state_z(self, source: Tensor, z: Tensor) -> Tensor:
         if self.command_mode == "z":
             return z
-        phi = self.diffsr.forward_phi(state, z)
+        phi = self.command_diffsr.forward_phi(source, z)
         if self.command_mode == "phi":
             return phi
         if self.command_mode == "z_phi":
@@ -1544,9 +1604,15 @@ class FrozenHighLevelSkillCommandSampler:
         self,
         env_ids: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        # Keep the five-tensor return contract used by planner adapters. Only
+        # phi modes need the past source; z deployment retains its old gather.
+        history_steps = (
+            int(self.config.source_history_steps) if self.command_mode != "z" else 0
+        )
         batch = self._current_macro_sampler(
             horizon_steps=int(self.config.horizon_steps),
             env_ids=env_ids,
+            **({"state_history_steps": history_steps} if history_steps else {}),
         )
         batch_size = int(env_ids.numel())
         state, future_window, target = _validate_macro_batch(
@@ -1562,6 +1628,17 @@ class FrozenHighLevelSkillCommandSampler:
             state,
             _encoder_input_window(self.config, future_window),
         )
+        if history_steps > 0:
+            state_history = _macro_batch_state_history(
+                batch,
+                batch_size=batch_size,
+                history_steps=history_steps,
+                state_dim=self.state_dim,
+                device=self.device,
+            )
+            self._current_command_source = state_history.reshape(batch_size, -1)
+        else:
+            self._current_command_source = state
         return z, state, future_window, target, initial_z
 
     def start_rollout_cache(self) -> None:
@@ -2105,7 +2182,11 @@ class FrozenHighLevelSkillCommandSampler:
             z, state, future_window, target, initial_z = (
                 self._encode_current_macro_batch(env_ids.to(self.device))
             )
-            command_codes = self._command_code_from_state_z(state, z)
+            source = state
+            if self.command_mode != "z" and self.config.source_history_steps > 0:
+                assert self._current_command_source is not None
+                source = self._current_command_source
+            command_codes = self._command_code_from_state_z(source, z)
             command_codes = command_codes.to(
                 device=device,
                 dtype=dtype,
@@ -2294,21 +2375,11 @@ class HighLevelSkillDiffSRTrainer:
                 # Generative next-chunk head: a second DiffSR whose denoising
                 # target is the next TOKEN (diff_token, z_dim wide) or the
                 # next chunk's H raw frames (diff_chunk, H*state_dim wide).
-                head_name = str(self.config.jepa_ntp_head)
-                if head_name == "diff_token":
-                    ntp_target_dim = z_dim
-                elif head_name == "diff_pair":
-                    ntp_target_dim = int(self.state_dim) + z_dim
-                else:  # diff_chunk
-                    span_steps = int(self.config.horizon_steps)
-                    if str(self.config.jepa_ntp_chunk_span) == "boundary_next":
-                        span_steps += 1
-                    ntp_target_dim = span_steps * int(self.state_dim)
                 self.jepa_ntp_diffsr = _build_diffsr(
                     self.config,
                     self.state_dim,
                     self.device,
-                    next_obs_dim=ntp_target_dim,
+                    next_obs_dim=_jepa_ntp_target_dim(self.config, self.state_dim),
                 ).to(self.device)
             self.optimizer.add_param_group(
                 {
