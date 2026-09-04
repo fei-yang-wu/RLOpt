@@ -46,34 +46,43 @@ class _FakeEnv:
         self.achieved_horizons: list[int] = []
         self.achieved_available = True
 
-    def _macro_batch(self, batch_size: int, horizon_steps: int) -> TensorDict:
+    def _macro_batch(
+        self, batch_size: int, horizon_steps: int, state_history_steps: int = 0
+    ) -> TensorDict:
         generator = torch.Generator().manual_seed(batch_size + horizon_steps)
-        return TensorDict(
-            {
-                ("hl", "state"): torch.randn(
-                    batch_size, STATE_DIM, generator=generator
-                ),
-                ("hl", "future_window"): torch.randn(
-                    batch_size, horizon_steps, STATE_DIM, generator=generator
-                ),
-                ("hl", "target"): torch.randn(
-                    batch_size, STATE_DIM, generator=generator
-                ),
-            },
-            batch_size=[batch_size],
-        )
+        payload = {
+            ("hl", "state"): torch.randn(batch_size, STATE_DIM, generator=generator),
+            ("hl", "future_window"): torch.randn(
+                batch_size, horizon_steps, STATE_DIM, generator=generator
+            ),
+            ("hl", "target"): torch.randn(batch_size, STATE_DIM, generator=generator),
+        }
+        if state_history_steps > 0:
+            history = torch.randn(
+                batch_size,
+                state_history_steps + 1,
+                STATE_DIM,
+                generator=generator,
+            )
+            history[:, -1].copy_(payload[("hl", "state")])
+            payload[("hl", "state_history")] = history
+        return TensorDict(payload, batch_size=[batch_size])
 
     def sample_expert_macro_transition_batch(
         self, *, batch_size: int, horizon_steps: int, **_: object
     ) -> TensorDict:
         self.expert_horizons.append(int(horizon_steps))
-        return self._macro_batch(int(batch_size), int(horizon_steps))
+        return self._macro_batch(
+            int(batch_size),
+            int(horizon_steps),
+            int(_.get("state_history_steps", 0)),
+        )
 
     def current_expert_macro_transition_batch(
         self, horizon_steps: int, env_ids=None, state_history_steps: int = 0
     ) -> TensorDict:
-        del env_ids, state_history_steps
-        return self._macro_batch(4, int(horizon_steps))
+        count = 4 if env_ids is None else int(env_ids.numel())
+        return self._macro_batch(count, int(horizon_steps), int(state_history_steps))
 
     def sample_achieved_chunk_windows(
         self, batch_size: int, horizon_steps: int
@@ -135,6 +144,94 @@ def _sampler(
     }
     kwargs.update(overrides)
     return FrozenHighLevelSkillCommandSampler(**kwargs)  # type: ignore[arg-type]
+
+
+def test_phi_command_uses_trained_jepa_head_and_source_history(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        jepa_ntp_head="diff_chunk",
+        jepa_ntp_chunk_span="boundary_next",
+        jepa_endpoint_coeff=0.0,
+        source_history_steps=5,
+        z_dim=64,
+        diffsr_feature_dim=64,
+        diffsr_phi_parameterization="affine",
+    )
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeEnv())
+    assert trainer.jepa_ntp_diffsr is not None
+    with torch.no_grad():
+        for parameter in trainer.diffsr.parameters():
+            parameter.zero_()
+        for parameter in trainer.jepa_ntp_diffsr.parameters():
+            parameter.fill_(0.125)
+    checkpoint = tmp_path / "merged.pt"
+    trainer.save_checkpoint(checkpoint)
+
+    env = _FakeEnv()
+    sampler = FrozenHighLevelSkillCommandSampler(
+        env=env,
+        checkpoint_path=checkpoint,
+        latent_dim=config.diffsr_feature_dim + 2,
+        latent_steps_min=1,
+        latent_steps_max=1,
+        discover_env_method=_discover,
+        horizon_steps=HORIZON,
+        command_mode="phi",
+        command_phase_mode="sin_cos",
+        finetune_enabled=False,
+    )
+    assert sampler.command_diffsr is not sampler.diffsr
+    source = next(sampler.command_diffsr.parameters())
+    endpoint = next(sampler.diffsr.parameters())
+    assert torch.equal(source, torch.full_like(source, 0.125))
+    assert torch.equal(endpoint, torch.zeros_like(endpoint))
+
+    env_ids = torch.arange(4)
+    z, state, future, target, initial_z = sampler._encode_current_macro_batch(env_ids)
+    phi_source = sampler._current_command_source
+    assert phi_source is not None
+    assert tuple(phi_source.shape) == (4, 6 * STATE_DIM)
+    assert torch.equal(phi_source[:, -STATE_DIM:], state)
+    assert tuple(sampler._command_code_from_state_z(phi_source, z).shape) == (
+        4,
+        config.diffsr_feature_dim,
+    )
+    assert tuple(future.shape) == (4, HORIZON, STATE_DIM)
+    assert tuple(target.shape) == (4, STATE_DIM)
+    assert tuple(initial_z.shape) == (4, 64)
+    command = sampler.sample_for_step(
+        TensorDict({}, batch_size=[4]), device=torch.device("cpu"), dtype=torch.float32
+    )
+    assert command.shape == (4, 66)
+    assert torch.isfinite(command).all()
+    torch.testing.assert_close(command[:, -2:], torch.tensor([[0.0, 1.0]]).expand(4, 2))
+
+
+def test_phi_command_rejects_merged_checkpoint_without_trained_head(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        jepa_ntp_head="diff_chunk", source_history_steps=1, jepa_endpoint_coeff=0.0
+    )
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeEnv())
+    checkpoint = trainer.checkpoint_state_dict()
+    del checkpoint["jepa_state_dict"]["ntp_diffsr"]
+    path = tmp_path / "missing-head.pt"
+    torch.save(checkpoint, path)
+
+    with pytest.raises(ValueError, match="trained phi head is missing"):
+        FrozenHighLevelSkillCommandSampler(
+            env=_FakeEnv(),
+            checkpoint_path=path,
+            latent_dim=config.diffsr_feature_dim,
+            latent_steps_min=1,
+            latent_steps_max=1,
+            discover_env_method=_discover,
+            horizon_steps=HORIZON,
+            command_mode="phi",
+            finetune_enabled=False,
+        )
 
 
 def test_jepa_heads_are_restored_not_reinitialized(tmp_path: Path) -> None:
