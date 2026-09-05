@@ -371,6 +371,14 @@ class IPMDConfig(PPOConfig):
     hl_skill_finetune_enabled: bool = False
     """Enable online policy-gradient finetuning for command_source='hl_skill'."""
 
+    hl_skill_live_horizon: str = "base"
+    """Window-length policy of a variable-window (horizon_choices / stride_choices)
+    hl_skill encoder at rollout time. 'base' = the deployable base (the maximum
+    horizon; stride 1; every block under the block layout), an integer = that
+    member of the checkpoint's set held for the run, 'episode' = one member per
+    environment redrawn at reset, 'step' = redrawn at every code renewal.
+    A fixed-window checkpoint accepts 'base' only."""
+
     hl_skill_pg_coeff: float = 0.05
     # Weight of the DiffSR endpoint loss on ACHIEVED windows sampled from the
     # environment's raw-pose ring (env.achieved_ring_capacity > 0). 0 disables.
@@ -733,6 +741,9 @@ class IPMDConfig(PPOConfig):
                     self.hl_skill_horizon_steps,
                 )
             self.hl_skill_command_mode = str(self.hl_skill_command_mode).strip().lower()
+            self.hl_skill_live_horizon = (
+                str(self.hl_skill_live_horizon).strip().lower() or "base"
+            )
             hl_skill_command_aliases = {"fz": "phi", "z_fz": "z_phi"}
             self.hl_skill_command_mode = hl_skill_command_aliases.get(
                 self.hl_skill_command_mode,
@@ -1408,6 +1419,7 @@ class IPMD(PPO):
                 offline_batch_size=int(self.config.ipmd.hl_skill_offline_batch_size),
                 update_interval=int(self.config.ipmd.hl_skill_update_interval),
                 train_diffsr=bool(self.config.ipmd.hl_skill_train_diffsr),
+                live_horizon=str(self.config.ipmd.hl_skill_live_horizon),
             )
         if self._use_latent_command and self._command_source == "skill_commander":
             from rlopt.agent.skill_commander import (  # noqa: PLC0415
