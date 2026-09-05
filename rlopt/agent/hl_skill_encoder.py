@@ -214,12 +214,90 @@ def _anneal_tau(step: int | None, start: float, end: float, iters: int) -> float
 # --------------------------------------------------------------------------- #
 # Encoders.
 # --------------------------------------------------------------------------- #
+ENCODER_TRUNKS = ("flat", "padded", "sequence")
+
+
+class _SequenceTrunk(nn.Module):
+    """Attention trunk over per-frame tokens; variable window length for free.
+
+    Slot 0 is the current state, slots ``1..W`` are the future window. A row's
+    ``lengths`` marks how many window slots are real; the rest are masked out
+    of attention and out of the mean pool, so the same weights serve every
+    window length. An optional ``variant`` id (the window's horizon or stride
+    class) is added to every token as a learned embedding.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        window_steps: int,
+        raw_dim: int,
+        width: int,
+        depth: int,
+        heads: int,
+        num_variants: int,
+    ) -> None:
+        super().__init__()
+        self.window_steps = int(window_steps)
+        self.token = nn.Linear(int(state_dim), int(width))
+        self.pos = nn.Parameter(torch.zeros(self.window_steps + 1, int(width)))
+        nn.init.normal_(self.pos, std=0.02)
+        self.variant = (
+            nn.Embedding(int(num_variants), int(width))
+            if int(num_variants) > 0
+            else None
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=int(width),
+            nhead=int(heads),
+            dim_feedforward=2 * int(width),
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(
+            layer, num_layers=int(depth), enable_nested_tensor=False
+        )
+        self.norm = nn.LayerNorm(int(width))
+        self.out = nn.Linear(int(width), int(raw_dim))
+
+    def forward(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        lengths: Tensor,
+        variant: Tensor | None,
+    ) -> Tensor:
+        tokens = torch.cat([state.unsqueeze(1), future_window], dim=1)
+        x = self.token(tokens) + self.pos[: tokens.shape[1]].unsqueeze(0)
+        if self.variant is not None:
+            if variant is None:
+                msg = "sequence trunk was built with variants; pass `variant`."
+                raise ValueError(msg)
+            x = x + self.variant(variant).unsqueeze(1)
+        slots = torch.arange(tokens.shape[1], device=tokens.device)
+        valid = slots.unsqueeze(0) < (lengths + 1).unsqueeze(1)
+        x = self.blocks(x, src_key_padding_mask=~valid)
+        valid_f = valid.to(x.dtype).unsqueeze(-1)
+        pooled = (x * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp(min=1.0)
+        return self.out(self.norm(pooled))
+
+
 class HighLevelSkillEncoder(nn.Module, ABC):
-    """Shared MLP trunk over ``[state ; future_window]`` + a latent head.
+    """Shared trunk over ``[state ; future_window]`` + a latent head.
 
     ``encode`` returns ``(z [B, z_dim], reg_loss scalar, info dict)``. ``reg_loss``
     is the latent regularizer, weighted by a single ``reg_coeff``: L2 on z
     (deterministic), KL (gaussian / categorical / gumbel), commitment (vq), 0 (fsq).
+
+    Trunks. ``flat`` is the original MLP over the flattened window and is
+    byte-identical to every existing checkpoint. ``padded`` is the same MLP over
+    a window padded to ``window_steps`` slots: slots at or past a row's
+    ``lengths`` are zeroed and a one-hot of the row's ``variant`` id is
+    appended, so one MLP serves several window lengths. ``sequence`` is the
+    attention trunk above.
     """
 
     def __init__(
@@ -232,13 +310,42 @@ class HighLevelSkillEncoder(nn.Module, ABC):
         raw_dim: int,
         activation: str = "mish",
         layer_norm: bool = True,
+        trunk: str = "flat",
+        num_variants: int = 0,
+        sequence_width: int = 256,
+        sequence_depth: int = 2,
+        sequence_heads: int = 4,
     ) -> None:
         super().__init__()
         self.state_dim = int(state_dim)
         self.window_steps = int(window_steps)
         self.z_dim = int(z_dim)
+        self.trunk = str(trunk).strip().lower()
+        if self.trunk not in ENCODER_TRUNKS:
+            msg = f"trunk must be one of {ENCODER_TRUNKS}, got {trunk!r}."
+            raise ValueError(msg)
+        self.num_variants = int(num_variants)
+        if self.num_variants < 0:
+            msg = f"num_variants must be >= 0, got {num_variants}."
+            raise ValueError(msg)
+        if self.trunk == "flat" and self.num_variants > 0:
+            msg = (
+                "The flat trunk takes no variant id; use trunk='padded' or 'sequence'."
+            )
+            raise ValueError(msg)
+        if self.trunk == "sequence":
+            self.net: nn.Module = _SequenceTrunk(
+                state_dim=self.state_dim,
+                window_steps=self.window_steps,
+                raw_dim=int(raw_dim),
+                width=int(sequence_width),
+                depth=int(sequence_depth),
+                heads=int(sequence_heads),
+                num_variants=self.num_variants,
+            )
+            return
         layers: list[nn.Module] = []
-        prev = self.state_dim * (self.window_steps + 1)
+        prev = self.state_dim * (self.window_steps + 1) + self.num_variants
         activation_name = str(activation).strip().lower()
         activation_types: dict[str, type[nn.Module]] = {
             "elu": nn.ELU,
@@ -263,7 +370,7 @@ class HighLevelSkillEncoder(nn.Module, ABC):
         layers.append(nn.Linear(prev, int(raw_dim)))
         self.net = nn.Sequential(*layers)
 
-    def _raw(self, state: Tensor, future_window: Tensor) -> Tensor:
+    def _check_shapes(self, state: Tensor, future_window: Tensor) -> tuple[int, int]:
         if state.ndim != 2:
             msg = f"state must have shape [B, D], got {tuple(state.shape)}."
             raise ValueError(msg)
@@ -285,8 +392,68 @@ class HighLevelSkillEncoder(nn.Module, ABC):
                 f"{tuple(future_window.shape)}."
             )
             raise ValueError(msg)
-        flat_window = future_window.reshape(batch_size, self.window_steps * state_dim)
-        return self.net(torch.cat([state, flat_window], dim=-1))
+        return int(batch_size), int(state_dim)
+
+    def _resolve_lengths(
+        self, lengths: Tensor | None, batch_size: int, device
+    ) -> Tensor:
+        if lengths is None:
+            return torch.full(
+                (batch_size,), self.window_steps, device=device, dtype=torch.long
+            )
+        lengths = lengths.reshape(-1).to(device=device, dtype=torch.long)
+        if int(lengths.numel()) != batch_size:
+            msg = f"lengths must have {batch_size} entries, got {int(lengths.numel())}."
+            raise ValueError(msg)
+        return lengths
+
+    def _resolve_variant(
+        self, variant: Tensor | None, batch_size: int, device
+    ) -> Tensor | None:
+        if self.num_variants == 0:
+            if variant is not None:
+                msg = "This encoder was built without variants; do not pass `variant`."
+                raise ValueError(msg)
+            return None
+        if variant is None:
+            msg = "This encoder was built with variants; pass `variant` [B] long."
+            raise ValueError(msg)
+        variant = variant.reshape(-1).to(device=device, dtype=torch.long)
+        if int(variant.numel()) != batch_size:
+            msg = f"variant must have {batch_size} entries, got {int(variant.numel())}."
+            raise ValueError(msg)
+        return variant
+
+    def _raw(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        *,
+        lengths: Tensor | None = None,
+        variant: Tensor | None = None,
+    ) -> Tensor:
+        batch_size, state_dim = self._check_shapes(state, future_window)
+        if self.trunk == "flat":
+            if lengths is not None or variant is not None:
+                msg = "The flat trunk takes neither `lengths` nor `variant`."
+                raise ValueError(msg)
+            flat_window = future_window.reshape(
+                batch_size, self.window_steps * state_dim
+            )
+            return self.net(torch.cat([state, flat_window], dim=-1))
+        lengths_t = self._resolve_lengths(lengths, batch_size, state.device)
+        variant_t = self._resolve_variant(variant, batch_size, state.device)
+        if self.trunk == "sequence":
+            return self.net(state, future_window, lengths_t, variant_t)
+        slots = torch.arange(self.window_steps, device=state.device)
+        mask = (slots.unsqueeze(0) < lengths_t.unsqueeze(1)).to(future_window.dtype)
+        flat_window = (future_window * mask.unsqueeze(-1)).reshape(
+            batch_size, self.window_steps * state_dim
+        )
+        parts = [state, flat_window]
+        if variant_t is not None:
+            parts.append(F.one_hot(variant_t, self.num_variants).to(dtype=state.dtype))
+        return self.net(torch.cat(parts, dim=-1))
 
     @abstractmethod
     def _latent(
@@ -300,13 +467,25 @@ class HighLevelSkillEncoder(nn.Module, ABC):
         *,
         deterministic: bool = False,
         step: int | None = None,
+        lengths: Tensor | None = None,
+        variant: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         return self._latent(
-            self._raw(state, future_window), deterministic=deterministic, step=step
+            self._raw(state, future_window, lengths=lengths, variant=variant),
+            deterministic=deterministic,
+            step=step,
         )
 
-    def forward(self, state: Tensor, future_window: Tensor) -> Tensor:
-        return self.encode(state, future_window, deterministic=True)[0]
+    def forward(
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        lengths: Tensor | None = None,
+        variant: Tensor | None = None,
+    ) -> Tensor:
+        return self.encode(
+            state, future_window, deterministic=True, lengths=lengths, variant=variant
+        )[0]
 
     def on_after_train_step(self, step: int) -> None:
         """Called after each optimizer step (VQ overrides for dead-code revival)."""
@@ -322,10 +501,14 @@ class HighLevelSkillEncoder(nn.Module, ABC):
 
     @torch.no_grad()
     def diversity_metrics(
-        self, state: Tensor, future_window: Tensor
+        self,
+        state: Tensor,
+        future_window: Tensor,
+        lengths: Tensor | None = None,
+        variant: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Per-method diversity / collapse diagnostics (eval calls this)."""
-        return self._z_diversity(self.forward(state, future_window))
+        return self._z_diversity(self.forward(state, future_window, lengths, variant))
 
 
 class DeterministicSkillEncoder(HighLevelSkillEncoder):
@@ -352,8 +535,10 @@ class GaussianSkillEncoder(HighLevelSkillEncoder):
         return z, kl, {}
 
     @torch.no_grad()
-    def diversity_metrics(self, state, future_window):
-        mean, logstd = self._raw(state, future_window).chunk(2, dim=-1)
+    def diversity_metrics(self, state, future_window, lengths=None, variant=None):
+        mean, logstd = self._raw(
+            state, future_window, lengths=lengths, variant=variant
+        ).chunk(2, dim=-1)
         logstd = logstd.clamp(self.logstd_min, self.logstd_max)
         kl_per_dim = 0.5 * (mean.pow(2) + (2 * logstd).exp() - 1.0 - 2 * logstd).mean(0)
         metrics = self._z_diversity(mean)
@@ -391,8 +576,8 @@ class _DiscreteSkillEncoder(HighLevelSkillEncoder):
         return z, reg, info
 
     @torch.no_grad()
-    def diversity_metrics(self, state, future_window):
-        raw = self._raw(state, future_window)
+    def diversity_metrics(self, state, future_window, lengths=None, variant=None):
+        raw = self._raw(state, future_window, lengths=lengths, variant=variant)
         z_e = self._pre_quantize(raw)
         z_q, code, _, _ = self._quantize(z_e, deterministic=True, step=None)
         z = self.code_to_latent(z_q).reshape(*raw.shape[:-1], self.z_dim)
@@ -444,8 +629,10 @@ class MultiCategoricalSkillEncoder(_DiscreteSkillEncoder):
         return z_q, logits.argmax(dim=-1), kl, {}
 
     @torch.no_grad()
-    def diversity_metrics(self, state, future_window):
-        logits = self._pre_quantize(self._raw(state, future_window))
+    def diversity_metrics(self, state, future_window, lengths=None, variant=None):
+        logits = self._pre_quantize(
+            self._raw(state, future_window, lengths=lengths, variant=variant)
+        )
         z_q, codes, _, _ = self._quantize(
             logits,
             deterministic=True,
@@ -584,8 +771,8 @@ class VQSkillEncoder(_DiscreteSkillEncoder):
             self.vq.revive_dead_codes(self._last_z_e)
 
     @torch.no_grad()
-    def diversity_metrics(self, state, future_window):
-        metrics = super().diversity_metrics(state, future_window)
+    def diversity_metrics(self, state, future_window, lengths=None, variant=None):
+        metrics = super().diversity_metrics(state, future_window, lengths, variant)
         # EMA cluster usage gives a global (not per-batch) dead-code estimate.
         metrics["dead_code_frac"] = (self.vq.cluster_size < 1e-3).float().mean()
         return metrics
@@ -714,6 +901,11 @@ def build_skill_encoder(
     spec: SkillLatentSpec,
     activation: str = "mish",
     layer_norm: bool = True,
+    trunk: str = "flat",
+    num_variants: int = 0,
+    sequence_width: int = 256,
+    sequence_depth: int = 2,
+    sequence_heads: int = 4,
 ) -> HighLevelSkillEncoder:
     base = {
         "state_dim": state_dim,
@@ -722,6 +914,11 @@ def build_skill_encoder(
         "hidden_dims": hidden_dims,
         "activation": activation,
         "layer_norm": layer_norm,
+        "trunk": trunk,
+        "num_variants": num_variants,
+        "sequence_width": sequence_width,
+        "sequence_depth": sequence_depth,
+        "sequence_heads": sequence_heads,
     }
     mode = spec.latent_mode
     if mode == "deterministic":

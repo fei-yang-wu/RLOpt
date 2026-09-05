@@ -162,6 +162,145 @@ def _encoder_window_steps(config: HighLevelSkillDiffSRConfig) -> int:
     return int(config.horizon_steps)
 
 
+def _variant_kind(config: HighLevelSkillDiffSRConfig) -> str | None:
+    """``'horizon'``, ``'stride'`` or None for a fixed-window encoder."""
+    if tuple(config.horizon_choices):
+        return "horizon"
+    if tuple(config.stride_choices):
+        return "stride"
+    return None
+
+
+def _variant_values(config: HighLevelSkillDiffSRConfig) -> tuple[int, ...]:
+    kind = _variant_kind(config)
+    if kind == "horizon":
+        return tuple(int(v) for v in config.horizon_choices)
+    if kind == "stride":
+        return tuple(int(v) for v in config.stride_choices)
+    return ()
+
+
+def _variant_labels(config: HighLevelSkillDiffSRConfig) -> tuple[str, ...]:
+    kind = _variant_kind(config)
+    prefix = "h" if kind == "horizon" else "s"
+    return tuple(f"{prefix}{v}" for v in _variant_values(config))
+
+
+def _visible_steps(config: HighLevelSkillDiffSRConfig, horizon: int) -> int:
+    """Window slots the encoder sees at horizon ``horizon`` (no suffix modes)."""
+    if config.encoder_window_mode == "intermediate":
+        return int(horizon) - 1
+    return int(horizon)
+
+
+def _variant_span_steps(config: HighLevelSkillDiffSRConfig, horizon: int) -> int:
+    """Frames the merged head denoises at horizon ``horizon``."""
+    span = int(horizon)
+    if str(config.jepa_ntp_chunk_span) == "boundary_next":
+        span += 1
+    return span
+
+
+def _variant_target_horizon(config: HighLevelSkillDiffSRConfig, index: int) -> int:
+    """Horizon of the head that variant ``index`` trains."""
+    if str(config.horizon_target_mode) == "fixed":
+        return int(config.horizon_fixed_target_steps or config.horizon_steps)
+    if _variant_kind(config) == "horizon":
+        return int(config.horizon_choices[int(index)])
+    return int(config.horizon_steps)
+
+
+def _variant_head_key(config: HighLevelSkillDiffSRConfig, index: int) -> str:
+    """Head that variant ``index`` trains: one per variant, or one shared."""
+    if str(config.horizon_target_mode) == "fixed":
+        return "0"
+    return str(int(index))
+
+
+def _variant_head_keys(config: HighLevelSkillDiffSRConfig) -> tuple[str, ...]:
+    if str(config.horizon_target_mode) == "fixed":
+        return ("0",)
+    return tuple(str(i) for i in range(len(_variant_values(config))))
+
+
+def _code_mask(
+    config: HighLevelSkillDiffSRConfig, index: int, *, device: torch.device
+) -> Tensor | None:
+    """Which code dims head ``index`` reads (None = all, the flat layout)."""
+    layout = str(config.horizon_code_layout)
+    if layout == "flat":
+        return None
+    z_dim = int(config.z_dim)
+    count = len(_variant_values(config))
+    mask = torch.zeros(z_dim, device=device)
+    if layout == "nested":
+        keep = (z_dim * (int(index) + 1)) // count
+        mask[:keep] = 1.0
+    else:
+        width = z_dim // count
+        mask[int(index) * width : (int(index) + 1) * width] = 1.0
+    return mask
+
+
+def _code_mask_rows(
+    config: HighLevelSkillDiffSRConfig, index: Tensor, *, device: torch.device
+) -> Tensor | None:
+    """Per-row code mask ``[B, z_dim]`` for a per-row variant ``index``; -1 = all."""
+    layout = str(config.horizon_code_layout)
+    if layout == "flat":
+        return None
+    count = len(_variant_values(config))
+    table = torch.stack(
+        [cast(Tensor, _code_mask(config, i, device=device)) for i in range(count)]
+        + [torch.ones(int(config.z_dim), device=device)]
+    )
+    index = index.to(device=device, dtype=torch.long)
+    return table[torch.where(index < 0, torch.full_like(index, count), index)]
+
+
+def _encoder_build_kwargs(config: HighLevelSkillDiffSRConfig) -> dict[str, Any]:
+    """Trunk arguments shared by the trainer and the frozen sampler."""
+    kind = _variant_kind(config)
+    if kind is None:
+        return {"trunk": "flat", "num_variants": 0}
+    count = len(_variant_values(config))
+    if kind == "horizon" and str(config.horizon_input_mode) == "full":
+        trunk = "flat" if str(config.horizon_encoder) == "padded" else "sequence"
+        num_variants = 0
+    else:
+        trunk = str(config.horizon_encoder)
+        num_variants = count
+    return {
+        "trunk": trunk,
+        "num_variants": num_variants,
+        "sequence_width": int(config.sequence_width),
+        "sequence_depth": int(config.sequence_depth),
+        "sequence_heads": int(config.sequence_heads),
+    }
+
+
+def _gather_slots(window: Tensor, start: Tensor, length: int) -> Tensor:
+    """``window[b, start[b] : start[b] + length]`` for every row ``b``."""
+    total, width = int(window.shape[1]), int(window.shape[2])
+    offsets = torch.arange(int(length), device=window.device)
+    index = start.to(device=window.device, dtype=torch.long).unsqueeze(1) + offsets
+    if bool((index >= total).any()) or bool((index < 0).any()):
+        msg = f"_gather_slots index out of range for a window of {total} slots."
+        raise ValueError(msg)
+    return torch.gather(window, 1, index.unsqueeze(-1).expand(-1, -1, width))
+
+
+def _strided_window(window: Tensor, stride: Tensor, length: int) -> Tensor:
+    """Frames ``t+s, t+2s, ..., t+length*s`` from a stride-1 window ``s[t+1..]``."""
+    total, width = int(window.shape[1]), int(window.shape[2])
+    steps = torch.arange(1, int(length) + 1, device=window.device)
+    index = stride.to(device=window.device, dtype=torch.long).unsqueeze(1) * steps - 1
+    if bool((index >= total).any()):
+        msg = f"_strided_window needs {int(index.max()) + 1} slots, window has {total}."
+        raise ValueError(msg)
+    return torch.gather(window, 1, index.unsqueeze(-1).expand(-1, -1, width))
+
+
 class _WindowReconstructionDecoder(nn.Module):
     """Decode a skill code into the exact window visible to the encoder."""
 
@@ -486,6 +625,48 @@ class HighLevelSkillDiffSRConfig:
     trajectory_split_seed: int = 0
     preflight_batch_size: int = 8
     encoder_window_mode: str = "full"
+    horizon_choices: tuple[int, ...] = ()
+    """Horizon SET for the variable-window encoder (empty = fixed horizon).
+
+    Non-empty: each pretrain row draws one horizon ``h`` uniformly from this
+    set, and ``horizon_steps`` must equal ``max(horizon_choices)``. The macro
+    batch is sampled at the maximum and sliced per row. Requires the merged
+    chunk recipe (``jepa_ntp`` + ``sigreg_ebm`` + ``diff_chunk``, context 0,
+    anchor ``executed``) and ``encoder_window_mode`` in {intermediate, full}.
+    """
+    horizon_input_mode: str = "sample"
+    """What the encoder sees under ``horizon_choices``.
+
+    ``sample``: the visible window of the drawn ``h`` (padded or as a token
+    sequence), so the code's input shrinks with the horizon.
+    ``full``: always the maximum window; the drawn ``h`` selects the target
+    only, and the code is one h-agnostic vector that the per-horizon heads read
+    through ``horizon_code_layout``.
+    """
+    horizon_encoder: str = "padded"
+    """Encoder trunk under a variant set: ``padded`` MLP (zero-masked window plus
+    a one-hot of the variant) or ``sequence`` (attention over frame tokens)."""
+    horizon_target_mode: str = "follow"
+    """``follow``: one diffusion head per horizon, each denoising the merged
+    span at that horizon (``s[t+h .. t+2h]``, boundary_next). ``fixed``: one
+    head at ``horizon_fixed_target_steps`` for every input length, so only the
+    encoder's input varies."""
+    horizon_fixed_target_steps: int = 0
+    """Target horizon of the single head under ``horizon_target_mode='fixed'``
+    (0 = ``horizon_steps``)."""
+    horizon_code_layout: str = "flat"
+    """How the per-horizon heads read the code. ``flat``: every head reads all
+    of ``z``. ``nested``: head ``i`` reads the prefix ``z[: z_dim * (i+1)/n]``
+    (Matryoshka over time). ``block``: head ``i`` reads its own disjoint
+    ``z_dim/n`` block. Both non-flat layouts require ``horizon_input_mode='full'``."""
+    stride_choices: tuple[int, ...] = ()
+    """Frame-stride SET: each row draws one stride and the ``horizon_steps``-frame
+    window is gathered at that spacing from a stride-1 macro window, so the
+    window's duration varies with a fixed frame count. Mutually exclusive with
+    ``horizon_choices``; must contain 1 (the deployable base)."""
+    sequence_width: int = 256
+    sequence_depth: int = 2
+    sequence_heads: int = 4
     source_history_steps: int = 0
     """Past frames added to phi's conditioning, on top of the current state.
 
@@ -810,6 +991,7 @@ class HighLevelSkillDiffSRConfig:
                 "untested."
             )
             raise ValueError(msg)
+        self._validate_variants()
         window_suffix = _encoder_window_suffix_steps(self.encoder_window_mode)
         if window_suffix is not None and window_suffix > self.horizon_steps - 1:
             msg = (
@@ -1105,6 +1287,131 @@ class HighLevelSkillDiffSRConfig:
             vq_dead_code_reset_iters=self.vq_dead_code_reset_iters,
         )
 
+    def _validate_variants(self) -> None:
+        self.horizon_choices = tuple(
+            _require_positive_int("horizon_choices", v) for v in self.horizon_choices
+        )
+        self.stride_choices = tuple(
+            _require_positive_int("stride_choices", v) for v in self.stride_choices
+        )
+        self.horizon_input_mode = str(self.horizon_input_mode).strip().lower()
+        self.horizon_encoder = str(self.horizon_encoder).strip().lower()
+        self.horizon_target_mode = str(self.horizon_target_mode).strip().lower()
+        self.horizon_code_layout = str(self.horizon_code_layout).strip().lower()
+        self.horizon_fixed_target_steps = _require_non_negative_int(
+            "horizon_fixed_target_steps", self.horizon_fixed_target_steps
+        )
+        for name, value in (
+            ("sequence_width", self.sequence_width),
+            ("sequence_depth", self.sequence_depth),
+            ("sequence_heads", self.sequence_heads),
+        ):
+            _require_positive_int(name, value)
+        if self.horizon_input_mode not in {"sample", "full"}:
+            msg = f"horizon_input_mode must be 'sample' or 'full', got {self.horizon_input_mode!r}."
+            raise ValueError(msg)
+        if self.horizon_encoder not in {"padded", "sequence"}:
+            msg = f"horizon_encoder must be 'padded' or 'sequence', got {self.horizon_encoder!r}."
+            raise ValueError(msg)
+        if self.horizon_target_mode not in {"follow", "fixed"}:
+            msg = f"horizon_target_mode must be 'follow' or 'fixed', got {self.horizon_target_mode!r}."
+            raise ValueError(msg)
+        if self.horizon_code_layout not in {"flat", "nested", "block"}:
+            msg = (
+                "horizon_code_layout must be 'flat', 'nested' or 'block', got "
+                f"{self.horizon_code_layout!r}."
+            )
+            raise ValueError(msg)
+        if self.horizon_choices and self.stride_choices:
+            msg = "horizon_choices and stride_choices are mutually exclusive."
+            raise ValueError(msg)
+        kind = _variant_kind(self)
+        if kind is None:
+            return
+        values = _variant_values(self)
+        if tuple(sorted(set(values))) != values:
+            msg = f"{kind}_choices must be unique and strictly increasing, got {values!r}."
+            raise ValueError(msg)
+        if (
+            self.transition_objective != "jepa_ntp"
+            or self.jepa_loss != "sigreg_ebm"
+            or str(self.jepa_ntp_head) != "diff_chunk"
+            or int(self.jepa_context_chunks) != 0
+            or str(self.jepa_ntp_chunk_anchor) != "executed"
+        ):
+            msg = (
+                f"{kind}_choices needs the merged chunk recipe: "
+                "transition_objective='jepa_ntp', jepa_loss='sigreg_ebm', "
+                "jepa_ntp_head='diff_chunk', jepa_context_chunks=0, "
+                "jepa_ntp_chunk_anchor='executed'."
+            )
+            raise ValueError(msg)
+        if self.encoder_window_mode not in {"intermediate", "full"}:
+            msg = (
+                f"{kind}_choices supports encoder_window_mode 'intermediate' or "
+                f"'full', got {self.encoder_window_mode!r}."
+            )
+            raise ValueError(msg)
+        count = len(values)
+        if kind == "horizon":
+            if values[-1] != self.horizon_steps:
+                msg = (
+                    "horizon_steps must equal max(horizon_choices): "
+                    f"{self.horizon_steps} != {values[-1]}."
+                )
+                raise ValueError(msg)
+            if self.encoder_window_mode == "intermediate" and values[0] < 2:
+                msg = "horizon_choices need h >= 2 under encoder_window_mode='intermediate'."
+                raise ValueError(msg)
+            if self.horizon_target_mode == "fixed":
+                fixed = int(self.horizon_fixed_target_steps or self.horizon_steps)
+                if fixed < 2 or fixed > self.horizon_steps:
+                    msg = (
+                        "horizon_fixed_target_steps must lie in [2, horizon_steps], "
+                        f"got {fixed}."
+                    )
+                    raise ValueError(msg)
+                if self.horizon_code_layout != "flat":
+                    msg = "horizon_target_mode='fixed' has one head; it needs horizon_code_layout='flat'."
+                    raise ValueError(msg)
+        else:
+            if 1 not in values:
+                msg = f"stride_choices must contain 1 (the deployable base), got {values!r}."
+                raise ValueError(msg)
+            if int(self.macro_frame_stride) != 1:
+                msg = "stride_choices require macro_frame_stride=1; the stride is applied in RLOpt."
+                raise ValueError(msg)
+            if (
+                self.horizon_input_mode != "sample"
+                or self.horizon_code_layout != "flat"
+            ):
+                msg = (
+                    "stride_choices support horizon_input_mode='sample' and "
+                    "horizon_code_layout='flat' only."
+                )
+                raise ValueError(msg)
+        if self.horizon_code_layout != "flat":
+            if self.horizon_input_mode != "full":
+                msg = (
+                    f"horizon_code_layout={self.horizon_code_layout!r} requires "
+                    "horizon_input_mode='full': one code, read at several scales."
+                )
+                raise ValueError(msg)
+            if self.horizon_code_layout == "block" and int(self.z_dim) % count != 0:
+                msg = (
+                    f"block layout needs z_dim divisible by {count}, got {self.z_dim}."
+                )
+                raise ValueError(msg)
+            if self.horizon_code_layout == "nested" and int(self.z_dim) < count:
+                msg = f"nested layout needs z_dim >= {count}, got {self.z_dim}."
+                raise ValueError(msg)
+        if self.source_history_steps > 0 and str(self.source_anchor) != "current":
+            msg = f"{kind}_choices require source_anchor='current'."
+            raise ValueError(msg)
+        if self.horizon_code_layout != "flat" and self.latent_mode != "deterministic":
+            msg = "nested/block code layouts are implemented for latent_mode='deterministic'."
+            raise ValueError(msg)
+
     def to_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], _jsonable(asdict(self)))
 
@@ -1121,6 +1428,8 @@ class HighLevelSkillDiffSRConfig:
             "sonic_fsq_levels",
             "commander_hidden_dims",
             "transition_offsets",
+            "horizon_choices",
+            "stride_choices",
         }
         for key in tuple_fields:
             if key in kwargs:
@@ -1138,6 +1447,14 @@ class FrozenHighLevelSkillCommandSampler:
     renewed command so PPO minibatches can recompute skill commands with gradient
     flow into the skill encoder.
     """
+
+    # Subclasses that bypass this constructor (the skill-commander samplers)
+    # deploy a fixed window: no variant set, no live policy.
+    variant_kind: str | None = None
+    variant_values: tuple[int, ...] = ()
+    _live_variant: Tensor | None = None
+    _live_policy: str = "base"
+    _live_fixed_index: int = -1
 
     def __init__(
         self,
@@ -1166,8 +1483,10 @@ class FrozenHighLevelSkillCommandSampler:
         offline_batch_size: int = 8192,
         update_interval: int = 1,
         train_diffsr: bool = False,
+        live_horizon: str = "base",
     ) -> None:
         self.latent_dim = _require_positive_int("latent_dim", latent_dim)
+        self.live_horizon = str(live_horizon).strip().lower() or "base"
         self.latent_steps_min = max(1, int(latent_steps_min))
         self.latent_steps_max = max(self.latent_steps_min, int(latent_steps_max))
         self.finetune_enabled = bool(finetune_enabled)
@@ -1248,6 +1567,23 @@ class FrozenHighLevelSkillCommandSampler:
                 "Live skill commands require source_anchor='current'; "
                 "a past_start checkpoint needs a delayed heading anchor."
             )
+        self.variant_kind = _variant_kind(self.config)
+        self.variant_values = _variant_values(self.config)
+        self._live_variant: Tensor | None = None
+        self._live_policy, self._live_fixed_index = self._resolve_live_policy()
+        if self.variant_kind is not None:
+            if self.finetune_enabled:
+                msg = (
+                    "Online finetuning is not implemented for a variable-window "
+                    "(horizon_choices / stride_choices) encoder."
+                )
+                raise ValueError(msg)
+            if self.command_mode != "z":
+                msg = (
+                    "A variable-window encoder deploys command_mode='z' only; the "
+                    "phi command would need per-horizon heads at the boundary."
+                )
+                raise ValueError(msg)
         if self.finetune_enabled and self.config.source_history_steps > 0:
             raise ValueError(
                 "Online finetuning with source_history_steps > 0 is not supported."
@@ -1298,9 +1634,12 @@ class FrozenHighLevelSkillCommandSampler:
 
         state_dict = checkpoint["skill_encoder_state_dict"]
         self.encoder_window_steps = _encoder_window_steps(self.config)
+        encoder_kwargs = _encoder_build_kwargs(self.config)
         self.state_dim = self._state_dim_from_encoder_state(
             state_dict,
             window_steps=self.encoder_window_steps,
+            trunk=str(encoder_kwargs["trunk"]),
+            num_variants=int(encoder_kwargs["num_variants"]),
         )
         self.skill_encoder = build_skill_encoder(
             state_dim=self.state_dim,
@@ -1310,6 +1649,7 @@ class FrozenHighLevelSkillCommandSampler:
             spec=self.config.latent_spec(),
             activation=self.config.encoder_activation,
             layer_norm=self.config.encoder_layer_norm,
+            **encoder_kwargs,
         ).to(self.device)
         self.skill_encoder.load_state_dict(state_dict)
 
@@ -1321,6 +1661,7 @@ class FrozenHighLevelSkillCommandSampler:
             spec=self.config.latent_spec(),
             activation=self.config.encoder_activation,
             layer_norm=self.config.encoder_layer_norm,
+            **encoder_kwargs,
         ).to(self.device)
         self.initial_skill_encoder.load_state_dict(state_dict)
         self.initial_skill_encoder.eval()
@@ -1430,14 +1771,22 @@ class FrozenHighLevelSkillCommandSampler:
         state_dict: Mapping[str, Tensor],
         *,
         window_steps: int,
+        trunk: str = "flat",
+        num_variants: int = 0,
     ) -> int:
+        if str(trunk) == "sequence":
+            token_weight = state_dict.get("net.token.weight")
+            if token_weight is None or token_weight.ndim != 2:
+                msg = "Checkpoint sequence encoder is missing net.token.weight."
+                raise ValueError(msg)
+            return int(token_weight.shape[1])
         first_weight = state_dict.get("net.0.weight")
         if first_weight is None or first_weight.ndim != 2:
             msg = (
                 "Checkpoint skill encoder is missing first linear weight net.0.weight."
             )
             raise ValueError(msg)
-        input_dim = int(first_weight.shape[1])
+        input_dim = int(first_weight.shape[1]) - int(num_variants)
         divisor = int(window_steps) + 1
         if input_dim % divisor != 0:
             msg = (
@@ -1600,6 +1949,103 @@ class FrozenHighLevelSkillCommandSampler:
         return torch.cat((code_latents, phase_features), dim=-1)
 
     @torch.no_grad()
+    def _resolve_live_policy(self) -> tuple[str, int]:
+        """Parse ``live_horizon`` against the checkpoint's variant set.
+
+        ``base``: the deployable base (max horizon; stride 1); for the block
+        code layout, every block. An integer: that member of the set, held for
+        the whole run. ``episode``: one member per environment, redrawn at
+        reset. ``step``: redrawn at every code renewal.
+        Returns ``(policy, fixed_index)`` where ``fixed_index`` is -1 unless the
+        policy is a fixed member.
+        """
+        policy = self.live_horizon
+        if self.variant_kind is None:
+            if policy != "base":
+                msg = (
+                    f"live_horizon={policy!r} needs a variable-window encoder; "
+                    "this checkpoint has a fixed window."
+                )
+                raise ValueError(msg)
+            return "base", -1
+        if policy in {"base", "episode", "step"}:
+            return policy, -1
+        try:
+            value = int(policy)
+        except ValueError as error:
+            msg = (
+                "live_horizon must be 'base', 'episode', 'step' or a member of "
+                f"the checkpoint's {self.variant_kind} set {self.variant_values!r}, "
+                f"got {policy!r}."
+            )
+            raise ValueError(msg) from error
+        if value not in self.variant_values:
+            msg = (
+                f"live_horizon={value} is not in the checkpoint's "
+                f"{self.variant_kind} set {self.variant_values!r}."
+            )
+            raise ValueError(msg)
+        return "fixed", int(self.variant_values.index(value))
+
+    def _base_variant_index(self) -> int:
+        """Index of the deployable base member (-1 = all blocks, block layout)."""
+        if self.variant_kind == "horizon":
+            if str(self.config.horizon_code_layout) == "block":
+                return -1
+            return int(self.variant_values.index(int(self.config.horizon_steps)))
+        return int(self.variant_values.index(1))
+
+    def _draw_live_variant(self, count: int, *, device: torch.device) -> Tensor:
+        """Fresh variant indices for ``count`` environments under the live policy."""
+        if self._live_policy == "fixed":
+            return torch.full(
+                (count,), self._live_fixed_index, device=device, dtype=torch.long
+            )
+        if self._live_policy == "base":
+            return torch.full(
+                (count,), self._base_variant_index(), device=device, dtype=torch.long
+            )
+        return torch.randint(len(self.variant_values), (count,), device=device)
+
+    def _ensure_live_variant(self, batch_size: int, *, device: torch.device) -> Tensor:
+        if (
+            self._live_variant is None
+            or int(self._live_variant.numel()) != int(batch_size)
+            or self._live_variant.device != device
+        ):
+            self._live_variant = self._draw_live_variant(int(batch_size), device=device)
+        return self._live_variant
+
+    def _live_encoder_inputs(
+        self, future_window: Tensor, variant: Tensor
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
+        """(window, lengths, encoder variant, code mask) for the live rows."""
+        window_steps = int(self.encoder_window_steps)
+        values = torch.tensor(
+            self.variant_values, device=future_window.device, dtype=torch.long
+        )
+        index = variant.to(device=future_window.device, dtype=torch.long)
+        safe = torch.where(
+            index < 0, torch.full_like(index, len(self.variant_values) - 1), index
+        )
+        if self.variant_kind == "stride":
+            window = _strided_window(future_window, values[safe], window_steps)
+        else:
+            window = future_window[:, :window_steps]
+        enc_variant: Tensor | None = (
+            safe if int(self.skill_encoder.num_variants) > 0 else None
+        )
+        lengths: Tensor | None = None
+        if (
+            self.variant_kind == "horizon"
+            and str(self.config.horizon_input_mode) == "sample"
+        ):
+            lengths = values[safe] - (
+                1 if self.config.encoder_window_mode == "intermediate" else 0
+            )
+        mask = _code_mask_rows(self.config, index, device=future_window.device)
+        return window, lengths, enc_variant, mask
+
     def _encode_current_macro_batch(
         self,
         env_ids: Tensor,
@@ -1609,8 +2055,13 @@ class FrozenHighLevelSkillCommandSampler:
         history_steps = (
             int(self.config.source_history_steps) if self.command_mode != "z" else 0
         )
+        request_horizon = int(self.config.horizon_steps)
+        if self.variant_kind == "stride":
+            request_horizon = int(self.config.horizon_steps) * int(
+                self.variant_values[-1]
+            )
         batch = self._current_macro_sampler(
-            horizon_steps=int(self.config.horizon_steps),
+            horizon_steps=request_horizon,
             env_ids=env_ids,
             **({"state_history_steps": history_steps} if history_steps else {}),
         )
@@ -1618,11 +2069,24 @@ class FrozenHighLevelSkillCommandSampler:
         state, future_window, target = _validate_macro_batch(
             batch,
             batch_size=batch_size,
-            horizon_steps=int(self.config.horizon_steps),
+            horizon_steps=request_horizon,
             device=self.device,
             state_dim=self.state_dim,
             source="Current expert",
         )
+        if self.variant_kind is not None:
+            assert self._live_variant is not None
+            variant = self._live_variant.to(self.device)[env_ids.to(self.device)]
+            window, lengths, enc_variant, mask = self._live_encoder_inputs(
+                future_window, variant
+            )
+            z = self.skill_encoder(state, window, lengths, enc_variant)
+            initial_z = self.initial_skill_encoder(state, window, lengths, enc_variant)
+            if mask is not None:
+                z = z * mask
+                initial_z = initial_z * mask
+            self._current_command_source = state
+            return z, state, future_window, target, initial_z
         z = self.skill_encoder(state, _encoder_input_window(self.config, future_window))
         initial_z = self.initial_skill_encoder(
             state,
@@ -2178,6 +2642,19 @@ class FrozenHighLevelSkillCommandSampler:
             env_ids = (
                 torch.nonzero(renew_mask, as_tuple=False).reshape(-1) if renew else None
             )
+        if self.variant_kind is not None:
+            # The live window-length policy. Tensor ops only, so the hold-1
+            # fast path keeps its no-host-sync property.
+            live = self._ensure_live_variant(batch_size, device=device)
+            if self._live_policy == "episode":
+                done_mask = self._done_mask(td, batch_size=batch_size, device=device)
+                self._live_variant = torch.where(
+                    done_mask, self._draw_live_variant(batch_size, device=device), live
+                )
+            elif self._live_policy == "step" and renew:
+                assert env_ids is not None
+                fresh = self._draw_live_variant(int(env_ids.numel()), device=device)
+                self._live_variant = live.index_copy(0, env_ids, fresh)
         if renew:
             z, state, future_window, target, initial_z = (
                 self._encode_current_macro_batch(env_ids.to(self.device))
@@ -2268,6 +2745,11 @@ class HighLevelSkillDiffSRTrainer:
         self.state_dim = int(state.shape[-1])
         self.encoder_window_steps = _encoder_window_steps(self.config)
         self.feature_slices = self._resolve_feature_slices()
+        # Variable-window encoder: the horizon (or stride) SET, drawn per row.
+        self.variant_kind = _variant_kind(self.config)
+        self.variant_values = _variant_values(self.config)
+        self.variant_labels = _variant_labels(self.config)
+        self.jepa_ntp_heads: nn.ModuleDict | None = None
 
         self.skill_encoder = build_skill_encoder(
             state_dim=self.state_dim,
@@ -2277,6 +2759,7 @@ class HighLevelSkillDiffSRTrainer:
             spec=self.config.latent_spec(),
             activation=self.config.encoder_activation,
             layer_norm=self.config.encoder_layer_norm,
+            **_encoder_build_kwargs(self.config),
         ).to(self.device)
         self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
             self.device
@@ -2371,7 +2854,25 @@ class HighLevelSkillDiffSRTrainer:
             self.jepa_f = nn.Sequential(
                 nn.Linear(z_dim, 512), nn.SiLU(), nn.Linear(512, energy_dim)
             ).to(self.device)
-            if str(self.config.jepa_ntp_head) != "mlp":
+            if self.variant_kind is not None:
+                # One merged head per target horizon (or one shared head under
+                # horizon_target_mode='fixed'); each denoises its own span.
+                self.jepa_ntp_heads = nn.ModuleDict(
+                    {
+                        key: _build_diffsr(
+                            self.config,
+                            self.state_dim,
+                            self.device,
+                            next_obs_dim=_variant_span_steps(
+                                self.config,
+                                _variant_target_horizon(self.config, int(key)),
+                            )
+                            * self.state_dim,
+                        )
+                        for key in _variant_head_keys(self.config)
+                    }
+                ).to(self.device)
+            elif str(self.config.jepa_ntp_head) != "mlp":
                 # Generative next-chunk head: a second DiffSR whose denoising
                 # target is the next TOKEN (diff_token, z_dim wide) or the
                 # next chunk's H raw frames (diff_chunk, H*state_dim wide).
@@ -2392,6 +2893,11 @@ class HighLevelSkillDiffSRTrainer:
                             if self.jepa_ntp_diffsr is not None
                             else []
                         ),
+                        *(
+                            self.jepa_ntp_heads.parameters()
+                            if self.jepa_ntp_heads is not None
+                            else []
+                        ),
                     ],
                     "lr": self.config.encoder_lr,
                 }
@@ -2406,6 +2912,23 @@ class HighLevelSkillDiffSRTrainer:
         if self.config.cotrain_commander:
             self._init_commander()
 
+    def _base_variant(self, batch_size: int) -> tuple[Tensor | None, Tensor | None]:
+        """(lengths, variant) of the deployable base under a variant set.
+
+        Horizon set: the maximum horizon (the full window). Stride set: stride 1.
+        Returns ``(None, None)`` for a fixed-window encoder or a variant-free trunk.
+        """
+        if self.variant_kind is None or int(self.skill_encoder.num_variants) == 0:
+            return None, None
+        base_value = (
+            int(self.config.horizon_steps) if self.variant_kind == "horizon" else 1
+        )
+        index = self.variant_values.index(base_value)
+        variant = torch.full(
+            (int(batch_size),), index, device=self.device, dtype=torch.long
+        )
+        return None, variant
+
     def _encode_skill(
         self,
         state: Tensor,
@@ -2414,11 +2937,14 @@ class HighLevelSkillDiffSRTrainer:
         deterministic: bool = False,
         step: int | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        lengths, variant = self._base_variant(int(state.shape[0]))
         return self.skill_encoder.encode(
             state,
             _encoder_input_window(self.config, future_window),
             deterministic=deterministic,
             step=step,
+            lengths=lengths,
+            variant=variant,
         )
 
     def _reconstruction_target(
@@ -3156,6 +3682,327 @@ class HighLevelSkillDiffSRTrainer:
         )
         return state, window, state_history.reshape(batch_size, -1)
 
+    def _variant_batch(
+        self,
+        *,
+        batch_size: int,
+        split: str | None,
+        variant: Tensor | None,
+    ) -> dict[str, Any]:
+        """One variable-window batch, sliced per row by its drawn variant.
+
+        Returns the encoder inputs of the executed chunk, the per-row horizon,
+        the row's boundary state ``s[t+h]`` (the endpoint), and the 2H-frame
+        window (already at the row's stride) that the heads slice their targets
+        from. ``variant=None`` draws uniformly.
+        """
+        from rlopt.env_interface import require_imitation_interface
+
+        sampler = require_imitation_interface(
+            self.env,
+            "sample_expert_macro_transition_batch",
+            purpose="Offline skill-encoder training requires it but",
+        )
+        horizon = int(self.config.horizon_steps)
+        count = len(self.variant_values)
+        values = torch.tensor(self.variant_values, device=self.device, dtype=torch.long)
+        if self.variant_kind == "stride":
+            chunk_steps = 2 * horizon * int(self.variant_values[-1])
+        else:
+            chunk_steps = 2 * horizon
+        state, window, source = self._sample_jepa_window(
+            sampler, batch_size=batch_size, chunk_steps=chunk_steps, split=split
+        )
+        if variant is None:
+            variant = torch.randint(count, (int(batch_size),), device=self.device)
+        variant = variant.to(device=self.device, dtype=torch.long)
+        if self.variant_kind == "stride":
+            window = _strided_window(window, values[variant], 2 * horizon)
+            h_row = torch.full_like(variant, horizon)
+        else:
+            h_row = values[variant]
+        window_steps = int(self.encoder_window_steps)
+        enc_window = window[:, :window_steps]
+        enc_variant: Tensor | None = variant
+        lengths: Tensor | None = None
+        if int(self.skill_encoder.num_variants) == 0:
+            enc_variant = None
+        if (
+            self.variant_kind == "horizon"
+            and str(self.config.horizon_input_mode) == "sample"
+        ):
+            lengths = h_row - (
+                1 if self.config.encoder_window_mode == "intermediate" else 0
+            )
+        # The executed chunk's boundary s[t+h] in the executed chunk's frame:
+        # the endpoint target, and the anchor of the next chunk's token.
+        endpoint = _gather_slots(window, h_row - 1, 1)[:, 0]
+        target_window = _reanchor_heading_frames(
+            _gather_slots(window, h_row, window_steps), endpoint
+        )
+        return {
+            "state": state,
+            "source": source,
+            "window": window,
+            "variant": variant,
+            "h_row": h_row,
+            "enc_window": enc_window,
+            "enc_variant": enc_variant,
+            "lengths": lengths,
+            "endpoint": endpoint,
+            "target_state": _reanchor_heading_frames(endpoint, endpoint),
+            "target_window": target_window,
+        }
+
+    def _variant_ntp_terms(
+        self,
+        batch: dict[str, Any],
+        z1: Tensor,
+        *,
+        update_norm: bool,
+    ) -> tuple[Tensor, dict[int, Tensor]]:
+        """Batch-mean merged-head loss over the per-variant heads.
+
+        Rows are grouped by the head they train; each group's loss is the
+        head's own row mean, weighted by the group's share of the batch, so the
+        sum equals the mean over all rows.
+        """
+        assert self.jepa_ntp_heads is not None
+        window: Tensor = batch["window"]
+        variant: Tensor = batch["variant"]
+        source: Tensor = batch["source"]
+        batch_size = int(z1.shape[0])
+        total = z1.new_zeros(())
+        per_variant: dict[int, Tensor] = {}
+        for index in range(len(self.variant_values)):
+            rows = torch.nonzero(variant == index, as_tuple=False).reshape(-1)
+            if int(rows.numel()) == 0:
+                continue
+            target_horizon = _variant_target_horizon(self.config, index)
+            span = _variant_span_steps(self.config, target_horizon)
+            start = (
+                target_horizon - 1
+                if str(self.config.jepa_ntp_chunk_span) == "boundary_next"
+                else target_horizon
+            )
+            target = window[rows, start : start + span].reshape(int(rows.numel()), -1)
+            target = target.detach()
+            head = self.jepa_ntp_heads[_variant_head_key(self.config, index)]
+            if update_norm:
+                head.update_obs_norm(target)
+            z_rows = z1[rows]
+            mask = _code_mask(self.config, index, device=z1.device)
+            if mask is not None:
+                z_rows = z_rows * mask
+            zero_reward = torch.zeros(int(rows.numel()), 1, device=self.device)
+            _, loss, _ = head.compute_loss(source[rows], z_rows, target, zero_reward)
+            per_variant[index] = loss.detach()
+            total = total + loss * (float(rows.numel()) / float(batch_size))
+        return total, per_variant
+
+    def _jepa_variant_train_step(self) -> dict[str, float]:
+        """``_jepa_train_step`` for a horizon or stride SET drawn per row."""
+        assert self.jepa_predictor is not None
+        assert self.jepa_ntp_heads is not None
+        ema_mode = str(self.config.jepa_target_encoder_mode) == "ema"
+        self.skill_encoder.train()
+        batch = self._variant_batch(
+            batch_size=int(self.config.batch_size),
+            split=self.config.train_split,
+            variant=None,
+        )
+        source: Tensor = batch["source"]
+        z1, reg_loss, info = self.skill_encoder.encode(
+            batch["state"],
+            batch["enc_window"],
+            step=self.update,
+            lengths=batch["lengths"],
+            variant=batch["enc_variant"],
+        )
+        target_kwargs = {
+            "deterministic": True,
+            "lengths": batch["lengths"],
+            "variant": batch["enc_variant"],
+        }
+        if ema_mode:
+            assert self.jepa_target_encoder is not None
+            with torch.no_grad():
+                self.jepa_target_encoder.eval()
+                z2, _, _ = self.jepa_target_encoder.encode(
+                    batch["target_state"], batch["target_window"], **target_kwargs
+                )
+        elif str(self.config.jepa_target_encoder_mode) == "stopgrad":
+            with torch.no_grad():
+                z2, _, _ = self.skill_encoder.encode(
+                    batch["target_state"], batch["target_window"], **target_kwargs
+                )
+        else:
+            z2, _, _ = self.skill_encoder.encode(
+                batch["target_state"],
+                batch["target_window"],
+                step=self.update,
+                lengths=batch["lengths"],
+                variant=batch["enc_variant"],
+            )
+        prediction = self.jepa_predictor(z1)
+        with torch.no_grad():
+            copy_mse = F.mse_loss(z1.detach(), z2.detach())
+            pred_mse = F.mse_loss(prediction.detach(), z2.detach())
+        endpoint: Tensor = batch["endpoint"]
+        self.diffsr.update_obs_norm(endpoint.detach())
+        diffsr_loss = self._diffsr_loss_for_z(source, z1, endpoint)
+        ntp, per_variant = self._variant_ntp_terms(batch, z1, update_norm=True)
+        sigreg = _sigreg_epps_pulley(
+            z1, num_sketches=int(self.config.jepa_sigreg_sketches)
+        )
+        objective = (
+            float(self.config.jepa_endpoint_coeff) * diffsr_loss
+            + float(self.config.jepa_ntp_coeff) * ntp
+        )
+        if float(self.config.jepa_token_pred_coeff) > 0:
+            objective = objective + float(
+                self.config.jepa_token_pred_coeff
+            ) * F.mse_loss(prediction, z2)
+        loss = (
+            objective
+            + float(self.config.jepa_sigreg_coeff) * sigreg
+            + self.config.reg_coeff * reg_loss
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        metrics = self._z_diagnostics(z1.detach(), prefix="train")
+        if self.config.grad_clip_norm is not None:
+            params = [
+                *self.skill_encoder.parameters(),
+                *self.jepa_predictor.parameters(),
+                *self.jepa_g.parameters(),  # type: ignore[union-attr]
+                *self.jepa_f.parameters(),  # type: ignore[union-attr]
+                *self.diffsr.parameters(),
+                *self.jepa_ntp_heads.parameters(),
+            ]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params, max_norm=float(self.config.grad_clip_norm)
+            )
+            metrics["train/grad_norm"] = float(grad_norm.item())
+        self.optimizer.step()
+        if ema_mode:
+            momentum = float(self.config.jepa_ema_momentum)
+            with torch.no_grad():
+                for target, online in zip(
+                    self.jepa_target_encoder.parameters(),  # type: ignore[union-attr]
+                    self.skill_encoder.parameters(),
+                    strict=True,
+                ):
+                    target.mul_(momentum).add_(online, alpha=1.0 - momentum)
+        self.skill_encoder.on_after_train_step(self.update)
+        self.update += 1
+        with torch.no_grad():
+            logits = -torch.cdist(prediction, z2)
+            labels = torch.arange(logits.shape[0], device=logits.device)
+            accuracy = (logits.argmax(dim=1) == labels).float().mean()
+        metrics.update(
+            {
+                "train/loss": float(loss.detach().item()),
+                "train/jepa_objective": float(objective.detach().item()),
+                "train/jepa_sigreg": float(sigreg.detach().item()),
+                "train/jepa_ntp_accuracy": float(accuracy.item()),
+                "train/jepa_copy_mse": float(copy_mse.item()),
+                "train/jepa_pred_mse": float(pred_mse.item()),
+                "train/jepa_pred_over_copy": float(
+                    (pred_mse / copy_mse.clamp_min(1.0e-12)).item()
+                ),
+                "train/jepa_endpoint_loss": float(diffsr_loss.detach().item()),
+                "train/jepa_ntp_loss": float(ntp.detach().item()),
+                "train/reg_loss": float(reg_loss.detach().item()),
+            }
+        )
+        for index, value in per_variant.items():
+            metrics[f"train/jepa_ntp_loss/{self.variant_labels[index]}"] = float(
+                value.item()
+            )
+        for key, value in info.items():
+            metrics[f"train/{key}"] = float(value.item())
+        if self.device.type == "cuda":
+            # The affine phi materializes [rows, embed, feature] per head, so
+            # the peak is the number to read before choosing a GPU.
+            metrics["train/gpu_max_allocated_gb"] = float(
+                torch.cuda.max_memory_allocated(self.device) / 1.0e9
+            )
+        return metrics
+
+    def _jepa_variant_eval_term_metrics(
+        self, *, batch_size: int, split: str | None, prefix: str
+    ) -> dict[str, float]:
+        """``_jepa_eval_term_metrics`` per variant, plus their mean.
+
+        Every variant is scored on its own batch with all rows at that variant,
+        so the per-variant keys are one-window-length reads and the unlabeled
+        keys are the mean over the set.
+        """
+        assert self.jepa_ntp_heads is not None
+        was_training = self.skill_encoder.training
+        self.skill_encoder.eval()
+        per_key: dict[str, list[float]] = {}
+        out: dict[str, float] = {}
+        with torch.no_grad():
+            for index, label in enumerate(self.variant_labels):
+                variant = torch.full(
+                    (int(batch_size),), index, device=self.device, dtype=torch.long
+                )
+                batch = self._variant_batch(
+                    batch_size=int(batch_size), split=split, variant=variant
+                )
+                z1, *_ = self.skill_encoder.encode(
+                    batch["state"],
+                    batch["enc_window"],
+                    deterministic=True,
+                    lengths=batch["lengths"],
+                    variant=batch["enc_variant"],
+                )
+                if int(z1.shape[0]) > 1:
+                    z_shuffled = z1[torch.randperm(z1.shape[0], device=z1.device)]
+                else:
+                    z_shuffled = z1.clone()
+                source: Tensor = batch["source"]
+                endpoint: Tensor = batch["endpoint"]
+                endpoint_loss = self._diffsr_loss_for_z(source, z1, endpoint)
+                endpoint_shuffled = self._diffsr_loss_for_z(
+                    source, z_shuffled, endpoint
+                )
+                ntp_loss, _ = self._variant_ntp_terms(batch, z1, update_norm=False)
+                ntp_shuffled, _ = self._variant_ntp_terms(
+                    batch, z_shuffled, update_norm=False
+                )
+                rank = _effective_rank(z1)
+
+                def _explained(real: Tensor, shuffled: Tensor) -> float:
+                    control = float(shuffled.item())
+                    if abs(control) < 1e-12:
+                        return 0.0
+                    return 1.0 - float(real.item()) / control
+
+                values = {
+                    "jepa_endpoint_loss_eval": float(endpoint_loss.item()),
+                    "jepa_endpoint_loss_shuffled_eval": float(endpoint_shuffled.item()),
+                    "jepa_endpoint_z_explained": _explained(
+                        endpoint_loss, endpoint_shuffled
+                    ),
+                    "jepa_ntp_loss_eval": float(ntp_loss.item()),
+                    "jepa_ntp_loss_shuffled_eval": float(ntp_shuffled.item()),
+                    "jepa_ntp_z_explained": _explained(ntp_loss, ntp_shuffled),
+                    "z_effective_rank": float(rank.item()),
+                }
+                for key, value in values.items():
+                    out[f"{prefix}/{key}/{label}"] = value
+                    per_key.setdefault(key, []).append(value)
+        for key, items in per_key.items():
+            if key == "z_effective_rank":
+                continue
+            out[f"{prefix}/{key}"] = float(sum(items) / len(items))
+        if was_training:
+            self.skill_encoder.train()
+        return out
+
     def _jepa_train_step(self) -> dict[str, float]:
         assert self.jepa_predictor is not None
         assert self.jepa_g is not None and self.jepa_f is not None
@@ -3428,6 +4275,8 @@ class HighLevelSkillDiffSRTrainer:
 
     def train_step(self) -> dict[str, float]:
         if self.config.transition_objective == "jepa_ntp":
+            if self.variant_kind is not None:
+                return self._jepa_variant_train_step()
             return self._jepa_train_step()
         if self.config.transition_objective == "reconstruction":
             return self._reconstruction_train_step()
@@ -3558,6 +4407,10 @@ class HighLevelSkillDiffSRTrainer:
             or int(self.config.jepa_context_chunks) != 0
         ):
             return {}
+        if self.variant_kind is not None:
+            return self._jepa_variant_eval_term_metrics(
+                batch_size=batch_size, split=split, prefix=prefix
+            )
         horizon = int(self.config.horizon_steps)
         from rlopt.env_interface import require_imitation_interface
 
@@ -3761,8 +4614,12 @@ class HighLevelSkillDiffSRTrainer:
                 )
             )
             # Per-method diversity / collapse diagnostics.
+            base_lengths, base_variant = self._base_variant(int(state.shape[0]))
             diversity = self.skill_encoder.diversity_metrics(
-                state, _encoder_input_window(self.config, future_window)
+                state,
+                _encoder_input_window(self.config, future_window),
+                base_lengths,
+                base_variant,
             )
             batch_metrics.update(
                 {
@@ -3880,6 +4737,10 @@ class HighLevelSkillDiffSRTrainer:
                 jepa_state["target_encoder"] = self.jepa_target_encoder.state_dict()
             if self.jepa_ntp_diffsr is not None:
                 jepa_state["ntp_diffsr"] = self.jepa_ntp_diffsr.state_dict()
+            if self.jepa_ntp_heads is not None:
+                jepa_state["ntp_diffsr_heads"] = {
+                    key: head.state_dict() for key, head in self.jepa_ntp_heads.items()
+                }
             checkpoint["jepa_state_dict"] = jepa_state
         if self.reconstruction_decoder is not None:
             checkpoint["reconstruction_decoder_state_dict"] = (
