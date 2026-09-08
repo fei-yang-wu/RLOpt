@@ -25,6 +25,7 @@ from rlopt.agent.imitation.latent_learning import (
     build_latent_learner,
     held_command_policy_surrogate,
 )
+from rlopt.agent.ipmd.dagger_config import DAggerConfig
 from rlopt.agent.ipmd.utils import (
     IPMD_COMMAND_SOURCES,
     IPMD_REWARD_INPUT_TYPES,
@@ -1046,6 +1047,9 @@ class IPMDConfig(PPOConfig):
 @dataclass
 class IPMDRLOptConfig(PPORLOptConfig):
     """IPMD configuration extending PPORLOptConfig (PPO-based)."""
+
+    dagger: DAggerConfig = field(default_factory=DAggerConfig)
+    """Optional frozen-teacher warm start; ordinary IPMD ignores disabled settings."""
 
     ipmd: IPMDConfig = field(default_factory=IPMDConfig)
     """IPMD configuration."""
