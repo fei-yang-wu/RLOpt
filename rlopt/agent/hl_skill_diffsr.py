@@ -325,6 +325,7 @@ def _build_diffsr(
         g_hidden_dims=config.diffsr_g_hidden_dims,
         f_hidden_dims=config.diffsr_f_hidden_dims,
         phi_parameterization=config.diffsr_phi_parameterization,
+        mu_conditioning=config.diffsr_mu_conditioning,
         mu_hidden_dims=config.diffsr_mu_hidden_dims,
         num_noises=config.diffsr_num_noises,
         use_ema_for_policy=False,
@@ -474,7 +475,16 @@ class HighLevelSkillDiffSRConfig:
     `BilinearSR.forward_phi`; this field is what lets the pretrain entrypoint
     select between them, and its default matches `BilinearSR`'s so omitting it
     changes nothing. The value is stored in the checkpoint config, so a loaded
-    encoder rebuilds the same parameterization."""
+    encoder rebuilds the same parameterization. "identity" sets phi(s, z) = z
+    and needs `diffsr_feature_dim == z_dim`; see `diffsr_mu_conditioning`."""
+    diffsr_mu_conditioning: str = "next"
+    """What the DiffSR denoiser mu sees: "next" is mu(s', t), the default;
+    "pair" is mu(s, s', t), the transition pair. With
+    `diffsr_phi_parameterization="identity"` the pair form makes the noise
+    prediction `<z, E(s, s', t)>` with `E = mu`: the product-of-experts
+    reparameterization, linear in z with no bias. Stored in the checkpoint
+    config like the phi parameterization. Applies to every DiffSR head this
+    config builds (the endpoint head and the diff_* NTP heads)."""
     batch_size: int = 8192
     num_updates: int = 2000
     log_interval: int = 100

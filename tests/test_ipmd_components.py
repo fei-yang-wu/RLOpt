@@ -3212,3 +3212,128 @@ def test_first_layer_bias_lr_scale_default_is_inert():
         assert names == {"actor", "critic", "actor_log_std"}
     finally:
         env.close()
+
+
+def _poe_sr(*, mu_conditioning: str = "pair", seed: int = 0):
+    """float32 DiffSR with phi(s, z) = z; feature_dim must equal action_dim.
+
+    float32, not fp64: PositionalFeature inside mu's time embedding emits
+    float32, so these tests go through forward_mu at working precision and
+    the linearity assertion carries a float32 tolerance."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    torch.manual_seed(seed)
+    module = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=3,
+        feature_dim=3,
+        embed_dim=7,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        phi_parameterization="identity",
+        mu_conditioning=mu_conditioning,
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+    return module
+
+
+def test_identity_phi_returns_the_action_unchanged() -> None:
+    module = _poe_sr()
+    s = torch.randn(4, 5)
+    z = torch.randn(4, 3)
+    torch.testing.assert_close(module.forward_phi(s, z), z)
+
+
+def test_identity_phi_requires_feature_dim_to_equal_action_dim() -> None:
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    with pytest.raises(ValueError, match="feature_dim must equal action_dim"):
+        build_bilinear_sr(
+            "diffsr",
+            obs_dim=5,
+            next_obs_dim=4,
+            action_dim=3,
+            feature_dim=6,
+            embed_dim=7,
+            g_hidden_dims=(8,),
+            mu_hidden_dims=(8,),
+            phi_parameterization="identity",
+            device="cpu",
+        )
+
+
+def test_pair_mu_sees_the_source_state() -> None:
+    """mu(s, s', t) changes with s; mu(s', t) does not and rejects nothing."""
+    module = _poe_sr(mu_conditioning="pair")
+    sp = torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    s1 = torch.randn(4, 5)
+    s2 = torch.randn(4, 5)
+    mu1 = module.forward_mu(sp=sp, t=t, s=s1)
+    mu2 = module.forward_mu(sp=sp, t=t, s=s2)
+    assert mu1.shape == (4, 3, 4)
+    assert not torch.allclose(mu1, mu2)
+    with pytest.raises(ValueError, match="needs the source state"):
+        module.forward_mu(sp=sp, t=t)
+    plain = _poe_sr(mu_conditioning="next")
+    torch.testing.assert_close(
+        plain.forward_mu(sp=sp, t=t, s=s1), plain.forward_mu(sp=sp, t=t)
+    )
+
+
+def test_poe_eps_prediction_is_linear_in_z_for_any_weights() -> None:
+    """<a z_1 + b z_2, E> = a <z_1, E> + b <z_2, E> with NO sum-to-one
+    condition: the product of experts tempers freely, unlike the affine head."""
+    module = _poe_sr()
+    torch.manual_seed(3)
+    s = torch.randn(4, 5)
+    sp = torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    zs = [torch.randn(4, 3) for _ in range(3)]
+    weights = (2.0, -0.5, 0.25)  # sum 1.75
+    mixed = module.forward_eps(s=s, a=_combine(zs, weights), sp=sp, t=t)
+    combined = _combine([module.forward_eps(s=s, a=z, sp=sp, t=t) for z in zs], weights)
+    torch.testing.assert_close(mixed, combined, atol=2e-5, rtol=0.0)
+
+
+def test_poe_loss_and_sampling_run_end_to_end() -> None:
+    module = _poe_sr()
+    s = torch.randn(6, 5)
+    z = torch.randn(6, 3)
+    sp = torch.randn(6, 4)
+    module.update_obs_norm(sp)
+    metrics, loss, aux = module.compute_loss(s, z, sp, torch.zeros(6, 1))
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in module.mu_net.parameters()
+    )
+    sample, _ = module.sample(s, z)
+    assert sample.shape == (6, 4)
+
+
+def test_mu_conditioning_rejects_unknown_values() -> None:
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    with pytest.raises(ValueError, match="mu_conditioning"):
+        build_bilinear_sr(
+            "diffsr",
+            obs_dim=5,
+            next_obs_dim=4,
+            action_dim=3,
+            feature_dim=3,
+            embed_dim=7,
+            g_hidden_dims=(8,),
+            mu_hidden_dims=(8,),
+            phi_parameterization="identity",
+            mu_conditioning="both",
+            device="cpu",
+        )
