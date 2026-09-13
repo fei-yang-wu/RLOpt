@@ -99,11 +99,17 @@ class RunningMeanStdCatInputs(torch.nn.Module):
         epsilon: float = 1.0e-5,
         clip: float = 5.0,
         normalize_mask: Tensor | None = None,
+        frozen: bool = False,
     ) -> None:
         super().__init__()
         if feature_dim <= 0:
             msg = "feature_dim must be positive."
             raise ValueError(msg)
+        # Frozen statistics never move, in train mode included: a fine-tune
+        # off a checkpoint keeps the parent's input scale so its exported
+        # bundle and the parent's stay comparable. Not a buffer: the flag is
+        # a run setting, not part of the model state.
+        self.frozen = bool(frozen)
         if epsilon <= 0.0:
             msg = "epsilon must be positive."
             raise ValueError(msg)
@@ -176,7 +182,7 @@ class RunningMeanStdCatInputs(torch.nn.Module):
             # with their original scale and geometry.
             normalized = torch.where(self.normalize_mask, normalized, value)
         # Match SONIC: normalize with the prior statistics, then update them.
-        if self.training:
+        if self.training and not self.frozen:
             self._update(value)
         return self.module(normalized)
 
@@ -205,6 +211,16 @@ class PPOConfig:
 
     normalize_advantage: bool = True
     """Whether to normalize the advantage estimates."""
+
+    update_normalizers_after_rollout: bool = True
+    """Keep updating the running input statistics of the actor and critic.
+
+    ``False`` freezes ``RunningMeanStdCatInputs`` at the values a checkpoint
+    restores (or the constructor's zero mean / unit variance for a fresh run),
+    so a fine-tune keeps its parent's input scale. Before 2026-09-13 this key
+    did not exist and was accepted silently by the Hydra path; every campaign
+    that passed it still updated the statistics on every minibatch.
+    """
 
     normalize_advantage_global: bool = False
     """Normalize once over the complete rollout instead of per mini-batch."""
@@ -269,6 +285,10 @@ class PPORLOptConfig(RLOptConfig):
 
     ppo: PPOConfig = field(default_factory=PPOConfig)
     """PPO configuration."""
+
+    use_value_function: bool = True
+    """PPO always trains a value function; declared so the resolved config
+    carries no undeclared attributes."""
 
     def __post_init__(self):
         self.use_value_function = True
@@ -362,6 +382,11 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         msg = "PPO does not require a feature extractor by default."
         raise NotImplementedError(msg)
 
+    def _normalizers_frozen(self) -> bool:
+        """Whether running input statistics stay at their loaded values."""
+        ppo = getattr(self.config, "ppo", None)
+        return not bool(getattr(ppo, "update_normalizers_after_rollout", True))
+
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
@@ -429,6 +454,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 epsilon=policy_config.normalization_epsilon,
                 clip=policy_config.normalization_clip,
                 normalize_mask=self._input_normalize_mask(policy_config),
+                frozen=self._normalizers_frozen(),
             )
 
         net = GaussianPolicyHead(
@@ -491,6 +517,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 epsilon=policy_config.normalization_epsilon,
                 clip=policy_config.normalization_clip,
                 normalize_mask=self._input_normalize_mask(policy_config),
+                frozen=self._normalizers_frozen(),
             ).to(self.device)
         else:
             pre_module = _CatInputs()
@@ -598,6 +625,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 epsilon=self.config.value_function.normalization_epsilon,
                 clip=self.config.value_function.normalization_clip,
                 normalize_mask=self._input_normalize_mask(self.config.value_function),
+                frozen=self._normalizers_frozen(),
             )
         else:
             module = CatInputs(value_mlp) if len(in_keys) > 1 else value_mlp
