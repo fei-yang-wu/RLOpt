@@ -371,6 +371,17 @@ class IPMDConfig(PPOConfig):
     hl_skill_finetune_enabled: bool = False
     """Enable online policy-gradient finetuning for command_source='hl_skill'."""
 
+    hl_skill_restore_from_checkpoint: bool = True
+    """Restore the command sampler (skill encoder weights, DiffSR, optimizer)
+    from a tracker checkpoint's ``hl_skill_command_sampler_state_dict``.
+
+    ``False`` keeps the encoder loaded from ``hl_skill_checkpoint_path`` when
+    a tracker is fine-tuned onto a DIFFERENT encoder (an encoder swap): the
+    tracker checkpoint's embedded encoder is the old one, and restoring it
+    would silently undo the swap (same width) or fail (new width). The
+    encoder is frozen in that setting, so no sampler state is lost.
+    """
+
     hl_skill_pg_coeff: float = 0.05
     # Weight of the DiffSR endpoint loss on ACHIEVED windows sampled from the
     # environment's raw-pose ring (env.achieved_ring_capacity > 0). 0 disables.
@@ -3313,6 +3324,15 @@ class IPMD(PPO):
             if callable(reset_sampler):
                 reset_sampler()
         if (
+            self._hl_skill_command_sampler is not None
+            and "hl_skill_command_sampler_state_dict" in data
+            and not bool(self.config.ipmd.hl_skill_restore_from_checkpoint)
+        ):
+            self.log.info(
+                "hl_skill_restore_from_checkpoint=false: keeping the encoder "
+                "from hl_skill_checkpoint_path, not the tracker checkpoint's."
+            )
+        elif (
             self._hl_skill_command_sampler is not None
             and "hl_skill_command_sampler_state_dict" in data
         ):

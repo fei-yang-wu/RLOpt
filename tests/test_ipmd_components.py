@@ -3212,3 +3212,14 @@ def test_first_layer_bias_lr_scale_default_is_inert():
         assert names == {"actor", "critic", "actor_log_std"}
     finally:
         env.close()
+
+
+def test_hl_skill_restore_from_checkpoint_flag_is_declared() -> None:
+    """Encoder-swap fine-tunes (2026-09-14) keep the encoder from
+    hl_skill_checkpoint_path instead of the tracker checkpoint's embedded one."""
+    from rlopt.agent.ipmd.ipmd import IPMDConfig
+
+    config = IPMDConfig()
+    assert config.hl_skill_restore_from_checkpoint is True
+    config.hl_skill_restore_from_checkpoint = False
+    assert config.hl_skill_restore_from_checkpoint is False

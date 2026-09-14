@@ -429,14 +429,44 @@ def test_reanchor_accepts_fullbody_and_keeps_qvel_invariant() -> None:
     assert torch.allclose(out[:, 0, 58:60], torch.zeros(4, 2), atol=1e-5)
 
 
+def test_reanchor_root_qpos_ee_moves_the_end_effector_points_with_the_anchor() -> None:
+    """50-wide root_qpos + ee frame (2026-09-14): the four trailing points are
+    positions in the window's heading frame and must transform exactly like
+    the anchor position (yaw-only rotation, xy-only origin)."""
+    import math
+
+    import torch
+
+    from rlopt.agent.hl_skill_diffsr import _reanchor_heading_frames
+
+    torch.manual_seed(0)
+    frames = torch.randn(3, 5, 50)
+    # Anchor heading: yaw 90 deg, rot6d columns (cos, sin, 0), (-sin, cos, 0).
+    yaw = math.pi / 2
+    frames[..., 32:38] = torch.tensor([math.cos(yaw), math.sin(yaw), 0.0, -math.sin(yaw), math.cos(yaw), 0.0])
+    anchor = frames[:, 0].clone()
+    out = _reanchor_heading_frames(frames, anchor)
+    assert out.shape == frames.shape
+    assert torch.allclose(out[..., :29], frames[..., :29])
+    # A point transforms as R_yaw^T (p - origin_xy), the anchor block the same way.
+    origin = anchor[:, 29:32].clone()
+    origin[:, 2] = 0.0
+    r_t = torch.tensor([[math.cos(yaw), math.sin(yaw), 0.0], [-math.sin(yaw), math.cos(yaw), 0.0], [0.0, 0.0, 1.0]])
+    points = frames[..., 38:50].reshape(3, 5, 4, 3) - origin[:, None, None, :]
+    expected = torch.einsum("ij,bskj->bski", r_t, points).reshape(3, 5, 12)
+    assert torch.allclose(out[..., 38:50], expected, atol=1e-5)
+    expected_anchor = torch.einsum("ij,bsj->bsi", r_t, frames[..., 29:32] - origin[:, None, :])
+    assert torch.allclose(out[..., 29:32], expected_anchor, atol=1e-5)
+
+
 def test_reanchor_rejects_unknown_width() -> None:
     import pytest
     import torch
 
     from rlopt.agent.hl_skill_diffsr import _reanchor_heading_frames
 
-    frames = torch.randn(2, 3, 50)
-    with pytest.raises(ValueError, match="38-wide root_qpos or 67-wide"):
+    frames = torch.randn(2, 3, 44)
+    with pytest.raises(ValueError, match="38-wide root_qpos, 67-wide"):
         _reanchor_heading_frames(frames, frames[:, 0])
 
 

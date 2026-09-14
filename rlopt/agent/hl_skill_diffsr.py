@@ -208,6 +208,17 @@ def _rot6d_to_matrix(rot6d: Tensor) -> Tensor:
 
 
 _FULL_BODY_FRAME_DIM = 67
+# root_qpos + the four end-effector positions in the same anchor frame
+# (`expert_ee_pos_b`: ankles and wrists, 4 x 3), 2026-09-14.
+_ROOT_QPOS_EE_FRAME_DIM = 50
+# width -> (invariant prefix width, trailing position floats after the
+# anchor pos(3) + rot6d(6) block). The trailing positions are points in the
+# same heading frame and transform like the anchor position.
+_HEADING_FRAME_LAYOUTS = {
+    _ROOT_QPOS_FRAME_DIM: (29, 0),
+    _FULL_BODY_FRAME_DIM: (58, 0),
+    _ROOT_QPOS_EE_FRAME_DIM: (29, 12),
+}
 
 
 def _reanchor_heading_frames(frames: Tensor, anchor: Tensor) -> Tensor:
@@ -222,16 +233,17 @@ def _reanchor_heading_frames(frames: Tensor, anchor: Tensor) -> Tensor:
     here because the outer frame is itself yaw-only, so yaw components add.
     """
     width = int(frames.shape[-1])
-    if width not in (_ROOT_QPOS_FRAME_DIM, _FULL_BODY_FRAME_DIM):
+    if width not in _HEADING_FRAME_LAYOUTS:
         msg = (
-            "heading re-anchoring needs the 38-wide root_qpos or 67-wide "
-            f"full_body frame, got {width}."
+            "heading re-anchoring needs the 38-wide root_qpos, 67-wide "
+            f"full_body or 50-wide root_qpos+ee frame, got {width}."
         )
         raise ValueError(msg)
     # Invariant prefix: joint qpos (root_qpos) or joint qpos+qvel (full_body).
-    # Joint velocities are frame-invariant under a yaw re-anchor; only the
-    # trailing anchor pos(3) + rot6d(6) block transforms.
-    inv = width - 9
+    # Joint velocities are frame-invariant under a yaw re-anchor; the anchor
+    # pos(3) + rot6d(6) block transforms, and so do any trailing end-effector
+    # positions (points in the same frame).
+    inv, trailing = _HEADING_FRAME_LAYOUTS[width]
     rotation = _rot6d_to_matrix(anchor[..., inv + 3 : inv + 9])
     yaw = torch.atan2(rotation[..., 1, 0], rotation[..., 0, 0])
     cos, sin = torch.cos(yaw), torch.sin(yaw)
@@ -257,7 +269,14 @@ def _reanchor_heading_frames(frames: Tensor, anchor: Tensor) -> Tensor:
     rotations = _rot6d_to_matrix(frames[..., inv + 3 : inv + 9])
     rotated = yaw_t @ rotations
     ori6d = torch.cat([rotated[..., :, 0], rotated[..., :, 1]], dim=-1)
-    return torch.cat([frames[..., :inv], position, ori6d], dim=-1)
+    if trailing == 0:
+        return torch.cat([frames[..., :inv], position, ori6d], dim=-1)
+    points = frames[..., inv + 9 :].reshape(*frames.shape[:-1], trailing // 3, 3)
+    points = torch.einsum("...ij,...kj->...ki", yaw_t, points - origin.unsqueeze(-2))
+    return torch.cat(
+        [frames[..., :inv], position, ori6d, points.reshape(*frames.shape[:-1], trailing)],
+        dim=-1,
+    )
 
 
 def _sigreg_epps_pulley(z: Tensor, num_sketches: int) -> Tensor:
@@ -2340,14 +2359,11 @@ class HighLevelSkillDiffSRTrainer:
                     f"got {self.config.jepa_loss!r}."
                 )
                 raise ValueError(msg)
-            if int(self.state_dim) not in (
-                _ROOT_QPOS_FRAME_DIM,
-                _FULL_BODY_FRAME_DIM,
-            ):
+            if int(self.state_dim) not in _HEADING_FRAME_LAYOUTS:
                 msg = (
                     "jepa_ntp re-anchors the next chunk in heading frame and "
-                    "needs the 38-wide root_qpos or 67-wide full_body macro "
-                    f"state, got {int(self.state_dim)}."
+                    "needs the 38-wide root_qpos, 67-wide full_body or 50-wide "
+                    f"root_qpos+ee macro state, got {int(self.state_dim)}."
                 )
                 raise ValueError(msg)
             if str(self.config.jepa_target_encoder_mode) == "ema":
