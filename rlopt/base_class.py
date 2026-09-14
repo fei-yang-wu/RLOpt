@@ -27,6 +27,7 @@ from torchrl.data import (
     ReplayBuffer,
 )
 from torchrl.envs import TransformedEnv
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.objectives import group_optimizers
 from torchrl.record.loggers.common import Logger
 
@@ -1034,7 +1035,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             target_path = target_base / "model.pt"
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        data_to_save: dict[str, torch.Tensor | dict] = {
+        data_to_save: dict[str, Any] = {
             "policy_state_dict": (self.policy.state_dict() if self.policy else {}),
             "optimizer_state_dict": self.optim.state_dict(),
         }
@@ -1054,6 +1055,8 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
         data_to_save.update(self._extra_model_state_dict())
+        if step is not None:
+            data_to_save["cumulative_env_frames"] = int(step)
 
         torch.save(data_to_save, target_path)
 
@@ -1077,6 +1080,8 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             >>> algorithm.train()  # Resume training
         """
         data = torch.load(path, map_location=self.device)
+        if "cumulative_env_frames" in data:
+            self._resume_frame_offset = max(0, int(data["cumulative_env_frames"]))
         if self.policy and "policy_state_dict" in data:
             self.policy.load_state_dict(data["policy_state_dict"])  # type: ignore[arg-type]
         if self.value_function and "value_state_dict" in data:
@@ -1350,27 +1355,46 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     def _compute_kl_after_update(
         self, kl_context: dict[str, Tensor], policy_op: TensorDictModule
     ) -> Tensor | None:
-        with torch.no_grad():
-            obs_td = kl_context["obs_td"].clone()
-            obs_td = policy_op(obs_td)
-            new_loc = obs_td.get("loc")
-            new_scale = obs_td.get("scale")
-            old_loc = kl_context["old_loc"]
-            old_scale = kl_context["old_scale"]
+        # A diagnostic forward must not update normalization statistics or
+        # consume action-sampling RNG. Restore mixed child modes exactly.
+        training_modes = [(module, module.training) for module in policy_op.modules()]
+        try:
+            policy_op.eval()
+            with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
+                obs_td = policy_op(kl_context["obs_td"].clone())
+                new_loc = obs_td.get("loc")
+                new_scale = obs_td.get("scale")
+                old_loc = kl_context["old_loc"]
+                old_scale = kl_context["old_scale"]
 
-            var_old = old_scale.pow(2)
-            var_new = new_scale.pow(2)
-            kl = (
-                torch.log(new_scale / old_scale)
-                + (var_old + (old_loc - new_loc).pow(2)) / (2.0 * var_new)
-                - 0.5
-            )
-            if kl.ndim > 0:
-                kl = kl.sum(dim=-1)
-            kl_approx = kl.mean()
+                var_old = old_scale.pow(2)
+                var_new = new_scale.pow(2)
+                kl = (
+                    torch.log(new_scale / old_scale)
+                    + (var_old + (old_loc - new_loc).pow(2)) / (2.0 * var_new)
+                    - 0.5
+                )
+                if kl.ndim > 0:
+                    kl = kl.sum(dim=-1)
+                kl_approx = kl.mean()
+        finally:
+            for module, training in training_modes:
+                module.training = training
         if not torch.isfinite(kl_approx):
             return None
         return kl_approx
+
+    @staticmethod
+    @contextmanager
+    def _evaluation_mode(module: torch.nn.Module):
+        """Temporarily evaluate a module without overwriting mixed child modes."""
+        modes = [(child, child.training) for child in module.modules()]
+        try:
+            module.eval()
+            yield
+        finally:
+            for child, training in modes:
+                child.training = training
 
     def _record_kl_for_lr_adaptation(
         self, kl_approx: Tensor, schedule_cfg: Any

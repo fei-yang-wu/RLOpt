@@ -69,6 +69,39 @@ def _normalize_advantage_over_rollout(advantage: Tensor) -> Tensor:
     return (advantage - advantage_mean) / (advantage_std + 1.0e-8)
 
 
+def apply_rsl_rl_truncation_bootstrap(
+    rollout: TensorDict, value_operator: torch.nn.Module, gamma: float
+) -> TensorDict:
+    """Return a GAE input view that bootstraps time-outs like RSL-RL.
+
+    RSL-RL adds ``gamma * V(s_t)`` to the reward of every time-out step and
+    then treats the step as terminal. TorchRL's GAE instead bootstraps a
+    truncated step from ``V(next_obs)``, which under an auto-resetting
+    environment is the observation of the *next* episode. This helper rewrites
+    a shallow copy of the rollout so TorchRL's GAE reproduces the RSL-RL
+    formula: the reward at truncated steps gains ``gamma * V(s_t)`` and
+    ``("next", "terminated")`` is set to ``("next", "done")``.
+
+    The stored rollout is not modified. The caller copies the keys GAE adds
+    (advantage, value target, state value) back into the stored rollout.
+    """
+
+    done = rollout.get(("next", "done")).to(dtype=torch.bool)
+    terminated = rollout.get(("next", "terminated"), default=done).to(dtype=torch.bool)
+    truncated = done & ~terminated
+    view = rollout.copy()
+    if bool(truncated.any()):
+        state_value = value_operator(rollout.copy()).get("state_value")
+        reward = view.get(("next", "reward"))
+        bootstrap = float(gamma) * state_value.to(reward.dtype)
+        view.set(
+            ("next", "reward"),
+            reward + bootstrap * truncated.to(reward.dtype),
+        )
+    view.set(("next", "terminated"), done.clone())
+    return view
+
+
 class CatInputs(torch.nn.Module):
     """Concatenate multiple input tensors along the last dimension.
 
@@ -185,7 +218,12 @@ class PPOConfig:
     """PPO-specific configuration."""
 
     gae_lambda: float = 0.95
-    """GAE lambda parameter."""
+    """Lambda parameter for GAE."""
+    normalizer_update_mode: str = "minibatch"
+    """``minibatch`` keeps the existing normalizer schedule; ``rollout`` holds
+    actor/critic statistics fixed through collection and optimization, then
+    updates each normalizer once from the complete rollout for the next one.
+    """
 
     clip_epsilon: float = 0.2
     """Clipping epsilon for PPO."""
@@ -219,6 +257,16 @@ class PPOConfig:
 
     log_std_max: float = 2.0
     """Maximum log standard deviation (when clipping is enabled)."""
+
+    truncation_bootstrap: str = "none"
+    """How time-outs are bootstrapped before GAE.
+
+    ``"none"`` keeps TorchRL's GAE, which bootstraps a truncated step from
+    ``V(next_obs)``. ``"rsl_rl"`` adds ``gamma * V(s_t)`` to the reward of
+    every time-out step and treats it as terminal, which is RSL-RL's rule and
+    the correct one for an auto-resetting Isaac Lab environment whose
+    ``next_obs`` at a time-out is already the reset observation.
+    """
 
 
 @dataclass
@@ -516,7 +564,11 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
         # Initialize lazy layers by performing a forward pass with dummy data
         fake_tensordict = self.env.fake_tensordict()
-        with torch.no_grad():
+        with (
+            torch.no_grad(),
+            self._evaluation_mode(self.actor_critic),
+            set_exploration_type(ExplorationType.DETERMINISTIC),
+        ):
             _ = self.actor_critic(fake_tensordict)
 
         return ClipPPOLoss(
@@ -532,6 +584,15 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             ),
             clip_value=ppo_config.clip_value,
         )
+
+    def _construct_collector(self, env, policy):
+        # Collector shape probes are synthetic observations, not training data.
+        with (
+            torch.no_grad(),
+            self._evaluation_mode(policy),
+            set_exploration_type(ExplorationType.DETERMINISTIC),
+        ):
+            return super()._construct_collector(env, policy)
 
     def _construct_adv_module(self) -> torch.nn.Module:
         """Construct advantage module"""
@@ -731,7 +792,11 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             next_log_frame=resume_offset + log_interval_frames,
             next_file_log_frame=resume_offset + log_interval_frames,
             frames_processed=resume_offset,
-            updates_completed=torch.zeros((), dtype=torch.int64, device=self.device),
+            updates_completed=torch.tensor(
+                int(getattr(self, "_resume_updates_completed", 0)),
+                dtype=torch.int64,
+                device=self.device,
+            ),
             minibatches_per_epoch=num_mini_batches,
             epochs_per_rollout=cfg.loss.epochs,
             anneal_clip_epsilon=cfg.ppo.anneal_clip_epsilon,
@@ -785,7 +850,26 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         # minibatches.  TorchRL evaluates current/next values through ``vmap``;
         # mutating normalizer buffers from that vmapped forward is invalid too.
         with torch.no_grad(), self._freeze_value_normalizer_updates():
-            rollout = self.adv_module(rollout)
+            mode = getattr(self.config.ppo, "truncation_bootstrap", "none")
+            if mode == "rsl_rl":
+                before = set(rollout.keys(include_nested=True, leaves_only=True))
+                view = apply_rsl_rl_truncation_bootstrap(
+                    rollout,
+                    self.actor_critic.get_value_operator(),  # type: ignore
+                    float(self.config.loss.gamma),
+                )
+                view = self.adv_module(view)
+                for key in view.keys(include_nested=True, leaves_only=True):
+                    if key not in before:
+                        rollout.set(key, view.get(key))
+            elif mode == "none":
+                rollout = self.adv_module(rollout)
+            else:
+                message = (
+                    f"Unknown ppo.truncation_bootstrap {mode!r}; "
+                    "use 'none' or 'rsl_rl'."
+                )
+                raise ValueError(message)
             if (
                 self.config.ppo.normalize_advantage
                 and self.config.ppo.normalize_advantage_global
@@ -809,14 +893,53 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             for module in self.value_function.modules()
             if isinstance(module, RunningMeanStdCatInputs)
         ]
-        training_states = [module.training for module in normalizers]
+        training_states = [
+            (child, child.training)
+            for module in normalizers
+            for child in module.modules()
+        ]
         try:
             for module in normalizers:
                 module.eval()
             yield
         finally:
-            for module, training in zip(normalizers, training_states, strict=True):
-                module.train(training)
+            for module, training in training_states:
+                module.training = training
+
+    @contextmanager
+    def _freeze_rollout_normalizer_updates(self):
+        normalizers = [
+            module
+            for module in self.actor_critic.modules()
+            if isinstance(module, RunningMeanStdCatInputs)
+        ]
+        states = [module.training for module in normalizers]
+        try:
+            for module in normalizers:
+                # Freeze statistics only; preserve child-network training mode.
+                module.training = False
+            yield
+        finally:
+            for module, training in zip(normalizers, states, strict=True):
+                module.training = training
+
+    def _update_normalizers_from_rollout(self, rollout: TensorDict) -> None:
+        updated: set[int] = set()
+        with torch.no_grad():
+            for network, config in (
+                (self.policy, self.config.policy),
+                (self.value_function, self.config.value_function),
+            ):
+                if network is None or config is None:
+                    continue
+                inputs = tuple(rollout.get(key) for key in config.get_input_keys())
+                for module in network.modules():
+                    if (
+                        isinstance(module, RunningMeanStdCatInputs)
+                        and id(module) not in updated
+                    ):
+                        module._update(module._concatenate(inputs))
+                        updated.add(id(module))
 
     @property
     def _required_loss_metrics(self) -> list[str]:
@@ -846,6 +969,26 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
     def iterate(
         self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
     ) -> None:
+        mode = getattr(self.config.ppo, "normalizer_update_mode", "minibatch")
+        if mode == "minibatch":
+            self._iterate_updates(iteration, metadata)
+        elif mode == "rollout":
+            # The collector uses eval mode. Use those identical statistics for
+            # every likelihood, value target, gradient and KL in this rollout.
+            self.actor_critic.train()
+            self.adv_module.train()
+            with self._freeze_rollout_normalizer_updates():
+                self._iterate_updates(iteration, metadata)
+            update_start = time.perf_counter()
+            self._update_normalizers_from_rollout(iteration.rollout)
+            iteration.learn_time += time.perf_counter() - update_start
+        else:
+            msg = "ppo.normalizer_update_mode must be 'minibatch' or 'rollout'."
+            raise ValueError(msg)
+
+    def _iterate_updates(
+        self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
+    ) -> None:
         """Run update epochs over the current rollout and aggregate minibatch metrics."""
         losses = TensorDict(
             batch_size=[metadata.epochs_per_rollout, metadata.minibatches_per_epoch]
@@ -853,8 +996,14 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         learn_start = time.perf_counter()
 
         self.data_buffer.empty()
-        self.actor_critic.train()
-        self.adv_module.train()
+        # The caller sets actor/critic mode so a rollout can freeze its
+        # normalizers while preserving train mode on the underlying networks.
+        if (
+            getattr(self.config.ppo, "normalizer_update_mode", "minibatch")
+            == "minibatch"
+        ):
+            self.actor_critic.train()
+            self.adv_module.train()
 
         with timeit("training"):
             # Pre-iteration compute GAE, once per rollout
@@ -963,6 +1112,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         metadata: PPOTrainingMetadata,
     ) -> None:
         """Flush metrics, refresh progress, and handle checkpoint cadence."""
+        self._ppo_updates_completed = metadata.updates_completed
         rollout = iteration.rollout
 
         step_rewards = rollout["next", "reward"]
@@ -1020,6 +1170,18 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                     path=checkpoint_dir,
                     step=metadata.frames_processed,
                 )
+
+    def _extra_model_state_dict(self) -> dict[str, Any]:
+        state = super()._extra_model_state_dict()
+        updates = getattr(self, "_ppo_updates_completed", 0)
+        state["ppo_updates_completed"] = int(updates)
+        return state
+
+    def _load_extra_model_state_dict(self, checkpoint) -> None:
+        super()._load_extra_model_state_dict(checkpoint)
+        self._resume_updates_completed = max(
+            0, int(checkpoint.get("ppo_updates_completed", 0))
+        )
 
     def train(self) -> None:  # type: ignore
         """Train the agent with the shared on-policy rollout-to-update workflow."""
