@@ -24,7 +24,7 @@ from rlopt.env_utils import make_parallel_env
 
 def test_frozen_forward_keeps_likelihood_and_gradients():
     torch.manual_seed(0)
-    norm = RunningMeanStdCatInputs(torch.nn.Linear(3, 2), 3, update_on_forward=False)
+    norm = RunningMeanStdCatInputs(torch.nn.Linear(3, 2), 3, frozen=True)
     x = torch.randn(12, 3) + 2
     norm.train()
     first = norm(x)

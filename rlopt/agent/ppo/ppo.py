@@ -117,7 +117,6 @@ class RunningMeanStdCatInputs(torch.nn.Module):
             msg = "clip must be positive."
             raise ValueError(msg)
         self.module = module
-        self.update_on_forward = bool(update_on_forward)
         self.epsilon = float(epsilon)
         self.clip = float(clip)
         module_device = next(module.parameters(), torch.empty(0)).device
@@ -390,9 +389,16 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         raise NotImplementedError(msg)
 
     def _normalizers_frozen(self) -> bool:
-        """Whether running input statistics stay at their loaded values."""
+        """Whether the forward pass leaves running input statistics alone.
+
+        `update_normalizers_after_rollout` means the statistics move ONCE,
+        from `_update_normalizers_after_rollout`, after optimization and
+        before checkpointing. The forward pass must therefore stay frozen:
+        the two paths together would count every visited state twice and
+        change the likelihood under which the rollout was collected.
+        """
         ppo = getattr(self.config, "ppo", None)
-        return not bool(getattr(ppo, "update_normalizers_after_rollout", True))
+        return bool(getattr(ppo, "update_normalizers_after_rollout", True))
 
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None

@@ -3135,8 +3135,10 @@ def test_affine_parameterization_structure_and_state_dict_roundtrip() -> None:
 
 
 def test_unknown_phi_parameterization_is_rejected() -> None:
+    # "linear" became a real parameterization on 2026-09-11; the rejection
+    # test needs a name that is still not one.
     with pytest.raises(ValueError, match="phi_parameterization"):
-        _affine_sr("linear")
+        _affine_sr("quadratic")
 
 
 def test_skill_config_accepts_affine_parameterization() -> None:
