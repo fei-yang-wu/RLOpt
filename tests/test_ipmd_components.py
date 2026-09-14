@@ -3223,3 +3223,328 @@ def test_hl_skill_restore_from_checkpoint_flag_is_declared() -> None:
     assert config.hl_skill_restore_from_checkpoint is True
     config.hl_skill_restore_from_checkpoint = False
     assert config.hl_skill_restore_from_checkpoint is False
+
+
+def _poe_sr(*, mu_conditioning: str = "pair", seed: int = 0, base: bool = False):
+    """float32 DiffSR with phi(s, z) = z; feature_dim must equal action_dim.
+
+    float32, not fp64: PositionalFeature inside mu's time embedding emits
+    float32, so these tests go through forward_mu at working precision and
+    the linearity assertion carries a float32 tolerance."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    torch.manual_seed(seed)
+    module = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=3,
+        feature_dim=4 if base else 3,
+        embed_dim=7,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        phi_parameterization="identity_bias" if base else "identity",
+        mu_conditioning=mu_conditioning,
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+    return module
+
+
+def test_identity_phi_returns_the_action_unchanged() -> None:
+    module = _poe_sr()
+    s = torch.randn(4, 5)
+    z = torch.randn(4, 3)
+    torch.testing.assert_close(module.forward_phi(s, z), z)
+
+
+def test_identity_phi_requires_feature_dim_to_equal_action_dim() -> None:
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    with pytest.raises(ValueError, match="feature_dim must equal action_dim"):
+        build_bilinear_sr(
+            "diffsr",
+            obs_dim=5,
+            next_obs_dim=4,
+            action_dim=3,
+            feature_dim=6,
+            embed_dim=7,
+            g_hidden_dims=(8,),
+            mu_hidden_dims=(8,),
+            phi_parameterization="identity",
+            device="cpu",
+        )
+
+
+def test_pair_mu_sees_the_source_state() -> None:
+    """mu(s, s', t) changes with s; mu(s', t) does not and rejects nothing."""
+    module = _poe_sr(mu_conditioning="pair")
+    sp = torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    s1 = torch.randn(4, 5)
+    s2 = torch.randn(4, 5)
+    mu1 = module.forward_mu(sp=sp, t=t, s=s1)
+    mu2 = module.forward_mu(sp=sp, t=t, s=s2)
+    assert mu1.shape == (4, 3, 4)
+    assert not torch.allclose(mu1, mu2)
+    with pytest.raises(ValueError, match="needs the source state"):
+        module.forward_mu(sp=sp, t=t)
+    plain = _poe_sr(mu_conditioning="next")
+    torch.testing.assert_close(
+        plain.forward_mu(sp=sp, t=t, s=s1), plain.forward_mu(sp=sp, t=t)
+    )
+
+
+def test_poe_eps_prediction_is_linear_in_z_for_any_weights() -> None:
+    """<a z_1 + b z_2, E> = a <z_1, E> + b <z_2, E> with NO sum-to-one
+    condition: the product of experts tempers freely, unlike the affine head."""
+    module = _poe_sr()
+    torch.manual_seed(3)
+    s = torch.randn(4, 5)
+    sp = torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    zs = [torch.randn(4, 3) for _ in range(3)]
+    weights = (2.0, -0.5, 0.25)  # sum 1.75
+    mixed = module.forward_eps(s=s, a=_combine(zs, weights), sp=sp, t=t)
+    combined = _combine([module.forward_eps(s=s, a=z, sp=sp, t=t) for z in zs], weights)
+    torch.testing.assert_close(mixed, combined, atol=2e-5, rtol=0.0)
+
+
+def test_poe_loss_and_sampling_run_end_to_end() -> None:
+    module = _poe_sr()
+    s = torch.randn(6, 5)
+    z = torch.randn(6, 3)
+    sp = torch.randn(6, 4)
+    module.update_obs_norm(sp)
+    metrics, loss, aux = module.compute_loss(s, z, sp, torch.zeros(6, 1))
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in module.mu_net.parameters()
+    )
+    sample, _ = module.sample(s, z)
+    assert sample.shape == (6, 4)
+
+
+def test_mu_conditioning_rejects_unknown_values() -> None:
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    with pytest.raises(ValueError, match="mu_conditioning"):
+        build_bilinear_sr(
+            "diffsr",
+            obs_dim=5,
+            next_obs_dim=4,
+            action_dim=3,
+            feature_dim=3,
+            embed_dim=7,
+            g_hidden_dims=(8,),
+            mu_hidden_dims=(8,),
+            phi_parameterization="identity",
+            mu_conditioning="both",
+            device="cpu",
+        )
+
+
+def test_poe_base_preserves_affinity_with_the_correct_offset() -> None:
+    module = _poe_sr(base=True)
+    s, sp = torch.randn(4, 5), torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    z1, z2 = torch.randn(4, 3), torch.randn(4, 3)
+    fields = module.forward_mu(sp, t, s=s)
+    base = module.forward_eps(s=s, a=torch.zeros_like(z1), sp=sp, t=t)
+    torch.testing.assert_close(base, fields[:, 0])
+    assert base.abs().sum() > 0
+    for a, b in [(0.3, 0.7), (1.2, -0.4)]:
+        mixed = module.forward_eps(s=s, a=a * z1 + b * z2, sp=sp, t=t)
+        expected = (
+            a * module.forward_eps(s=s, a=z1, sp=sp, t=t)
+            + b * module.forward_eps(s=s, a=z2, sp=sp, t=t)
+            + (1 - a - b) * base
+        )
+        torch.testing.assert_close(mixed, expected, atol=2e-5, rtol=0.0)
+
+
+def test_poe_base_loss_updates_encoder_and_base_and_restores_checkpoint() -> None:
+    module = _poe_sr(base=True)
+    encoder = torch.nn.Linear(7, 3)
+    s, sp = torch.randn(6, 5), torch.randn(6, 4)
+    z = encoder(torch.randn(6, 7))
+    module.update_obs_norm(sp)
+    _, loss, _ = module.compute_loss(s, z, sp, torch.zeros(6, 1))
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert encoder.weight.grad is not None and encoder.weight.grad.norm() > 0
+    # At z=0 the first field must still receive a learning signal.
+    module.zero_grad(set_to_none=True)
+    fields = module.forward_mu(sp, torch.zeros(6, 1, dtype=torch.int64), s=s)
+    fields.retain_grad()
+    pred = module.forward_eps(
+        z_phi=module.forward_phi(s, torch.zeros_like(z)), z_mu=fields
+    )
+    pred.square().mean().backward()
+    assert fields.grad[:, 0].norm() > 0
+    assert fields.grad[:, 1:].count_nonzero() == 0
+    restored = _poe_sr(base=True, seed=9)
+    restored.load_state_dict(module.state_dict(), strict=True)
+    t = torch.zeros(6, 1, dtype=torch.int64)
+    torch.testing.assert_close(
+        restored.forward_eps(s=s, a=z.detach(), sp=sp, t=t),
+        module.forward_eps(s=s, a=z.detach(), sp=sp, t=t),
+    )
+    sample, _ = restored.sample(s, z.detach())
+    assert sample.shape == sp.shape and torch.isfinite(sample).all()
+
+
+def test_poe_base_config_roundtrip_and_dimension_guard() -> None:
+    _rlopt()
+    from rlopt.agent.hl_skill_diffsr import HighLevelSkillDiffSRConfig, _build_diffsr
+
+    config = HighLevelSkillDiffSRConfig(
+        z_dim=3,
+        diffsr_feature_dim=4,
+        diffsr_embed_dim=7,
+        diffsr_g_hidden_dims=(8,),
+        diffsr_mu_hidden_dims=(8,),
+        diffsr_phi_parameterization="identity_bias",
+        diffsr_mu_conditioning="pair",
+    )
+    config = HighLevelSkillDiffSRConfig.from_dict(config.to_dict())
+    config.validate()
+    module = _build_diffsr(config, state_dim=5, device=torch.device("cpu"))
+    assert module.forward_phi(torch.zeros(2, 5), torch.zeros(2, 3)).shape == (2, 4)
+    config.diffsr_feature_dim = 3
+    with pytest.raises(ValueError, match=r"feature_dim must equal action_dim \+ 1"):
+        _build_diffsr(config, state_dim=5, device=torch.device("cpu"))
+
+
+def _proj_sr(
+    parameterization: str, *, feature_dim: int = 8, action_dim: int = 3, seed: int = 0
+):
+    """float32 DiffSR with a projected phi and pair-conditioned mu."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    torch.manual_seed(seed)
+    return build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=action_dim,
+        feature_dim=feature_dim,
+        embed_dim=7,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        phi_parameterization=parameterization,
+        mu_conditioning="pair",
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+
+
+def test_linear_phi_widens_the_latent_and_stays_linear() -> None:
+    """phi = A z: wider than z, exactly linear, no constant offset."""
+    module = _proj_sr("linear", feature_dim=8, action_dim=3)
+    z = torch.randn(4, 3)
+    s = torch.randn(4, 5)
+    phi = module.forward_phi(s, z)
+    assert phi.shape == (4, 8)
+    torch.testing.assert_close(
+        module.forward_phi(s, torch.zeros_like(z)), torch.zeros_like(phi)
+    )
+    weights = (2.0, -0.5, 0.25)
+    zs = [torch.randn(4, 3) for _ in weights]
+    torch.testing.assert_close(
+        module.forward_phi(s, _combine(zs, weights)),
+        _combine([module.forward_phi(s, z_i) for z_i in zs], weights),
+        atol=2e-6,
+        rtol=0.0,
+    )
+
+
+def test_linear_bias_prepends_the_constant_channel() -> None:
+    """phi = [1; A z]: the first coordinate is the base denoiser's weight and
+    never depends on the command."""
+    module = _proj_sr("linear_bias", feature_dim=8, action_dim=3)
+    s = torch.randn(4, 5)
+    phi = module.forward_phi(s, torch.randn(4, 3))
+    assert phi.shape == (4, 8)
+    torch.testing.assert_close(phi[:, 0], torch.ones(4))
+    zero = module.forward_phi(s, torch.zeros(4, 3))
+    torch.testing.assert_close(zero[:, 1:], torch.zeros(4, 7))
+    # The projection is bias-free, so the ONLY command-independent term is the
+    # constant channel.
+    assert module.action_net.bias is None
+
+
+def test_projected_phi_keeps_eps_linear_in_z() -> None:
+    for name in ("linear", "linear_bias"):
+        module = _proj_sr(name, feature_dim=8, action_dim=3)
+        s, sp = torch.randn(4, 5), torch.randn(4, 4)
+        t = torch.zeros(4, 1, dtype=torch.int64)
+        zs = [torch.randn(4, 3) for _ in range(2)]
+        a, b = 1.5, -0.5  # affine weights: sum 1, so the constant channel cancels
+        mixed = module.forward_eps(s=s, a=a * zs[0] + b * zs[1], sp=sp, t=t)
+        combined = a * module.forward_eps(
+            s=s, a=zs[0], sp=sp, t=t
+        ) + b * module.forward_eps(s=s, a=zs[1], sp=sp, t=t)
+        torch.testing.assert_close(mixed, combined, atol=2e-5, rtol=0.0, msg=name)
+
+
+def test_projected_phi_loss_and_sampling_run() -> None:
+    for name in ("linear", "linear_bias"):
+        module = _proj_sr(name, feature_dim=8, action_dim=3)
+        s, z, sp = torch.randn(6, 5), torch.randn(6, 3), torch.randn(6, 4)
+        module.update_obs_norm(sp)
+        _, loss, _ = module.compute_loss(s, z, sp, torch.zeros(6, 1))
+        assert torch.isfinite(loss), name
+        loss.backward()
+        assert module.action_net.weight.grad is not None
+        assert module.sample(s, z)[0].shape == (6, 4)
+
+
+def test_projected_phi_rejects_degenerate_widths() -> None:
+    with pytest.raises(ValueError, match="feature_dim >= 1"):
+        _proj_sr("linear", feature_dim=0)
+    with pytest.raises(ValueError, match="at least 2"):
+        _proj_sr("linear_bias", feature_dim=1)
+
+
+def test_affine_poe_preserves_parameters_predictions_and_gradients():
+    affine = _affine_sr("affine").float()
+    poe = _affine_sr("affine_poe").float()
+    poe.load_state_dict(affine.state_dict(), strict=True)
+    for key, value in affine.state_dict().items():
+        torch.testing.assert_close(value, poe.state_dict()[key], atol=0, rtol=0)
+    inputs = [torch.randn(4, n, dtype=torch.float32, requires_grad=True)
+              for n in (5, 3, 4)]
+    other = [x.detach().clone().requires_grad_() for x in inputs]
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    y = affine.forward_eps(*inputs, t)
+    yp = poe.forward_eps(*other, t)
+    assert poe.forward_phi(other[0], other[1]).shape == (4, 4)
+    torch.testing.assert_close(y, yp, atol=1e-5, rtol=1e-4)
+    y.square().sum().backward()
+    yp.square().sum().backward()
+    for x, xp in zip(inputs, other, strict=True):
+        torch.testing.assert_close(x.grad, xp.grad, atol=1e-5, rtol=1e-4)
+    for (name, p), (other_name, q) in zip(affine.named_parameters(), poe.named_parameters(), strict=True):
+        assert name == other_name
+        assert (p.grad is None) == (q.grad is None)
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, q.grad, atol=1e-5, rtol=1e-4)
+    torch.manual_seed(123)
+    loss = affine.compute_loss(*inputs, torch.zeros(4))[1]
+    torch.manual_seed(123)
+    loss_poe = poe.compute_loss(*other, torch.zeros(4))[1]
+    torch.testing.assert_close(loss, loss_poe, atol=1e-5, rtol=1e-4)
+    torch.manual_seed(456)
+    samples = affine.sample(inputs[0], inputs[1])[0]
+    torch.manual_seed(456)
+    samples_poe = poe.sample(other[0], other[1])[0]
+    torch.testing.assert_close(samples, samples_poe, atol=1e-4, rtol=1e-4)

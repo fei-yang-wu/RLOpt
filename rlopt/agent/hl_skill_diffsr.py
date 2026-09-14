@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 from torch import Tensor, nn
 
+from rlopt.agent.diffsr_diagnostics import noise_level_losses
 from rlopt.agent.hl_skill_encoder import (
     LATENT_MODES as _LATENT_MODES,
 )
@@ -23,6 +24,7 @@ from rlopt.agent.hl_skill_encoder import (
     build_skill_encoder,
 )
 from rlopt.agent.ipmd.module import BilinearSR, build_bilinear_sr
+from rlopt.env_interface import require_imitation_interface
 
 
 def _require_positive_int(name: str, value: int) -> int:
@@ -344,6 +346,7 @@ def _build_diffsr(
         g_hidden_dims=config.diffsr_g_hidden_dims,
         f_hidden_dims=config.diffsr_f_hidden_dims,
         phi_parameterization=config.diffsr_phi_parameterization,
+        mu_conditioning=config.diffsr_mu_conditioning,
         mu_hidden_dims=config.diffsr_mu_hidden_dims,
         num_noises=config.diffsr_num_noises,
         use_ema_for_policy=False,
@@ -493,7 +496,24 @@ class HighLevelSkillDiffSRConfig:
     `BilinearSR.forward_phi`; this field is what lets the pretrain entrypoint
     select between them, and its default matches `BilinearSR`'s so omitting it
     changes nothing. The value is stored in the checkpoint config, so a loaded
-    encoder rebuilds the same parameterization."""
+    encoder rebuilds the same parameterization. "identity" sets phi(s, z) = z
+    and needs `diffsr_feature_dim == z_dim`. "identity_bias" sets phi = [1; z]
+    and needs `diffsr_feature_dim == z_dim + 1`, adding a command-independent
+    denoising field without changing z; see `diffsr_mu_conditioning`.
+    "affine_poe" preserves affine weights and internal dimensions, returning
+    phi=[1; z] and factorized (z_dim + 1)-field mu.
+    "affine_no_bias" uses the affine matrix factorization with g(z)=Az,
+    retaining the pure linear field <z, A^T F(s) mu>."""
+    diffsr_mu_conditioning: str = "next"
+    """What the DiffSR denoiser mu sees: "next" is mu(s', t), the default;
+    "pair" is mu(s, s', t), the transition pair. With
+    `diffsr_phi_parameterization="identity"` the pair form makes the noise
+    prediction `<z, E(s, s', t)>` with `E = mu`: the product-of-experts
+    reparameterization, linear in z with no bias. Stored in the checkpoint
+    config like the phi parameterization. Applies to every DiffSR head this
+    config builds (the endpoint head and the diff_* NTP heads). "film" uses
+    source-dependent scale and shift on target hidden features; z stays outside
+    the target network, preserving linearity for identity phi."""
     batch_size: int = 8192
     num_updates: int = 2000
     log_interval: int = 100
@@ -1169,6 +1189,8 @@ class FrozenHighLevelSkillCommandSampler:
         discover_env_method: Callable[[object, str], Callable[..., Any] | None],
         horizon_steps: int | None = None,
         command_phase_mode: str = "none",
+        command_quantizer: str = "none",
+        command_fsq_levels: tuple[int, ...] | list[int] | None = None,
         code_latent_dim: int | None = None,
         phase_period: int | None = None,
         phase_source: str = "hold",
@@ -1216,6 +1238,25 @@ class FrozenHighLevelSkillCommandSampler:
             )
             raise ValueError(msg)
         self.phase_dim = 2 if self.command_phase_mode == "sin_cos" else 0
+        self.command_quantizer = str(command_quantizer).strip().lower()
+        if self.command_quantizer not in {"none", "sonic_fsq"}:
+            msg = (
+                "command_quantizer must be 'none' or 'sonic_fsq', got "
+                f"{command_quantizer!r}."
+            )
+            raise ValueError(msg)
+        self._command_fsq = None
+        self._command_fsq_half = None
+        if self.command_quantizer == "sonic_fsq":
+            from rlopt.agent.hl_skill_encoder import FSQQuantizer
+
+            levels = tuple(int(v) for v in (command_fsq_levels or ((32,) * 64)))
+            self._command_fsq = FSQQuantizer(levels).to(self.device)
+            # SONIC normalization: the lattice divided by ``levels // 2`` lands
+            # in [-1, 1]; at 32 levels that is exact multiples of 1/16.
+            self._command_fsq_half = torch.tensor(
+                [float(level // 2) for level in levels], device=self.device
+            )
         self.phase_period = (
             _require_positive_int("phase_period", int(phase_period))
             if phase_period is not None
@@ -1609,6 +1650,31 @@ class FrozenHighLevelSkillCommandSampler:
             return torch.cat((z, phi), dim=-1)
         msg = f"Unsupported high-level skill command mode: {self.command_mode!r}."
         raise ValueError(msg)
+
+    def _quantize_command(self, code_latents: Tensor) -> Tensor:
+        """Snap the published code to SONIC's lattice; identity when off.
+
+        Applied to the code columns ONLY and before the phase features, so the
+        tracker observes lattice values exactly as it would from a `sonic_fsq`
+        encoder while the encoder itself stays continuous.
+        """
+        # `getattr`, not attribute access: `FrozenSkillCommanderSampler`
+        # subclasses this sampler without running its __init__, so a subclass
+        # that never configured a quantizer must simply not quantize.
+        quantizer = getattr(self, "_command_fsq", None)
+        if quantizer is None:
+            return code_latents
+        if code_latents.shape[-1] != quantizer.code_dim:
+            msg = (
+                "command_quantizer='sonic_fsq' needs one FSQ level per code "
+                f"dimension: code width {int(code_latents.shape[-1])}, levels "
+                f"{int(quantizer.code_dim)}."
+            )
+            raise ValueError(msg)
+        quantized, _ = quantizer(code_latents)
+        return quantized / self._command_fsq_half.to(
+            device=quantized.device, dtype=quantized.dtype
+        )
 
     def _append_command_phase(self, code_latents: Tensor, phase: Tensor) -> Tensor:
         if self.phase_dim == 0:
@@ -2205,7 +2271,9 @@ class FrozenHighLevelSkillCommandSampler:
             if self.command_mode != "z" and self.config.source_history_steps > 0:
                 assert self._current_command_source is not None
                 source = self._current_command_source
-            command_codes = self._command_code_from_state_z(source, z)
+            command_codes = self._quantize_command(
+                self._command_code_from_state_z(source, z)
+            )
             command_codes = command_codes.to(
                 device=device,
                 dtype=dtype,
@@ -3552,6 +3620,75 @@ class HighLevelSkillDiffSRTrainer:
         return metrics
 
     @torch.no_grad()
+    def evaluate_dynamics_probe(
+        self, *, batch_size: int = 256, num_batches: int = 4, seed: int = 1729
+    ) -> dict[str, float]:
+        """Final matched-noise train/eval probe for the raw-chunk DiffSR head.
+
+        Sampling seeds are independent of architecture initialization. All noise
+        levels reuse the same examples and Gaussian draw. No normalizers change.
+        """
+        if (
+            self.config.transition_objective != "jepa_ntp"
+            or self.config.jepa_ntp_head != "diff_chunk"
+            or self.config.jepa_context_chunks != 0
+            or self.jepa_ntp_diffsr is None
+        ):
+            msg = "Dynamics probe requires the context-free diff_chunk head."
+            raise ValueError(msg)
+        batch_size = _require_positive_int("batch_size", batch_size)
+        num_batches = _require_positive_int("num_batches", num_batches)
+        sampler = require_imitation_interface(
+            self.env, "sample_expert_macro_transition_batch", purpose="dynamics probe"
+        )
+        modules = [self.skill_encoder, self.jepa_ntp_diffsr]
+        modes = [module.training for module in modules]
+        devices = [self.device.index or 0] if self.device.type == "cuda" else []
+        accum: dict[str, float] = {}
+        horizon = self.config.horizon_steps
+        try:
+            for module in modules:
+                module.eval()
+            with torch.random.fork_rng(devices=devices):
+                for split in ("train", "eval"):
+                    for batch_index in range(num_batches):
+                        sample_seed = seed + batch_index
+                        torch.random.default_generator.manual_seed(sample_seed)
+                        if devices:
+                            with torch.cuda.device(self.device):
+                                torch.cuda.manual_seed(sample_seed)
+                        state, window, source = self._sample_jepa_window(
+                            sampler, batch_size=batch_size,
+                            chunk_steps=2 * horizon, split=split,
+                        )
+                        z, *_ = self.skill_encoder.encode(
+                            state, _encoder_input_window(self.config, window[:, :horizon]),
+                            deterministic=True,
+                        )
+                        if self.config.jepa_ntp_chunk_anchor == "next":
+                            target = _reanchor_heading_frames(
+                                window[:, horizon:2 * horizon], window[:, horizon - 1]
+                            ).reshape(batch_size, -1)
+                        else:
+                            start = horizon - (
+                                self.config.jepa_ntp_chunk_span == "boundary_next"
+                            )
+                            target = window[:, start:2 * horizon].reshape(batch_size, -1)
+                        losses = noise_level_losses(
+                            self.jepa_ntp_diffsr, source, z, target,
+                            seed=seed + 10000 + batch_index,
+                        )
+                        for name, loss in losses.items():
+                            key = f"dynamics_probe/{split}/{name}"
+                            accum[key] = accum.get(key, 0.0) + float(loss) / num_batches
+        finally:
+            for module, mode in zip(modules, modes, strict=True):
+                module.train(mode)
+        accum["dynamics_probe/seed"] = float(seed)
+        accum["dynamics_probe/examples_per_split_per_level"] = float(batch_size * num_batches)
+        return accum
+
+    @torch.no_grad()
     def _jepa_eval_term_metrics(
         self, *, batch_size: int, split: str | None, prefix: str
     ) -> dict[str, float]:
@@ -4019,6 +4156,20 @@ class HighLevelSkillDiffSRTrainer:
         self.encoder_window_steps = _encoder_window_steps(self.config)
         self.skill_encoder.load_state_dict(checkpoint["skill_encoder_state_dict"])
         self.diffsr.load_state_dict(checkpoint["diffsr_state_dict"])
+        if self.jepa_predictor is not None:
+            jepa_state = checkpoint.get("jepa_state_dict")
+            if jepa_state is None:
+                msg = "JEPA checkpoint has no jepa_state_dict for restoring its heads."
+                raise ValueError(msg)
+            for name, module in (
+                ("predictor", self.jepa_predictor),
+                ("g", self.jepa_g),
+                ("f", self.jepa_f),
+                ("target_encoder", self.jepa_target_encoder),
+                ("ntp_diffsr", self.jepa_ntp_diffsr),
+            ):
+                if module is not None:
+                    module.load_state_dict(jepa_state[name])
         if self.reconstruction_decoder is not None:
             decoder_state = checkpoint.get("reconstruction_decoder_state_dict")
             if decoder_state is None:

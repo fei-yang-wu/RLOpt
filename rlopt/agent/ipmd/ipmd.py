@@ -192,6 +192,30 @@ class IPMDLatentLearningConfig:
     command_phase_period: int = 0
     """Phase clock period in env steps. ``0`` uses ``code_period``."""
 
+    command_quantizer: str = "none"
+    """Quantize the published command AT THE COMMAND BOUNDARY.
+
+    The encoder stays continuous; only what the tracker observes is snapped to
+    a lattice. This is NOT ``latent_mode="sonic_fsq"``, which makes the encoder
+    itself an FSQ bottleneck at pretrain time.
+
+    - ``"none"``: publish the continuous code (the default).
+    - ``"sonic_fsq"``: SONIC's token space -- per-dimension FSQ, then divide by
+      ``levels // 2`` so values land on the lattice in ``[-1, 1]``. At the
+      default 32 levels that is exact multiples of ``1/16``, which is what
+      every entry of ``gear_sonic``'s ``LATENT_INITIAL_MOTION_TOKEN`` is.
+
+    The phase features, when present, are appended AFTER quantization and are
+    never quantized.
+    """
+
+    command_fsq_levels: list[int] = field(default_factory=lambda: [32] * 64)
+    """Per-dimension levels for ``command_quantizer="sonic_fsq"``.
+
+    SONIC publishes 64 dimensions at 32 levels. The length must equal the code
+    width (``code_latent_dim``), since the quantizer acts per dimension.
+    """
+
     fsq_levels: list[int] = field(default_factory=lambda: [8, 8, 8, 5, 5])
     """Per-dimension level counts for FSQ. Effective codebook size = prod(levels)."""
 
@@ -1404,6 +1428,12 @@ class IPMD(PPO):
                 ),
                 phase_source=str(self.config.ipmd.latent_learning.command_phase_source),
                 command_mode=str(self.config.ipmd.hl_skill_command_mode),
+                command_quantizer=str(
+                    self.config.ipmd.latent_learning.command_quantizer
+                ),
+                command_fsq_levels=list(
+                    self.config.ipmd.latent_learning.command_fsq_levels
+                ),
                 discover_env_method=self._discover_env_method,
                 device=self._get_device(self.config.device),
                 finetune_enabled=bool(self.config.ipmd.hl_skill_finetune_enabled),

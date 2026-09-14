@@ -350,3 +350,74 @@ def test_jepa_checkpoint_without_heads_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="jepa_state_dict"):
         _sampler(checkpoint_path, _FakeEnv())
+
+
+@pytest.mark.parametrize("phi,mu", [("affine_no_bias", "next"), ("identity", "film")])
+def test_factored_poe_is_linear_and_restores(tmp_path, phi, mu):
+    config = _config(
+        device="cpu",
+        diffsr_phi_parameterization=phi, diffsr_mu_conditioning=mu,
+        diffsr_feature_dim=Z_DIM if phi == "identity" else 8, source_history_steps=5,
+        jepa_ntp_head="diff_chunk", jepa_ntp_chunk_span="boundary_next",
+        jepa_endpoint_coeff=0.0,
+    )
+    trainer = HighLevelSkillDiffSRTrainer(config, _FakeEnv())
+    metrics = trainer.train_step()
+    assert metrics["train/jepa_ntp_loss"] > 0
+    head = trainer.jepa_ntp_diffsr
+    if phi == "affine_no_bias":
+        assert head.action_net.bias is None
+    source = torch.randn(3, 6 * STATE_DIM)
+    target = torch.randn(3, 3 * STATE_DIM)
+    z1, z2 = torch.randn(3, Z_DIM), torch.randn(3, Z_DIM)
+    for level in range(head.num_noises):
+        time = torch.full((3, 1), level)
+        def prediction(z):
+            return head.forward_eps(s=source, a=z, sp=target, t=time)
+        torch.testing.assert_close(prediction(2 * z1 - 0.3 * z2),
+                                   2 * prediction(z1) - 0.3 * prediction(z2))
+        torch.testing.assert_close(prediction(torch.zeros_like(z1)), torch.zeros_like(target))
+    if phi == "affine_no_bias":
+        assert head.state_net.fc2.weight.grad is not None
+        assert head.action_net.weight.grad is not None
+    else:
+        assert head.mu_modulation.fc2.weight.grad.abs().sum() > 0
+        assert not torch.allclose(prediction(z1), head.forward_eps(
+            s=source + 1, a=z1, sp=target, t=time))
+    assert head.mu_net.fc2.weight.grad is not None
+    checkpoint = tmp_path / "factored.pt"
+    trainer.save_checkpoint(checkpoint)
+    restored = HighLevelSkillDiffSRTrainer(config, _FakeEnv())
+    restored.load_checkpoint(checkpoint)
+    torch.testing.assert_close(restored.jepa_ntp_diffsr.forward_eps(
+        s=source, a=z1, sp=target, t=time), prediction(z1))
+
+
+def test_dynamics_probe_is_repeatable_and_preserves_state():
+    trainer = HighLevelSkillDiffSRTrainer(_config(
+        device="cpu",
+        diffsr_phi_parameterization="affine_no_bias", source_history_steps=5,
+        jepa_ntp_head="diff_chunk", jepa_ntp_chunk_span="boundary_next",
+        jepa_endpoint_coeff=0.0,
+    ), _FakeEnv())
+    trainer.train_step()
+    head = trainer.jepa_ntp_diffsr
+    before = {key: value.clone() for key, value in head.state_dict().items()}
+    rng = torch.get_rng_state().clone()
+    first = trainer.evaluate_dynamics_probe(batch_size=8, num_batches=2)
+    torch.testing.assert_close(torch.get_rng_state(), rng)
+    assert first == trainer.evaluate_dynamics_probe(batch_size=8, num_batches=2)
+    for key, value in head.state_dict().items():
+        torch.testing.assert_close(value, before[key])
+    assert head.training and trainer.skill_encoder.training
+    assert first["dynamics_probe/examples_per_split_per_level"] == 16
+    for split in ("train", "eval"):
+        for code in ("real_z", "shuffled_z", "zero_z"):
+            values = [first[f"dynamics_probe/{split}/noise_{t}/{code}"]
+                      for t in range(head.num_noises)]
+            assert first[f"dynamics_probe/{split}/mean/{code}"] == pytest.approx(
+                sum(values) / len(values))
+        # A pure linear head at z=0 predicts zero at every level. Shared noise
+        # must therefore give exactly equal losses at every diffusion level.
+        assert len({first[f"dynamics_probe/{split}/noise_{t}/zero_z"]
+                    for t in range(head.num_noises)}) == 1
