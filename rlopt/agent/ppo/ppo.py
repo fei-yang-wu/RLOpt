@@ -117,6 +117,7 @@ class RunningMeanStdCatInputs(torch.nn.Module):
             msg = "clip must be positive."
             raise ValueError(msg)
         self.module = module
+        self.update_on_forward = bool(update_on_forward)
         self.epsilon = float(epsilon)
         self.clip = float(clip)
         module_device = next(module.parameters(), torch.empty(0)).device
@@ -208,6 +209,12 @@ class PPOConfig:
 
     entropy_coeff: float = 0.008
     """Entropy coefficient."""
+
+    update_normalizers_after_rollout: bool = False
+    """Freeze actor/critic input statistics during collection and optimization,
+    then update once from current rollout observations before checkpointing.
+    False preserves historical forward-driven normalization updates.
+    """
 
     normalize_advantage: bool = True
     """Whether to normalize the advantage estimates."""
@@ -1300,6 +1307,34 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                     step=metadata.frames_processed,
                 )
 
+    @torch.no_grad()
+    def _update_rollout_normalizers(self, rollout: TensorDict) -> None:
+        """Count each collected current observation once, after all PPO/KL work.
+
+        Updating before record() ensures both saved checkpoints and the next
+        collector weight refresh receive the same new buffers. Do not include
+        next/final observations: the rollout already counts each visited state.
+        """
+        if not self.config.ppo.update_normalizers_after_rollout:
+            return
+        for network, network_config in (
+            (self.policy, self.config.policy),
+            (self.value_function, self.config.value_function),
+        ):
+            if network is None or network_config is None:
+                continue
+            normalizers = [
+                module
+                for module in network.modules()
+                if isinstance(module, RunningMeanStdCatInputs)
+            ]
+            if not normalizers:
+                continue
+            values = tuple(rollout.get(key) for key in network_config.get_input_keys())
+            value = values[0] if len(values) == 1 else torch.cat(values, dim=-1)
+            for normalizer in normalizers:
+                normalizer._update(value)
+
     def train(self) -> None:  # type: ignore
         """Train the agent with the shared on-policy rollout-to-update workflow."""
         self.validate_training()
@@ -1319,6 +1354,8 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                     self.iterate(iteration, metadata)
                 if "learn" in iteration.phase_times:
                     iteration.learn_time = iteration.phase_times["learn"]
+
+                self._update_rollout_normalizers(iteration.rollout)
 
                 # 4) Log, refresh collector weights, and checkpoint if needed.
                 with self._profile_iteration_phase(iteration.phase_times, "record"):
