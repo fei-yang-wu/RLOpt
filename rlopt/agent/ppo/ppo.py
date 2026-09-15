@@ -152,13 +152,16 @@ class RunningMeanStdCatInputs(torch.nn.Module):
         return torch.cat(inputs, dim=-1)
 
     @torch.no_grad()
-    def _update(self, value: Tensor) -> None:
+    def _update(self, value: Tensor, *, moments=None) -> None:
         flat = value.detach().reshape(-1, value.shape[-1]).to(torch.float32)
         if flat.shape[0] == 0:
             return
-        batch_mean = flat.mean(dim=0)
-        batch_var = flat.var(dim=0, correction=1 if flat.shape[0] > 1 else 0)
-        batch_count = float(flat.shape[0])
+        if moments is None:
+            batch_mean = flat.mean(dim=0)
+            batch_var = flat.var(dim=0, correction=1 if flat.shape[0] > 1 else 0)
+            batch_count = float(flat.shape[0])
+        else:
+            batch_mean, batch_var, batch_count = moments
         delta = batch_mean - self.running_mean
         total_count = self.count + batch_count
         new_mean = self.running_mean + delta * batch_count / total_count
@@ -894,6 +897,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         total_loss = critic_loss + actor_loss
         # Backward pass
         total_loss.backward()  # type: ignore
+        self._synchronize_gradients()
 
         output_loss = loss.detach()  # type: ignore
         for key, value in extra_actor_metrics.items():
@@ -917,6 +921,15 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         output_loss.set("alpha", torch.tensor(1.0, device=self.device))  # type: ignore
         output_loss.set("grad_norm", grad_norm_tensor.detach())  # type: ignore
         return output_loss, num_network_updates + 1  # type: ignore
+
+    def _synchronize_gradients(self) -> None:
+        """Distributed PPO averages gradients here, before clipping."""
+
+    def _normalize_rollout_advantage(self, advantage: Tensor) -> Tensor:
+        return _normalize_advantage_over_rollout(advantage)
+
+    def _should_stop_training(self, metadata: PPOTrainingMetadata) -> bool:
+        return False
 
     def _collector_iter(self) -> Iterator[TensorDict]:
         """Yield data from the collector while enforcing NaN guards per batch."""
@@ -1048,7 +1061,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 advantage = rollout.get("advantage")
                 rollout.set(
                     "advantage",
-                    _normalize_advantage_over_rollout(advantage),
+                    self._normalize_rollout_advantage(advantage),
                 )
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
@@ -1373,6 +1386,8 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 with self._profile_iteration_phase(iteration.phase_times, "record"):
                     self.record(iteration, metadata)
                 self._finish_iteration_profile(metadata, iteration)
+                if self._should_stop_training(metadata):
+                    break
         except KeyboardInterrupt:
             # Walltime/SIGTERM (or a real Ctrl+C): persist the current state so
             # a chained segment resumes from HERE rather than from the last
