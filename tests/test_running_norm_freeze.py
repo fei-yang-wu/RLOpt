@@ -1,4 +1,4 @@
-"""`update_normalizers_after_rollout=false` must freeze the running input statistics."""
+"""`freeze_normalizers=true` must freeze the running input statistics everywhere."""
 
 import warnings
 
@@ -41,3 +41,34 @@ def test_ppo_config_declares_the_freeze_key():
     assert config.update_normalizers_after_rollout is True
     config.update_normalizers_after_rollout = False
     assert config.update_normalizers_after_rollout is False
+
+
+def test_ppo_config_declares_freeze_normalizers():
+    config = PPOConfig()
+    assert config.freeze_normalizers is False
+    assert config.update_normalizers_after_rollout is True
+    config.freeze_normalizers = True
+    assert config.freeze_normalizers is True
+
+
+def test_freeze_normalizers_wins_in_both_paths():
+    import types
+
+    from rlopt.agent.ppo.ppo import PPO
+
+    class _Probe:
+        pass
+
+    probe = _Probe()
+    # freeze_normalizers -> forward frozen whatever the after-rollout flag says
+    probe.config = types.SimpleNamespace(
+        ppo=types.SimpleNamespace(freeze_normalizers=True, update_normalizers_after_rollout=False)
+    )
+    assert PPO._normalizers_frozen(probe) is True
+    probe.config.ppo.update_normalizers_after_rollout = True
+    assert PPO._normalizers_frozen(probe) is True
+    # without it the after-rollout flag decides
+    probe.config.ppo.freeze_normalizers = False
+    assert PPO._normalizers_frozen(probe) is True
+    probe.config.ppo.update_normalizers_after_rollout = False
+    assert PPO._normalizers_frozen(probe) is False

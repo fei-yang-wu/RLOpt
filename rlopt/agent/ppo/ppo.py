@@ -209,12 +209,6 @@ class PPOConfig:
     entropy_coeff: float = 0.008
     """Entropy coefficient."""
 
-    update_normalizers_after_rollout: bool = False
-    """Freeze actor/critic input statistics during collection and optimization,
-    then update once from current rollout observations before checkpointing.
-    False preserves historical forward-driven normalization updates.
-    """
-
     normalize_advantage: bool = True
     """Whether to normalize the advantage estimates."""
 
@@ -226,6 +220,14 @@ class PPOConfig:
     so a fine-tune keeps its parent's input scale. Before 2026-09-13 this key
     did not exist and was accepted silently by the Hydra path; every campaign
     that passed it still updated the statistics on every minibatch.
+    """
+
+    freeze_normalizers: bool = False
+    """Never move the running input statistics: neither on the forward pass
+    nor after the rollout. They stay at the values the checkpoint restored
+    (or the zero-mean / unit-variance prior for a fresh run). This is the
+    "frozen normalizer" the 2026-09 fine-tune campaigns mean; it overrides
+    `update_normalizers_after_rollout` in both places that read it.
     """
 
     normalize_advantage_global: bool = False
@@ -398,6 +400,8 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         change the likelihood under which the rollout was collected.
         """
         ppo = getattr(self.config, "ppo", None)
+        if bool(getattr(ppo, "freeze_normalizers", False)):
+            return True
         return bool(getattr(ppo, "update_normalizers_after_rollout", True))
 
     def _construct_policy(
@@ -1321,6 +1325,8 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         collector weight refresh receive the same new buffers. Do not include
         next/final observations: the rollout already counts each visited state.
         """
+        if getattr(self.config.ppo, "freeze_normalizers", False):
+            return
         if not self.config.ppo.update_normalizers_after_rollout:
             return
         for network, network_config in (
