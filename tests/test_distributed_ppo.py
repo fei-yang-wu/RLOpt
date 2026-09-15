@@ -7,6 +7,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -16,7 +17,7 @@ from rlopt.agent.ppo.ppo import PPO, PPORLOptConfig, RunningMeanStdCatInputs
 from rlopt.env_utils import env_maker
 
 
-def config(root, rank):
+def config(root, rank, global_advantage):
     cfg = PPORLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
     cfg.env.device = cfg.device = "cpu"
@@ -31,7 +32,7 @@ def config(root, rank):
     cfg.ppo.entropy_coeff = (
         0.0  # Remove Monte Carlo entropy noise for exact update parity.
     )
-    cfg.ppo.normalize_advantage_global = True
+    cfg.ppo.normalize_advantage_global = global_advantage
     cfg.policy.input_keys = ["observation"]
     cfg.value_function.input_keys = ["observation"]
     cfg.policy.num_cells = cfg.value_function.num_cells = [8]
@@ -45,7 +46,7 @@ def config(root, rank):
     return cfg
 
 
-def worker(rank, root, rendezvous):
+def worker(rank, root, rendezvous, global_advantage):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -68,7 +69,7 @@ def worker(rank, root, rendezvous):
         reference_norm._update(all_values)
         torch.testing.assert_close(local_norm.running_var, reference_norm.running_var)
 
-        cfg = config(root, rank)
+        cfg = config(root, rank, global_advantage)
         env = env_maker(cfg)
         agent = DistributedPPO(env, cfg)
         baseline = None
@@ -94,21 +95,22 @@ def worker(rank, root, rendezvous):
         env.close()
         dist.barrier()
 
-        cfg = config(root / "train", rank)
+        cfg = config(root / "train", rank, global_advantage)
         env = env_maker(cfg)
         agent = DistributedPPO(env, cfg)
         agent.train()
         env.close()
         checkpoints = list((root / "train" / "rank-0").rglob("model_step_32.pt"))
         assert len(checkpoints) == 1
-        cfg = config(root / "resume", rank)
-        cfg.collector.total_frames = 48
+        cfg = config(root / "resume", rank, global_advantage)
+        cfg.collector.total_frames = 64
         env = env_maker(cfg)
-        resumed = DistributedPPO(env, cfg)
+        resumed = DistributedPPO(env, cfg, max_training_seconds=1e-9)
         resumed.load_model(str(checkpoints[0]))
         resumed.train()
         env.close()
         health = json.loads((resumed.log_dir / "distributed_health.json").read_text())
+        assert health["stop_reason"] == "time_budget"
         assert health["initial_frames"] == 32
         assert health["cumulative_env_frames"] == 48
         assert health["optimizer_updates_this_segment"] == 1
@@ -117,6 +119,12 @@ def worker(rank, root, rendezvous):
         dist.destroy_process_group()
 
 
-def test_two_worker_ppo_parity_and_resume(tmp_path):
-    mp.spawn(worker, args=(str(tmp_path), str(tmp_path / "group")), nprocs=2, join=True)
+@pytest.mark.parametrize("global_advantage", [True, False])
+def test_two_worker_ppo_parity_and_resume(tmp_path, global_advantage):
+    mp.spawn(
+        worker,
+        args=(str(tmp_path), str(tmp_path / "group"), global_advantage),
+        nprocs=2,
+        join=True,
+    )
     assert not list((tmp_path / "train" / "rank-1").rglob("*.pt"))

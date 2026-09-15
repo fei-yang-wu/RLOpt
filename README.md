@@ -15,7 +15,7 @@ can differ. The fixed coordinate is internal, not an extra policy command.
 ### Distributed PPO qualification
 
 `rlopt.agent.ppo.distributed.DistributedPPO` uses an initialized PyTorch process
- group to average gradients before clipping and pool observation/advantage
+group to average gradients before clipping and pool observation/advantage
 statistics and adaptive KL decisions. The caller creates one environment and
 agent per worker. `collector.frames_per_batch` and `loss.mini_batch_size` are
 local; `collector.total_frames`, checkpoint frame counts and save intervals are
