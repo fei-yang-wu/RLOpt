@@ -49,7 +49,7 @@ class DistributedPPO(PPO):
         if config.ppo.rnn_hidden_size:
             msg = "Distributed PPO currently supports feed-forward policies"
             raise ValueError(msg)
-        if not config.ppo.update_normalizers_after_rollout:
+        if not config.ppo.update_normalizers_after_rollout and not config.ppo.freeze_normalizers:
             msg = "Distributed PPO requires update_normalizers_after_rollout=true"
             raise ValueError(msg)
         if config.collector.frames_per_batch % config.loss.mini_batch_size:
@@ -95,14 +95,14 @@ class DistributedPPO(PPO):
     def _normalize_rollout_advantage(self, advantage):
         return normalize_global(advantage)
 
-    def update(self, batch, num_network_updates):
+    def update(self, batch, num_network_updates, *args, **kwargs):
         if (
             self.config.ppo.normalize_advantage
             and not self.config.ppo.normalize_advantage_global
         ):
             batch = batch.clone(False)
             batch.set("advantage", normalize_global(batch.get("advantage")))
-        return super().update(batch, num_network_updates)
+        return super().update(batch, num_network_updates, *args, **kwargs)
 
     def _record_kl_for_lr_adaptation(self, kl_approx, schedule_cfg):
         pooled = kl_approx.detach().mean().clone()
@@ -132,6 +132,19 @@ class DistributedPPO(PPO):
         return metadata
 
     def collect(self, metadata, iteration_idx):
+        # Simulator allocators cannot reuse PyTorch's cached update workspaces.
+        # Release unused blocks at the rollout boundary, never in env.step().
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.empty_cache()
+            if iteration_idx < 10 or iteration_idx % 100 == 0:
+                free, total = torch.cuda.mem_get_info(self.device)
+                print(
+                    f"[DISTRIBUTED MEMORY] rank={self.rank} iteration={iteration_idx} "
+                    f"allocated={torch.cuda.memory_allocated(self.device)} "
+                    f"reserved={torch.cuda.memory_reserved(self.device)} "
+                    f"free={free} total={total}",
+                    flush=True,
+                )
         iteration = super().collect(metadata, iteration_idx)
         extra = iteration.frames * (self.world_size - 1)
         metadata.frames_processed += extra

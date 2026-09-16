@@ -28,3 +28,9 @@ The parent IsaacLab-Imitation entrypoint exposes `--distributed` under
 `torchrun`; its environment count and minibatch CLI settings are global and
 are divided before constructing the worker agents. See the parent's
 `2026-09-15-distributed-ppo-qualification` campaign for the bounded ICE test.
+
+`DistributedIPMD` extends that path for a frozen `hl_skill` encoder and environment
+rewards, preserving IPMD checkpoint/encoder restoration. Learned rewards and
+auxiliary encoder/BC updates are rejected. Frozen input normalizers are supported.
+Before CUDA rollouts, distributed agents release unused PyTorch allocator cache
+so simulator allocators can reuse temporary update workspace memory.
