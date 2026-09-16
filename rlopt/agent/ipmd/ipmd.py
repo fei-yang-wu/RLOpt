@@ -3635,6 +3635,7 @@ class IPMD(PPO):
         bc_metrics = self._backward_bc_terms(expert_batch, has_expert)
         rollout_bc_metrics = self._backward_rollout_bc_terms(batch)
 
+        self._synchronize_gradients()
         # Gradient clipping — always call for a fixed graph
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
