@@ -3550,3 +3550,74 @@ def test_affine_poe_preserves_parameters_predictions_and_gradients():
     torch.manual_seed(456)
     samples_poe = poe.sample(other[0], other[1])[0]
     torch.testing.assert_close(samples, samples_poe, atol=1e-4, rtol=1e-4)
+
+
+def test_ipmd_pre_policy_reward_updates_run_the_chi2_objective_end_to_end() -> None:
+    """The new objectives must flow through the pre-PPO reward path unchanged.
+
+    Every metric key ``_backward_reward_terms`` returns has to exist in
+    ``_empty_reward_metrics`` (the summation indexes it), and the estimator
+    must then score the whole rollout with driving off (plan 5.4 B3).
+    """
+    from rlopt.agent.ppo.ppo import PPOTrainingMetadata
+
+    rlopt = _rlopt()
+    cfg = rlopt.IPMDRLOptConfig()
+    cfg.env.env_name = "Pendulum-v1"
+    cfg.env.device = "cpu"
+    cfg.device = "cpu"
+    cfg.collector.frames_per_batch = 4
+    cfg.collector.total_frames = 4
+    cfg.replay_buffer.size = 64
+    cfg.loss.mini_batch_size = 2
+    cfg.compile.compile = False
+    cfg.ipmd.reward_num_cells = (16, 16)
+    cfg.ipmd.reward_input_type = "s"
+    cfg.ipmd.reward_objective = "chi2_lsgan"
+    cfg.ipmd.reward_output_activation = "none"
+    cfg.ipmd.reward_grad_penalty_coeff = 10.0
+    cfg.ipmd.reward_l2_coeff = 0.0
+    _apply_nonlatent_obs_input_keys(cfg)
+
+    env = rlopt.make_parallel_env(cfg)
+    agent = rlopt.IPMD(env, cfg, logger=None)
+    agent._set_test_expert_batch_sampler(
+        _make_test_expert_sampler(create_synthetic_expert_data(env, num_transitions=8))
+    )
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    rollout_flat = TensorDict(
+        {"observation": torch.randn(4, obs_dim, device=agent.device)},
+        batch_size=[4],
+        device=agent.device,
+    )
+    metadata = PPOTrainingMetadata(
+        collector_iter=iter(()),
+        total_iterations=1,
+        policy_operator=agent.actor_critic.get_policy_operator(),
+        updates_completed=0,
+        minibatches_per_epoch=2,
+        epochs_per_rollout=1,
+        anneal_clip_epsilon=False,
+        base_clip_epsilon=agent.config.ppo.clip_epsilon,
+    )
+    metrics = agent._run_pre_policy_reward_updates(rollout_flat, metadata)
+    assert metrics["reward_updates_applied"].item() == pytest.approx(1.0)
+    assert metrics["loss_reward_objective"].item() > 0.0
+    assert metrics["loss_reward_grad_penalty_expert"].item() > 0.0
+    assert 0.0 <= metrics["reward_separation_auc"].item() <= 1.0
+    assert metrics["reward_grad_norm"].item() > 0.0
+
+    env_reward = torch.randn(4, 1, device=agent.device)
+    rollout = TensorDict(
+        {
+            "observation": torch.randn(4, obs_dim, device=agent.device),
+            ("next", "reward"): env_reward.clone(),
+            ("next", "done"): torch.zeros(4, 1, dtype=torch.bool, device=agent.device),
+        },
+        batch_size=[4],
+        device=agent.device,
+    )
+    prepared = agent._prepare_rollout_rewards(rollout)
+    assert torch.equal(rollout.get(("next", "reward")), env_reward)
+    assert rollout.get(("next", "est_reward")).shape == (4, 1)
+    assert "reward/env_vs_est/pearson_corr" in prepared

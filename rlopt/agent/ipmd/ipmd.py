@@ -31,17 +31,25 @@ from rlopt.agent.ipmd.utils import (
     IPMD_REWARD_INPUT_TYPES,
     IPMD_REWARD_MODEL_TYPES,
     IPMD_REWARD_OUTPUT_ACTIVATIONS,
+    LinearDualRewardHead,
     RewardInputBlock,
     build_reward_input_blocks,
     normalize_ipmd_command_source,
     normalize_ipmd_reward_input_type,
     normalize_ipmd_reward_model_type,
+    normalize_ipmd_reward_objective,
     normalize_ipmd_reward_output_activation,
+    normalize_ipmd_reward_ppo_squash,
     require_non_negative,
     require_positive_int,
     required_batch_keys_from_reward_blocks,
+    resolve_ipmd_reward_ppo_squash,
     reward_alignment_metrics,
     reward_grad_penalty_from_input,
+    reward_saturation_fraction,
+    reward_separation_auc,
+    rollout_done_mask,
+    squash_reward_for_ppo,
 )
 from rlopt.agent.ppo.ppo import (
     PPO,
@@ -626,6 +634,83 @@ class IPMDConfig(PPOConfig):
     Set to 0 to disable.
     """
 
+    # Reward-estimation revival (plan 2026-10-07, section 5.4 B2/B3). Every
+    # default below reproduces the historical behaviour bitwise.
+    reward_objective: str = "ipmd_diff"
+    """Reward-estimator objective in ``_backward_reward_terms``.
+
+    - ``"ipmd_diff"``      - the parked objective (default; historical path).
+    - ``"logistic_ratio"`` - label-smoothed BCE, reward = logit.
+    - ``"chi2_lsgan"``     - AMP least-squares discriminator with R1 on expert
+      samples (``reward_grad_penalty_coeff`` is the R1 coefficient, applied
+      as ``coeff / 2``); reward = D(x).
+    - ``"linear_dual"``    - parameter-free IPMD linear dual over whitened
+      features; no optimizer; ``w* = Delta / reward_linear_weight_decay``.
+
+    The three new objectives require ``reward_output_activation == "none"``
+    and ``reward_model_type == "mlp"``. They scale their main term by
+    ``reward_loss_coeff`` and add ``reward_param_weight_decay_coeff``; the
+    ``reward_l2_coeff`` output penalty belongs to ``ipmd_diff`` only.
+    """
+
+    reward_ppo_squash: str = "auto"
+    """How the raw estimate ``r`` becomes ``r_hat`` before PPO mixing.
+
+    ``"auto"`` resolves per objective: ipmd_diff -> ``"none"``,
+    logistic_ratio -> ``"sigmoid"``, chi2_lsgan -> ``"amp"`` (``max(0, 1 -
+    0.25 (r - 1)^2)``), linear_dual -> ``"affine_frozen"`` (``clip(0.5 + (r -
+    m0) / (6 s0), 0, 1)`` with ``m0, s0`` captured on the first rollout after
+    PPO driving turns on and frozen into the checkpoint).
+    """
+
+    estimated_reward_scale: float = 1.0
+    """Multiplier on ``r_hat`` before mixing: ``est = scale * r_hat``.
+
+    Magnitude-matches a [0, 1] squash to the env reward (ceiling 0.30 per step
+    on the campaign recipe). 1.0 keeps the historical path.
+    """
+
+    reward_ramp_updates: int = 0
+    """Linear ramp of ``est_reward_weight`` over this many PPO iterations.
+
+    Counted in rollouts (``_prepare_rollout_rewards`` calls) since PPO driving
+    turned on: ``effective = est_reward_weight * min(1, seen / ramp)``. 0
+    disables the ramp (full weight from the first rollout).
+    """
+
+    reward_mask_done_rows: bool = False
+    """Zero the estimated reward on rows whose ``("next", "done")`` is true.
+
+    Both terminated and truncated rows. With >= 75% of episode ends being
+    terminations, any non-zero estimate on done rows pays for dying.
+    """
+
+    reward_constant_bonus: bool = False
+    """Survival-effect control: replace ``r_hat`` by its frozen batch mean.
+
+    The mean is captured on the first rollout after PPO driving turns on and
+    frozen (checkpointed); every alive row gets ``scale * mean``, done rows 0.
+    """
+
+    reward_whiten_ridge: float = 1e-3
+    """Ridge added to the pooled covariance before the inverse square root
+    (``linear_dual`` whitening)."""
+
+    reward_linear_weight_decay: float = 1.0
+    """``lambda`` of the ``linear_dual`` step ``w <- w + alpha (Delta - lambda w)``;
+    fixed point ``w* = Delta / lambda``."""
+
+    reward_linear_closed_form: bool = True
+    """``linear_dual``: jump to ``w* = Delta / lambda`` each step instead of
+    taking the ``alpha``-sized dual step (``alpha = reward_lr or optim.lr``)."""
+
+    reward_moment_momentum: float = 0.05
+    """EMA momentum of the ``linear_dual`` running moments over pooled rows;
+    ``<= 0`` switches to the exact cumulative mean."""
+
+    reward_label_smoothing: float = 0.05
+    """``logistic_ratio`` targets: expert -> ``1 - eps``, policy -> ``eps``."""
+
     expert_batch_size: int | None = None
     """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
 
@@ -732,6 +817,10 @@ class IPMDConfig(PPOConfig):
         )
         self.reward_output_activation = normalize_ipmd_reward_output_activation(
             self.reward_output_activation
+        )
+        self.reward_objective = normalize_ipmd_reward_objective(self.reward_objective)
+        self.reward_ppo_squash = normalize_ipmd_reward_ppo_squash(
+            self.reward_ppo_squash
         )
         self.latent_dim = require_positive_int("ipmd.latent_dim", self.latent_dim)
         self.latent_steps_min = require_positive_int(
@@ -995,6 +1084,7 @@ class IPMDConfig(PPOConfig):
         )
         require_non_negative("ipmd.est_reward_weight", self.est_reward_weight)
         require_non_negative("ipmd.env_reward_weight", self.env_reward_weight)
+        self._validate_reward_objective_fields()
         require_non_negative("ipmd.bc_coef", self.bc_coef)
         require_non_negative("ipmd.rollout_bc_coef", self.rollout_bc_coef)
         if self.actor_learning_rate is not None and self.actor_learning_rate <= 0.0:
@@ -1072,6 +1162,54 @@ class IPMDConfig(PPOConfig):
             msg = (
                 "ipmd.estimated_reward_clamp_min must be <= "
                 f"ipmd.estimated_reward_clamp_max, got {clamp_min!r} > {clamp_max!r}."
+            )
+            raise ValueError(msg)
+
+    def _validate_reward_objective_fields(self) -> None:
+        """Checks for the reward-estimation revival fields (plan 5.4 B2/B3)."""
+        objective = self.reward_objective
+        if objective != "ipmd_diff":
+            if self.reward_output_activation != "none":
+                msg = (
+                    f"ipmd.reward_objective={objective!r} requires "
+                    "ipmd.reward_output_activation='none' (the objective's reward "
+                    "is the raw head output), got "
+                    f"{self.reward_output_activation!r}."
+                )
+                raise ValueError(msg)
+            if self.reward_model_type != "mlp":
+                msg = (
+                    f"ipmd.reward_objective={objective!r} requires "
+                    "ipmd.reward_model_type='mlp'; grouped heads implement the "
+                    "ipmd_diff objective only."
+                )
+                raise ValueError(msg)
+        require_non_negative("ipmd.estimated_reward_scale", self.estimated_reward_scale)
+        if int(self.reward_ramp_updates) < 0:
+            msg = f"ipmd.reward_ramp_updates must be >= 0, got {self.reward_ramp_updates!r}."
+            raise ValueError(msg)
+        self.reward_ramp_updates = int(self.reward_ramp_updates)
+        if float(self.reward_whiten_ridge) <= 0.0:
+            msg = f"ipmd.reward_whiten_ridge must be > 0, got {self.reward_whiten_ridge!r}."
+            raise ValueError(msg)
+        if float(self.reward_linear_weight_decay) <= 0.0:
+            msg = (
+                "ipmd.reward_linear_weight_decay must be > 0 (the dual fixed point "
+                f"is Delta / lambda), got {self.reward_linear_weight_decay!r}."
+            )
+            raise ValueError(msg)
+        momentum = float(self.reward_moment_momentum)
+        if momentum > 1.0:
+            msg = (
+                "ipmd.reward_moment_momentum must be <= 1 (<= 0 selects the exact "
+                f"cumulative mean), got {self.reward_moment_momentum!r}."
+            )
+            raise ValueError(msg)
+        smoothing = float(self.reward_label_smoothing)
+        if not 0.0 <= smoothing < 0.5:
+            msg = (
+                "ipmd.reward_label_smoothing must lie in [0, 0.5), got "
+                f"{self.reward_label_smoothing!r}."
             )
             raise ValueError(msg)
 
@@ -1332,6 +1470,15 @@ class IPMD(PPO):
             self._use_latent_command
             and self._latent_key in self._reward_required_batch_keys()
         )
+
+        # Reward-estimation revival (plan 5.4): objective and PPO squash are
+        # structural, so they are resolved once; the mixing scalars are read
+        # live from the config like est/env weights.
+        self._reward_objective: str = self.config.ipmd.reward_objective
+        self._reward_ppo_squash: str = resolve_ipmd_reward_ppo_squash(
+            self._reward_objective, self.config.ipmd.reward_ppo_squash
+        )
+        self._reward_mix_state: dict[str, Tensor] = self._initial_reward_mix_state()
 
         # Reward estimator: r(s, a, s') -> scalar
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
@@ -1968,10 +2115,43 @@ class IPMD(PPO):
         )
         return tuple(context_keys), specs
 
+    @property
+    def _reward_estimator_is_linear(self) -> bool:
+        return self._reward_objective == "linear_dual"
+
+    def _initial_reward_mix_state(self) -> dict[str, Tensor]:
+        """Frozen PPO-mixing state (plan 5.4 B3), checkpointed by the hooks.
+
+        ``driving_rollouts``: rollouts seen with PPO driving on (the ramp
+        clock). ``affine_center`` / ``affine_scale`` with ``affine_frozen``:
+        the ``m0, s0`` of the affine_frozen squash. ``constant_bonus_mean``
+        with ``constant_bonus_frozen``: the batch mean of ``r_hat`` that the
+        constant-bonus control pays on alive rows.
+        """
+        device = self.device
+        return {
+            "driving_rollouts": torch.zeros((), dtype=torch.int64, device=device),
+            "affine_center": torch.zeros((), device=device),
+            "affine_scale": torch.ones((), device=device),
+            "affine_frozen": torch.zeros((), dtype=torch.bool, device=device),
+            "constant_bonus_mean": torch.zeros((), device=device),
+            "constant_bonus_frozen": torch.zeros((), dtype=torch.bool, device=device),
+        }
+
     def _construct_reward_estimator(self) -> torch.nn.Module:
         """Create reward network whose input depends on ``reward_input_type``."""
         cfg = self.config
         assert isinstance(cfg, IPMDRLOptConfig)
+
+        if self._reward_objective == "linear_dual":
+            return LinearDualRewardHead(
+                self._reward_input_dim,
+                ridge=float(cfg.ipmd.reward_whiten_ridge),
+                weight_decay=float(cfg.ipmd.reward_linear_weight_decay),
+                momentum=float(cfg.ipmd.reward_moment_momentum),
+                closed_form=bool(cfg.ipmd.reward_linear_closed_form),
+                device=self.device,
+            )
 
         if self._reward_model_type == "grouped":
             heads = torch.nn.ModuleDict()
@@ -2024,7 +2204,7 @@ class IPMD(PPO):
         compile_mode = self.config.compile.compile_mode or "default"
         self.loss_module = torch.compile(self.loss_module, mode=compile_mode)
         self.adv_module = torch.compile(self.adv_module, mode=compile_mode)
-        if self._reward_update_enabled:
+        if self._reward_update_enabled and not self._reward_estimator_is_linear:
             self.reward_estimator = torch.compile(self.reward_estimator)
         self._components_compiled = True
 
@@ -2140,17 +2320,22 @@ class IPMD(PPO):
             return [optimizer_cls(all_params, **optimizer_kwargs)]
 
         policy_params = list(self.actor_critic.parameters()) + joint_params
-        reward_optimizer_kwargs = dict(optimizer_kwargs)
-        reward_optimizer_kwargs["lr"] = (
-            self._reward_lr
-            if self._reward_lr is not None
-            else float(reward_optimizer_kwargs["lr"])
-        )
-        reward_optimizer_kwargs["weight_decay"] = 0.0
-        self.reward_optim = optimizer_cls(
-            self.reward_estimator.parameters(),
-            **reward_optimizer_kwargs,
-        )
+        if self._reward_estimator_is_linear:
+            # The linear dual has buffers only; its step is closed-form or the
+            # explicit dual update, so there is nothing for Adam to own.
+            self.reward_optim = None
+        else:
+            reward_optimizer_kwargs = dict(optimizer_kwargs)
+            reward_optimizer_kwargs["lr"] = (
+                self._reward_lr
+                if self._reward_lr is not None
+                else float(reward_optimizer_kwargs["lr"])
+            )
+            reward_optimizer_kwargs["weight_decay"] = 0.0
+            self.reward_optim = optimizer_cls(
+                self.reward_estimator.parameters(),
+                **reward_optimizer_kwargs,
+            )
         if split_actor_critic_lr:
             return [optimizer_cls(optimizer_params, **optimizer_kwargs)]
         return [optimizer_cls(policy_params, **optimizer_kwargs)]
@@ -2425,11 +2610,26 @@ class IPMD(PPO):
             "expert_reward_mean": torch.zeros((), device=self.device),
             "expert_reward_std": torch.zeros((), device=self.device),
         }
+        for key in self._reward_objective_metric_keys():
+            metrics[key] = torch.zeros((), device=self.device)
         for key in self._grouped_reward_loss_metric_keys():
             metrics[key] = torch.zeros((), device=self.device)
         for key in self._reward_condition_metric_keys():
             metrics[key] = torch.zeros((), device=self.device)
         return metrics
+
+    @staticmethod
+    def _reward_objective_metric_keys() -> list[str]:
+        """Metrics every objective reports on its update batch (plan 5.4 B2)."""
+        return [
+            "reward_separation_auc",
+            "reward_saturation_frac",
+            "loss_reward_objective",
+            "reward_linear_delta_norm",
+            "reward_linear_w_norm",
+            "reward_linear_dual_value",
+            "reward_linear_whitening_condition",
+        ]
 
     def _grouped_reward_loss_metric_keys(self) -> list[str]:
         keys: list[str] = []
@@ -2515,6 +2715,7 @@ class IPMD(PPO):
             "expert_reward_mean",
             "expert_reward_std",
             "reward_grad_norm",
+            *self._reward_objective_metric_keys(),
             *self._grouped_reward_loss_metric_keys(),
             *self._reward_condition_metric_keys(),
         ]
@@ -2529,36 +2730,64 @@ class IPMD(PPO):
         return loss.select(*loss_keys)
 
     def _prepare_rollout_rewards(self, rollout: TensorDict) -> dict[str, float]:
-        """Attach reward-model diagnostics and PPO reward mixing to one rollout."""
+        """Attach reward-model diagnostics and PPO reward mixing to one rollout.
+
+        Plan 5.4 B3. The raw estimate ``r`` is computed over the whole rollout
+        whenever the estimator trains or drives PPO, and the alignment metrics
+        against the env reward are logged whenever it is computed. The PPO
+        reward is ``env_w * env + est_w_eff * est`` only when
+        ``use_estimated_rewards_for_ppo`` is on, with
+
+        ``r -> clamp -> r_hat (reward_ppo_squash) -> scale -> done penalty ->
+        done mask / constant bonus -> est``;
+
+        otherwise the PPO reward is the env reward, untouched. With the
+        historical defaults (squash none, scale 1, no mask, no bonus, no ramp)
+        ``est`` is the historical clamped-and-penalized estimate.
+        """
         metrics: dict[str, float] = {}
         reward_key = ("next", "reward")
+        cfg = self.config.ipmd
+        driving = bool(cfg.use_estimated_rewards_for_ppo)
+        estimate = driving or self._reward_update_enabled
 
         with torch.no_grad():
             env_reward = rollout[reward_key]
             est_reward: Tensor | None = None
-            if self.config.ipmd.use_estimated_rewards_for_ppo:
-                est_reward = (
+            raw_reward: Tensor | None = None
+            r_hat: Tensor | None = None
+            effective_est_weight = float(cfg.est_reward_weight)
+            if estimate:
+                raw_reward = (
                     self._reward_from_td(
                         rollout,
                         batch_role="rollout",
                     )
                     .detach()  # type: ignore[attr-defined]
                     .clamp(
-                        min=self.config.ipmd.estimated_reward_clamp_min,
-                        max=self.config.ipmd.estimated_reward_clamp_max,
+                        min=cfg.estimated_reward_clamp_min,
+                        max=cfg.estimated_reward_clamp_max,
                     )
                 )  # type: ignore[attr-defined]
+                r_hat = self._squash_rollout_reward(raw_reward, driving=driving)
+                scale = float(cfg.estimated_reward_scale)
+                est_reward = r_hat if scale == 1.0 else scale * r_hat
                 est_reward = self._apply_estimated_reward_done_penalty(
                     rollout,
                     est_reward,
                 )
+                est_reward = self._apply_reward_done_controls(
+                    rollout, est_reward, r_hat, scale=scale, driving=driving
+                )
 
             if self._use_estimated_rewards_for_ppo:
                 assert est_reward is not None
+                effective_est_weight = self._effective_est_reward_weight()
                 mixed_reward = (
-                    self.config.ipmd.env_reward_weight * env_reward
-                    + self.config.ipmd.est_reward_weight * est_reward
+                    cfg.env_reward_weight * env_reward
+                    + effective_est_weight * est_reward
                 )
+                self._reward_mix_state["driving_rollouts"] += 1
             else:
                 mixed_reward = env_reward
 
@@ -2571,17 +2800,98 @@ class IPMD(PPO):
             }
         )
         if est_reward is not None:
+            assert raw_reward is not None
+            assert r_hat is not None
             rollout.set(("next", "est_reward"), est_reward)
             metrics["train/est_reward_mean"] = est_reward.mean().item()
+            metrics["train/est_reward_raw_mean"] = raw_reward.mean().item()
+            metrics["train/est_reward_raw_std"] = raw_reward.std().item()
+            metrics["train/est_reward_hat_mean"] = r_hat.mean().item()
+            metrics["train/est_reward_saturation_frac"] = reward_saturation_fraction(
+                raw_reward
+            ).item()
+            metrics["train/est_reward_weight_effective"] = (
+                effective_est_weight if self._use_estimated_rewards_for_ppo else 0.0
+            )
             metrics.update(
                 reward_alignment_metrics(
                     "reward/env_vs_est",
                     env_reward,
-                    est_reward,
+                    raw_reward,
                 )
             )
 
         return metrics
+
+    def _squash_rollout_reward(self, raw_reward: Tensor, *, driving: bool) -> Tensor:
+        """``r -> r_hat`` per the resolved squash; freezes ``m0, s0`` once."""
+        squash = self._reward_ppo_squash
+        if squash != "affine_frozen":
+            return squash_reward_for_ppo(raw_reward, squash)
+        state = self._reward_mix_state
+        if driving and not bool(state["affine_frozen"].item()):
+            flat = raw_reward.reshape(-1).float()
+            state["affine_center"].copy_(flat.mean())
+            state["affine_scale"].copy_(flat.std(unbiased=False).clamp_min(1e-6))
+            state["affine_frozen"].fill_(True)
+        if not bool(state["affine_frozen"].item()):
+            # Diagnostics only (driving off): centre on the current rollout.
+            flat = raw_reward.reshape(-1).float()
+            return squash_reward_for_ppo(
+                raw_reward,
+                squash,
+                affine_center=flat.mean(),
+                affine_scale=flat.std(unbiased=False).clamp_min(1e-6),
+            )
+        return squash_reward_for_ppo(
+            raw_reward,
+            squash,
+            affine_center=state["affine_center"],
+            affine_scale=state["affine_scale"],
+        )
+
+    def _apply_reward_done_controls(
+        self,
+        rollout: TensorDict,
+        est_reward: Tensor,
+        r_hat: Tensor,
+        *,
+        scale: float,
+        driving: bool,
+    ) -> Tensor:
+        """Done-row mask and the constant-bonus control (plan 5.4 B3)."""
+        cfg = self.config.ipmd
+        constant_bonus = bool(cfg.reward_constant_bonus)
+        mask_done = bool(cfg.reward_mask_done_rows)
+        if not constant_bonus and not mask_done:
+            return est_reward
+        if constant_bonus:
+            state = self._reward_mix_state
+            if driving and not bool(state["constant_bonus_frozen"].item()):
+                state["constant_bonus_mean"].copy_(r_hat.float().mean())
+                state["constant_bonus_frozen"].fill_(True)
+            bonus = (
+                state["constant_bonus_mean"]
+                if bool(state["constant_bonus_frozen"].item())
+                else r_hat.float().mean()
+            )
+            est_reward = torch.full_like(est_reward, 0.0) + (scale * bonus).to(
+                est_reward.dtype
+            )
+        done = rollout_done_mask(rollout, est_reward)
+        if done is None:
+            return est_reward
+        return torch.where(done, torch.zeros_like(est_reward), est_reward)
+
+    def _effective_est_reward_weight(self) -> float:
+        """``est_reward_weight`` under the linear ramp (unit: driving rollouts)."""
+        cfg = self.config.ipmd
+        weight = float(cfg.est_reward_weight)
+        ramp = int(cfg.reward_ramp_updates)
+        if ramp <= 0:
+            return weight
+        seen = int(self._reward_mix_state["driving_rollouts"].item())
+        return weight * min(1.0, seen / float(ramp))
 
     def _expert_batch_for_update(self, batch: TensorDict) -> tuple[TensorDict, Tensor]:
         """Return an expert batch aligned with one PPO minibatch update."""
@@ -2812,9 +3122,23 @@ class IPMD(PPO):
         batch: TensorDict,
         expert_batch: TensorDict,
     ) -> dict[str, Tensor]:
-        """Backpropagate the IPMD reward objective and return detached metrics."""
+        """Backpropagate the IPMD reward objective and return detached metrics.
+
+        ``reward_objective`` selects the branch; ``"ipmd_diff"`` (the parked
+        campaign objective) is the historical arithmetic, kept bitwise.
+        """
         if self._reward_model_type == "grouped":
             return self._backward_grouped_reward_terms(batch, expert_batch)
+        if self._reward_objective == "logistic_ratio":
+            return self._backward_logistic_ratio_reward_terms(batch, expert_batch)
+        if self._reward_objective == "chi2_lsgan":
+            return self._backward_chi2_lsgan_reward_terms(batch, expert_batch)
+        if self._reward_objective == "linear_dual":
+            msg = (
+                "linear_dual has no backward pass; _run_reward_updates routes it "
+                "through _linear_dual_reward_step."
+            )
+            raise RuntimeError(msg)
 
         metrics = self._empty_reward_metrics()
         if not self._reward_update_enabled:
@@ -2869,6 +3193,169 @@ class IPMD(PPO):
         metrics["estimated_reward_std"] = r_pi.std().detach()
         metrics["expert_reward_mean"] = r_exp.mean().detach()
         metrics["expert_reward_std"] = r_exp.std().detach()
+        return metrics
+
+    def _reward_side_metrics(
+        self,
+        metrics: dict[str, Tensor],
+        r_pi: Tensor,
+        r_exp: Tensor,
+    ) -> None:
+        """Per-side moments, rank AUC and saturation shared by every objective."""
+        r_pi = r_pi.detach()
+        r_exp = r_exp.detach()
+        metrics["estimated_reward_mean"] = r_pi.mean()
+        metrics["estimated_reward_std"] = r_pi.std()
+        metrics["expert_reward_mean"] = r_exp.mean()
+        metrics["expert_reward_std"] = r_exp.std()
+        metrics["reward_separation_auc"] = reward_separation_auc(r_exp, r_pi)
+        metrics["reward_saturation_frac"] = reward_saturation_fraction(
+            torch.cat([r_pi.reshape(-1), r_exp.reshape(-1)], dim=0)
+        )
+
+    def _reward_pair_inputs(
+        self, batch: TensorDict, expert_batch: TensorDict, *, expert_requires_grad: bool
+    ) -> tuple[Tensor, Tensor]:
+        r_pi_input = self._reward_input_from_td(
+            batch,
+            detach=self._reward_detach_features,
+            requires_grad=False,
+        )
+        r_exp_input = self._reward_input_from_td(
+            expert_batch,
+            detach=self._reward_detach_features,
+            requires_grad=expert_requires_grad,
+        )
+        return r_pi_input, r_exp_input
+
+    def _backward_logistic_ratio_reward_terms(
+        self,
+        batch: TensorDict,
+        expert_batch: TensorDict,
+    ) -> dict[str, Tensor]:
+        """Label-smoothed BCE classifier; the reward is the logit.
+
+        ``loss = BCE(logits; expert -> 1 - eps, policy -> eps)
+        + reward_grad_penalty_coeff * R1(expert)
+        + reward_logit_reg_coeff * mean logit^2`` (+ parameter weight decay).
+        The cross-entropy optimum is the finite log density ratio where the
+        supports overlap; smoothing bounds it where they do not.
+        """
+        metrics = self._empty_reward_metrics()
+        if not self._reward_update_enabled:
+            return metrics
+        penalized = self._reward_grad_penalty_coeff > 0.0
+        r_pi_input, r_exp_input = self._reward_pair_inputs(
+            batch, expert_batch, expert_requires_grad=penalized
+        )
+        logits_pi = self.reward_estimator(r_pi_input)
+        logits_exp = self.reward_estimator(r_exp_input)
+        eps = float(self.config.ipmd.reward_label_smoothing)
+        target_exp = torch.full_like(logits_exp, 1.0 - eps)
+        target_pi = torch.full_like(logits_pi, eps)
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.cat([logits_exp.reshape(-1), logits_pi.reshape(-1)], dim=0),
+            torch.cat([target_exp.reshape(-1), target_pi.reshape(-1)], dim=0),
+        )
+        if penalized:
+            r1_expert = reward_grad_penalty_from_input(logits_exp, r_exp_input)
+        else:
+            r1_expert = torch.zeros((), device=self.device)
+        logit_reg = logits_pi.pow(2).mean() + logits_exp.pow(2).mean()
+        param_weight_decay = self._reward_parameter_weight_decay()
+        (
+            self._reward_loss_coeff * bce
+            + self._reward_grad_penalty_coeff * r1_expert
+            + self._reward_logit_reg_coeff * logit_reg
+            + self._reward_param_weight_decay_coeff * param_weight_decay
+        ).backward()
+
+        metrics["loss_reward_objective"] = bce.detach()
+        metrics["loss_reward_diff"] = (logits_pi.mean() - logits_exp.mean()).detach()
+        metrics["loss_reward_grad_penalty"] = r1_expert.detach()
+        metrics["loss_reward_grad_penalty_expert"] = r1_expert.detach()
+        metrics["loss_reward_logit_reg"] = logit_reg.detach()
+        metrics["loss_reward_param_weight_decay"] = param_weight_decay.detach()
+        self._reward_side_metrics(metrics, logits_pi, logits_exp)
+        return metrics
+
+    def _backward_chi2_lsgan_reward_terms(
+        self,
+        batch: TensorDict,
+        expert_batch: TensorDict,
+    ) -> dict[str, Tensor]:
+        """AMP least-squares discriminator (Peng et al. 2021); reward = D(x).
+
+        ``loss = mean (D_exp - 1)^2 + mean (D_pi + 1)^2
+        + (reward_grad_penalty_coeff / 2) * mean ||grad_x D(x_exp)||^2``
+        (+ ``reward_logit_reg_coeff`` on D^2 and parameter weight decay).
+        Population optimum without the penalty: ``(p_E - p_pi) / (p_E + p_pi)``
+        in [-1, 1], so the reward is bounded with no output activation.
+        """
+        metrics = self._empty_reward_metrics()
+        if not self._reward_update_enabled:
+            return metrics
+        penalized = self._reward_grad_penalty_coeff > 0.0
+        r_pi_input, r_exp_input = self._reward_pair_inputs(
+            batch, expert_batch, expert_requires_grad=penalized
+        )
+        d_pi = self.reward_estimator(r_pi_input)
+        d_exp = self.reward_estimator(r_exp_input)
+        ls_expert = (d_exp - 1.0).pow(2).mean()
+        ls_policy = (d_pi + 1.0).pow(2).mean()
+        objective = ls_expert + ls_policy
+        if penalized:
+            r1_expert = reward_grad_penalty_from_input(d_exp, r_exp_input)
+        else:
+            r1_expert = torch.zeros((), device=self.device)
+        logit_reg = d_pi.pow(2).mean() + d_exp.pow(2).mean()
+        param_weight_decay = self._reward_parameter_weight_decay()
+        (
+            self._reward_loss_coeff * objective
+            + 0.5 * self._reward_grad_penalty_coeff * r1_expert
+            + self._reward_logit_reg_coeff * logit_reg
+            + self._reward_param_weight_decay_coeff * param_weight_decay
+        ).backward()
+
+        metrics["loss_reward_objective"] = objective.detach()
+        metrics["loss_reward_diff"] = (d_pi.mean() - d_exp.mean()).detach()
+        metrics["loss_reward_l2"] = (ls_expert.detach() + ls_policy.detach())
+        metrics["loss_reward_grad_penalty"] = r1_expert.detach()
+        metrics["loss_reward_grad_penalty_expert"] = r1_expert.detach()
+        metrics["loss_reward_logit_reg"] = logit_reg.detach()
+        metrics["loss_reward_param_weight_decay"] = param_weight_decay.detach()
+        self._reward_side_metrics(metrics, d_pi, d_exp)
+        return metrics
+
+    def _linear_dual_reward_step(
+        self,
+        batch: TensorDict,
+        expert_batch: TensorDict,
+    ) -> dict[str, Tensor]:
+        """One ``linear_dual`` reward step: moments, whitening, ``w`` update."""
+        metrics = self._empty_reward_metrics()
+        if not self._reward_update_enabled:
+            return metrics
+        head = self.reward_estimator
+        assert isinstance(head, LinearDualRewardHead)
+        r_pi_input, r_exp_input = self._reward_pair_inputs(
+            batch, expert_batch, expert_requires_grad=False
+        )
+        alpha = (
+            self._reward_lr
+            if self._reward_lr is not None
+            else float(self.config.optim.lr)
+        )
+        out = head.dual_step(r_pi_input, r_exp_input, alpha=alpha)
+        metrics["reward_linear_delta_norm"] = out["delta_norm"]
+        metrics["reward_linear_w_norm"] = out["w_norm"]
+        metrics["reward_linear_dual_value"] = out["dual_value"]
+        metrics["reward_linear_whitening_condition"] = head.whitening_condition.clone()
+        metrics["loss_reward_objective"] = -out["dual_value"]
+        metrics["loss_reward_diff"] = (
+            out["reward_policy"].mean() - out["reward_expert"].mean()
+        )
+        self._reward_side_metrics(metrics, out["reward_policy"], out["reward_expert"])
         return metrics
 
     def _backward_grouped_reward_terms(
@@ -2977,7 +3464,7 @@ class IPMD(PPO):
         metrics["reward_grad_norm"] = torch.zeros((), device=self.device)
         if not self._reward_update_due(policy_update_idx):
             return metrics
-        if self.reward_optim is None:
+        if self.reward_optim is None and not self._reward_estimator_is_linear:
             msg = "Reward update is enabled, but reward_optim was not initialized."
             raise RuntimeError(msg)
 
@@ -2989,13 +3476,18 @@ class IPMD(PPO):
         )
 
         for _ in range(self._reward_updates_per_policy_update):
-            self.reward_optim.zero_grad(set_to_none=True)
-            step_metrics = self._backward_reward_terms(batch, expert_batch)
-            reward_grad_norm = clip_grad_norm_(
-                self._reward_grad_clip_params,
-                self._reward_max_grad_norm,
-            )
-            self.reward_optim.step()
+            if self._reward_estimator_is_linear:
+                step_metrics = self._linear_dual_reward_step(batch, expert_batch)
+                reward_grad_norm = torch.zeros((), device=self.device)
+            else:
+                assert self.reward_optim is not None
+                self.reward_optim.zero_grad(set_to_none=True)
+                step_metrics = self._backward_reward_terms(batch, expert_batch)
+                reward_grad_norm = clip_grad_norm_(
+                    self._reward_grad_clip_params,
+                    self._reward_max_grad_norm,
+                )
+                self.reward_optim.step()
             for key, value in step_metrics.items():
                 metrics[key] = metrics[key] + value
             metrics["reward_grad_norm"] = (
@@ -3179,8 +3671,20 @@ class IPMD(PPO):
         return self.policy.state_dict() if self.policy else {}
 
     def _extra_checkpoint_state_dict(self) -> dict[str, Any]:
-        """Return algorithm-specific additions to an IPMD checkpoint."""
-        return {}
+        """Return algorithm-specific additions to an IPMD checkpoint.
+
+        Carries the frozen PPO-mixing state (plan 5.4 B3/B4) so a walltime
+        segment resumes with the same ``m0, s0``, constant-bonus mean and ramp
+        clock. The ``linear_dual`` head's buffers travel in
+        ``reward_estimator_state_dict``. Subclasses that override this hook
+        must merge ``super()``'s dict.
+        """
+        return {
+            "reward_mix_state_dict": {
+                key: value.detach().cpu().clone()
+                for key, value in self._reward_mix_state.items()
+            }
+        }
 
     def _load_checkpoint_policy_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
         """Restore the primary IPMD policy from one checkpoint."""
@@ -3205,8 +3709,17 @@ class IPMD(PPO):
         )
 
     def _load_extra_checkpoint_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
-        """Restore algorithm-specific additions from an IPMD checkpoint."""
-        del checkpoint
+        """Restore algorithm-specific additions from an IPMD checkpoint.
+
+        Pre-revival checkpoints carry no ``reward_mix_state_dict``; they resume
+        with a fresh mixing state, which is the historical behaviour.
+        """
+        saved = checkpoint.get("reward_mix_state_dict")
+        if not isinstance(saved, Mapping):
+            return
+        for key, target in self._reward_mix_state.items():
+            if key in saved:
+                target.copy_(torch.as_tensor(saved[key]).to(target.device, target.dtype))
 
     def save_model(
         self, path: str | Path | None = None, step: int | None = None
