@@ -4,10 +4,16 @@
 The buffer keeps one vector step (all ``N`` envs) per ring row. Storage is
 ``[T, N, F]``, indexed by time row. Each observation is stored once. The next
 observation of a transition is read from row ``t + 1`` of the same env when
-the episode did not end. When the episode ended (time-out or termination),
-the env wrapper gives the terminal observation in ``next_obs``, and the buffer
-copies it into a small dense *terminal pool* on the GPU. A per-(row, env) slot
-index points to the pool entry.
+the episode did not end. When the episode ended by a time-out (truncation
+without termination), the env wrapper gives the terminal observation in
+``next_obs``, and the buffer copies it into a small dense *terminal pool* on
+the GPU. A per-(row, env) slot index points to the pool entry. A termination
+does not bootstrap, so its next observation is never read by the target; the
+window returns the observation of the terminating row as a finite filler
+(it only enters the critic's shared BatchNorm forward). Pooling terminations
+too would size the pool by the termination rate, which is far above the
+time-out rate early in training (a random G1 policy ends about 28 percent of
+rows), and an overwritten pool entry would then corrupt the time-out rows.
 
 The n-step window is built at sample time from per-env, time-contiguous data
 (raw per-step reward and the two done flags). A learned reward can therefore
@@ -19,7 +25,8 @@ be relabelled later. The window stops at the first episode end:
   one step, termination wins.
 * ``discount_n`` : gamma^n_eff, where n_eff is the number of steps summed.
 * ``next_obs``   : the observation after n_eff steps. On a truncated window it
-  is the terminal observation of the truncating step (from the pool).
+  is the terminal observation of the truncating step (from the pool). On a
+  terminated window it is the observation of the terminating row (filler).
 
 Guard rows. The newest ``n_step + 1`` rows are never used as window starts, so
 a window never reads past the write head (the next-observation row must be
@@ -39,14 +46,14 @@ the range from device tensors (``valid_rows_tensor``) that ``add()`` updates
 with ``fill_``. Rows are drawn as ``floor(u * valid)`` with ``u`` in float64.
 
 Terminal pool. The pool is a ring of ``pool_slots`` entries. Every ``add()``
-scatters the ``next_obs`` of the done rows into the next free entries. A done
-count needs no host read: slots come from a device ``cumsum``, and the rows
-that did not end write to a trash entry. Each entry carries a stamp
-(``step * N + env``). ``sample()`` compares the stamp of the entry it reads
+scatters the ``next_obs`` of the time-out rows (truncated and not terminated)
+into the next free entries. A count needs no host read: slots come from a
+device ``cumsum``, and the other rows write to a trash entry. Each entry
+carries a stamp (``step * N + env``). ``sample()`` compares the stamp of the entry it reads
 with the expected one and adds mismatches to ``pool_miss`` (device counter).
 A non-zero ``pool_miss_count()`` means the pool was too small for the ring
 and the next-observation of some time-out rows was wrong; raise
-``pool_fraction``.
+``pool_fraction`` (it must exceed the time-out share of the rows).
 
 Memory formula. With ``b`` bytes per obs element (2 for bf16), per transition
 (one (row, env) slot)::
@@ -61,8 +68,9 @@ Memory formula. With ``b`` bytes per obs element (2 for bf16), per transition
 
 For Do=351, Dc=544, A=29, bf16 and the default ``pool_fraction`` of 0.05 this
 is 1,790 + 116 + 4 + 2 + 4 = 1,916 B plus 89.5 B of pool = 2,005.5 B per
-transition. At N=20,000 and T rows the ring takes ``20000 * T * 1,916`` B
-(``T=1024``: 39.2 GB, 36.5 GiB) plus the pool. See ``memory_bytes()``.
+transition. At N=20,480 (5 x 4,096) and T rows the ring takes
+``20480 * T * 1,916`` B (``T=1024``: 40.2 GB, 37.4 GiB; recomputed for
+N=20,480) plus the pool. See ``memory_bytes()``.
 
 Resume. ``state_dict()`` returns the counters (and, with
 ``include_storage=True``, the storage tensors). ``save_storage(path)`` writes
@@ -241,7 +249,6 @@ class TimeMajorReplay:
         obs_dt = self.obs_dtype
         terminated = step["terminated"].reshape(N).to(torch.bool)
         truncated = step["truncated"].reshape(N).to(torch.bool)
-        done = terminated | truncated
 
         self.obs[row] = step["obs"].reshape(N, -1).to(obs_dt)
         self.critic_obs[row] = step["critic_obs"].reshape(N, -1).to(obs_dt)
@@ -254,14 +261,17 @@ class TimeMajorReplay:
                 raise KeyError(f"replay.add: missing extra key '{key}'")
             buf[row] = step[key].reshape(N, -1).to(torch.float32)
 
-        # Terminal pool: device-side compaction of the done rows.
-        cs = done.to(torch.int64).cumsum(0)
+        # Terminal pool: device-side compaction of the time-out rows. A
+        # termination (which wins over a simultaneous time-out) never
+        # bootstraps, so it takes no pool entry.
+        timeout = truncated & ~terminated
+        cs = timeout.to(torch.int64).cumsum(0)
         slot = (self.pool_head + cs - 1) % self.pool_slots
-        slot = torch.where(done, slot, torch.full_like(slot, self.pool_slots))
+        slot = torch.where(timeout, slot, torch.full_like(slot, self.pool_slots))
         self.pool_obs[slot] = step["next_obs"].reshape(N, -1).to(obs_dt)
         self.pool_critic_obs[slot] = step["next_critic_obs"].reshape(N, -1).to(obs_dt)
         self.pool_stamp[slot] = self._total * N + self._env_ar
-        self.term_slot[row] = torch.where(done, slot, torch.full_like(slot, -1)).to(
+        self.term_slot[row] = torch.where(timeout, slot, torch.full_like(slot, -1)).to(
             torch.int32
         )
         self.pool_head += cs[-1]
@@ -350,17 +360,21 @@ class TimeMajorReplay:
             ended = ended | now
             alive = alive & ~done
 
+        timed_out = ended & ~term_any
         slot = self.term_slot[end_row, env].to(torch.int64)
         slot = slot.clamp(min=0)
         # Pool consistency: the entry must still belong to the row it was made for.
         expected = (oldest_logical + u + n_eff - 1) * self.num_envs + env
-        self.pool_miss += (ended & (self.pool_stamp[slot] != expected)).sum()
+        self.pool_miss += (timed_out & (self.pool_stamp[slot] != expected)).sum()
 
         nxt = (s + n) % T
-        e = ended.unsqueeze(-1)
-        next_obs = torch.where(e, self.pool_obs[slot], self.obs[nxt, env])
+        # Not ended: row s+n. Time-out: the pool. Termination: the terminating
+        # row's own observation (filler; the target does not bootstrap).
+        src = torch.where(ended, end_row, nxt)
+        e = timed_out.unsqueeze(-1)
+        next_obs = torch.where(e, self.pool_obs[slot], self.obs[src, env])
         next_critic = torch.where(
-            e, self.pool_critic_obs[slot], self.critic_obs[nxt, env]
+            e, self.pool_critic_obs[slot], self.critic_obs[src, env]
         )
         out = {
             "obs": self.obs[s, env].float(),

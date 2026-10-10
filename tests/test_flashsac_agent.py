@@ -491,6 +491,186 @@ def test_metrics_flush_reports_health_keys(trained):
         "health/bn_gap",
         "health/actor_bn_running_mean_norm",
         "health/critic_bn_running_var_norm",
+        "health/replay_pool_miss",
+        "health/final_obs_missing",
         "replay/rows",
     ):
         assert key in metrics, key
+    assert metrics["health/replay_pool_miss"] == 0.0
+
+
+def test_zero_terminal_obs_is_counted_in_next_mode(tmp_path):
+    """``health/final_obs_missing`` guards the ``next`` terminal mode too.
+
+    Regression guard for the dropped-VecGymEnvTransform wrapper bug, where the
+    terminal observation of done rows arrived as zeros in ``next``.
+    """
+    cfg = _make_cfg(tmp_path)
+    agent = FlashSAC(_make_env(), cfg)
+    run = agent.init_metadata()
+    it = agent.collect(run, 0)
+    r = it.rollout
+    done = torch.zeros_like(r.get(("next", "done")))
+    done[0] = True
+    r.set(("next", "done"), done)
+    r.set(("next", "truncated"), done.clone())
+    r.set(("next", "terminated"), torch.zeros_like(done))
+    obs = r.get(("next", "observation")).clone()
+    obs[0] = 0.0
+    r.set(("next", "observation"), obs)
+    agent.prepare(it, run)
+    assert agent._terminal_mode == "next"
+    metrics = agent._flush_metrics(run)
+    assert metrics["health/final_obs_missing"] == 1.0
+    agent.collector.shutdown()
+
+
+# --------------------------------------------------------------------- warm-up
+def _warmup_actions(mode: str, bound: list[float], n: int = 200_000):
+    from rlopt.agent.flashsac.agent import FlashSACPolicyNet
+
+    # The actor is never called in the random phase.
+    net = FlashSACPolicyNet(
+        torch.nn.Identity(), torch.tensor(bound), None, warmup_mode=mode
+    )
+    net.collecting = True
+    net.random_actions = True
+    torch.manual_seed(0)
+    with set_interaction_type(InteractionType.RANDOM):
+        return net(torch.zeros(n, 3))
+
+
+def test_normal_warmup_is_clipped_unit_normal_in_env_units():
+    """DV3: N(0, 1) per joint in env units, clipped to [-B_j, B_j]."""
+    bound = [0.5, 3.0, 24.5]
+    action, tanh_a = _warmup_actions("normal", bound)
+    b = torch.tensor(bound)
+    assert bool((action.abs() <= b).all())
+    torch.testing.assert_close(tanh_a, action / b)  # stored tanh-space action
+    assert bool((tanh_a.abs() <= 1.0).all())
+    # Narrow joint: P(|z| > 0.5) = 0.617 of the samples sit on the bound.
+    clipped = (action[:, 0].abs() == 0.5).float().mean().item()
+    assert clipped == pytest.approx(0.617, abs=0.01)
+    # Wide joints: the unit normal is untouched (std 1, not B / sqrt(3)).
+    assert action[:, 2].std().item() == pytest.approx(1.0, abs=0.01)
+    assert action[:, 2].abs().max().item() < 7.0
+    # Clipping at 3 sigma moves 0.27 percent of the mass onto the bound.
+    assert (action[:, 1].abs() == 3.0).float().mean().item() == pytest.approx(
+        0.0027, abs=0.001
+    )
+
+
+def test_uniform_warmup_spans_the_bound():
+    bound = [0.5, 24.5]
+    action, tanh_a = _warmup_actions("uniform", bound)
+    assert action[:, 1].std().item() == pytest.approx(24.5 / math.sqrt(3), rel=0.02)
+    assert bool((tanh_a.abs() <= 1.0).all())
+
+
+def test_warmup_mode_reaches_the_collector(tmp_path):
+    cfg = _make_cfg(tmp_path, total_frames=NUM_ENVS * 10)
+    cfg.flashsac.warmup_mode = "normal"
+    cfg.flashsac.action_bound = 24.5
+    agent = FlashSAC(_make_env(), cfg)
+    assert agent.policy_net.warmup_mode == "normal"
+    run = agent.init_metadata()
+    it = agent.collect(run, 0)
+    action = it.rollout.get("action")
+    torch.testing.assert_close(it.rollout.get("action_tanh"), action / 24.5)
+    assert action.abs().max().item() < 6.0  # uniform would reach ~24
+    agent.collector.shutdown()
+
+
+# ------------------------------------------------------------ clocks and timers
+def test_checkpoint_timer_starts_after_the_cold_start(tmp_path):
+    """``checkpoint_interval_s`` must not fire just because the first step was slow."""
+    import time
+
+    cfg = _make_cfg(tmp_path, total_frames=NUM_ENVS * 20)
+    cfg.save_interval = 10_000_000
+    cfg.flashsac.warmup_transitions = NUM_ENVS * 100  # no updates: a fast run
+    cfg.collector.total_frames = NUM_ENVS * 20
+    cfg.flashsac.checkpoint_interval_s = 1.0
+    agent = FlashSAC(_make_env(), cfg)
+    original = agent.collect
+
+    def slow_first(run, idx):
+        if idx == 0:
+            time.sleep(1.2)  # a cold start longer than the interval
+        return original(run, idx)
+
+    agent.collect = slow_first  # type: ignore[method-assign]
+    # validate_training requires total_frames > warm-up; skip it for this probe.
+    agent.validate_training = lambda: None  # type: ignore[method-assign]
+    start = time.monotonic()
+    agent.train()
+    assert time.monotonic() - start < 1.2 + 0.9, "run too slow for this probe"
+    # Only the end-of-run checkpoint (save_interval > 0), no timer checkpoint.
+    assert [int(p.stem.rsplit("_", 1)[1]) for p in _checkpoints(agent)] == [
+        NUM_ENVS * 20
+    ]
+    assert agent._train_clock_start is not None
+    assert agent._train_clock_start >= start + 1.2
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA required")
+def test_flush_reports_learner_time_and_memory(tmp_path):
+    cfg = _make_cfg(tmp_path, device="cuda:0", total_frames=NUM_ENVS * 60)
+    cfg.flashsac.warmup_transitions = 16
+    cfg.flashsac.learner.amp_dtype = "bf16"
+    agent = FlashSAC(_make_env("cuda:0"), cfg)
+    run = agent.init_metadata()
+    for i in range(30):
+        it = agent.collect(run, i)
+        agent.prepare(it, run)
+        agent.iterate(it, run)
+    assert agent._learn_events_used > 0
+    metrics = agent._flush_metrics(run)
+    assert metrics["time/learner_ms_per_update"] > 0.0
+    assert metrics["perf/cuda_max_memory_allocated_gib"] > 0.0
+    assert "time/train_elapsed_s" in metrics
+    assert metrics["train/cumulative_env_frames"] == NUM_ENVS * 30
+    # The window is drained: the next flush without updates has no timing.
+    assert agent._learn_events_used == 0
+    assert "time/learner_ms_per_update" not in agent._flush_metrics(run)
+    agent.collector.shutdown()
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA required")
+@pytest.mark.skipif(
+    __import__("os").environ.get("TORCHDYNAMO_DISABLE") == "1",
+    reason="compile is disabled by TORCHDYNAMO_DISABLE",
+)
+def test_compiled_graph_fp16_update_path_has_no_host_sync(tmp_path):
+    """The G1 recipe path: compile 'default' + CUDA graphs + fp16 GradScaler."""
+    cfg = _make_cfg(tmp_path, device="cuda:0", total_frames=NUM_ENVS * 120)
+    cfg.flashsac.warmup_transitions = 16
+    cfg.flashsac.learner.amp_dtype = "fp16"
+    cfg.flashsac.learner.compile_mode = "default"
+    cfg.flashsac.learner.use_cuda_graph = True
+    agent = FlashSAC(_make_env("cuda:0"), cfg)
+    agent.validate_training()
+    run = agent.init_metadata()
+    # Warm up outside the checked region: compile, graph capture, lazy state.
+    for i in range(12):
+        it = agent.collect(run, i)
+        agent.prepare(it, run)
+        agent.iterate(it, run)
+    assert agent._graph_ready
+    torch.cuda.synchronize()
+    before = agent.learner.update_count
+    for i in range(12, 30):
+        it = agent.collect(run, i)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            agent.prepare(it, run)
+            agent.iterate(it, run)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    assert agent.learner.update_count > before
+    metrics = agent._flush_metrics(run)
+    assert math.isfinite(metrics["train/critic/loss"])
+    assert metrics["time/learner_ms_per_update"] > 0.0
+    for param in agent.learner.parameters():
+        assert torch.isfinite(param).all()
+    agent.collector.shutdown()

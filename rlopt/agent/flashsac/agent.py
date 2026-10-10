@@ -12,6 +12,15 @@ One host thread runs the loop (architecture C of the plan). Per env step:
 ``record``   every ``log_interval_steps`` env steps: ONE device-to-host copy of a
              stacked metrics tensor, then logging and checkpoints.
 
+Walltime budget. ``trainer.max_train_seconds`` stops the loop at the first
+iteration boundary past the budget (host clock, started after the first
+collected step so the env cold start is excluded), logs final metrics and
+writes ``model_step_<cumulative_env_frames>.pt``.
+
+Learner timing. On CUDA, ``iterate`` brackets its updates with a pair of
+timing events; the elapsed times are read at the metric flush, after the one
+device-to-host copy has drained the stream (``time/learner_ms_per_update``).
+
 Host synchronisation. The hot loop reads no device value. Counters that drive
 control flow (frames, rows, update credit) are Python ints. The only device to
 host copies are the metric copy at each log and the checkpoint write.
@@ -25,6 +34,7 @@ Checkpoint. One file ``model_step_<cumulative_env_frames>.pt`` holds:
 ``learner_state_dict``  networks, optimizers, GradScaler, LR steps, reward statistics.
 ``agent_state``         update counter, noise-repeat state, host counters.
 ``cumulative_env_frames`` global frame count for walltime-segmented resume.
+``cumulative_train_seconds`` training wall-clock so far (``max_train_seconds``).
 
 There is no ``vec_norm_msg`` (the actor normalises its input with BatchNorm).
 The replay ring is not saved: a resume refills it with the loaded policy.
@@ -62,7 +72,12 @@ from rlopt.agent.flashsac.config import FlashSACRLOptConfig
 from rlopt.agent.flashsac.learner import FlashSACLearner
 from rlopt.agent.flashsac.noise import NoiseRepeat
 from rlopt.agent.flashsac.replay import TimeMajorReplay
-from rlopt.base_class import BaseAlgorithm, IterationData, TrainingMetadata
+from rlopt.base_class import (
+    BaseAlgorithm,
+    IterationData,
+    TrainingMetadata,
+    honours_train_time_budget,
+)
 from rlopt.config_utils import ObsKey
 
 __all__ = [
@@ -256,6 +271,10 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         self._acc_n: dict[str, int] = {}
         self._env_acc: Tensor | None = None
         self._terminal_mode = ""  # resolved at the first prepare()
+        # Reused CUDA timing-event pairs around iterate(), read at the flush.
+        self._learn_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._learn_events_used = 0
+        self._learn_window_updates = 0
         super().__init__(env=env, config=config, logger=logger, **kwargs)
         fs = self.config.flashsac
         self._rate = (
@@ -646,15 +665,17 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         next_critic = self._flat(r, ("next",), self._critic_keys)
         env_acc = self._env_acc
         assert env_acc is not None
-        final_missing = torch.zeros((), device=self.device)
         if self._terminal_mode == "final":
             group = (rep.final_group,)
             fin = self._flat(r, ("next", *group), self._actor_keys)
             fin_c = self._flat(r, ("next", *group), self._critic_keys)
-            final_missing = (done & (fin.abs().sum(-1) == 0)).sum().float()
             sel = done.unsqueeze(-1)
             next_obs = torch.where(sel, fin, next_obs)
             next_critic = torch.where(sel, fin_c, next_critic)
+        # Done rows whose stored terminal observation is all zero, in either
+        # mode: a dropped VecGymEnvTransform (the 2026-10 wrapper bug) or a
+        # reader that found no group zero-fills them. Device count, no sync.
+        final_missing = (done & (next_obs.abs().sum(-1) == 0)).sum().float()
         step = {
             "obs": self._flat(r, (), self._actor_keys),
             "critic_obs": self._flat(r, (), self._critic_keys),
@@ -752,10 +773,45 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         if not self._gate_open:
             return
         due = updates_due(self._train_steps, metadata.rate)
+        events = self._learn_event_pair() if due else None
+        if events is not None:
+            events[0].record()
         for _ in range(due):
             self._one_update()
+        if events is not None:
+            events[1].record()
+            self._learn_window_updates += due
         self._train_steps += 1
         iteration.updates = due
+
+    def _learn_event_pair(self) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+        """Next reusable timing-event pair (CUDA only); no host synchronisation."""
+        if self.device.type != "cuda":
+            return None
+        idx = self._learn_events_used
+        if idx == len(self._learn_events):
+            self._learn_events.append(
+                (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+            )
+        self._learn_events_used = idx + 1
+        return self._learn_events[idx]
+
+    def _drain_learn_events(self) -> float | None:
+        """Learner GPU milliseconds per update over the window, then reset.
+
+        Call only after a blocking device-to-host copy: the events are then
+        complete and ``elapsed_time`` is a host query.
+        """
+        used, updates = self._learn_events_used, self._learn_window_updates
+        self._learn_events_used = 0
+        self._learn_window_updates = 0
+        if not used or not updates:
+            return None
+        total = sum(s.elapsed_time(e) for s, e in self._learn_events[:used])
+        return total / updates
 
     # ----------------------------------------------------------------- logging
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
@@ -816,15 +872,18 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         """ONE device-to-host copy of every accumulated metric."""
         assert self._env_acc is not None
         keys = sorted(self._acc)
-        parts = [self._env_acc]
+        parts = [self._env_acc, self.data_buffer.pool_miss.reshape(1)]
         parts.extend(self._acc[k].reshape(-1).mean().reshape(1) for k in keys)
         health_names: list[str] = []
         if self.config.flashsac.health_checks:
             health_names, health = self._health_tensor()
             parts.append(health)
         host = torch.cat([p.reshape(-1).float() for p in parts]).cpu().numpy()
+        # The blocking copy above drained the stream: the events are complete.
+        learner_ms = self._drain_learn_events()
         env = dict(zip(_ENV_ACC_NAMES, host[: len(_ENV_ACC_NAMES)], strict=True))
-        offset = len(_ENV_ACC_NAMES)
+        pool_miss = float(host[len(_ENV_ACC_NAMES)])
+        offset = len(_ENV_ACC_NAMES) + 1
         metrics: dict[str, float] = {}
         steps = max(1, int(self.config.flashsac.log_interval_steps))
         metrics["train/step_reward_mean"] = float(env["reward_sum"]) / steps
@@ -837,6 +896,10 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
                 float(env["truncated_count"]) / done_count
             )
         metrics["health/final_obs_missing"] = float(env["final_obs_missing"])
+        # Cumulative sampled time-out windows whose terminal-pool entry was
+        # overwritten (wrong next observation). Must stay 0; else raise
+        # flashsac.replay.pool_fraction.
+        metrics["health/replay_pool_miss"] = pool_miss
         nonfinite: list[str] = []
         for i, k in enumerate(keys):
             value = float(host[offset + i]) / max(1, self._acc_n[k])
@@ -870,6 +933,9 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         )
         metrics["train/update_count"] = float(self.learner.update_count)
         metrics["health/nonfinite_metrics"] = float(len(nonfinite))
+        if learner_ms is not None:
+            metrics["time/learner_ms_per_update"] = learner_ms
+        metrics.update(self._train_clock_metrics(run.frames_processed))
         run.interval_start_time = now
         run.interval_start_frames = run.frames_processed
         run.interval_start_updates = self.learner.update_count
@@ -893,7 +959,10 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
     ) -> None:
         """Log every ``log_interval_steps`` env steps and write checkpoints."""
         fs = self.config.flashsac
-        end = iteration.iteration_idx + 1 == metadata.total_iterations
+        end = (
+            iteration.iteration_idx + 1 == metadata.total_iterations
+            or metadata.stop_after_iteration
+        )
         if (iteration.iteration_idx + 1) % fs.log_interval_steps == 0 or end:
             steps_in_window = (iteration.iteration_idx + 1) % fs.log_interval_steps
             metrics = self._flush_metrics(metadata)
@@ -922,6 +991,21 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
             metadata.last_checkpoint_time = time.monotonic()
 
     # ------------------------------------------------------------------- train
+    def _on_training_started(self, metadata: FlashSACTrainingMetadata) -> None:
+        """Start the clocks after the first collected step (the env cold start).
+
+        The wall-clock checkpoint timer, the speed window and the
+        ``trainer.max_train_seconds`` budget all start here, not at
+        ``init_metadata``, so the cold start neither triggers an immediate
+        ``checkpoint_interval_s`` save nor counts against the budget.
+        """
+        self._start_train_clock()
+        now = time.monotonic()
+        metadata.last_checkpoint_time = now
+        metadata.interval_start_time = now
+        metadata.interval_start_frames = metadata.frames_processed
+
+    @honours_train_time_budget
     def train(self) -> None:  # type: ignore[override]
         """Collect, insert, update, record. Thin orchestration only."""
         self.validate_training()
@@ -930,20 +1014,30 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         try:
             for iteration_idx in range(metadata.total_iterations):
                 iteration = self.collect(metadata, iteration_idx)
+                if iteration_idx == 0:
+                    self._on_training_started(metadata)
                 with self._profile_iteration_phase(iteration.phase_times, "prepare"):
                     self.prepare(iteration, metadata)
                 with self._profile_iteration_phase(iteration.phase_times, "learn"):
                     self.iterate(iteration, metadata)
                 if "learn" in iteration.phase_times:
                     iteration.learn_time = iteration.phase_times["learn"]
+                # Host clock only; a spent budget makes this the last iteration.
+                metadata.stop_after_iteration = self._train_time_budget_reached()
                 with self._profile_iteration_phase(iteration.phase_times, "record"):
                     self.record(iteration, metadata)
                 self._finish_iteration_profile(metadata, iteration)
-            if int(self.config.save_interval) > 0:
+                if metadata.stop_after_iteration:
+                    break
+            if metadata.stop_after_iteration:
+                self._finish_train_time_budget(metadata)
                 saved_at = metadata.frames_processed
+            elif int(self.config.save_interval) > 0:
                 self.save_model(
                     path=self._checkpoint_dir(), step=metadata.frames_processed
                 )
+                # Marked after the write: an interrupt during it re-saves.
+                saved_at = metadata.frames_processed
         except KeyboardInterrupt:
             # Walltime/SIGTERM or Ctrl+C: persist the state so a chained segment
             # resumes from HERE (same naming as periodic checkpoints).
@@ -1043,6 +1137,7 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
             },
             "flashsac_config": dataclasses.asdict(self.config.flashsac),
             "cumulative_env_frames": frames,
+            "cumulative_train_seconds": self.train_elapsed_seconds(),
         }
         tmp = target.with_name(target.name + ".tmp")
         torch.save(payload, tmp)
@@ -1072,6 +1167,7 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         frames = data.get("cumulative_env_frames")
         if frames is not None:
             self._resume_frame_offset = int(frames)
+        self._restore_train_clock(data)
         self._loaded_policy = True
         if learner_state is None:
             self.log.info("Loaded policy-only FlashSAC checkpoint (no learner state).")

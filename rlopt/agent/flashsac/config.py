@@ -62,16 +62,29 @@ class FlashSACReplayConfig:
     """Storage dtype of observations: ``float32``, ``bfloat16`` or ``float16``."""
 
     pool_fraction: float = 0.05
-    """Size of the terminal-observation pool as a fraction of the ring slots."""
+    """Size of the terminal-observation pool as a fraction of the ring slots.
+
+    Only time-out rows take an entry (a termination never bootstraps), so it
+    must exceed the time-out share of the rows. ``health/replay_pool_miss``
+    counts sampled windows whose entry was overwritten."""
 
     terminal_obs: str = "auto"
     """Where the observation after an episode end comes from.
 
     ``final``: the ``("next", "final", ...)`` group written by the terminal
-    observation reader (autoreset envs such as Isaac Lab, whose ``next``
-    observation is already the reset one). ``next``: the ``("next", ...)``
-    observation itself (envs that reset on the following call). ``auto``:
+    observation reader, for an autoreset env whose ``next`` observation is the
+    reset one. ``next``: the ``("next", ...)`` observation itself. ``auto``:
     ``final`` when the first collected step has the ``final`` group, else ``next``.
+
+    Isaac Lab through ``IsaacLabWrapper`` + ``attach_terminal_obs_reader``
+    resolves to ``next``: TorchRL's ``VecGymEnvTransform`` swaps the reader's
+    ``final`` group into ``next`` on done rows and pops the group, so ``next``
+    already holds the terminal observation. ``ImitationRLEnvV2`` publishes the
+    pre-step observation buffer as the terminal observation, i.e. the row's
+    own observation ``s_t`` ("stale" mode of wiki/flashsac-ipmd-plan.md), not
+    a post-physics ``s_{t+1}``. Without the wrapper fix ``next`` on done rows
+    was the reset observation; ``health/final_obs_missing`` counts all-zero
+    terminal observations as a guard.
     """
 
     final_group: str = "final"
@@ -111,8 +124,15 @@ class FlashSACConfig:
     """
 
     warmup_mode: str = "uniform"
-    """Random warm-up action law. ``uniform``: tanh-space action in [-1, 1].
-    ``normal``: N(0, 1) in env units, clipped to the bound."""
+    """Random warm-up action law.
+
+    ``uniform`` (the reference): tanh-space action uniform in [-1, 1], i.e.
+    uniform in ``[-B_j, B_j]`` env units. ``normal`` (clipped normal): N(0, 1)
+    in env units per joint, clipped to ``[-B_j, B_j]``; the stored tanh-space
+    action is ``a / B_j``. With wide per-joint bounds (G1 wrist yaw 24.5) the
+    uniform law commands extreme targets; the clipped normal keeps the
+    warm-up at the scale a PPO policy starts at (std 1). See DV3 of
+    wiki/flashsac-ipmd-plan.md."""
 
     noise_repeat: bool = True
     """Hold exploration noise for a zeta-distributed number of steps per env."""

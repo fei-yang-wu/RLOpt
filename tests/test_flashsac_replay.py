@@ -88,13 +88,17 @@ def reference_nstep(steps, t, e, n, gamma):
             last = s
             break
         last = s
+    # A terminated window never bootstraps: the buffer returns the terminating
+    # row's own observation as filler instead of pooling the terminal obs.
+    src_obs = "obs" if term_any else "next_obs"
+    src_critic = "critic_obs" if term_any else "next_critic_obs"
     return {
         "reward_n": ret,
         "terminated_n": 1.0 if term_any else 0.0,
         "discount_n": gamma**k_eff,
         "n_eff": k_eff,
-        "next_obs": last["next_obs"][e],
-        "next_critic_obs": last["next_critic_obs"][e],
+        "next_obs": last[src_obs][e],
+        "next_critic_obs": last[src_critic][e],
     }
 
 
@@ -231,19 +235,23 @@ def test_next_obs_equals_explicit_next_layout_n1():
     u = torch.arange(valid).repeat_interleave(N)
     env = torch.arange(N).repeat(valid)
     out = buf._window(u, env, 0, 0)
-    exp = torch.stack([sim.steps[int(a)]["next_obs"][int(b)] for a, b in zip(u, env)])
-    expc = torch.stack(
-        [sim.steps[int(a)]["next_critic_obs"][int(b)] for a, b in zip(u, env)]
-    )
+
+    def _expected(a, b, key):
+        st = sim.steps[int(a)]
+        own = "obs" if key == "next_obs" else "critic_obs"
+        return st[own if bool(st["terminated"][int(b)]) else key][int(b)]
+
+    exp = torch.stack([_expected(a, b, "next_obs") for a, b in zip(u, env)])
+    expc = torch.stack([_expected(a, b, "next_critic_obs") for a, b in zip(u, env)])
     assert torch.equal(out["next_obs"], exp)
     assert torch.equal(out["next_critic_obs"], expc)
 
 
 def test_pool_overflow_is_detected():
     N, T = 4, 20
-    # Everything ends every step; the pool (2N slots) cannot cover the ring.
+    # Every row times out; the pool (2N slots) cannot cover the ring.
     buf = make_buf(N, T, n=1, pool_fraction=0.01)
-    sim = Sim(N, p_term=1.0, p_trunc=0.0, p_both=0.0)
+    sim = Sim(N, p_term=0.0, p_trunc=1.0, p_both=0.0)
     _fill(buf, sim, 18)
     buf.sample(512)
     assert buf.pool_miss_count() > 0
@@ -467,3 +475,53 @@ def test_throughput_microbenchmark(capsys):
             f"sample {ts * 1e3:.2f} ms, output {nbytes / 2**20:.1f} MiB "
             f"({nbytes / ts / 1e9:.1f} GB/s out) | add {ta * 1e3:.2f} ms"
         )
+
+
+def test_terminations_do_not_consume_the_pool():
+    """A termination flood must not overwrite the time-out entries of the pool.
+
+    Regression: a G1 smoke with random warm-up ended 28 percent of rows by
+    termination; the pool (5 percent of slots) was overwritten and every
+    time-out window older than a few rows read another row's observation.
+    """
+    N, T, n = 8, 40, 1
+    buf = make_buf(N, T, n=n, pool_fraction=0.01)  # pool = 2N = 16 entries
+    g = torch.Generator().manual_seed(0)
+    timeouts = []
+    for t in range(36):
+        term = torch.rand(N, generator=g) < 0.9  # termination flood
+        trunc = torch.zeros(N, dtype=torch.bool)
+        if t == 3:  # one time-out early in the ring, on env 5
+            term[5] = False
+            trunc[5] = True
+            timeouts.append((t, 5))
+        buf.add(
+            {
+                "obs": torch.stack([_mk_obs(t, e, DO) for e in range(N)]),
+                "critic_obs": torch.stack([_mk_obs(t, e, DC) for e in range(N)]),
+                "action": torch.zeros(N, A),
+                "reward": torch.ones(N),
+                "terminated": term,
+                "truncated": trunc,
+                "next_obs": torch.stack(
+                    [_mk_obs(t + 1, e, DO, terminal=True) for e in range(N)]
+                ),
+                "next_critic_obs": torch.stack(
+                    [_mk_obs(t + 1, e, DC, terminal=True) for e in range(N)]
+                ),
+            }
+        )
+    ((t, e),) = timeouts
+    out = buf._window(torch.tensor([t]), torch.tensor([e]), 0, 0)
+    assert out["terminated_n"].item() == 0.0
+    assert out["next_obs"][0, 0].item() == t + 1.5  # its own terminal obs
+    assert out["next_obs"][0, 1].item() == e
+    # Terminated windows read the terminating row's own observation.
+    rows = torch.arange(buf.valid_rows).repeat_interleave(N)
+    envs = torch.arange(N).repeat(buf.valid_rows)
+    win = buf._window(rows, envs, 0, 0)
+    term_rows = win["terminated_n"] > 0
+    assert term_rows.any()
+    assert torch.equal(win["next_obs"][term_rows], win["obs"][term_rows])
+    assert torch.isfinite(win["next_obs"]).all()
+    assert buf.pool_miss_count() == 0

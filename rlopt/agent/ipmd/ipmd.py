@@ -3273,6 +3273,8 @@ class IPMD(PPO):
         # segment reads it and continues the SAME budget instead of restarting.
         if step is not None:
             data_to_save["cumulative_env_frames"] = int(step)
+        # Cumulative training wall-clock (trainer.max_train_seconds budget).
+        data_to_save["cumulative_train_seconds"] = self.train_elapsed_seconds()
 
         torch.save(data_to_save, target_path)
 
@@ -3319,6 +3321,7 @@ class IPMD(PPO):
         resume_frames = data.get("cumulative_env_frames")
         if resume_frames is not None:
             self._resume_frame_offset = int(resume_frames)
+        self._restore_train_clock(data)
         self._load_checkpoint_policy_state_dict(data)
         if not self._restore_training_state_from_checkpoint(data):
             self._load_extra_checkpoint_state_dict(data)
