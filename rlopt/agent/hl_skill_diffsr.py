@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +25,12 @@ from rlopt.agent.hl_skill_encoder import (
 )
 from rlopt.agent.ipmd.module import BilinearSR, build_bilinear_sr
 from rlopt.env_interface import require_imitation_interface
+
+if TYPE_CHECKING:  # skill_commander imports this module; keep the planner lazy.
+    from rlopt.agent.language_tilt_planner import (
+        LanguageTiltPlanner,
+        LanguageTiltPlannerConfig,
+    )
 
 
 def _require_positive_int(name: str, value: int) -> int:
@@ -195,6 +201,64 @@ class _WindowReconstructionDecoder(nn.Module):
         return self.network(z)
 
 
+class _NormalizedReconstructionHead(nn.Module):
+    """Decoder ``z -> target`` scored on a running per-dimension z-score.
+
+    The auxiliary autoencoder term of ``jepa_ntp``. Raw macro frames mix
+    radians, metres and rotation-matrix entries, so the decoder predicts the
+    target normalized by running mean/variance (buffers, checkpointed with the
+    head) and the squared error is summed over dimensions.
+    """
+
+    def __init__(
+        self,
+        *,
+        z_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...],
+        activation: str,
+        eps: float,
+    ) -> None:
+        super().__init__()
+        self.decoder = _WindowReconstructionDecoder(
+            z_dim=z_dim,
+            output_dim=output_dim,
+            hidden_dims=hidden_dims,
+            activation=activation,
+        )
+        self.eps = float(eps)
+        self.register_buffer("mean", torch.zeros(int(output_dim)))
+        self.register_buffer("var", torch.ones(int(output_dim)))
+        self.register_buffer("count", torch.zeros((), dtype=torch.float64))
+
+    @torch.no_grad()
+    def update(self, target: Tensor) -> None:
+        """Merge one batch into the running moments (Chan et al. parallel form)."""
+        batch = target.detach().to(torch.float32).reshape(-1, target.shape[-1])
+        n = float(batch.shape[0])
+        if n == 0:
+            return
+        batch_mean = batch.mean(dim=0)
+        batch_var = batch.var(dim=0, unbiased=False)
+        count = float(self.count.item())
+        total = count + n
+        delta = batch_mean - self.mean
+        self.mean.add_(delta * (n / total))
+        self.var.copy_(
+            (self.var * count + batch_var * n + delta.pow(2) * (count * n / total))
+            / total
+        )
+        self.count.fill_(total)
+
+    def normalize(self, target: Tensor) -> Tensor:
+        return (target - self.mean) / torch.sqrt(self.var + self.eps)
+
+    def loss(self, z: Tensor, target: Tensor) -> Tensor:
+        """Summed-over-dims squared z-score error, mean over rows."""
+        error = self.decoder(z) - self.normalize(target.detach())
+        return error.pow(2).sum(dim=-1).mean()
+
+
 _ROOT_QPOS_FRAME_DIM = 38  # qpos(29) + anchor_pos_b(3) + anchor_ori_b(6)
 
 
@@ -210,6 +274,48 @@ def _rot6d_to_matrix(rot6d: Tensor) -> Tensor:
 
 
 _FULL_BODY_FRAME_DIM = 67
+# full_body frame: joint qpos (29) | joint qvel (29) | anchor pos (3) | rot6d (6).
+_FULL_BODY_QVEL_SLICE = slice(29, 58)
+
+
+def _scale_macro_qvel(frames: Tensor, scale: float) -> Tensor:
+    """Multiply the joint-velocity block of full_body macro frames by ``scale``.
+
+    ``frames`` is ``[..., 67]`` or a flattened history ``[..., k * 67]``.
+    Joint velocities are frame-invariant, so the scaling commutes with every
+    heading re-anchoring. ``scale == 1`` returns the input untouched.
+    """
+    if float(scale) == 1.0:
+        return frames
+    width = int(frames.shape[-1])
+    if width % _FULL_BODY_FRAME_DIM != 0:
+        msg = f"macro_qvel_scale needs 67-wide full_body frames, got width {width}."
+        raise ValueError(msg)
+    shaped = frames.reshape(*frames.shape[:-1], width // _FULL_BODY_FRAME_DIM, _FULL_BODY_FRAME_DIM).clone()
+    shaped[..., _FULL_BODY_QVEL_SLICE] = shaped[..., _FULL_BODY_QVEL_SLICE] * float(scale)
+    return shaped.reshape(frames.shape)
+
+
+def _drop_macro_qvel(frames: Tensor) -> Tensor:
+    """full_body frames -> root_qpos frames: delete the joint-velocity block.
+
+    ``frames`` is ``[..., 67]`` or a flattened history ``[..., k * 67]``; the
+    result is ``[..., 38]`` / ``[..., k * 38]`` in the root_qpos layout
+    (qpos, anchor pos, anchor rot6d).
+    """
+    width = int(frames.shape[-1])
+    if width % _FULL_BODY_FRAME_DIM != 0:
+        msg = f"heads_drop_qvel needs 67-wide full_body frames, got width {width}."
+        raise ValueError(msg)
+    count = width // _FULL_BODY_FRAME_DIM
+    shaped = frames.reshape(*frames.shape[:-1], count, _FULL_BODY_FRAME_DIM)
+    kept = torch.cat([shaped[..., :29], shaped[..., 58:]], dim=-1)
+    return kept.reshape(*frames.shape[:-1], count * _ROOT_QPOS_FRAME_DIM)
+
+
+def _head_view(config: HighLevelSkillDiffSRConfig, frames: Tensor) -> Tensor:
+    """What phi and the generative heads see of macro frames (``heads_drop_qvel``)."""
+    return _drop_macro_qvel(frames) if config.heads_drop_qvel else frames
 # root_qpos + the four end-effector positions in the same anchor frame
 # (`expert_ee_pos_b`: ankles and wrists, 4 x 3), 2026-09-14.
 _ROOT_QPOS_EE_FRAME_DIM = 50
@@ -772,6 +878,66 @@ class HighLevelSkillDiffSRConfig:
     commander_cosine_loss_coeff: float = 1.0
     commander_z_norm_coeff: float = 1.0e-4
     commander_state_noise_std: float = 0.0
+    # Optional co-trained language-tilted flow planner (System-2 planner):
+    # p(z | X, l) ∝ p_base(z | X) exp(z^T b(X, l)). The base flow and the
+    # log-linear language expert are trained on the DETACHED encoder code, so
+    # the code space stays predictive-only. See rlopt/agent/language_tilt_planner.py.
+    cotrain_language_planner: bool = False
+    planner_language_embeddings_path: str = ""
+    planner_flow_hidden_dims: tuple[int, ...] = (1024, 512, 512)
+    planner_flow_time_embed_dim: int = 64
+    planner_flow_num_inference_steps: int = 16
+    planner_flow_noise_std: float = 1.0
+    planner_expert_hidden_dims: tuple[int, ...] = (512, 512)
+    planner_lang_proj_dim: int = 64
+    planner_lr: float = 3.0e-4
+    planner_weight_decay: float = 0.0
+    planner_state_noise_std: float = 0.0
+    planner_eval_betas: tuple[float, ...] = (0.0, 1.0, 2.0)
+    planner_eval_num_samples: int = 8
+    jepa_reconstruction_coeff: float = 0.0
+    """Weight of an autoencoder term added to the ``jepa_ntp`` objective.
+
+    ``0`` (default) reproduces every existing arm. Positive builds a decoder
+    ``z -> target`` (target chosen by ``reconstruction_target``; the default
+    ``input_window`` is the exact encoder input) whose loss joins the encoder's
+    optimizer step, so the code must also reconstruct its own input. The target
+    is normalized per dimension by running statistics and the squared error is
+    SUMMED over dimensions, the same per-dimension footing as the diffusion
+    heads' summed epsilon error."""
+    cotrain_regression_planner: bool = False
+    """Co-train a deterministic planner ``z_hat = P(X, l)`` on the encoder code.
+
+    ``X`` is phi's source (current macro state plus its past chunk), ``l`` the
+    clip caption embedding from ``planner_language_embeddings_path``. The loss
+    is the unit-variance Gaussian NLL ``0.5 ||z - P(X, l)||^2`` (summed over
+    code dims) weighted by ``regression_planner_coeff`` inside the encoder's
+    own optimizer step. See ``rlopt/agent/latent_regression_planner.py``."""
+    regression_planner_coeff: float = 1.0
+    regression_planner_detach_target: bool = False
+    """``False`` (default) trains encoder and planner JOINTLY: the NLL gradient
+    reaches the encoder through the target code. ``True`` detaches the target,
+    so the planner is fit to a predictive-only code."""
+    regression_planner_use_language: bool = True
+    regression_planner_hidden_dims: tuple[int, ...] = (1024, 1024, 512)
+    regression_planner_lr: float = 3.0e-4
+    macro_qvel_scale: float = 1.0
+    heads_drop_qvel: bool = False
+    """Encoder-only joint velocities for 67-wide full_body macro frames.
+
+    ``False`` (default) feeds the full frame everywhere. ``True`` keeps the
+    67-wide frame for the ENCODER input only and gives phi's source, the
+    endpoint target and the next-chunk target the root_qpos slice (joint
+    velocities deleted), so the prediction problem is the root_qpos one and the
+    only change is what the encoder sees."""
+    """Multiplier on the joint-velocity block of 67-wide full_body macro frames.
+
+    ``1.0`` (default) changes nothing. Applied to every macro frame the
+    jepa_ntp trainer samples (state, window, past chunk) and, because the value
+    is stored in the checkpoint config, to the live window the frozen sampler
+    encodes for the tracker. Raw reference joint velocities have about 3.6x the
+    spread of joint positions with outliers near 58 rad/s; 0.25 brings them to
+    the position scale."""
 
     def validate(self) -> None:
         self.horizon_steps = _require_positive_int("horizon_steps", self.horizon_steps)
@@ -1122,6 +1288,92 @@ class HighLevelSkillDiffSRConfig:
                 "cotrain_commander is enabled."
             )
             raise ValueError(msg)
+        self.cotrain_language_planner = bool(self.cotrain_language_planner)
+        self.planner_language_embeddings_path = str(
+            self.planner_language_embeddings_path
+        ).strip()
+        if self.cotrain_language_planner and not self.planner_language_embeddings_path:
+            msg = (
+                "planner_language_embeddings_path is required when "
+                "cotrain_language_planner is enabled."
+            )
+            raise ValueError(msg)
+        # Delegate the planner knobs to the planner's own config validator so
+        # the two never disagree on what is legal.
+        self.language_planner_config().validate()
+        self.jepa_reconstruction_coeff = _require_non_negative_float(
+            "jepa_reconstruction_coeff", self.jepa_reconstruction_coeff
+        )
+        if (
+            self.jepa_reconstruction_coeff > 0.0
+            and self.transition_objective != "jepa_ntp"
+        ):
+            msg = (
+                "jepa_reconstruction_coeff > 0 requires transition_objective="
+                f"'jepa_ntp', got {self.transition_objective!r}; the plain "
+                "'reconstruction' objective already is an autoencoder."
+            )
+            raise ValueError(msg)
+        self.cotrain_regression_planner = bool(self.cotrain_regression_planner)
+        self.regression_planner_coeff = _require_non_negative_float(
+            "regression_planner_coeff", self.regression_planner_coeff
+        )
+        self.regression_planner_detach_target = bool(
+            self.regression_planner_detach_target
+        )
+        self.regression_planner_use_language = bool(
+            self.regression_planner_use_language
+        )
+        self.regression_planner_hidden_dims = tuple(
+            _require_positive_int("regression_planner_hidden_dims", dim)
+            for dim in self.regression_planner_hidden_dims
+        )
+        self.regression_planner_lr = _require_positive_float(
+            "regression_planner_lr", self.regression_planner_lr
+        )
+        if self.cotrain_regression_planner:
+            if self.transition_objective != "jepa_ntp":
+                msg = (
+                    "cotrain_regression_planner requires transition_objective="
+                    f"'jepa_ntp', got {self.transition_objective!r}."
+                )
+                raise ValueError(msg)
+            if (
+                self.regression_planner_use_language
+                and not self.planner_language_embeddings_path
+            ):
+                msg = (
+                    "planner_language_embeddings_path is required when the "
+                    "regression planner is language-conditioned."
+                )
+                raise ValueError(msg)
+        self.macro_qvel_scale = _require_positive_float(
+            "macro_qvel_scale", self.macro_qvel_scale
+        )
+        self.heads_drop_qvel = bool(self.heads_drop_qvel)
+        if self.heads_drop_qvel and not (
+            self.transition_objective == "jepa_ntp"
+            and str(self.jepa_loss) == "sigreg_ebm"
+            and str(self.jepa_ntp_head) == "diff_chunk"
+            and str(self.jepa_ntp_chunk_anchor) == "executed"
+            and int(self.jepa_context_chunks) == 0
+            and int(self.source_history_steps) > 0
+        ):
+            msg = (
+                "heads_drop_qvel is wired for jepa_ntp / sigreg_ebm / diff_chunk with "
+                "the executed chunk anchor, no context chunk and a past chunk."
+            )
+            raise ValueError(msg)
+        if self.macro_qvel_scale != 1.0 and (
+            self.transition_objective != "jepa_ntp"
+            or int(self.source_history_steps) <= 0
+        ):
+            msg = (
+                "macro_qvel_scale != 1 is wired through the jepa_ntp past-chunk "
+                "sampling path only; it needs transition_objective='jepa_ntp' "
+                "and source_history_steps > 0."
+            )
+            raise ValueError(msg)
         self.device = str(self.device)
 
     def latent_spec(self) -> SkillLatentSpec:
@@ -1160,13 +1412,40 @@ class HighLevelSkillDiffSRConfig:
             "sonic_fsq_levels",
             "commander_hidden_dims",
             "transition_offsets",
+            "planner_flow_hidden_dims",
+            "planner_expert_hidden_dims",
+            "regression_planner_hidden_dims",
         }
         for key in tuple_fields:
             if key in kwargs:
                 kwargs[key] = tuple(int(item) for item in kwargs[key])
+        if "planner_eval_betas" in kwargs:
+            kwargs["planner_eval_betas"] = tuple(
+                float(item) for item in kwargs["planner_eval_betas"]
+            )
         config = cls(**kwargs)
         config.validate()
         return config
+
+    def language_planner_config(self) -> LanguageTiltPlannerConfig:
+        """The planner-side view of the ``planner_*`` fields."""
+        from rlopt.agent.language_tilt_planner import (  # noqa: PLC0415
+            LanguageTiltPlannerConfig,
+        )
+
+        return LanguageTiltPlannerConfig(
+            flow_hidden_dims=tuple(int(d) for d in self.planner_flow_hidden_dims),
+            flow_time_embed_dim=int(self.planner_flow_time_embed_dim),
+            flow_num_inference_steps=int(self.planner_flow_num_inference_steps),
+            flow_noise_std=float(self.planner_flow_noise_std),
+            expert_hidden_dims=tuple(int(d) for d in self.planner_expert_hidden_dims),
+            lang_proj_dim=int(self.planner_lang_proj_dim),
+            lr=float(self.planner_lr),
+            weight_decay=float(self.planner_weight_decay),
+            state_noise_std=float(self.planner_state_noise_std),
+            eval_betas=tuple(float(b) for b in self.planner_eval_betas),
+            eval_num_samples=int(self.planner_eval_num_samples),
+        )
 
 
 class FrozenHighLevelSkillCommandSampler:
@@ -1276,8 +1555,11 @@ class FrozenHighLevelSkillCommandSampler:
             )
             raise ValueError(msg)
         self.device = _resolve_device(device, env)
-        from rlopt.env_interface import require_imitation_interface, supports
-        from rlopt.env_interface import resolve_imitation_interface
+        from rlopt.env_interface import (
+            require_imitation_interface,
+            resolve_imitation_interface,
+            supports,
+        )
 
         self._env_interface = resolve_imitation_interface(env)
         self._current_macro_sampler = require_imitation_interface(
@@ -1311,6 +1593,13 @@ class FrozenHighLevelSkillCommandSampler:
         if self.finetune_enabled and self.config.source_history_steps > 0:
             raise ValueError(
                 "Online finetuning with source_history_steps > 0 is not supported."
+            )
+        if self.config.heads_drop_qvel and (
+            self.finetune_enabled or _normalize_command_mode(command_mode) != "z"
+        ):
+            raise ValueError(
+                "A heads_drop_qvel checkpoint publishes z only: its heads read "
+                "root_qpos frames, the live window is full_body."
             )
         if self.finetune_enabled and self.config.transition_objective not in (
             "endpoint",
@@ -1473,6 +1762,14 @@ class FrozenHighLevelSkillCommandSampler:
             params.extend(self._jepa_head_parameters())
             self.optimizer = torch.optim.Adam(params, lr=self.lr)
         self.finetune_updates = 0
+
+        # Optional replacement of the live command: a callable
+        # ``(state, encoder_window, *, batch, env_ids) -> z`` that takes over
+        # from ``skill_encoder`` when set (e.g. a universal multi-modality
+        # encoder that encodes the same window from another input device).
+        # ``skill_encoder`` is untouched, so checkpoints still carry the
+        # pretrained encoder's state.
+        self.command_override: Callable[..., Tensor] | None = None
 
         self._codes: Tensor | None = None
         self._latent_steps: Tensor | None = None
@@ -1708,7 +2005,19 @@ class FrozenHighLevelSkillCommandSampler:
             state_dim=self.state_dim,
             source="Current expert",
         )
-        z = self.skill_encoder(state, _encoder_input_window(self.config, future_window))
+        qvel_scale = float(self.config.macro_qvel_scale)
+        state = _scale_macro_qvel(state, qvel_scale)
+        future_window = _scale_macro_qvel(future_window, qvel_scale)
+        target = _scale_macro_qvel(target, qvel_scale)
+        if self.command_override is not None:
+            z = self.command_override(
+                state,
+                _encoder_input_window(self.config, future_window),
+                batch=batch,
+                env_ids=env_ids,
+            )
+        else:
+            z = self.skill_encoder(state, _encoder_input_window(self.config, future_window))
         initial_z = self.initial_skill_encoder(
             state,
             _encoder_input_window(self.config, future_window),
@@ -1721,7 +2030,9 @@ class FrozenHighLevelSkillCommandSampler:
                 state_dim=self.state_dim,
                 device=self.device,
             )
-            self._current_command_source = state_history.reshape(batch_size, -1)
+            self._current_command_source = _scale_macro_qvel(
+                state_history.reshape(batch_size, -1), qvel_scale
+            )
         else:
             self._current_command_source = state
         return z, state, future_window, target, initial_z
@@ -2353,6 +2664,13 @@ class HighLevelSkillDiffSRTrainer:
         )
         del future_window, target
         self.state_dim = int(state.shape[-1])
+        if self.config.heads_drop_qvel and self.state_dim != _FULL_BODY_FRAME_DIM:
+            msg = f"heads_drop_qvel needs the 67-wide full_body macro frame, got {self.state_dim}."
+            raise ValueError(msg)
+        # Width of the frames phi and the generative heads see.
+        self.head_state_dim = (
+            _ROOT_QPOS_FRAME_DIM if self.config.heads_drop_qvel else self.state_dim
+        )
         self.encoder_window_steps = _encoder_window_steps(self.config)
         self.feature_slices = self._resolve_feature_slices()
 
@@ -2365,7 +2683,7 @@ class HighLevelSkillDiffSRTrainer:
             activation=self.config.encoder_activation,
             layer_norm=self.config.encoder_layer_norm,
         ).to(self.device)
-        self.diffsr = _build_diffsr(self.config, self.state_dim, self.device).to(
+        self.diffsr = _build_diffsr(self.config, self.head_state_dim, self.device).to(
             self.device
         )
         self._initialize_diffsr_state_output()
@@ -2461,9 +2779,9 @@ class HighLevelSkillDiffSRTrainer:
                 # next chunk's H raw frames (diff_chunk, H*state_dim wide).
                 self.jepa_ntp_diffsr = _build_diffsr(
                     self.config,
-                    self.state_dim,
+                    self.head_state_dim,
                     self.device,
-                    next_obs_dim=_jepa_ntp_target_dim(self.config, self.state_dim),
+                    next_obs_dim=_jepa_ntp_target_dim(self.config, self.head_state_dim),
                 ).to(self.device)
             self.optimizer.add_param_group(
                 {
@@ -2489,6 +2807,53 @@ class HighLevelSkillDiffSRTrainer:
         self.commander_lang_embed_dim = 0
         if self.config.cotrain_commander:
             self._init_commander()
+        # Optional co-trained language-tilted flow planner (System-2). Its
+        # state input is phi's source: the current state plus its past chunk
+        # when source_history_steps > 0, i.e. the causal past X only.
+        self.planner: LanguageTiltPlanner | None = None
+        self.planner_optimizer: torch.optim.Optimizer | None = None
+        self.planner_rank_embeddings: Tensor | None = None
+        self.planner_lang_embed_dim = 0
+        self.planner_state_dim = int(self.head_state_dim) * _source_window_steps(self.config)
+        if self.config.cotrain_language_planner:
+            self._init_language_planner()
+        # Optional autoencoder term on the jepa_ntp code: its loss joins the
+        # encoder's optimizer step (unlike the planners above, which only ever
+        # see a detached code).
+        self.jepa_reconstruction_head: _NormalizedReconstructionHead | None = None
+        if float(self.config.jepa_reconstruction_coeff) > 0.0:
+            self.jepa_reconstruction_head = _NormalizedReconstructionHead(
+                z_dim=self.config.z_dim,
+                output_dim=self._reconstruction_output_dim(),
+                hidden_dims=tuple(reversed(self.config.encoder_hidden_dims)),
+                activation=self.config.encoder_activation,
+                # Variance floor of the target z-score: std 1 cm / 0.01 rad.
+                # Exactly constant slots (the anchor's own xy) normalize to 0.
+                eps=1.0e-4,
+            ).to(self.device)
+            self.optimizer.add_param_group(
+                {
+                    "params": self.jepa_reconstruction_head.parameters(),
+                    "lr": self.config.encoder_lr,
+                }
+            )
+        # Optional deterministic planner z_hat = P(X, l), trained in the SAME
+        # optimizer step as the encoder (jointly unless its target is detached).
+        self.regression_planner: nn.Module | None = None
+        if self.config.cotrain_regression_planner:
+            self._init_regression_planner()
+
+    def _head_frames(self, frames: Tensor) -> Tensor:
+        """What phi and the generative heads see of macro frames (see heads_drop_qvel)."""
+        return _head_view(self.config, frames)
+
+    def _reconstruction_output_dim(self) -> int:
+        """Width of ``_reconstruction_target`` for the configured target."""
+        if self.config.reconstruction_target == "endpoint":
+            return int(self.state_dim)
+        if self.config.reconstruction_target == "full_window":
+            return int(self.state_dim) * (int(self.config.horizon_steps) + 1)
+        return int(self.state_dim) * (int(self.encoder_window_steps) + 1)
 
     def _encode_skill(
         self,
@@ -2742,6 +3107,7 @@ class HighLevelSkillDiffSRTrainer:
             )
             if source_override is not None:
                 source = source_override
+                target = self._head_frames(target)
             real = float(self._diffsr_loss_for_z(source, z, target).item())
             zero = float(self._diffsr_loss_for_z(source, zero_z, target).item())
             shuffled = float(self._diffsr_loss_for_z(source, shuffled_z, target).item())
@@ -3172,6 +3538,26 @@ class HighLevelSkillDiffSRTrainer:
             self.commander.train()
         return metrics
 
+    def _sample_jepa_window_and_batch(
+        self,
+        sampler: Callable[..., TensorDictBase],
+        *,
+        batch_size: int,
+        chunk_steps: int,
+        split: str | None,
+    ) -> tuple[Tensor, Tensor, Tensor, TensorDictBase]:
+        """``_sample_jepa_window`` plus the raw batch (for ``hl/traj_rank``)."""
+        return cast(
+            tuple[Tensor, Tensor, Tensor, TensorDictBase],
+            self._sample_jepa_window(
+                sampler,
+                batch_size=batch_size,
+                chunk_steps=chunk_steps,
+                split=split,
+                return_batch=True,
+            ),
+        )
+
     def _sample_jepa_window(
         self,
         sampler: Callable[..., TensorDictBase],
@@ -3179,7 +3565,8 @@ class HighLevelSkillDiffSRTrainer:
         batch_size: int,
         chunk_steps: int,
         split: str | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        return_batch: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, TensorDictBase]:
         """Draw one jepa window and phi's conditioning source.
 
         Returns ``(state, window, source)`` where ``state`` is ``s_t``,
@@ -3211,8 +3598,13 @@ class HighLevelSkillDiffSRTrainer:
                 horizon_steps=span,
                 device=self.device,
             )
-            sequence = torch.cat([anchor_state.unsqueeze(1), anchor_window], dim=1)
-            source = sequence[:, : history + 1].reshape(batch_size, -1)
+            sequence = _scale_macro_qvel(
+                torch.cat([anchor_state.unsqueeze(1), anchor_window], dim=1),
+                float(self.config.macro_qvel_scale),
+            )
+            source = _head_view(self.config, sequence[:, : history + 1].reshape(batch_size, -1))
+            if return_batch:
+                return sequence[:, history], sequence[:, history + 1 :], source, batch
             return sequence[:, history], sequence[:, history + 1 :], source
 
         batch = sampler(
@@ -3229,8 +3621,12 @@ class HighLevelSkillDiffSRTrainer:
             horizon_steps=int(chunk_steps),
             device=self.device,
         )
+        qvel_scale = float(self.config.macro_qvel_scale)
+        state = _scale_macro_qvel(state, qvel_scale)
+        window = _scale_macro_qvel(window, qvel_scale)
         if history == 0:
-            return state, window, state
+            source = _head_view(self.config, state)
+            return (state, window, source, batch) if return_batch else (state, window, source)
         state_history = _macro_batch_state_history(
             batch,
             batch_size=batch_size,
@@ -3238,7 +3634,10 @@ class HighLevelSkillDiffSRTrainer:
             state_dim=int(state.shape[-1]),
             device=self.device,
         )
-        return state, window, state_history.reshape(batch_size, -1)
+        source = _head_view(self.config, 
+            _scale_macro_qvel(state_history.reshape(batch_size, -1), qvel_scale)
+        )
+        return (state, window, source, batch) if return_batch else (state, window, source)
 
     def _jepa_train_step(self) -> dict[str, float]:
         assert self.jepa_predictor is not None
@@ -3265,7 +3664,7 @@ class HighLevelSkillDiffSRTrainer:
         # predictor reads cat(z0, z1): the option-view dynamics model of
         # wiki/skill-encoder-jepa-plan.md phase 2.
         total_chunks = 2 + context
-        state, window, source = self._sample_jepa_window(
+        state, window, source, batch = self._sample_jepa_window_and_batch(
             sampler,
             batch_size=int(self.config.batch_size),
             chunk_steps=total_chunks * horizon,
@@ -3290,7 +3689,9 @@ class HighLevelSkillDiffSRTrainer:
         # requested; validate() pins context=0 in that case, so `source` always
         # belongs to the executed chunk.
         exec_source = (
-            source if int(self.config.source_history_steps) > 0 else exec_state
+            source
+            if int(self.config.source_history_steps) > 0
+            else self._head_frames(exec_state)
         )
         z1, reg_loss, info = self.skill_encoder.encode(
             exec_state,
@@ -3356,6 +3757,7 @@ class HighLevelSkillDiffSRTrainer:
                 )
             else:
                 endpoint = boundary
+            endpoint = self._head_frames(endpoint)
             self.diffsr.update_obs_norm(endpoint.detach())
             diffsr_loss = self._diffsr_loss_for_z(exec_source, z1, endpoint)
             head = str(self.config.jepa_ntp_head)
@@ -3381,9 +3783,9 @@ class HighLevelSkillDiffSRTrainer:
                         if str(self.config.jepa_ntp_chunk_span) == "boundary_next"
                         else horizon
                     )
-                    ntp_target = window[:, span_start : 2 * horizon].reshape(
-                        z1.shape[0], -1
-                    )
+                    ntp_target = self._head_frames(
+                        window[:, span_start : 2 * horizon]
+                    ).reshape(z1.shape[0], -1)
                 self.jepa_ntp_diffsr.update_obs_norm(ntp_target.detach())  # type: ignore[union-attr]
                 ntp = self._ntp_diffsr_loss(exec_source, z1, ntp_target.detach())
             elif head == "diff_pair":
@@ -3454,6 +3856,45 @@ class HighLevelSkillDiffSRTrainer:
             loss = objective + self.config.reg_coeff * reg_loss
             term_metrics = {}
 
+        if self.jepa_reconstruction_head is not None:
+            # Autoencoder term on the EXECUTED chunk: the code must also
+            # reproduce its own input window (or the configured target).
+            boundary = window[:, (context + 1) * horizon - 1]
+            exec_endpoint = (
+                boundary
+                if context == 0
+                else _reanchor_heading_frames(
+                    boundary, window[:, context * horizon - 1]
+                )
+            )
+            recon_target = self._reconstruction_target(
+                exec_state, exec_window, exec_endpoint
+            )
+            self.jepa_reconstruction_head.update(recon_target)
+            recon_loss = self.jepa_reconstruction_head.loss(z1, recon_target)
+            loss = loss + float(self.config.jepa_reconstruction_coeff) * recon_loss
+            term_metrics["train/jepa_reconstruction_loss"] = float(
+                recon_loss.detach().item()
+            )
+        if self.regression_planner is not None:
+            from rlopt.agent.latent_regression_planner import (  # noqa: PLC0415
+                LatentRegressionPlanner,
+            )
+
+            z_hat = self._regression_planner_predict(batch, exec_source)
+            planner_target = (
+                z1.detach() if self.config.regression_planner_detach_target else z1
+            )
+            planner_nll = LatentRegressionPlanner.gaussian_nll(z_hat, planner_target)
+            loss = loss + float(self.config.regression_planner_coeff) * planner_nll
+            term_metrics["train/regression_planner_nll"] = float(
+                planner_nll.detach().item()
+            )
+            for key, value in LatentRegressionPlanner.fit_metrics(
+                z_hat.detach(), z1.detach()
+            ).items():
+                term_metrics[f"train/regression_planner_{key}"] = value
+
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         metrics = self._z_diagnostics(z1.detach(), prefix="train")
@@ -3468,6 +3909,16 @@ class HighLevelSkillDiffSRTrainer:
                 *(
                     self.jepa_ntp_diffsr.parameters()
                     if self.jepa_ntp_diffsr is not None
+                    else []
+                ),
+                *(
+                    self.jepa_reconstruction_head.parameters()
+                    if self.jepa_reconstruction_head is not None
+                    else []
+                ),
+                *(
+                    self.regression_planner.parameters()
+                    if self.regression_planner is not None
                     else []
                 ),
             ]
@@ -3508,6 +3959,8 @@ class HighLevelSkillDiffSRTrainer:
                 **{f"train/{k}": float(v.item()) for k, v in info.items()},
             }
         )
+        if self.planner is not None:
+            metrics.update(self._planner_train_step(batch, exec_source, z1))
         return metrics
 
     def train_step(self) -> dict[str, float]:
@@ -3567,6 +4020,8 @@ class HighLevelSkillDiffSRTrainer:
         )
         if self.commander is not None:
             metrics.update(self._commander_train_step(batch, state, z))
+        if self.planner is not None:
+            metrics.update(self._planner_train_step(batch, state, z))
         return metrics
 
     def _reconstruction_train_step(self) -> dict[str, float]:
@@ -3617,6 +4072,8 @@ class HighLevelSkillDiffSRTrainer:
         )
         if self.commander is not None:
             metrics.update(self._commander_train_step(batch, state, z))
+        if self.planner is not None:
+            metrics.update(self._planner_train_step(batch, state, z))
         return metrics
 
     @torch.no_grad()
@@ -3736,7 +4193,7 @@ class HighLevelSkillDiffSRTrainer:
             z_shuffled = z1[torch.randperm(z1.shape[0], device=z1.device)]
         else:
             z_shuffled = z1.clone()
-        endpoint = window[:, horizon - 1]
+        endpoint = self._head_frames(window[:, horizon - 1])
         endpoint_loss = self._diffsr_loss_for_z(source, z1, endpoint)
         endpoint_shuffled = self._diffsr_loss_for_z(source, z_shuffled, endpoint)
 
@@ -3776,9 +4233,9 @@ class HighLevelSkillDiffSRTrainer:
                     if str(self.config.jepa_ntp_chunk_span) == "boundary_next"
                     else horizon
                 )
-                ntp_target = window[:, span_start : 2 * horizon].reshape(
-                    z1.shape[0], -1
-                )
+                ntp_target = self._head_frames(
+                    window[:, span_start : 2 * horizon]
+                ).reshape(z1.shape[0], -1)
             ntp_loss = self._ntp_diffsr_loss(source, z1, ntp_target)
             ntp_shuffled = self._ntp_diffsr_loss(source, z_shuffled, ntp_target)
         elif head == "diff_token":
@@ -3802,7 +4259,28 @@ class HighLevelSkillDiffSRTrainer:
                 return 0.0
             return 1.0 - float(real.item()) / control
 
+        recon_metrics: dict[str, float] = {}
+        if self.jepa_reconstruction_head is not None:
+            with torch.no_grad():
+                recon_target = self._reconstruction_target(
+                    state, window[:, :horizon], window[:, horizon - 1]
+                )
+                recon_loss = self.jepa_reconstruction_head.loss(z1, recon_target)
+                recon_shuffled = self.jepa_reconstruction_head.loss(
+                    z_shuffled, recon_target
+                )
+            recon_metrics = {
+                f"{prefix}/jepa_reconstruction_loss_eval": float(recon_loss.item()),
+                f"{prefix}/jepa_reconstruction_loss_shuffled_eval": float(
+                    recon_shuffled.item()
+                ),
+                f"{prefix}/jepa_reconstruction_z_explained": _explained(
+                    recon_loss, recon_shuffled
+                ),
+            }
+
         return {
+            **recon_metrics,
             f"{prefix}/jepa_endpoint_loss_eval": float(endpoint_loss.item()),
             f"{prefix}/jepa_endpoint_loss_shuffled_eval": float(
                 endpoint_shuffled.item()
@@ -3927,6 +4405,18 @@ class HighLevelSkillDiffSRTrainer:
                 batch_metrics.update(
                     self._commander_eval_metrics(batch, state, z, prefix=prefix)
                 )
+            if self.planner is not None:
+                batch_metrics.update(
+                    self._planner_eval_metrics(
+                        batch_size=batch_size, split=split, prefix=prefix
+                    )
+                )
+            if self.regression_planner is not None:
+                batch_metrics.update(
+                    self._regression_planner_eval_metrics(
+                        batch_size=batch_size, split=split, prefix=prefix
+                    )
+                )
             if include_reconstruction and self.reconstruction_decoder is None:
                 batch_metrics.update(
                     self._objective_reconstruction_metrics(
@@ -4038,6 +4528,19 @@ class HighLevelSkillDiffSRTrainer:
             checkpoint["reconstruction_decoder_state_dict"] = (
                 self.reconstruction_decoder.state_dict()
             )
+        if self.jepa_reconstruction_head is not None:
+            checkpoint["jepa_reconstruction_head_state_dict"] = (
+                self.jepa_reconstruction_head.state_dict()
+            )
+        if self.regression_planner is not None:
+            checkpoint["regression_planner"] = (
+                self.regression_planner.checkpoint_state_dict()  # type: ignore[operator]
+            )
+        if self.planner is not None and self.planner_optimizer is not None:
+            checkpoint["language_planner"] = self.planner.checkpoint_state_dict()
+            checkpoint["language_planner_optimizer_state_dict"] = (
+                self.planner_optimizer.state_dict()
+            )
         return checkpoint
 
     def save_checkpoint(self, path: str | Path) -> None:
@@ -4067,6 +4570,399 @@ class HighLevelSkillDiffSRTrainer:
                 os.unlink(staged)
         Path(f"{target}.json").write_text(
             json.dumps({"update": int(self.update)}), encoding="utf-8"
+        )
+
+    # ------------------------------------------------------------------
+    # Co-trained language-tilted flow planner (System-2)
+    # ------------------------------------------------------------------
+    def _init_language_planner(self) -> None:
+        from rlopt.agent.language_tilt_planner import (  # noqa: PLC0415
+            LanguageTiltPlanner,
+        )
+
+        self._init_planner_language_table()
+        self.planner = LanguageTiltPlanner(
+            state_dim=int(self.planner_state_dim),
+            lang_embed_dim=self.planner_lang_embed_dim,
+            z_dim=int(self.config.z_dim),
+            config=self.config.language_planner_config(),
+        ).to(self.device)
+        self.planner_optimizer = torch.optim.AdamW(
+            self.planner.parameters(),
+            lr=float(self.config.planner_lr),
+            weight_decay=float(self.config.planner_weight_decay),
+        )
+
+    def _init_planner_language_table(self) -> None:
+        """Rank-indexed caption embeddings shared by every co-trained planner."""
+        if self.planner_rank_embeddings is not None:
+            return
+        from rlopt.agent.skill_commander import (  # noqa: PLC0415
+            build_rank_embedding_lookup,
+            load_language_embedding_table,
+        )
+
+        # Resolve through the imitation interface: the Isaac wrapper does not
+        # expose the data-plane accessor as a plain attribute.
+        names_provider = require_imitation_interface(
+            self.env,
+            "expert_trajectory_motion_names",
+            purpose="co-trained language planners require it but",
+        )
+        table = load_language_embedding_table(
+            self.config.planner_language_embeddings_path
+        )
+        self.planner_lang_embed_dim = int(table["embed_dim"])
+        self.planner_rank_embeddings = build_rank_embedding_lookup(
+            table, [str(name) for name in names_provider()], self.device
+        )
+
+    def _init_regression_planner(self) -> None:
+        from rlopt.agent.latent_regression_planner import (  # noqa: PLC0415
+            LatentRegressionPlanner,
+        )
+
+        lang_dim = 0
+        if self.config.regression_planner_use_language:
+            self._init_planner_language_table()
+            lang_dim = int(self.planner_lang_embed_dim)
+        self.regression_planner = LatentRegressionPlanner(
+            state_dim=int(self.planner_state_dim),
+            lang_embed_dim=lang_dim,
+            z_dim=int(self.config.z_dim),
+            hidden_dims=tuple(self.config.regression_planner_hidden_dims),
+        ).to(self.device)
+        self.optimizer.add_param_group(
+            {
+                "params": self.regression_planner.parameters(),
+                "lr": float(self.config.regression_planner_lr),
+            }
+        )
+
+    def _regression_planner_predict(
+        self, batch: TensorDictBase, source: Tensor
+    ) -> Tensor:
+        assert self.regression_planner is not None
+        lang = (
+            self._planner_lang_for_batch(batch)
+            if self.config.regression_planner_use_language
+            else None
+        )
+        return self.regression_planner(self._planner_input(source.detach()), lang)
+
+    @torch.no_grad()
+    def _regression_planner_eval_metrics(
+        self, *, batch_size: int, split: str | None, prefix: str
+    ) -> dict[str, float]:
+        """Held-out fit of ``z_hat = P(X, l)`` and the prediction loss of ``z_hat``.
+
+        ``pred_loss`` scores the planner's code with the active generative head
+        against this window's real future, bracketed by the encoder's own code
+        and a batch-shuffled code (the same brackets as the flow planner). The
+        shuffled-language row measures how much of the fit the caption carries.
+        """
+        from rlopt.agent.latent_regression_planner import (  # noqa: PLC0415
+            LatentRegressionPlanner,
+        )
+
+        assert self.regression_planner is not None
+        was_training = self.regression_planner.training
+        self.regression_planner.eval()
+        state, exec_window, source, batch, loss_at_z = self._planner_eval_window(
+            batch_size=int(batch_size), split=split
+        )
+        z, *_ = self.skill_encoder.encode(
+            state, _encoder_input_window(self.config, exec_window), deterministic=True
+        )
+        z_hat = self._regression_planner_predict(batch, source)
+        tag = f"{prefix}/regression_planner"
+        metrics = {
+            f"{tag}_{key}_eval": value
+            for key, value in LatentRegressionPlanner.fit_metrics(z_hat, z).items()
+        }
+        metrics[f"{tag}_nll_eval"] = float(
+            LatentRegressionPlanner.gaussian_nll(z_hat, z).item()
+        )
+        rows = int(z.shape[0])
+        if self.config.regression_planner_use_language and rows > 1:
+            lang = self._planner_lang_for_batch(batch)
+            shuffled = lang[torch.randperm(rows, device=lang.device)]
+            z_hat_shuffled = self.regression_planner(
+                self._planner_input(source), shuffled
+            )
+            for key, value in LatentRegressionPlanner.fit_metrics(
+                z_hat_shuffled, z
+            ).items():
+                metrics[f"{tag}_{key}_shuffled_lang_eval"] = value
+        metrics[f"{tag}_pred_loss"] = float(loss_at_z(z_hat).item())
+        metrics[f"{tag}_pred_loss_encoder_z"] = float(loss_at_z(z).item())
+        if rows > 1:
+            metrics[f"{tag}_pred_loss_shuffled_z"] = float(
+                loss_at_z(z[torch.randperm(rows, device=z.device)]).item()
+            )
+        if was_training:
+            self.regression_planner.train()
+        return metrics
+
+    def _planner_lang_for_batch(self, batch: TensorDictBase) -> Tensor:
+        traj_rank = batch.get(("hl", "traj_rank"))
+        if traj_rank is None:
+            msg = "co-trained language planners require 'traj_rank' in the macro batch."
+            raise ValueError(msg)
+        traj_rank = traj_rank.reshape(-1).to(device=self.device, dtype=torch.long)
+        assert self.planner_rank_embeddings is not None
+        return self.planner_rank_embeddings.index_select(0, traj_rank)
+
+    def _planner_input(self, planner_state: Tensor) -> Tensor:
+        expected = (int(planner_state.shape[0]), int(self.planner_state_dim))
+        if tuple(planner_state.shape) != expected:
+            msg = (
+                "planner state width mismatch: expected "
+                f"{expected}, got {tuple(planner_state.shape)}. The planner reads "
+                "phi's source (current state plus its past chunk)."
+            )
+            raise ValueError(msg)
+        return planner_state.to(device=self.device, dtype=torch.float32)
+
+    def _planner_train_step(
+        self, batch: TensorDictBase, planner_state: Tensor, z: Tensor
+    ) -> dict[str, float]:
+        """One AdamW step of the base flow + language expert on detached ``z``."""
+        assert self.planner is not None
+        assert self.planner_optimizer is not None
+        self.planner.train()
+        lang = self._planner_lang_for_batch(batch)
+        z_target = z.detach()
+        state = self._planner_input(planner_state.detach())
+        std = float(self.config.planner_state_noise_std)
+        if std > 0.0 and int(state.shape[0]) > 1:
+            per_dim = state.std(dim=0, keepdim=True)
+            state = state + std * per_dim * torch.randn_like(state)
+        loss, info = self.planner.losses(state, z_target, lang)
+        self.planner_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        metrics = {"train/planner_loss": float(loss.detach().item())}
+        if self.config.grad_clip_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.planner.parameters(),
+                max_norm=float(self.config.grad_clip_norm),
+            )
+            metrics["train/planner_grad_norm"] = float(grad_norm.item())
+        self.planner_optimizer.step()
+        for key in ("flow_loss", "lang_loss", "lang_acc", "lang_unique", "lang_chance"):
+            if key in info:
+                metrics[f"train/planner_{key}"] = float(info[key])
+        return metrics
+
+    def _planner_eval_window(
+        self, *, batch_size: int, split: str | None
+    ) -> tuple[Tensor, Tensor, Tensor, TensorDictBase, Callable[[Tensor], Tensor]]:
+        """Draw an eval window and build ``loss_at_z`` for the active head.
+
+        Returns ``(state, exec_window, source, batch, loss_at_z)`` where
+        ``loss_at_z(z)`` is the prediction loss of the active generative head
+        for an arbitrary code ``z`` paired with THIS window's future: the NTP
+        chunk head for ``sigreg_ebm`` arms, the endpoint DiffSR head otherwise.
+        """
+        horizon = int(self.config.horizon_steps)
+        sampler = require_imitation_interface(
+            self.env,
+            "sample_expert_macro_transition_batch",
+            purpose="Language-planner evaluation requires it but",
+        )
+        jepa_chunk = (
+            self.config.transition_objective == "jepa_ntp"
+            and str(self.config.jepa_loss) == "sigreg_ebm"
+            and int(self.config.jepa_context_chunks) == 0
+            and str(self.config.jepa_ntp_head) == "diff_chunk"
+        )
+        if jepa_chunk:
+            state, window, source, batch = self._sample_jepa_window_and_batch(
+                sampler, batch_size=batch_size, chunk_steps=2 * horizon, split=split
+            )
+            if str(self.config.jepa_ntp_chunk_anchor) == "next":
+                anchor = window[:, horizon - 1]
+                ntp_target = _reanchor_heading_frames(
+                    window[:, horizon : 2 * horizon], anchor
+                ).reshape(batch_size, -1)
+            else:
+                span_start = (
+                    horizon - 1
+                    if str(self.config.jepa_ntp_chunk_span) == "boundary_next"
+                    else horizon
+                )
+                ntp_target = self._head_frames(
+                    window[:, span_start : 2 * horizon]
+                ).reshape(batch_size, -1)
+
+            def loss_at_z(z: Tensor, _target: Tensor = ntp_target, _src: Tensor = source) -> Tensor:
+                return self._chunked_loss_at_z(self._ntp_diffsr_loss, _src, z, _target)
+
+            return state, window[:, :horizon], source, batch, loss_at_z
+        state, window, source, batch = self._sample_jepa_window_and_batch(
+            sampler, batch_size=batch_size, chunk_steps=horizon, split=split
+        )
+        endpoint = self._head_frames(window[:, horizon - 1])
+
+        def loss_at_z_endpoint(z: Tensor, _target: Tensor = endpoint, _src: Tensor = source) -> Tensor:
+            return self._chunked_loss_at_z(self._diffsr_loss_for_z, _src, z, _target)
+
+        return state, window, source, batch, loss_at_z_endpoint
+
+    @staticmethod
+    def _chunked_loss_at_z(
+        loss_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
+        source: Tensor,
+        z: Tensor,
+        target: Tensor,
+    ) -> Tensor:
+        """Mean of ``loss_fn(source, z_k, target)`` over ``z`` laid out as
+        ``rows * repeat`` (row-major, ``repeat`` codes per row), scored in
+        chunks of ``rows`` so the diffusion head's per-row Jacobian
+        ``[rows, feature_dim, target_dim]`` is materialized once per chunk.
+        """
+        rows = int(target.shape[0])
+        repeat = int(z.shape[0]) // rows
+        if repeat * rows != int(z.shape[0]):
+            msg = f"z rows {int(z.shape[0])} are not a multiple of {rows}."
+            raise ValueError(msg)
+        if repeat == 1:
+            return loss_fn(source, z, target)
+        grouped = z.reshape(rows, repeat, -1)
+        total = torch.zeros((), device=z.device, dtype=torch.float32)
+        for k in range(repeat):
+            total = total + loss_fn(source, grouped[:, k], target).to(torch.float32)
+        return total / float(repeat)
+
+    @torch.no_grad()
+    def _planner_eval_metrics(
+        self, *, batch_size: int, split: str | None, prefix: str
+    ) -> dict[str, float]:
+        """Held-out planner diagnostics on a fresh window of ``split``.
+
+        Per guidance strength ``beta`` in ``planner_eval_betas`` the planner
+        draws ``planner_eval_num_samples`` codes per row and reports the cosine
+        to the encoder's code (mean and best-of-K), the spread across samples,
+        the language expert's top-1 accuracy ON THE SAMPLES (does guidance make
+        the sample carry the instruction), and the prediction loss of the
+        samples against this window's real future. The encoder's own code and
+        a batch-shuffled code bracket the prediction loss.
+        """
+        assert self.planner is not None
+        was_training = self.planner.training
+        self.planner.eval()
+        state, exec_window, source, batch, loss_at_z = self._planner_eval_window(
+            batch_size=int(batch_size), split=split
+        )
+        z, *_ = self.skill_encoder.encode(
+            state, _encoder_input_window(self.config, exec_window), deterministic=True
+        )
+        lang = self._planner_lang_for_batch(batch)
+        planner_state = self._planner_input(source)
+        rows = int(z.shape[0])
+        metrics: dict[str, float] = {}
+        _flow_loss, flow_info = self.planner.flow_loss(planner_state, z)
+        _lang_loss, lang_info = self.planner.language_loss(planner_state, z, lang)
+        metrics[f"{prefix}/planner_flow_loss_eval"] = float(flow_info["flow_loss"])
+        for key in ("lang_loss", "lang_acc", "lang_unique", "lang_chance"):
+            metrics[f"{prefix}/planner_{key}_eval"] = float(lang_info[key])
+        if rows > 1:
+            shuffled_lang = lang[torch.randperm(rows, device=lang.device)]
+            _l, shuffled_info = self.planner.language_loss(planner_state, z, shuffled_lang)
+            metrics[f"{prefix}/planner_lang_acc_shuffled_eval"] = float(
+                shuffled_info["lang_acc"]
+            )
+        metrics[f"{prefix}/planner_pred_loss_encoder_z"] = float(loss_at_z(z).item())
+        if rows > 1:
+            shuffled_z = z[torch.randperm(rows, device=z.device)]
+            metrics[f"{prefix}/planner_pred_loss_shuffled_z"] = float(
+                loss_at_z(shuffled_z).item()
+            )
+        num_samples = int(self.config.planner_eval_num_samples)
+        state_rep = planner_state.repeat_interleave(num_samples, dim=0)
+        lang_rep = lang.repeat_interleave(num_samples, dim=0)
+        z_rep = z.repeat_interleave(num_samples, dim=0)
+        unique, target = self.planner.expert.unique_instructions(lang)
+        lang_proj = self.planner.expert.project_language(unique)
+        target_rep = target.repeat_interleave(num_samples, dim=0)
+        for beta in self.config.planner_eval_betas:
+            tag = f"{prefix}/planner_beta{beta:g}"
+            samples = self.planner.sample(
+                state_rep, lang_rep, beta=float(beta), candidates=unique
+            )
+            cosine = F.cosine_similarity(samples, z_rep, dim=-1).reshape(rows, num_samples)
+            metrics[f"{tag}/cos_mean"] = float(cosine.mean().item())
+            metrics[f"{tag}/cos_best_of_k"] = float(cosine.max(dim=1).values.mean().item())
+            grouped = samples.reshape(rows, num_samples, -1)
+            metrics[f"{tag}/spread"] = float(
+                grouped.std(dim=1, unbiased=False).mean().item()
+            )
+            metrics[f"{tag}/z_rms"] = float(samples.pow(2).mean().sqrt().item())
+            logits = self.planner.expert.logits(state_rep, samples, lang_proj)
+            metrics[f"{tag}/lang_acc"] = float(
+                (logits.argmax(dim=-1) == target_rep).to(torch.float32).mean().item()
+            )
+            metrics[f"{tag}/pred_loss"] = float(loss_at_z(samples).item())
+        if was_training:
+            self.planner.train()
+        return metrics
+
+    def planner_checkpoint_state_dict(
+        self, *, skill_checkpoint_path: str = ""
+    ) -> dict[str, Any]:
+        """Standalone checkpoint of the co-trained language-tilted planner."""
+        if self.planner is None:
+            msg = "No co-trained language planner to checkpoint."
+            raise RuntimeError(msg)
+        return {
+            **self.planner.checkpoint_state_dict(),
+            "skill_config": self.config.to_dict(),
+            "skill_checkpoint_path": str(skill_checkpoint_path),
+            "source_history_steps": int(self.config.source_history_steps),
+            "source_anchor": str(self.config.source_anchor),
+            "macro_state_dim": int(self.state_dim),
+            "language_embeddings_path": str(self.config.planner_language_embeddings_path),
+            "update": int(self.update),
+        }
+
+    def save_regression_planner_checkpoint(
+        self, path: str | Path, *, skill_checkpoint_path: str = ""
+    ) -> None:
+        """Standalone checkpoint of the co-trained regression planner."""
+        if self.regression_planner is None:
+            msg = "No co-trained regression planner to checkpoint."
+            raise RuntimeError(msg)
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                **self.regression_planner.checkpoint_state_dict(),  # type: ignore[operator]
+                "skill_config": self.config.to_dict(),
+                "skill_checkpoint_path": str(skill_checkpoint_path),
+                "source_history_steps": int(self.config.source_history_steps),
+                "source_anchor": str(self.config.source_anchor),
+                "macro_state_dim": int(self.state_dim),
+                "language_embeddings_path": (
+                    str(self.config.planner_language_embeddings_path)
+                    if self.config.regression_planner_use_language
+                    else ""
+                ),
+                "detach_target": bool(self.config.regression_planner_detach_target),
+                "update": int(self.update),
+            },
+            target,
+        )
+
+    def save_planner_checkpoint(
+        self, path: str | Path, *, skill_checkpoint_path: str = ""
+    ) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            self.planner_checkpoint_state_dict(
+                skill_checkpoint_path=skill_checkpoint_path
+            ),
+            target,
         )
 
     def commander_checkpoint_state_dict(
@@ -4176,10 +5072,32 @@ class HighLevelSkillDiffSRTrainer:
                 msg = "Reconstruction checkpoint has no reconstruction decoder state."
                 raise ValueError(msg)
             self.reconstruction_decoder.load_state_dict(decoder_state)
+        for name, module in (
+            ("jepa_reconstruction_head_state_dict", self.jepa_reconstruction_head),
+            ("regression_planner", self.regression_planner),
+        ):
+            if module is None:
+                continue
+            module_state = checkpoint.get(name)
+            if module_state is None:
+                msg = f"Checkpoint has no {name!r} for the configured head."
+                raise ValueError(msg)
+            if name == "regression_planner":
+                module_state = module_state["planner_state_dict"]
+            module.load_state_dict(module_state)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         feature_norm_state = checkpoint.get("feature_normalization_state_dict")
         obs_norm = getattr(self.diffsr, "obs_norm", None)
         if isinstance(obs_norm, nn.Module) and feature_norm_state:
             obs_norm.load_state_dict(feature_norm_state)
+        if self.planner is not None:
+            planner_state = checkpoint.get("language_planner")
+            if planner_state is not None:
+                self.planner.load_state_dict(planner_state["planner_state_dict"])
+                optimizer_state = checkpoint.get(
+                    "language_planner_optimizer_state_dict"
+                )
+                if self.planner_optimizer is not None and optimizer_state:
+                    self.planner_optimizer.load_state_dict(optimizer_state)
         self.update = int(checkpoint.get("update", 0))
         return cast(dict[str, Any], checkpoint)
