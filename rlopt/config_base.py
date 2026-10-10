@@ -479,6 +479,18 @@ class TrainerConfig:
     profile_iterations: bool = False
     """Synchronize accelerators and report phase timings for every iteration."""
 
+    max_train_seconds: float | None = None
+    """Wall-clock training budget in seconds; ``None`` or ``<= 0`` disables it.
+
+    The clock starts when the first collector batch has returned, so env and
+    agent construction and the first-step cold start are outside the budget.
+    It is cumulative across resumed segments (checkpoints carry
+    ``cumulative_train_seconds``). When it runs out the loop stops at the next
+    iteration boundary, logs final metrics, writes a checkpoint named by the
+    cumulative env frames and returns normally. The frame budget
+    (``collector.total_frames``) still applies; whichever ends first stops the
+    run. Only loops decorated with ``honours_train_time_budget`` read it."""
+
 
 @dataclass
 class RLOptConfig:

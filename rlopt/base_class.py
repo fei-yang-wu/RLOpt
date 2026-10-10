@@ -71,6 +71,19 @@ class TrainingMetadata:
     next_file_log_frame: int = 1000
     # Number of table rows already emitted to the file-only summary.
     file_summary_rows: int = 0
+    # Set when ``trainer.max_train_seconds`` ran out: the current iteration is
+    # the last one (it logs, then the loop stops and writes a final checkpoint).
+    stop_after_iteration: bool = False
+
+
+def honours_train_time_budget(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark a ``train`` loop that reads ``trainer.max_train_seconds``.
+
+    A subclass that overrides ``train`` without this marker does not honour
+    the budget, and ``BaseAlgorithm.supports_train_time_budget`` is False.
+    """
+    fn._honours_train_time_budget = True  # type: ignore[attr-defined]
+    return fn
 
 
 @dataclass(kw_only=True)
@@ -150,6 +163,102 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     """
 
     _FILE_SUMMARY_HEADER_INTERVAL = 20
+
+    # ------------------------------------------------------- walltime budget
+    # Host-side clock only (time.monotonic): one call per iteration, no device
+    # synchronisation. ``_train_seconds_offset`` is the cumulative training
+    # time restored from a checkpoint (``cumulative_train_seconds``).
+    _train_clock_start: float | None = None
+    _train_seconds_offset: float = 0.0
+
+    @property
+    def supports_train_time_budget(self) -> bool:
+        """Whether this agent's ``train`` loop honours ``trainer.max_train_seconds``."""
+        return bool(getattr(type(self).train, "_honours_train_time_budget", False))
+
+    def _max_train_seconds(self) -> float | None:
+        trainer = getattr(self.config, "trainer", None)
+        value = getattr(trainer, "max_train_seconds", None)
+        if value is None or float(value) <= 0.0:
+            return None
+        return float(value)
+
+    def _start_train_clock(self) -> None:
+        """Start the training clock once (call after the first collected batch)."""
+        if self._train_clock_start is None:
+            self._train_clock_start = time.monotonic()
+            budget = self._max_train_seconds()
+            if budget is not None:
+                self.log.info(
+                    "Training clock started: budget %.1f s (%.1f s already used "
+                    "by earlier segments).",
+                    budget,
+                    self._train_seconds_offset,
+                )
+
+    def train_elapsed_seconds(self) -> float:
+        """Cumulative training seconds: earlier segments plus this one."""
+        start = self._train_clock_start
+        own = 0.0 if start is None else time.monotonic() - start
+        return float(self._train_seconds_offset) + own
+
+    def _train_time_budget_reached(self) -> bool:
+        budget = self._max_train_seconds()
+        if budget is None or self._train_clock_start is None:
+            return False
+        return self.train_elapsed_seconds() >= budget
+
+    def _train_clock_metrics(self, frames_processed: int) -> dict[str, float]:
+        """Time-axis metrics logged with every flush (host values only)."""
+        metrics = {
+            "time/train_elapsed_s": self.train_elapsed_seconds(),
+            "train/cumulative_env_frames": float(frames_processed),
+        }
+        if self.device.type == "cuda":
+            # Host-side allocator statistic: no device synchronisation.
+            metrics["perf/cuda_max_memory_allocated_gib"] = (
+                torch.cuda.max_memory_allocated(self.device) / 2**30
+            )
+        return metrics
+
+    def _restore_train_clock(self, checkpoint: Mapping[str, Any]) -> None:
+        seconds = checkpoint.get("cumulative_train_seconds")
+        if seconds is not None:
+            self._train_seconds_offset = float(seconds)
+
+    def _final_checkpoint_path(self, frames: int) -> Path:
+        return (
+            self.log_dir / self.config.logger.save_path / f"model_step_{int(frames)}.pt"
+        )
+
+    def _write_budget_checkpoint(self, frames: int) -> None:
+        """Write the final checkpoint unless one exists for this frame count."""
+        target = self._final_checkpoint_path(frames)
+        if target.exists():
+            return
+        custom_save = getattr(self, "save", None)
+        if callable(custom_save):
+            # Agents with a full-state ``save`` (the PPO record() path uses it too).
+            target.parent.mkdir(parents=True, exist_ok=True)
+            custom_save(target)
+        else:
+            self.save_model(path=target.parent, step=int(frames))
+
+    def _finish_train_time_budget(self, metadata: TrainingMetadata) -> None:
+        """Log the stop and write the final checkpoint named by cumulative frames."""
+        frames = int(metadata.frames_processed)
+        elapsed = self.train_elapsed_seconds()
+        self.log.info(
+            "Training time budget reached: %.1f s >= %.1f s at %d cumulative env "
+            "frames; stopping and writing the final checkpoint.",
+            elapsed,
+            float(self._max_train_seconds() or 0.0),
+            frames,
+        )
+        self._write_budget_checkpoint(frames)
+        metrics = self._train_clock_metrics(frames)
+        metrics["train/stopped_by_time_budget"] = 1.0
+        self.log_metrics(metrics, step=frames, log_python=False)
 
     def _iteration_profiling_enabled(self) -> bool:
         """Whether synchronized per-iteration phase profiling is enabled."""
@@ -1054,6 +1163,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
         data_to_save.update(self._extra_model_state_dict())
+        data_to_save["cumulative_train_seconds"] = self.train_elapsed_seconds()
 
         torch.save(data_to_save, target_path)
 
@@ -1089,6 +1199,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             self.feature_extractor.load_state_dict(data["feature_extractor_state_dict"])  # type: ignore[arg-type]
         if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in data:
             self.env.load_state_dict(data["vec_norm_msg"])  # type: ignore[arg-type]
+        self._restore_train_clock(data)
         self._load_extra_model_state_dict(data)
 
     def _extra_model_state_dict(self) -> dict[str, Any]:
@@ -1468,6 +1579,8 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         self, metadata: TrainingMetadata, iteration: IterationData
     ) -> bool:
         """Return whether this iteration should emit periodic logs."""
+        if metadata.stop_after_iteration:
+            return True
         if metadata.progress_bar_enabled:
             # The progress bar already provides live progress updates; avoid
             # duplicate periodic logs and only emit logs at the final iteration.
@@ -1482,7 +1595,8 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     ) -> bool:
         """Return whether this iteration should emit an rlopt.log summary."""
         return (
-            metadata.frames_processed >= metadata.next_file_log_frame
+            metadata.stop_after_iteration
+            or metadata.frames_processed >= metadata.next_file_log_frame
             or (iteration.iteration_idx + 1) == metadata.total_iterations
         )
 
