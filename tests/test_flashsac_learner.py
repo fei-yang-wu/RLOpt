@@ -243,6 +243,42 @@ def test_entropy_target_value():
     assert learner.target_entropy == pytest.approx(-13.87, abs=0.01)
 
 
+def test_physical_entropy_target_subtracts_log_bounds():
+    tanh = learner_mod.target_entropy(3, 0.5)
+    bounds = [2.0, 4.0, 8.0]
+    phys = learner_mod.target_entropy(3, 0.5, "physical", bounds)
+    assert phys == pytest.approx(tanh - math.log(2.0 * 4.0 * 8.0))
+    # A unit bound and the tanh space agree; a scalar bound broadcasts.
+    assert learner_mod.target_entropy(3, 0.5, "physical", 1.0) == pytest.approx(tanh)
+    assert learner_mod.target_entropy(3, 0.5, "physical", 2.0) == pytest.approx(
+        tanh - 3 * math.log(2.0)
+    )
+    learner = FlashSACLearner(
+        FlashSACLearnerConfig(
+            amp_dtype="fp32",
+            actor_dim=32,
+            critic_dim=64,
+            target_entropy_space="physical",
+            target_entropy_sigma=0.5,
+            action_bound=bounds,
+        ),
+        OA,
+        OC,
+        3,
+        torch.device("cpu"),
+    )
+    assert learner.target_entropy == pytest.approx(phys)
+
+
+def test_entropy_target_rejects_bad_space_and_bounds():
+    with pytest.raises(ValueError):
+        learner_mod.target_entropy(3, 0.5, "joint")
+    with pytest.raises(ValueError):
+        learner_mod.target_entropy(3, 0.5, "physical", [1.0, 2.0])
+    with pytest.raises(ValueError):
+        learner_mod.target_entropy(3, 0.5, "physical", [1.0, 0.0, 2.0])
+
+
 @pytest.mark.parametrize("sigma", [0.15, 0.001])
 def test_temperature_update_direction(sigma, fixed_noise):
     learner = FlashSACLearner(

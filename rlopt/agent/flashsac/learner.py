@@ -87,6 +87,14 @@ class FlashSACLearnerConfig:
     actor_update_period: int = 2
     temp_init: float = 0.01
     target_entropy_sigma: float = 0.15
+    target_entropy_space: str = "tanh"
+    """Space of the entropy target. ``tanh`` (reference): ``target_entropy_sigma``
+    is the per-dimension std of the tanh-space action, whatever the bound.
+    ``physical``: it is the std in env action units, so with a per-dimension
+    bound ``B_j`` the tanh-space target is ``target_entropy(|A|, sigma) -
+    sum_j ln B_j`` (the env action ``B * tanh(u)`` has entropy ``H_tanh +
+    sum_j ln B_j``). Only the target moves; the actor and temperature losses
+    are unchanged. See ``wiki/flashsac-ipmd-plan.md`` (DV2)."""
     action_bound: float | Sequence[float] | None = None
     weight_norm: bool = True
     amp_dtype: str = "fp16"
@@ -96,9 +104,39 @@ class FlashSACLearnerConfig:
     reward_g_max: float = 5.0
 
 
-def target_entropy(act_dim: int, sigma: float) -> float:
-    """Unified entropy target in tanh space: ``0.5 * |A| * ln(2 pi e sigma^2)``."""
-    return 0.5 * act_dim * math.log(2.0 * math.pi * math.e * sigma**2)
+_ENTROPY_SPACES = ("tanh", "physical")
+
+
+def target_entropy(
+    act_dim: int,
+    sigma: float,
+    space: str = "tanh",
+    action_bound: float | Sequence[float] | None = None,
+) -> float:
+    """Entropy target of the tanh-space action.
+
+    ``tanh``: ``0.5 * |A| * ln(2 pi e sigma^2)`` (the unified FlashSAC target).
+    ``physical``: the same formula read in env action units, minus
+    ``sum_j ln B_j`` to express it in tanh space. ``action_bound`` is a scalar
+    or ``act_dim`` values (``None`` means 1).
+    """
+    if space not in _ENTROPY_SPACES:
+        msg = f"target_entropy_space must be one of {_ENTROPY_SPACES}, got {space!r}"
+        raise ValueError(msg)
+    value = 0.5 * act_dim * math.log(2.0 * math.pi * math.e * sigma**2)
+    if space == "physical" and action_bound is not None:
+        bounds = (
+            [float(action_bound)] * act_dim
+            if isinstance(action_bound, (int, float))
+            else [float(b) for b in action_bound]
+        )
+        if len(bounds) == 1:
+            bounds = bounds * act_dim
+        if len(bounds) != act_dim or any(b <= 0.0 for b in bounds):
+            msg = f"action_bound must be positive with {act_dim} entries"
+            raise ValueError(msg)
+        value -= sum(math.log(b) for b in bounds)
+    return value
 
 
 def c51_project(
@@ -284,7 +322,12 @@ class FlashSACLearner(nn.Module):
         on_cuda = self.device_.type == "cuda"
         amp_dtype = _AMP_DTYPES[cfg.amp_dtype]
         self._amp_dtype = amp_dtype if on_cuda else None
-        self.target_entropy = target_entropy(act_dim, cfg.target_entropy_sigma)
+        self.target_entropy = target_entropy(
+            act_dim,
+            cfg.target_entropy_sigma,
+            cfg.target_entropy_space,
+            cfg.action_bound,
+        )
 
         # Build on CPU under a private RNG fork so the global RNG is not touched.
         with torch.random.fork_rng(devices=[]):
