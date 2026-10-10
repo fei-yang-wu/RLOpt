@@ -854,3 +854,41 @@ def test_parity_with_reference_one_update_fp32(fixed_noise):
         for key in shared:
             a, c = float(ri[key]), float(mi[key])
             assert abs(a - c) <= 1e-5 * max(1.0, abs(a)), (step, key, a, c)
+
+
+# ------------------------------------------------- q aggregation, adam beta2
+
+
+def test_q_aggregation_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        FlashSACLearner(_cfg(q_aggregation="max"), OA, OC, ACT, torch.device("cpu"))
+
+
+def test_adam_beta2_reaches_every_optimizer():
+    learner = FlashSACLearner(_cfg(adam_beta2=0.95), OA, OC, ACT, torch.device("cpu"))
+    for opt in learner.optimizers.values():
+        assert opt.param_groups[0]["betas"] == (0.9, 0.95)
+
+
+@pytest.mark.parametrize("mode", ["min", "mean"])
+def test_q_aggregation_modes_update_finitely(mode, fixed_noise):
+    learner = FlashSACLearner(
+        _cfg(q_aggregation=mode), OA, OC, ACT, torch.device("cpu")
+    )
+    for _ in range(3):
+        info = learner.update(make_batch(64, "cpu"))
+    assert all(torch.isfinite(v).all() for v in info.values())
+
+
+def test_mean_aggregation_regresses_each_head_on_its_own_target(fixed_noise):
+    """With mean aggregation the two heads see different targets, so two heads
+    that start identical still drift apart only through their own targets; with
+    min aggregation they share one target. Check the critic loss differs."""
+    batch = make_batch(64, "cpu")
+    losses = {}
+    for mode in ("min", "mean"):
+        learner = FlashSACLearner(
+            _cfg(q_aggregation=mode), OA, OC, ACT, torch.device("cpu")
+        )
+        losses[mode] = learner.update(batch)["critic/loss"].item()
+    assert losses["min"] != pytest.approx(losses["mean"])

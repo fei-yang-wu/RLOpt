@@ -102,9 +102,17 @@ class FlashSACLearnerConfig:
     use_cuda_graph: bool = False
     seed: int = 0
     reward_g_max: float = 5.0
+    q_aggregation: str = "min"
+    """How the two critic heads combine. ``min`` (reference): the actor
+    maximises ``min(Q1, Q2)`` and both heads regress on the target head with
+    the smaller expected value. ``mean`` (FastSAC humanoid recipe): the actor
+    maximises ``(Q1 + Q2) / 2`` and each head regresses on its own target head."""
+    adam_beta2: float = 0.999
+    """Adam second-moment decay for every optimizer (FastSAC uses 0.95)."""
 
 
 _ENTROPY_SPACES = ("tanh", "physical")
+_Q_AGGREGATIONS = ("min", "mean")
 
 
 def target_entropy(
@@ -354,6 +362,10 @@ class FlashSACLearner(nn.Module):
 
         # Optimizers: fused capturable Adam with a device LR tensor (CPU: plain Adam).
         lr_fn = _cosine_schedule(cfg.lr, cfg.lr_final, cfg.lr_decay_steps)
+        if cfg.q_aggregation not in _Q_AGGREGATIONS:
+            msg = f"q_aggregation must be one of {_Q_AGGREGATIONS}, got {cfg.q_aggregation!r}"
+            raise ValueError(msg)
+        betas = (0.9, float(cfg.adam_beta2))
         self.optimizers: dict[str, torch.optim.Optimizer] = {}
         self.schedules: dict[str, _LRSchedule] = {}
         for name, module in (
@@ -364,10 +376,16 @@ class FlashSACLearner(nn.Module):
             lr_t = torch.tensor(cfg.lr, device=self.device_, dtype=torch.float32)
             if on_cuda:
                 opt = torch.optim.Adam(
-                    module.parameters(), lr=lr_t, fused=True, capturable=True
+                    module.parameters(),
+                    lr=lr_t,
+                    betas=betas,
+                    fused=True,
+                    capturable=True,
                 )
             else:
-                opt = torch.optim.Adam(module.parameters(), lr=lr_t, foreach=False)
+                opt = torch.optim.Adam(
+                    module.parameters(), lr=lr_t, betas=betas, foreach=False
+                )
             self.optimizers[name] = opt
             self.schedules[name] = _LRSchedule(lr_t, lr_fn)
 
@@ -535,7 +553,10 @@ class FlashSACLearner(nn.Module):
             self.critic.requires_grad_(False)
             qs, _ = self._fn.critic(b["critic_obs"], actions, False)
             self.critic.requires_grad_(True)
-            q = torch.minimum(qs[0], qs[1])
+            if self.cfg.q_aggregation == "mean":
+                q = 0.5 * (qs[0] + qs[1])
+            else:
+                q = torch.minimum(qs[0], qs[1])
             alpha = self.temperature().detach()
             actor_loss = (log_probs * alpha - q).mean()
             entropy = -log_probs.mean()
@@ -564,20 +585,35 @@ class FlashSACLearner(nn.Module):
                 act_all = torch.cat([b["action"], next_a], dim=0)
                 qs_all, lp_all = self._fn.target(obs_all, act_all, True)
                 next_qs = qs_all.chunk(2, dim=1)[1]
-                next_lp = self._fn.select_min_q(next_qs, lp_all.chunk(2, dim=1)[1])
-                target_probs = self._fn.project(
-                    next_lp,
-                    reward,
-                    b["terminated_n"],
-                    b["discount_n"],
-                    entropy_term,
-                    cfg.v_min,
-                    cfg.v_max,
-                )
+                next_lp_heads = lp_all.chunk(2, dim=1)[1]
+                if cfg.q_aggregation == "mean":
+                    # Each head regresses on its own target head: project the
+                    # two heads as one (2B, atoms) batch.
+                    heads, batch, atoms = next_lp_heads.shape
+                    target_probs = self._fn.project(
+                        next_lp_heads.reshape(heads * batch, atoms),
+                        reward.repeat(heads),
+                        b["terminated_n"].repeat(heads),
+                        b["discount_n"].repeat(heads),
+                        entropy_term.repeat(heads),
+                        cfg.v_min,
+                        cfg.v_max,
+                    ).view(heads, batch, atoms)
+                else:
+                    next_lp = self._fn.select_min_q(next_qs, next_lp_heads)
+                    target_probs = self._fn.project(
+                        next_lp,
+                        reward,
+                        b["terminated_n"],
+                        b["discount_n"],
+                        entropy_term,
+                        cfg.v_min,
+                        cfg.v_max,
+                    ).unsqueeze(0)
                 max_bonus = entropy_term.max()
             pred_qs, pred_lp_all = self._fn.critic(obs_all, act_all, True)
             pred_lp = torch.chunk(pred_lp_all, 2, dim=1)[0]
-            ce = -(target_probs.unsqueeze(0) * pred_lp).sum(dim=-1)
+            ce = -(target_probs * pred_lp).sum(dim=-1)
             critic_loss = ce.mean()
         self._backward_step(critic_loss, self.optimizers["critic"])
         if cfg.weight_norm:
