@@ -711,6 +711,37 @@ class IPMDConfig(PPOConfig):
     reward_label_smoothing: float = 0.05
     """``logistic_ratio`` targets: expert -> ``1 - eps``, policy -> ``eps``."""
 
+    reward_prior_checkpoint: str | None = None
+    """``hl_skill_diffsr`` checkpoint whose next-chunk head gives the fixed
+    prior reward ``g`` (``rlopt.agent.ipmd.reward_prior``). ``None`` disables
+    the prior. The PPO reward becomes ``env_reward_weight * r_env (+ est) + g``
+    and the estimator never sees ``g`` (MaxEnt IRL with the reward
+    regularizer centred at ``g``)."""
+
+    reward_prior_obs_key: list[str] = field(
+        default_factory=lambda: ["reward_prior_state", "macro_pair"]
+    )
+    """Rollout key of the per-step raw ``[robot | reference]`` macro components."""
+
+    reward_prior_weight: float = 0.3
+    """Per-step scale of ``g = weight * stride * exp(r_B / kappa)``."""
+
+    reward_prior_kappa: float = 150.0
+    """Temperature of ``exp(r_B / kappa)``; ``r_B`` is a negative denoising error."""
+
+    reward_prior_stride: int = 10
+    """Evaluate one chunk every ``stride`` steps of each episode."""
+
+    reward_prior_draws: int = 1
+    """Noise draws per diffusion level in the ``r_B`` estimate."""
+
+    reward_prior_transform: str = "log"
+    """Fixed map ``h(r_B)`` to [0, 1]: ``"log"`` (graded over the whole range)
+    or ``"exp"`` (``exp(r_B / kappa)``)."""
+
+    reward_prior_log_range: list[float] = field(default_factory=lambda: [5.0, 1.0e5])
+    """``(lo, hi)`` of the ``"log"`` map: ``-r_B <= lo`` maps to 1, ``>= hi`` to 0."""
+
     expert_batch_size: int | None = None
     """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
 
@@ -1205,6 +1236,18 @@ class IPMDConfig(PPOConfig):
                 f"cumulative mean), got {self.reward_moment_momentum!r}."
             )
             raise ValueError(msg)
+        if self.reward_prior_checkpoint is not None:
+            if float(self.reward_prior_kappa) <= 0.0 or int(self.reward_prior_stride) < 1:
+                raise ValueError(
+                    "ipmd.reward_prior_kappa must be > 0 and ipmd.reward_prior_stride >= 1."
+                )
+            if int(self.reward_prior_draws) < 1:
+                raise ValueError("ipmd.reward_prior_draws must be >= 1.")
+            if self.reward_prior_transform not in {"log", "exp"}:
+                raise ValueError(
+                    "ipmd.reward_prior_transform must be 'log' or 'exp', got "
+                    f"{self.reward_prior_transform!r}."
+                )
         smoothing = float(self.reward_label_smoothing)
         if not 0.0 <= smoothing < 0.5:
             msg = (
@@ -1479,6 +1522,25 @@ class IPMD(PPO):
             self._reward_objective, self.config.ipmd.reward_ppo_squash
         )
         self._reward_mix_state: dict[str, Tensor] = self._initial_reward_mix_state()
+
+        # Fixed prior reward g (2026-10-11): a frozen DiffSR next-chunk head
+        # scored on rollouts only. None when ipmd.reward_prior_checkpoint is unset.
+        self._reward_prior = None
+        if self.config.ipmd.reward_prior_checkpoint:
+            from rlopt.agent.ipmd.reward_prior import DiffSRChunkPrior
+
+            cfg_ipmd = self.config.ipmd
+            self._reward_prior = DiffSRChunkPrior(
+                cfg_ipmd.reward_prior_checkpoint,
+                num_envs=int(self.env.batch_size[0]),
+                device=self.device,
+                weight=float(cfg_ipmd.reward_prior_weight),
+                kappa=float(cfg_ipmd.reward_prior_kappa),
+                stride=int(cfg_ipmd.reward_prior_stride),
+                draws=int(cfg_ipmd.reward_prior_draws),
+                transform=str(cfg_ipmd.reward_prior_transform),
+                log_range=tuple(float(v) for v in cfg_ipmd.reward_prior_log_range),
+            )
 
         # Reward estimator: r(s, a, s') -> scalar
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
@@ -2788,8 +2850,21 @@ class IPMD(PPO):
                     + effective_est_weight * est_reward
                 )
                 self._reward_mix_state["driving_rollouts"] += 1
+            elif self._reward_prior is not None:
+                mixed_reward = cfg.env_reward_weight * env_reward
             else:
                 mixed_reward = env_reward
+            prior_reward: Tensor | None = None
+            if self._reward_prior is not None:
+                prior_key = tuple(cfg.reward_prior_obs_key)
+                done = rollout.get(("next", "done"))
+                prior_reward, prior_metrics = self._reward_prior.compute(
+                    rollout.get(prior_key), done
+                )
+                prior_reward = prior_reward.reshape(mixed_reward.shape).to(
+                    mixed_reward.dtype
+                )
+                mixed_reward = mixed_reward + prior_reward
 
         rollout.set(("next", "env_reward"), env_reward)
         rollout.set(reward_key, mixed_reward)
@@ -2799,6 +2874,12 @@ class IPMD(PPO):
                 "train/env_reward_mean": env_reward.mean().item(),
             }
         )
+        if prior_reward is not None:
+            rollout.set(("next", "prior_reward"), prior_reward)
+            metrics.update({f"train/{k}": v for k, v in prior_metrics.items()})
+            metrics.update(
+                reward_alignment_metrics("reward/env_vs_prior", env_reward, prior_reward)
+            )
         if est_reward is not None:
             assert raw_reward is not None
             assert r_hat is not None
