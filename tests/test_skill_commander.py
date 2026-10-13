@@ -316,6 +316,65 @@ def test_multicheckpoint_objective_train_step_reports_sampled_offsets(
     assert torch.isfinite(torch.tensor(metrics["train/loss"]))
 
 
+@pytest.mark.parametrize("latent_mode", ["deterministic", "sonic_fsq"])
+def test_reconstruction_objective_uses_offline_encoder_path(
+    tmp_path: Path,
+    latent_mode: str,
+) -> None:
+    torch.manual_seed(20)
+    env = _FakeMacroEnv(state_dim=7, horizon_steps=4, deterministic=True)
+    config = HighLevelSkillDiffSRConfig(
+        horizon_steps=4,
+        encoder_window_mode="intermediate",
+        transition_objective="reconstruction",
+        latent_mode=latent_mode,
+        sonic_fsq_levels=(4,) * 5,
+        z_dim=5,
+        diffsr_feature_dim=4,
+        diffsr_embed_dim=8,
+        batch_size=6,
+        num_updates=1,
+        log_interval=1,
+        eval_batches=1,
+        eval_batch_size=4,
+        preflight_batch_size=4,
+        encoder_hidden_dims=(16, 12),
+        diffsr_f_hidden_dims=(16,),
+        diffsr_g_hidden_dims=(16,),
+        diffsr_mu_hidden_dims=(16,),
+        diffsr_num_noises=2,
+        device="cpu",
+    )
+    trainer = HighLevelSkillDiffSRTrainer(config, env)
+    assert trainer.reconstruction_decoder is not None
+    assert trainer._reconstruction_target(
+        torch.zeros(2, 7), torch.zeros(2, 4, 7), torch.zeros(2, 7)
+    ).shape == (2, 28)
+
+    metrics = trainer.train_step()
+    assert torch.isfinite(torch.tensor(metrics["train/reconstruction_loss"]))
+    eval_metrics = trainer.evaluate(prefix="eval")
+    assert "eval/reconstruction_loss_eval" in eval_metrics
+    assert "eval/reconstruction_loss_zero_z_eval" in eval_metrics
+    assert "eval/loss_real_z_eval" not in eval_metrics
+
+    checkpoint_path = tmp_path / f"reconstruction_{latent_mode}.pt"
+    trainer.save_checkpoint(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    assert "reconstruction_decoder_state_dict" in checkpoint
+
+    restored = HighLevelSkillDiffSRTrainer(config, env)
+    restored.load_checkpoint(checkpoint_path)
+    assert restored.update == trainer.update
+    assert restored.reconstruction_decoder is not None
+    for expected, actual in zip(
+        trainer.reconstruction_decoder.parameters(),
+        restored.reconstruction_decoder.parameters(),
+        strict=True,
+    ):
+        assert torch.equal(expected, actual)
+
+
 def _make_language_table(
     tmp_path: Path,
     names: list[str],

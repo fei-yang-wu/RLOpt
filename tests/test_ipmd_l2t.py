@@ -83,6 +83,29 @@ def _make_agent(*, split_learning_rates: bool = True):
     return rlopt.IPMDL2T(env, cfg, logger=None), env
 
 
+def _make_split_command_agent():
+    """Build an L2T agent whose teacher is explicit and student is latent."""
+    rlopt = _rlopt()
+    cfg = _config()
+    cfg.policy.input_keys = ["observation"]
+    assert cfg.value_function is not None
+    cfg.value_function.input_keys = ["observation"]
+    cfg.ipmd_l2t.student_policy.input_keys = ["student_latent"]
+    cfg.ipmd.use_latent_command = True
+    cfg.ipmd.latent_key = "student_latent"
+    cfg.ipmd_l2t.student_latent_key = "student_latent"
+    cfg.ipmd.latent_dim = 3
+    cfg.ipmd.command_source = "random"
+    cfg.ipmd.latent_learning.posterior_input_keys = ["observation"]
+    cfg.ipmd.latent_learning.reconstruction_target_keys = ["observation"]
+
+    env = rlopt.make_parallel_env(cfg)
+    spec = env.observation_spec.clone()
+    spec.set("student_latent", spec["observation"].clone())
+    env.observation_spec = spec
+    return rlopt.IPMDL2T(env, cfg, logger=None), env
+
+
 def _policy_batch(agent, batch_size: int = 4) -> TensorDict:
     obs_dim = agent.env.observation_spec["observation"].shape[-1]
     act_dim = agent.env.action_spec.shape[-1]
@@ -131,6 +154,25 @@ def test_collection_is_teacher_only_and_student_is_deployment_policy() -> None:
         assert {id(param) for param in agent.student_policy.parameters()}.issubset(
             monitored_ids
         )
+    finally:
+        env.close()
+
+
+def test_latent_command_can_belong_only_to_student_policy() -> None:
+    agent, env = _make_split_command_agent()
+    try:
+        assert agent._policy_obs_keys == ["observation"]
+        assert agent._value_obs_keys == ["observation"]
+        assert agent._student_obs_keys == ["student_latent"]
+        assert agent._latent_key == "student_latent"
+        assert agent._latent_key not in agent._policy_obs_keys
+
+        td = env.reset()
+        assert "student_latent" not in td.keys(True)
+        agent.collector_policy(td)
+        assert isinstance(td["student_latent"], torch.Tensor)
+        assert td["student_latent"].shape[-1] == 3
+        assert "action" in td.keys(True)
     finally:
         env.close()
 
@@ -270,7 +312,7 @@ def test_update_clips_roles_separately_and_emits_finite_diagnostics(
         env.close()
 
 
-def test_latent_command_is_mirrored_tensor_identically(
+def test_latent_command_is_written_only_to_student_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rlopt = _rlopt()
@@ -278,28 +320,26 @@ def test_latent_command_is_mirrored_tensor_identically(
     student_key = ("policy", "latent_command")
     latent = torch.randn(3, 8)
 
-    def _fake_teacher_injection(self, td):
+    def _fake_student_injection(self, td):
         td.set(self._latent_key, latent)
 
     monkeypatch.setattr(
         rlopt.IPMDBase,
         "_inject_latent_command",
-        _fake_teacher_injection,
+        _fake_student_injection,
     )
     agent = object.__new__(rlopt.IPMDL2T)
     agent._use_latent_command = True
-    agent._latent_key = teacher_key
+    agent._latent_key = student_key
     agent._student_latent_key = student_key
     td = TensorDict({}, batch_size=[3])
 
     rlopt.IPMDL2T._inject_latent_command(agent, td)
 
-    teacher_value = td.get(teacher_key)
     student_value = td.get(student_key)
-    assert isinstance(teacher_value, torch.Tensor)
     assert isinstance(student_value, torch.Tensor)
-    assert torch.equal(teacher_value, student_value)
-    assert teacher_value.data_ptr() == student_value.data_ptr()
+    assert torch.equal(student_value, latent)
+    assert teacher_key not in td.keys(True)
 
 
 def test_checkpoint_round_trip_and_standard_ipmd_deployment_load(tmp_path) -> None:

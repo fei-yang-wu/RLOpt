@@ -15,6 +15,7 @@ from tensordict import TensorDict
 from tensordict.nn import (
     InteractionType,
     TensorDictModule,
+    TensorDictSequential,
 )
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
@@ -48,6 +49,7 @@ from rlopt.base_class import (
     BaseAlgorithm,
     IterationData,
     TrainingMetadata,
+    honours_train_time_budget,
 )
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
@@ -98,11 +100,17 @@ class RunningMeanStdCatInputs(torch.nn.Module):
         epsilon: float = 1.0e-5,
         clip: float = 5.0,
         normalize_mask: Tensor | None = None,
+        frozen: bool = False,
     ) -> None:
         super().__init__()
         if feature_dim <= 0:
             msg = "feature_dim must be positive."
             raise ValueError(msg)
+        # Frozen statistics never move, in train mode included: a fine-tune
+        # off a checkpoint keeps the parent's input scale so its exported
+        # bundle and the parent's stay comparable. Not a buffer: the flag is
+        # a run setting, not part of the model state.
+        self.frozen = bool(frozen)
         if epsilon <= 0.0:
             msg = "epsilon must be positive."
             raise ValueError(msg)
@@ -175,7 +183,7 @@ class RunningMeanStdCatInputs(torch.nn.Module):
             # with their original scale and geometry.
             normalized = torch.where(self.normalize_mask, normalized, value)
         # Match SONIC: normalize with the prior statistics, then update them.
-        if self.training:
+        if self.training and not self.frozen:
             self._update(value)
         return self.module(normalized)
 
@@ -205,6 +213,24 @@ class PPOConfig:
     normalize_advantage: bool = True
     """Whether to normalize the advantage estimates."""
 
+    update_normalizers_after_rollout: bool = True
+    """Keep updating the running input statistics of the actor and critic.
+
+    ``False`` freezes ``RunningMeanStdCatInputs`` at the values a checkpoint
+    restores (or the constructor's zero mean / unit variance for a fresh run),
+    so a fine-tune keeps its parent's input scale. Before 2026-09-13 this key
+    did not exist and was accepted silently by the Hydra path; every campaign
+    that passed it still updated the statistics on every minibatch.
+    """
+
+    freeze_normalizers: bool = False
+    """Never move the running input statistics: neither on the forward pass
+    nor after the rollout. They stay at the values the checkpoint restored
+    (or the zero-mean / unit-variance prior for a fresh run). This is the
+    "frozen normalizer" the 2026-09 fine-tune campaigns mean; it overrides
+    `update_normalizers_after_rollout` in both places that read it.
+    """
+
     normalize_advantage_global: bool = False
     """Normalize once over the complete rollout instead of per mini-batch."""
 
@@ -220,6 +246,47 @@ class PPOConfig:
     log_std_max: float = 2.0
     """Maximum log standard deviation (when clipping is enabled)."""
 
+    lcp_coeff: float = 0.0
+    """Lipschitz-constrained-policy gradient penalty coefficient.
+
+    Adds ``lcp_coeff * mean(||d loc / d obs||^2)`` to the actor loss — the
+    soft Lipschitz constraint of arXiv:2410.11825, computed with the
+    vector-Jacobian ones-trick on the policy MEAN (the ``loc`` head; the
+    sampled action and ``scale`` are untouched). ``0`` (default) skips the
+    extra forward/backward entirely and reproduces every existing arm.
+    """
+
+    lcp_batch_cap: int = 65536
+    """Rows of the mini-batch the LCP penalty is computed on.
+
+    The penalty needs ``create_graph=True`` through the actor, whose memory
+    scales with the rows it sees; a production mini-batch (300k+ rows) does
+    not fit. The first ``lcp_batch_cap`` rows of the mini-batch are an
+    unbiased-enough sample because the collector interleaves environments.
+    """
+
+    rnn_hidden_size: int = 0
+    """LSTM hidden size for a recurrent ACTOR. ``0`` (default) keeps the
+    plain MLP actor and changes nothing.
+
+    When positive, the actor becomes normalize/concat -> ``LSTMModule`` ->
+    MLP head, the environment gains ``InitTracker`` and the LSTM's
+    ``TensorDictPrimer`` (so the collector carries recurrent states across
+    steps and zero-fills them on reset), and PPO mini-batches become
+    time-contiguous ``[env, T]`` sequences instead of shuffled flat rows.
+    TorchRL loss modules run their forward under ``set_recurrent_mode(True)``,
+    so the sequence batches give true BPTT over the rollout window with
+    ``is_init`` resetting the hidden state at episode boundaries. The critic
+    stays a plain MLP, so GAE is untouched.
+
+    NOTE: the pre-existing ``PPORecurrent`` class pairs an LSTM with the
+    flat shuffled mini-batches; in recurrent mode those rows are treated as
+    one arbitrary sequence. Prefer this flag.
+    """
+
+    rnn_num_layers: int = 1
+    """Number of LSTM layers when ``rnn_hidden_size > 0``."""
+
 
 @dataclass
 class PPORLOptConfig(RLOptConfig):
@@ -227,6 +294,10 @@ class PPORLOptConfig(RLOptConfig):
 
     ppo: PPOConfig = field(default_factory=PPOConfig)
     """PPO configuration."""
+
+    use_value_function: bool = True
+    """PPO always trains a value function; declared so the resolved config
+    carries no undeclared attributes."""
 
     def __post_init__(self):
         self.use_value_function = True
@@ -320,6 +391,20 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         msg = "PPO does not require a feature extractor by default."
         raise NotImplementedError(msg)
 
+    def _normalizers_frozen(self) -> bool:
+        """Whether the forward pass leaves running input statistics alone.
+
+        `update_normalizers_after_rollout` means the statistics move ONCE,
+        from `_update_normalizers_after_rollout`, after optimization and
+        before checkpointing. The forward pass must therefore stay frozen:
+        the two paths together would count every visited state twice and
+        change the likelihood under which the rollout was collected.
+        """
+        ppo = getattr(self.config, "ppo", None)
+        if bool(getattr(ppo, "freeze_normalizers", False)):
+            return True
+        return bool(getattr(ppo, "update_normalizers_after_rollout", True))
+
     def _construct_policy(
         self, policy_net: torch.nn.Module | None = None
     ) -> TensorDictModule:
@@ -353,6 +438,14 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             distribution_class = IndependentNormal
             distribution_kwargs = {}
 
+        if int(self.config.ppo.rnn_hidden_size) > 0 and policy_net is None:
+            return self._construct_recurrent_policy_from_config(
+                policy_config,
+                action_dim=action_dim,
+                distribution_class=distribution_class,
+                distribution_kwargs=distribution_kwargs,
+            )
+
         # Build policy network
         if policy_net is None:
             policy_mlp = MLP(
@@ -379,6 +472,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 epsilon=policy_config.normalization_epsilon,
                 clip=policy_config.normalization_clip,
                 normalize_mask=self._input_normalize_mask(policy_config),
+                frozen=self._normalizers_frozen(),
             )
 
         net = GaussianPolicyHead(
@@ -399,6 +493,112 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         )
 
         # Add probabilistic sampling of the actions
+        return ProbabilisticActor(
+            policy_td,
+            in_keys=["loc", "scale"],
+            spec=self.env.full_action_spec_unbatched.to(self.device),  # type: ignore
+            distribution_class=distribution_class,
+            distribution_kwargs=distribution_kwargs,
+            return_log_prob=True,
+            default_interaction_type=ExplorationType.RANDOM,
+        )
+
+    def _construct_recurrent_policy_from_config(
+        self,
+        policy_config: NetworkConfig,
+        *,
+        action_dim: int,
+        distribution_class: type,
+        distribution_kwargs: dict,
+    ) -> TensorDictModule:
+        """Build the LSTM actor: normalize/concat -> LSTMModule -> MLP head.
+
+        The critic stays feed-forward. The LSTM's primer and ``InitTracker``
+        are attached to ``self.env`` here — the policy is constructed before
+        the collector, so the collector sees the transformed env.
+        """
+        hidden_size = int(self.config.ppo.rnn_hidden_size)
+        num_layers = int(self.config.ppo.rnn_num_layers)
+        policy_in_keys = list(policy_config.get_input_keys())
+        feature_dim = sum(self.observation_feature_size(key) for key in policy_in_keys)
+
+        class _CatInputs(torch.nn.Module):
+            def forward(self, *inputs: Tensor) -> Tensor:
+                if len(inputs) == 1:
+                    return inputs[0]
+                return torch.cat(inputs, dim=-1)
+
+        if getattr(policy_config, "normalize_input", False):
+            pre_module: torch.nn.Module = RunningMeanStdCatInputs(
+                torch.nn.Identity(),
+                feature_dim,
+                epsilon=policy_config.normalization_epsilon,
+                clip=policy_config.normalization_clip,
+                normalize_mask=self._input_normalize_mask(policy_config),
+                frozen=self._normalizers_frozen(),
+            ).to(self.device)
+        else:
+            pre_module = _CatInputs()
+        pre = TensorDictModule(
+            module=pre_module,
+            in_keys=policy_in_keys,
+            out_keys=["_actor_features"],
+        )
+        lstm = LSTMModule(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            device=self.device,
+            in_key="_actor_features",
+            out_key="_actor_rnn",
+        )
+        self._actor_lstm = lstm
+        head_mlp = MLP(
+            in_features=hidden_size,
+            activation_class=get_activation_class(policy_config.activation_fn),
+            out_features=action_dim,
+            num_cells=list(policy_config.num_cells),
+            device=self.device,
+        )
+        head = GaussianPolicyHead(
+            base=head_mlp,
+            action_dim=action_dim,
+            log_std_init=self.config.ppo.log_std_init,
+            log_std_min=self.config.ppo.log_std_min,
+            log_std_max=self.config.ppo.log_std_max,
+            clip_log_std=self.config.ppo.clip_log_std,
+            device=self.device,
+        )
+        post = TensorDictModule(
+            module=head,
+            in_keys=["_actor_rnn"],
+            out_keys=["loc", "scale"],
+        )
+        policy_td = TensorDictSequential(pre, lstm, post)
+
+        # Env plumbing: InitTracker for episode boundaries, the primer so the
+        # collector knows the recurrent-state specs. Guard against double
+        # attachment when an asymmetric algorithm builds a second actor.
+        if not getattr(self, "_recurrent_transforms_attached", False):
+            env = PPORecurrent.add_required_transforms(self.env)
+            primer = lstm.make_tensordict_primer()
+            if hasattr(env, "append_transform"):
+                env.append_transform(primer)
+            elif hasattr(env, "transform") and env.transform is not None:
+                if isinstance(env.transform, Compose):
+                    env.transform.append(primer)
+                else:
+                    env.transform = Compose(env.transform, primer)
+            else:
+                msg = (
+                    "ppo.rnn_hidden_size > 0 requires an env that accepts "
+                    "transforms (TransformedEnv); got "
+                    f"{type(self.env).__name__}."
+                )
+                raise TypeError(msg)
+            self.env = env
+            self._recurrent_transforms_attached = True
+
         return ProbabilisticActor(
             policy_td,
             in_keys=["loc", "scale"],
@@ -443,6 +643,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 epsilon=self.config.value_function.normalization_epsilon,
                 clip=self.config.value_function.normalization_clip,
                 normalize_mask=self._input_normalize_mask(self.config.value_function),
+                frozen=self._normalizers_frozen(),
             )
         else:
             module = CatInputs(value_mlp) if len(in_keys) > 1 else value_mlp
@@ -560,6 +761,24 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         sampler = (
             SamplerWithoutReplacement()
         )  # Removed True parameter to match ppo_mujoco.py
+        if int(cfg.ppo.rnn_hidden_size) > 0:
+            # Recurrent actor: the buffer stores whole per-env rollout
+            # sequences and samples along the ENV dimension, so every
+            # mini-batch is [env_rows, T] and BPTT sees real time order.
+            # mini_batch_size stays in FRAMES; it converts to env rows here.
+            num_envs = int(self.env.batch_size[0])
+            seq_len = max(1, int(cfg.collector.frames_per_batch) // num_envs)
+            env_rows = max(1, int(cfg.loss.mini_batch_size) // seq_len)
+            return TensorDictReplayBuffer(
+                storage=LazyTensorStorage(
+                    num_envs,
+                    compilable=cfg.compile.compile,  # type: ignore
+                    device=self.device,
+                ),
+                sampler=sampler,
+                batch_size=env_rows,
+                compilable=cfg.compile.compile,
+            )
         return TensorDictReplayBuffer(
             storage=LazyTensorStorage(
                 cfg.collector.frames_per_batch,
@@ -629,8 +848,38 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
     def _extra_actor_loss(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
         """Return actor-only auxiliary losses added on top of the PPO objective."""
-        del batch
-        return torch.zeros((), device=self.device), {}
+        return self._lcp_penalty(batch)
+
+    def _lcp_penalty(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
+        """Soft Lipschitz constraint on the policy mean (arXiv:2410.11825).
+
+        ``lcp_coeff * mean_over_rows(sum_over_obs (d sum(loc) / d obs)^2)``,
+        the vector-Jacobian ones-trick surrogate for the Jacobian norm. Runs
+        a second actor forward on a leaf copy of the observations, so the PPO
+        objective's graph is untouched.
+        """
+        coeff = float(self.config.ppo.lcp_coeff)
+        if coeff <= 0.0:
+            return torch.zeros((), device=self.device), {}
+        policy_op = self.actor_critic.get_policy_operator()
+        obs_keys = [key for key in policy_op.in_keys if key not in ("loc", "scale")]
+        cap = max(1, int(self.config.ppo.lcp_batch_cap))
+        rows = min(int(batch.batch_size[0]), cap)
+        sub = batch[:rows].select(*obs_keys).clone()
+        grad_inputs: list[Tensor] = []
+        for key in obs_keys:
+            leaf = sub.get(key).detach().requires_grad_(True)
+            sub.set(key, leaf)
+            grad_inputs.append(leaf)
+        with torch.enable_grad():
+            loc = policy_op(sub).get("loc")
+            grads = torch.autograd.grad(
+                outputs=loc.sum(),
+                inputs=grad_inputs,
+                create_graph=True,
+            )
+            penalty = sum(g.pow(2).sum(dim=-1) for g in grads).mean()
+        return coeff * penalty, {"loss_lcp_penalty": penalty.detach()}
 
     def update(
         self, batch: TensorDict, num_network_updates: int
@@ -697,20 +946,47 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         )
 
         self.collector = cast(Collector, self.collector)
+        # Walltime-segmented resume: a checkpoint records the GLOBAL frame
+        # count, load_model stores it here, and the loop continues from that
+        # offset instead of restarting the budget. total_frames stays the full
+        # target for every segment -- a segment ends either by reaching it or
+        # by the scheduler's walltime, never by a shrunken per-segment budget.
+        resume_offset = int(getattr(self, "_resume_frame_offset", 0))
+        if resume_offset <= 0:
+            # Checkpoints from before 2026-08-16 have no cumulative_env_frames
+            # key, so load_model leaves the offset unset; the launcher may then
+            # supply the known global count explicitly. A checkpoint value
+            # always wins over the config one.
+            resume_offset = int(getattr(cfg.collector, "initial_frame_offset", 0) or 0)
+        resume_offset = max(0, resume_offset)
+        frames_per_batch = int(cfg.collector.frames_per_batch)
+        remaining_frames = max(0, int(cfg.collector.total_frames) - resume_offset)
+        remaining_iterations = min(
+            len(self.collector),
+            -(-remaining_frames // frames_per_batch),
+        )
+        if resume_offset:
+            self.log.info(
+                "Resuming the frame budget at %d/%d (%d iterations remain).",
+                resume_offset,
+                int(cfg.collector.total_frames),
+                remaining_iterations,
+            )
         return PPOTrainingMetadata(
             collector_iter=iter(self._collector_iter()),
-            total_iterations=len(self.collector),
+            total_iterations=remaining_iterations,
             policy_operator=self.actor_critic.get_policy_operator(),
             progress_bar=tqdm(
                 total=cfg.collector.total_frames,
+                initial=resume_offset,
                 disable=not progress_bar_enabled or not sys.stdout.isatty(),
                 dynamic_ncols=True,
             ),
             progress_bar_enabled=progress_bar_enabled,
             log_interval_frames=log_interval_frames,
-            next_log_frame=log_interval_frames,
-            next_file_log_frame=log_interval_frames,
-            frames_processed=0,
+            next_log_frame=resume_offset + log_interval_frames,
+            next_file_log_frame=resume_offset + log_interval_frames,
+            frames_processed=resume_offset,
             updates_completed=torch.zeros((), dtype=torch.int64, device=self.device),
             minibatches_per_epoch=num_mini_batches,
             epochs_per_rollout=cfg.loss.epochs,
@@ -778,8 +1054,49 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
-        self.data_buffer.extend(rollout.reshape(-1))
+        self.data_buffer.extend(self._rollout_for_buffer(rollout))
         return rollout
+
+    def _rollout_for_buffer(self, rollout: TensorDict) -> TensorDict:
+        """Shape a rollout for the data buffer.
+
+        Feed-forward: flat rows (the classic shuffled PPO minibatch).
+        Recurrent (``ppo.rnn_hidden_size > 0``): [env, T] sequences, so
+        mini-batches sampled along the env dimension carry real time order
+        for BPTT. A flat rollout is reshaped back — ``reshape(-1)`` of an
+        [env, T] tensordict is env-major, so the round trip is exact. EVERY
+        extend site must route through this helper: IPMD's own extends
+        bypassed the sequence path on 2026-08-29 and the mismatched buffer
+        (16k-sequence capacity fed 393k flat rows) destroyed the first
+        ``lstm`` arm in under 0.3B frames.
+        """
+        if int(self.config.ppo.rnn_hidden_size) <= 0:
+            return rollout if rollout.batch_dims == 1 else rollout.reshape(-1)
+        num_envs = int(self.env.batch_size[0])
+        if rollout.batch_dims == 1:
+            total = int(rollout.batch_size[0])
+            if total % num_envs != 0:
+                msg = (
+                    f"Recurrent PPO cannot reshape a flat rollout of {total} "
+                    f"rows into sequences of {num_envs} environments."
+                )
+                raise RuntimeError(msg)
+            return rollout.reshape(num_envs, total // num_envs)
+        seq_rollout = rollout
+        if int(seq_rollout.batch_size[0]) != num_envs:
+            if (
+                seq_rollout.batch_dims >= 2
+                and int(seq_rollout.batch_size[1]) == num_envs
+            ):
+                seq_rollout = seq_rollout.transpose(0, 1)
+            else:
+                msg = (
+                    "Recurrent PPO expected a rollout with the env dimension "
+                    f"first (num_envs={num_envs}), got batch size "
+                    f"{tuple(seq_rollout.batch_size)}."
+                )
+                raise RuntimeError(msg)
+        return seq_rollout
 
     @contextmanager
     def _freeze_value_normalizer_updates(self):
@@ -915,11 +1232,12 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             if metadata.progress_bar_enabled
             else None
         )
+        clock = self._train_clock_metrics(metadata.frames_processed)
         if rate is not None:
-            return {"time/speed": float(rate)}
+            return {"time/speed": float(rate), **clock}
         iter_time = iteration.collect_time + iteration.learn_time
         speed = float(iteration.frames) / iter_time if iter_time > 0.0 else 0.0
-        return {"time/speed": speed}
+        return {"time/speed": speed, **clock}
 
     def _record_env_metrics(self, iteration: PPOIterationData) -> None:
         """Add environment-side scalar metrics when the env exposes them."""
@@ -1001,6 +1319,37 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                     step=metadata.frames_processed,
                 )
 
+    @torch.no_grad()
+    def _update_rollout_normalizers(self, rollout: TensorDict) -> None:
+        """Count each collected current observation once, after all PPO/KL work.
+
+        Updating before record() ensures both saved checkpoints and the next
+        collector weight refresh receive the same new buffers. Do not include
+        next/final observations: the rollout already counts each visited state.
+        """
+        if getattr(self.config.ppo, "freeze_normalizers", False):
+            return
+        if not self.config.ppo.update_normalizers_after_rollout:
+            return
+        for network, network_config in (
+            (self.policy, self.config.policy),
+            (self.value_function, self.config.value_function),
+        ):
+            if network is None or network_config is None:
+                continue
+            normalizers = [
+                module
+                for module in network.modules()
+                if isinstance(module, RunningMeanStdCatInputs)
+            ]
+            if not normalizers:
+                continue
+            values = tuple(rollout.get(key) for key in network_config.get_input_keys())
+            value = values[0] if len(values) == 1 else torch.cat(values, dim=-1)
+            for normalizer in normalizers:
+                normalizer._update(value)
+
+    @honours_train_time_budget
     def train(self) -> None:  # type: ignore
         """Train the agent with the shared on-policy rollout-to-update workflow."""
         self.validate_training()
@@ -1010,6 +1359,9 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             for iteration_idx in range(metadata.total_iterations):
                 # 1) Collect a rollout and create the iteration state.
                 iteration = self.collect(metadata, iteration_idx)
+                # The first batch carries the env cold start; the walltime
+                # budget (trainer.max_train_seconds) starts after it.
+                self._start_train_clock()
 
                 # 2) Let the algorithm reshape rewards or attach extra data.
                 with self._profile_iteration_phase(iteration.phase_times, "prepare"):
@@ -1021,10 +1373,34 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 if "learn" in iteration.phase_times:
                     iteration.learn_time = iteration.phase_times["learn"]
 
+                self._update_rollout_normalizers(iteration.rollout)
+
+                # Host clock only; a spent budget makes this the last iteration.
+                metadata.stop_after_iteration = self._train_time_budget_reached()
+
                 # 4) Log, refresh collector weights, and checkpoint if needed.
                 with self._profile_iteration_phase(iteration.phase_times, "record"):
                     self.record(iteration, metadata)
                 self._finish_iteration_profile(metadata, iteration)
+                if metadata.stop_after_iteration:
+                    break
+            if metadata.stop_after_iteration:
+                self._finish_train_time_budget(metadata)
+        except KeyboardInterrupt:
+            # Walltime/SIGTERM (or a real Ctrl+C): persist the current state so
+            # a chained segment resumes from HERE rather than from the last
+            # save_interval boundary. Saved with the global frame step, same
+            # naming as periodic checkpoints.
+            if int(getattr(self, "config", None).save_interval or 0) > 0:
+                self.log.info(
+                    "Interrupted at frame %d; writing a final resume checkpoint.",
+                    int(metadata.frames_processed),
+                )
+                self.save_model(
+                    path=self.log_dir / self.config.logger.save_path,
+                    step=int(metadata.frames_processed),
+                )
+            raise
         finally:
             metadata.progress_bar.close()  # type: ignore[attr-defined]
             self.collector.shutdown()

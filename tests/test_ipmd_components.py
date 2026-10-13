@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import warnings
 from functools import lru_cache
 from types import SimpleNamespace
@@ -91,7 +92,12 @@ def create_synthetic_expert_data(env, num_transitions: int = 100) -> TensorDict:
     )
 
 
-def _make_env_reward_only_ipmd_agent(*, split_actor_critic_lr: bool = False):
+def _make_env_reward_only_ipmd_agent(
+    *,
+    split_actor_critic_lr: bool = False,
+    weight_decay: float = 0.0,
+    first_layer_bias_lr_scale: float = 1.0,
+):
     rlopt = _rlopt()
     cfg = rlopt.IPMDRLOptConfig()
     cfg.env.env_name = "Pendulum-v1"
@@ -113,12 +119,14 @@ def _make_env_reward_only_ipmd_agent(*, split_actor_critic_lr: bool = False):
     cfg.ipmd.reward_grad_penalty_coeff = 0.0
     cfg.ipmd.bc_coef = 0.0
     cfg.ipmd.diversity_bonus_coeff = 0.0
+    cfg.optim.weight_decay = weight_decay
     if split_actor_critic_lr:
         cfg.ipmd.actor_learning_rate = 2.0e-5
         cfg.ipmd.critic_learning_rate = 1.0e-3
         cfg.optim.scheduler = "adaptive"
         cfg.optim.min_lr = 1.0e-5
         cfg.optim.max_lr = 2.0e-4
+    cfg.ipmd.first_layer_bias_lr_scale = first_layer_bias_lr_scale
 
     env = rlopt.make_parallel_env(cfg)
     return rlopt.IPMD(env, cfg, logger=None), env
@@ -222,6 +230,143 @@ def test_kl_adapt_step_iteration_drops_non_finite_samples():
         assert groups["actor"]["lr"] == pytest.approx(3.0e-5)
     finally:
         env.close()
+
+
+def test_ipmd_log_std_is_excluded_from_weight_decay():
+    """AdamW decay on log_std would drag sigma toward 1.0 rad, against the anneal."""
+    agent, env = _make_env_reward_only_ipmd_agent(
+        split_actor_critic_lr=True, weight_decay=1.0e-2
+    )
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert groups["actor"]["weight_decay"] == pytest.approx(1.0e-2)
+        assert groups["critic"]["weight_decay"] == pytest.approx(1.0e-2)
+        assert groups["actor_log_std"]["weight_decay"] == 0.0
+
+        log_std_ids = {
+            id(param)
+            for name, param in agent.policy.named_parameters()
+            if "log_std" in name
+        }
+        assert log_std_ids
+        assert {id(p) for p in groups["actor_log_std"]["params"]} == log_std_ids
+        assert not log_std_ids & {id(p) for p in groups["actor"]["params"]}
+
+        # The KL rule still owns it: it scales with the rest of the actor.
+        agent._maybe_adjust_lr(torch.tensor(1.0e-4), agent.config.optim)
+        assert groups["actor_log_std"]["lr"] == pytest.approx(groups["actor"]["lr"])
+    finally:
+        env.close()
+
+
+def test_optimizer_restore_survives_a_param_group_count_change():
+    """Splitting log_std into its own group must not void earlier checkpoints.
+
+    Every checkpoint written before that split stores two param groups. A
+    strict `Optimizer.load_state_dict` raises on the count, which blocked
+    evaluation of the whole back catalogue on 2026-08-30 -- and evaluation
+    needs no optimizer state at all.
+    """
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        live = agent.optim.state_dict()
+        assert len(live["param_groups"]) == 3
+
+        # A pre-split checkpoint: actor and critic only, log_std folded in.
+        legacy = copy.deepcopy(live)
+        legacy["param_groups"] = legacy["param_groups"][:2]
+
+        agent._load_optimizer_state_dict(legacy)
+
+        # Skipped, not applied, and the live optimizer is still usable.
+        assert len(agent.optim.param_groups) == 3
+
+        # A matching state dict still restores normally.
+        agent.optim.param_groups[0]["lr"] = 1.234e-4
+        restored = copy.deepcopy(agent.optim.state_dict())
+        agent.optim.param_groups[0]["lr"] = 9.9e-9
+        agent._load_optimizer_state_dict(restored)
+        assert agent.optim.param_groups[0]["lr"] == pytest.approx(1.234e-4)
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_linear_interpolates_on_cumulative_frames():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.ipmd.critic_lr_schedule = "linear"
+        agent.config.ipmd.critic_lr_final = 1.0e-5
+        agent.config.collector.total_frames = 100
+
+        for frames, expected in ((0, 1.0e-3), (50, 5.05e-4), (100, 1.0e-5)):
+            agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=frames))
+            assert groups["critic"]["lr"] == pytest.approx(expected)
+
+        # Past the budget the schedule clamps instead of running below the floor.
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=1000))
+        assert groups["critic"]["lr"] == pytest.approx(1.0e-5)
+
+        # A resume mid-budget continues the decay; it does not restart at the top.
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=75))
+        assert groups["critic"]["lr"] == pytest.approx(2.575e-4)
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_leaves_the_actor_group_alone():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        agent.config.ipmd.critic_lr_schedule = "cosine"
+        agent.config.ipmd.critic_lr_final = 1.0e-5
+        agent.config.collector.total_frames = 100
+
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=50))
+
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5)
+        # Cosine midpoint of [1e-3, 1e-5].
+        assert groups["critic"]["lr"] == pytest.approx(5.05e-4)
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_constant_is_a_no_op():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert agent.config.ipmd.critic_lr_schedule == "constant"
+        agent.config.collector.total_frames = 100
+
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=100))
+
+        assert groups["critic"]["lr"] == pytest.approx(1.0e-3)
+    finally:
+        env.close()
+
+
+def test_critic_lr_schedule_requires_a_final_rate():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.actor_learning_rate = 2.0e-5
+    cfg.ipmd.critic_learning_rate = 1.0e-3
+    cfg.ipmd.critic_lr_schedule = "linear"
+    with pytest.raises(ValueError, match=r"ipmd\.critic_lr_final must be > 0"):
+        cfg.ipmd.validate()
+
+
+def test_critic_lr_schedule_requires_split_learning_rates():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.critic_lr_schedule = "linear"
+    cfg.ipmd.critic_lr_final = 1.0e-5
+    with pytest.raises(ValueError, match=r"requires ipmd\.critic_learning_rate"):
+        cfg.ipmd.validate()
+
+
+def test_critic_lr_schedule_rejects_an_unknown_shape():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.critic_lr_schedule = "exponential"
+    with pytest.raises(ValueError, match="must be 'constant', 'linear' or 'cosine'"):
+        cfg.ipmd.validate()
 
 
 def test_ipmd_split_learning_rates_must_be_configured_together():
@@ -2843,3 +2988,565 @@ def test_residual_mlp_supports_tapered_hidden_widths() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# non-finite watchdog (2026-08-24)
+# ---------------------------------------------------------------------------
+
+
+def test_nonfinite_watchdog_flags_only_bad_metrics() -> None:
+    """The watchdog's key set and finiteness test, without building a trainer."""
+    import math
+
+    from rlopt.agent.ipmd.ipmd import IPMD
+
+    keys = IPMD._NONFINITE_WATCH_KEYS
+    assert "train/step_reward_mean" in keys
+    assert "episode/return" in keys
+    # A loss going non-finite for one update is recoverable and must NOT be a
+    # watch key; a non-finite reward or return is not.
+    assert "train/loss_objective" not in keys
+
+    healthy = {"train/step_reward_mean": 0.25, "episode/return": 46.5}
+    dead = {"train/step_reward_mean": float("nan"), "episode/return": -0.7}
+    assert [k for k in keys if k in healthy and not math.isfinite(healthy[k])] == []
+    assert [k for k in keys if k in dead and not math.isfinite(dead[k])] == [
+        "train/step_reward_mean"
+    ]
+
+
+def test_abort_on_nonfinite_defaults_true() -> None:
+    from rlopt.agent.ipmd.ipmd import IPMDRLOptConfig
+
+    assert IPMDRLOptConfig().abort_on_nonfinite is True
+
+
+# ---------------------------------------------------------------------------
+# Affine phi parameterization (linear-closure arm)
+# ---------------------------------------------------------------------------
+
+
+def _affine_sr(parameterization: str, *, seed: int = 0):
+    """Small fp64 DiffSR module for exact affinity arithmetic."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    torch.manual_seed(seed)
+    module = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=3,
+        feature_dim=6,
+        embed_dim=7,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        phi_parameterization=parameterization,
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+    return module.double()
+
+
+# Weights sum to one but are not all positive, so the assertion covers the
+# affine offset as well as linearity.
+_AFFINE_WEIGHTS = (0.7, -0.4, 0.7)
+
+
+def _combine(tensors, weights):
+    out = torch.zeros_like(tensors[0])
+    for tensor, weight in zip(tensors, weights, strict=True):
+        out = out + weight * tensor
+    return out
+
+
+def test_affine_phi_is_affine_in_action() -> None:
+    """phi(s, sum w_i z_i) == sum w_i phi(s, z_i) when the weights sum to 1."""
+    module = _affine_sr("affine")
+    torch.manual_seed(1)
+    s = torch.randn(4, 5, dtype=torch.float64)
+    zs = [torch.randn(4, 3, dtype=torch.float64) for _ in _AFFINE_WEIGHTS]
+
+    mixed = module.forward_phi(s, _combine(zs, _AFFINE_WEIGHTS))
+    combined = _combine([module.forward_phi(s, z) for z in zs], _AFFINE_WEIGHTS)
+
+    torch.testing.assert_close(mixed, combined, atol=1e-10, rtol=0.0)
+
+
+def test_affine_eps_prediction_is_affine_in_action() -> None:
+    """The denoising prediction inherits the affinity, so the learned score
+    field of p(next | s, z) is affine in z at every diffusion time."""
+    module = _affine_sr("affine")
+    torch.manual_seed(2)
+    s = torch.randn(4, 5, dtype=torch.float64)
+    zs = [torch.randn(4, 3, dtype=torch.float64) for _ in _AFFINE_WEIGHTS]
+    # mu carries the noisy sample and the diffusion time and never sees z, so
+    # holding it fixed is the exact statement of the claim. It is passed in
+    # because PositionalFeature casts its input to float32.
+    z_mu = torch.randn(4, module.feature_dim, module.next_obs_dim, dtype=torch.float64)
+
+    mixed = module.forward_eps(s=s, a=_combine(zs, _AFFINE_WEIGHTS), z_mu=z_mu)
+    combined = _combine(
+        [module.forward_eps(s=s, a=z, z_mu=z_mu) for z in zs], _AFFINE_WEIGHTS
+    )
+
+    torch.testing.assert_close(mixed, combined, atol=1e-9, rtol=0.0)
+
+
+def test_bilinear_phi_is_not_affine_in_action() -> None:
+    """Negative control: the nonlinear g of 'bilinear' breaks the identity, so
+    a wrong action_net cannot pass the affinity tests silently."""
+    module = _affine_sr("bilinear")
+    torch.manual_seed(1)
+    s = torch.randn(4, 5, dtype=torch.float64)
+    zs = [torch.randn(4, 3, dtype=torch.float64) for _ in _AFFINE_WEIGHTS]
+
+    mixed = module.forward_phi(s, _combine(zs, _AFFINE_WEIGHTS))
+    combined = _combine([module.forward_phi(s, z) for z in zs], _AFFINE_WEIGHTS)
+
+    assert not torch.allclose(mixed, combined, atol=1e-6)
+
+
+def test_affine_parameterization_structure_and_state_dict_roundtrip() -> None:
+    from rlopt.agent.ipmd.network import ResidualMLP
+
+    affine = _affine_sr("affine")
+    bilinear = _affine_sr("bilinear")
+
+    assert isinstance(affine.action_net, torch.nn.Linear)
+    assert affine.action_net.bias is not None
+    assert isinstance(bilinear.action_net, ResidualMLP)
+    # Both factorized paths keep the matrix-valued F(s).
+    assert affine._matrix_f
+    assert bilinear._matrix_f
+    assert not _affine_sr("concat")._matrix_f
+
+    # A checkpoint written by one affine module restores into another.
+    restored = _affine_sr("affine", seed=99)
+    restored.load_state_dict(affine.state_dict())
+    torch.manual_seed(3)
+    s = torch.randn(2, 5, dtype=torch.float64)
+    z = torch.randn(2, 3, dtype=torch.float64)
+    torch.testing.assert_close(
+        restored.forward_phi(s, z), affine.forward_phi(s, z), atol=1e-12, rtol=0.0
+    )
+
+
+def test_unknown_phi_parameterization_is_rejected() -> None:
+    # "linear" became a real parameterization on 2026-09-11; the rejection
+    # test needs a name that is still not one.
+    with pytest.raises(ValueError, match="phi_parameterization"):
+        _affine_sr("quadratic")
+
+
+def test_skill_config_accepts_affine_parameterization() -> None:
+    _rlopt()
+    from rlopt.agent.hl_skill_diffsr import HighLevelSkillDiffSRConfig
+
+    config = HighLevelSkillDiffSRConfig(diffsr_phi_parameterization="affine")
+    config.validate()
+    assert (
+        HighLevelSkillDiffSRConfig.from_dict(
+            config.to_dict()
+        ).diffsr_phi_parameterization
+        == "affine"
+    )
+
+
+def test_first_layer_bias_lr_scale_splits_both_biases_and_keeps_the_ratio():
+    """The first-layer biases get their own groups at scale x the parent lr."""
+    agent, env = _make_env_reward_only_ipmd_agent(
+        split_actor_critic_lr=True, first_layer_bias_lr_scale=2.0
+    )
+    try:
+        groups = {group["name"]: group for group in agent.optim.param_groups}
+        assert set(groups) == {
+            "actor",
+            "critic",
+            "actor_log_std",
+            "actor_first_bias",
+            "critic_first_bias",
+        }
+        actor_bias = groups["actor_first_bias"]["params"]
+        critic_bias = groups["critic_first_bias"]["params"]
+        assert len(actor_bias) == 1
+        assert len(critic_bias) == 1
+        # The first hidden layer's bias, by name, and removed from the parents.
+        policy_names = {id(p): n for n, p in agent.policy.named_parameters()}
+        value_names = {id(p): n for n, p in agent.value_function.named_parameters()}
+        assert policy_names[id(actor_bias[0])].endswith("0.bias")
+        assert value_names[id(critic_bias[0])].endswith("0.bias")
+        assert all(id(p) != id(actor_bias[0]) for p in groups["actor"]["params"])
+        assert all(id(p) != id(critic_bias[0]) for p in groups["critic"]["params"])
+        # Every parameter is still optimized exactly once.
+        n_opt = sum(len(g["params"]) for g in agent.optim.param_groups)
+        n_all = len(list(agent.policy.parameters())) + len(
+            list(agent.value_function.parameters())
+        )
+        assert n_opt == n_all
+
+        assert groups["actor_first_bias"]["lr"] == pytest.approx(4.0e-5)
+        assert groups["critic_first_bias"]["lr"] == pytest.approx(2.0e-3)
+        assert groups["actor_first_bias"]["lr_max"] == pytest.approx(4.0e-4)
+
+        # The KL rule scales the actor and its bias group together.
+        agent._maybe_adjust_lr(torch.tensor(1.0), agent.config.optim)
+        assert groups["actor"]["lr"] == pytest.approx(2.0e-5 / 1.5)
+        assert groups["actor_first_bias"]["lr"] == pytest.approx(4.0e-5 / 1.5)
+
+        # The critic schedule carries the critic bias group at the same ratio.
+        agent.config.ipmd.critic_lr_schedule = "linear"
+        agent.config.ipmd.critic_lr_final = 1.0e-5
+        agent.config.collector.total_frames = 100
+        agent._apply_critic_lr_schedule(SimpleNamespace(frames_processed=50))
+        assert groups["critic"]["lr"] == pytest.approx(5.05e-4)
+        assert groups["critic_first_bias"]["lr"] == pytest.approx(2 * 5.05e-4)
+    finally:
+        env.close()
+
+
+def test_first_layer_bias_lr_scale_default_is_inert():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        names = {group["name"] for group in agent.optim.param_groups}
+        assert names == {"actor", "critic", "actor_log_std"}
+    finally:
+        env.close()
+
+
+def test_hl_skill_restore_from_checkpoint_flag_is_declared() -> None:
+    """Encoder-swap fine-tunes (2026-09-14) keep the encoder from
+    hl_skill_checkpoint_path instead of the tracker checkpoint's embedded one."""
+    from rlopt.agent.ipmd.ipmd import IPMDConfig
+
+    config = IPMDConfig()
+    assert config.hl_skill_restore_from_checkpoint is True
+    config.hl_skill_restore_from_checkpoint = False
+    assert config.hl_skill_restore_from_checkpoint is False
+
+
+def _poe_sr(*, mu_conditioning: str = "pair", seed: int = 0, base: bool = False):
+    """float32 DiffSR with phi(s, z) = z; feature_dim must equal action_dim.
+
+    float32, not fp64: PositionalFeature inside mu's time embedding emits
+    float32, so these tests go through forward_mu at working precision and
+    the linearity assertion carries a float32 tolerance."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    torch.manual_seed(seed)
+    module = build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=3,
+        feature_dim=4 if base else 3,
+        embed_dim=7,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        phi_parameterization="identity_bias" if base else "identity",
+        mu_conditioning=mu_conditioning,
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+    return module
+
+
+def test_identity_phi_returns_the_action_unchanged() -> None:
+    module = _poe_sr()
+    s = torch.randn(4, 5)
+    z = torch.randn(4, 3)
+    torch.testing.assert_close(module.forward_phi(s, z), z)
+
+
+def test_identity_phi_requires_feature_dim_to_equal_action_dim() -> None:
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    with pytest.raises(ValueError, match="feature_dim must equal action_dim"):
+        build_bilinear_sr(
+            "diffsr",
+            obs_dim=5,
+            next_obs_dim=4,
+            action_dim=3,
+            feature_dim=6,
+            embed_dim=7,
+            g_hidden_dims=(8,),
+            mu_hidden_dims=(8,),
+            phi_parameterization="identity",
+            device="cpu",
+        )
+
+
+def test_pair_mu_sees_the_source_state() -> None:
+    """mu(s, s', t) changes with s; mu(s', t) does not and rejects nothing."""
+    module = _poe_sr(mu_conditioning="pair")
+    sp = torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    s1 = torch.randn(4, 5)
+    s2 = torch.randn(4, 5)
+    mu1 = module.forward_mu(sp=sp, t=t, s=s1)
+    mu2 = module.forward_mu(sp=sp, t=t, s=s2)
+    assert mu1.shape == (4, 3, 4)
+    assert not torch.allclose(mu1, mu2)
+    with pytest.raises(ValueError, match="needs the source state"):
+        module.forward_mu(sp=sp, t=t)
+    plain = _poe_sr(mu_conditioning="next")
+    torch.testing.assert_close(
+        plain.forward_mu(sp=sp, t=t, s=s1), plain.forward_mu(sp=sp, t=t)
+    )
+
+
+def test_poe_eps_prediction_is_linear_in_z_for_any_weights() -> None:
+    """<a z_1 + b z_2, E> = a <z_1, E> + b <z_2, E> with NO sum-to-one
+    condition: the product of experts tempers freely, unlike the affine head."""
+    module = _poe_sr()
+    torch.manual_seed(3)
+    s = torch.randn(4, 5)
+    sp = torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    zs = [torch.randn(4, 3) for _ in range(3)]
+    weights = (2.0, -0.5, 0.25)  # sum 1.75
+    mixed = module.forward_eps(s=s, a=_combine(zs, weights), sp=sp, t=t)
+    combined = _combine([module.forward_eps(s=s, a=z, sp=sp, t=t) for z in zs], weights)
+    torch.testing.assert_close(mixed, combined, atol=2e-5, rtol=0.0)
+
+
+def test_poe_loss_and_sampling_run_end_to_end() -> None:
+    module = _poe_sr()
+    s = torch.randn(6, 5)
+    z = torch.randn(6, 3)
+    sp = torch.randn(6, 4)
+    module.update_obs_norm(sp)
+    metrics, loss, aux = module.compute_loss(s, z, sp, torch.zeros(6, 1))
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in module.mu_net.parameters()
+    )
+    sample, _ = module.sample(s, z)
+    assert sample.shape == (6, 4)
+
+
+def test_mu_conditioning_rejects_unknown_values() -> None:
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    with pytest.raises(ValueError, match="mu_conditioning"):
+        build_bilinear_sr(
+            "diffsr",
+            obs_dim=5,
+            next_obs_dim=4,
+            action_dim=3,
+            feature_dim=3,
+            embed_dim=7,
+            g_hidden_dims=(8,),
+            mu_hidden_dims=(8,),
+            phi_parameterization="identity",
+            mu_conditioning="both",
+            device="cpu",
+        )
+
+
+def test_poe_base_preserves_affinity_with_the_correct_offset() -> None:
+    module = _poe_sr(base=True)
+    s, sp = torch.randn(4, 5), torch.randn(4, 4)
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    z1, z2 = torch.randn(4, 3), torch.randn(4, 3)
+    fields = module.forward_mu(sp, t, s=s)
+    base = module.forward_eps(s=s, a=torch.zeros_like(z1), sp=sp, t=t)
+    torch.testing.assert_close(base, fields[:, 0])
+    assert base.abs().sum() > 0
+    for a, b in [(0.3, 0.7), (1.2, -0.4)]:
+        mixed = module.forward_eps(s=s, a=a * z1 + b * z2, sp=sp, t=t)
+        expected = (
+            a * module.forward_eps(s=s, a=z1, sp=sp, t=t)
+            + b * module.forward_eps(s=s, a=z2, sp=sp, t=t)
+            + (1 - a - b) * base
+        )
+        torch.testing.assert_close(mixed, expected, atol=2e-5, rtol=0.0)
+
+
+def test_poe_base_loss_updates_encoder_and_base_and_restores_checkpoint() -> None:
+    module = _poe_sr(base=True)
+    encoder = torch.nn.Linear(7, 3)
+    s, sp = torch.randn(6, 5), torch.randn(6, 4)
+    z = encoder(torch.randn(6, 7))
+    module.update_obs_norm(sp)
+    _, loss, _ = module.compute_loss(s, z, sp, torch.zeros(6, 1))
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert encoder.weight.grad is not None and encoder.weight.grad.norm() > 0
+    # At z=0 the first field must still receive a learning signal.
+    module.zero_grad(set_to_none=True)
+    fields = module.forward_mu(sp, torch.zeros(6, 1, dtype=torch.int64), s=s)
+    fields.retain_grad()
+    pred = module.forward_eps(
+        z_phi=module.forward_phi(s, torch.zeros_like(z)), z_mu=fields
+    )
+    pred.square().mean().backward()
+    assert fields.grad[:, 0].norm() > 0
+    assert fields.grad[:, 1:].count_nonzero() == 0
+    restored = _poe_sr(base=True, seed=9)
+    restored.load_state_dict(module.state_dict(), strict=True)
+    t = torch.zeros(6, 1, dtype=torch.int64)
+    torch.testing.assert_close(
+        restored.forward_eps(s=s, a=z.detach(), sp=sp, t=t),
+        module.forward_eps(s=s, a=z.detach(), sp=sp, t=t),
+    )
+    sample, _ = restored.sample(s, z.detach())
+    assert sample.shape == sp.shape and torch.isfinite(sample).all()
+
+
+def test_poe_base_config_roundtrip_and_dimension_guard() -> None:
+    _rlopt()
+    from rlopt.agent.hl_skill_diffsr import HighLevelSkillDiffSRConfig, _build_diffsr
+
+    config = HighLevelSkillDiffSRConfig(
+        z_dim=3,
+        diffsr_feature_dim=4,
+        diffsr_embed_dim=7,
+        diffsr_g_hidden_dims=(8,),
+        diffsr_mu_hidden_dims=(8,),
+        diffsr_phi_parameterization="identity_bias",
+        diffsr_mu_conditioning="pair",
+    )
+    config = HighLevelSkillDiffSRConfig.from_dict(config.to_dict())
+    config.validate()
+    module = _build_diffsr(config, state_dim=5, device=torch.device("cpu"))
+    assert module.forward_phi(torch.zeros(2, 5), torch.zeros(2, 3)).shape == (2, 4)
+    config.diffsr_feature_dim = 3
+    with pytest.raises(ValueError, match=r"feature_dim must equal action_dim \+ 1"):
+        _build_diffsr(config, state_dim=5, device=torch.device("cpu"))
+
+
+def _proj_sr(
+    parameterization: str, *, feature_dim: int = 8, action_dim: int = 3, seed: int = 0
+):
+    """float32 DiffSR with a projected phi and pair-conditioned mu."""
+    _rlopt()
+    from rlopt.agent.ipmd.module import build_bilinear_sr
+
+    torch.manual_seed(seed)
+    return build_bilinear_sr(
+        "diffsr",
+        obs_dim=5,
+        next_obs_dim=4,
+        action_dim=action_dim,
+        feature_dim=feature_dim,
+        embed_dim=7,
+        g_hidden_dims=(8,),
+        mu_hidden_dims=(8,),
+        phi_parameterization=parameterization,
+        mu_conditioning="pair",
+        num_noises=2,
+        use_ema_for_policy=False,
+        device="cpu",
+    )
+
+
+def test_linear_phi_widens_the_latent_and_stays_linear() -> None:
+    """phi = A z: wider than z, exactly linear, no constant offset."""
+    module = _proj_sr("linear", feature_dim=8, action_dim=3)
+    z = torch.randn(4, 3)
+    s = torch.randn(4, 5)
+    phi = module.forward_phi(s, z)
+    assert phi.shape == (4, 8)
+    torch.testing.assert_close(
+        module.forward_phi(s, torch.zeros_like(z)), torch.zeros_like(phi)
+    )
+    weights = (2.0, -0.5, 0.25)
+    zs = [torch.randn(4, 3) for _ in weights]
+    torch.testing.assert_close(
+        module.forward_phi(s, _combine(zs, weights)),
+        _combine([module.forward_phi(s, z_i) for z_i in zs], weights),
+        atol=2e-6,
+        rtol=0.0,
+    )
+
+
+def test_linear_bias_prepends_the_constant_channel() -> None:
+    """phi = [1; A z]: the first coordinate is the base denoiser's weight and
+    never depends on the command."""
+    module = _proj_sr("linear_bias", feature_dim=8, action_dim=3)
+    s = torch.randn(4, 5)
+    phi = module.forward_phi(s, torch.randn(4, 3))
+    assert phi.shape == (4, 8)
+    torch.testing.assert_close(phi[:, 0], torch.ones(4))
+    zero = module.forward_phi(s, torch.zeros(4, 3))
+    torch.testing.assert_close(zero[:, 1:], torch.zeros(4, 7))
+    # The projection is bias-free, so the ONLY command-independent term is the
+    # constant channel.
+    assert module.action_net.bias is None
+
+
+def test_projected_phi_keeps_eps_linear_in_z() -> None:
+    for name in ("linear", "linear_bias"):
+        module = _proj_sr(name, feature_dim=8, action_dim=3)
+        s, sp = torch.randn(4, 5), torch.randn(4, 4)
+        t = torch.zeros(4, 1, dtype=torch.int64)
+        zs = [torch.randn(4, 3) for _ in range(2)]
+        a, b = 1.5, -0.5  # affine weights: sum 1, so the constant channel cancels
+        mixed = module.forward_eps(s=s, a=a * zs[0] + b * zs[1], sp=sp, t=t)
+        combined = a * module.forward_eps(
+            s=s, a=zs[0], sp=sp, t=t
+        ) + b * module.forward_eps(s=s, a=zs[1], sp=sp, t=t)
+        torch.testing.assert_close(mixed, combined, atol=2e-5, rtol=0.0, msg=name)
+
+
+def test_projected_phi_loss_and_sampling_run() -> None:
+    for name in ("linear", "linear_bias"):
+        module = _proj_sr(name, feature_dim=8, action_dim=3)
+        s, z, sp = torch.randn(6, 5), torch.randn(6, 3), torch.randn(6, 4)
+        module.update_obs_norm(sp)
+        _, loss, _ = module.compute_loss(s, z, sp, torch.zeros(6, 1))
+        assert torch.isfinite(loss), name
+        loss.backward()
+        assert module.action_net.weight.grad is not None
+        assert module.sample(s, z)[0].shape == (6, 4)
+
+
+def test_projected_phi_rejects_degenerate_widths() -> None:
+    with pytest.raises(ValueError, match="feature_dim >= 1"):
+        _proj_sr("linear", feature_dim=0)
+    with pytest.raises(ValueError, match="at least 2"):
+        _proj_sr("linear_bias", feature_dim=1)
+
+
+def test_affine_poe_preserves_parameters_predictions_and_gradients():
+    affine = _affine_sr("affine").float()
+    poe = _affine_sr("affine_poe").float()
+    poe.load_state_dict(affine.state_dict(), strict=True)
+    for key, value in affine.state_dict().items():
+        torch.testing.assert_close(value, poe.state_dict()[key], atol=0, rtol=0)
+    inputs = [torch.randn(4, n, dtype=torch.float32, requires_grad=True)
+              for n in (5, 3, 4)]
+    other = [x.detach().clone().requires_grad_() for x in inputs]
+    t = torch.zeros(4, 1, dtype=torch.int64)
+    y = affine.forward_eps(*inputs, t)
+    yp = poe.forward_eps(*other, t)
+    assert poe.forward_phi(other[0], other[1]).shape == (4, 4)
+    torch.testing.assert_close(y, yp, atol=1e-5, rtol=1e-4)
+    y.square().sum().backward()
+    yp.square().sum().backward()
+    for x, xp in zip(inputs, other, strict=True):
+        torch.testing.assert_close(x.grad, xp.grad, atol=1e-5, rtol=1e-4)
+    for (name, p), (other_name, q) in zip(affine.named_parameters(), poe.named_parameters(), strict=True):
+        assert name == other_name
+        assert (p.grad is None) == (q.grad is None)
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, q.grad, atol=1e-5, rtol=1e-4)
+    torch.manual_seed(123)
+    loss = affine.compute_loss(*inputs, torch.zeros(4))[1]
+    torch.manual_seed(123)
+    loss_poe = poe.compute_loss(*other, torch.zeros(4))[1]
+    torch.testing.assert_close(loss, loss_poe, atol=1e-5, rtol=1e-4)
+    torch.manual_seed(456)
+    samples = affine.sample(inputs[0], inputs[1])[0]
+    torch.manual_seed(456)
+    samples_poe = poe.sample(other[0], other[1])[0]
+    torch.testing.assert_close(samples, samples_poe, atol=1e-4, rtol=1e-4)

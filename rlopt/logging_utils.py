@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
@@ -54,6 +55,26 @@ def resolve_log_level(level: str | int | None, *, default: int = logging.INFO) -
     if isinstance(numeric, int):
         return numeric
     return default
+
+
+# Name of the frame counter published as an ordinary metric alongside every
+# scalar, and declared as the wandb x-axis. `MetricReporter.log_scalars` is
+# always called with `metadata.frames_processed`, so this is the cumulative
+# environment-frame count, continuous across a walltime-segmented resume.
+#
+# It exists because wandb's SHARED mode discards `wandb.log(step=...)`
+# entirely ("In shared mode, the use of `wandb.log` with the step argument is
+# not supported and will be ignored", wandb/sdk/wandb_run.py). Without this a
+# shared-mode run plots against a bare log-call index, which is not comparable
+# with a non-shared run and does not survive a resume offset.
+_STEP_METRIC = "env_frames"
+
+
+def _wandb_is_shared(experiment: Any) -> bool:
+    """True when this wandb run was opened in shared (multi-writer) mode."""
+
+    settings = getattr(experiment, "settings", None)
+    return bool(getattr(settings, "_shared", False))
 
 
 def _coerce_step(step: Any) -> int:
@@ -190,6 +211,45 @@ def _looks_like_run_dir(path: Path) -> bool:
     return bool(_TIMESTAMP_DIR_PATTERN.fullmatch(path.name))
 
 
+def _run_dir_timestamp(run_dir: Path) -> str | None:
+    """The ``YYYY-MM-DD_HH-MM-SS`` prefix of a run directory, when it has one."""
+    match = _TIMESTAMP_DIR_PATTERN.fullmatch(run_dir.name)
+    if not match:
+        return None
+    return run_dir.name[:19]
+
+
+def _build_wandb_identity(exp_name: Any, run_dir: Path) -> tuple[str, list[str]]:
+    """Return the W&B run name and tags for one training run.
+
+    The W&B name is the configured functional name followed by the run
+    directory's launch timestamp, for example
+    ``fsq64-hold10-s0-2026-08-18_16-52-30``. The timestamp makes two launches
+    of one arm distinguishable in a W&B list, which the functional name alone
+    is not. A directory without a timestamp prefix (an explicit ``log_dir``
+    that is already a run directory) keeps the bare name.
+
+    Deliberately the NAME and not the run id: RLOpt also tags the run
+    ``logdir:<19-char timestamp>_wandb-<run id>``, and W&B caps a tag at 64
+    characters, which leaves 31 for the id. Appending 20 more characters there
+    overflows the cap and the run creation fails (job 5580199).
+
+    On a walltime-segmented chain every segment resumes one run id and passes
+    its own name, so the displayed name tracks the most recent segment W&B
+    accepted a name from; the per-segment ``logdir:`` tags accumulate, so the
+    full chain remains traceable to every local run directory.
+    """
+    tags = [
+        tag.strip()
+        for tag in os.environ.get("WANDB_TAGS", "").split(",")
+        if tag.strip()
+    ]
+    tags.append(f"logdir:{run_dir.name}")
+    timestamp = _run_dir_timestamp(run_dir)
+    name = f"{exp_name}-{timestamp}" if timestamp else str(exp_name)
+    return name, tags
+
+
 def _build_console_handler(cfg: RLOptConfig, level: int) -> logging.Handler | None:
     if not cfg.logger.log_to_console:
         return None
@@ -300,6 +360,25 @@ class MetricReporter:
     ) -> None:
         self._metrics_logger = metrics_logger
         self._python_logger = python_logger
+        self._step_metric_declared = False
+
+    def _declare_step_metric(self, experiment: Any) -> None:
+        """Make :data:`_STEP_METRIC` the wandb x-axis. Idempotent, once per run."""
+
+        if self._step_metric_declared:
+            return
+        self._step_metric_declared = True
+        define_metric = getattr(experiment, "define_metric", None)
+        if not callable(define_metric):
+            return
+        try:
+            define_metric(_STEP_METRIC)
+            define_metric("*", step_metric=_STEP_METRIC)
+        except Exception:  # pragma: no cover - defensive
+            if self._python_logger is not None:
+                self._python_logger.debug(
+                    "Could not declare %s as the wandb x-axis.", _STEP_METRIC
+                )
 
     def log_scalars(
         self,
@@ -349,7 +428,16 @@ class MetricReporter:
                 and callable(getattr(experiment, "log", None))
                 and not callable(getattr(experiment, "add_scalar", None))
             ):
-                experiment.log(sanitized, step=record_step, commit=True)
+                self._declare_step_metric(experiment)
+                # The step travels as a metric so it survives shared mode,
+                # where the `step` argument is ignored. Passing `step` as well
+                # in shared mode only produces a warning, so it is dropped.
+                payload: dict[str, float | int] = dict(sanitized)
+                payload[_STEP_METRIC] = record_step
+                if _wandb_is_shared(experiment):
+                    experiment.log(payload, commit=True)
+                else:
+                    experiment.log(payload, step=record_step, commit=True)
             else:
                 for key, value in sanitized.items():
                     self._metrics_logger.log_scalar(key, value, record_step)
@@ -447,9 +535,15 @@ class LoggingManager:
         if backend in (None, ""):
             return None
 
-        exp_name = generate_exp_name(
-            self.component.upper(), f"{self._config.logger.exp_name}"
-        )
+        # ``generate_exp_name`` is only the TorchRL-internal experiment id.
+        # The visible W&B name is set below from ``logger.exp_name`` so it stays
+        # stable when a walltime-segmented chain resumes the same W&B run.
+        if os.environ.get("WANDB_RUN_ID"):
+            exp_name = f"{self.component.upper()}_{self._config.logger.exp_name}"
+        else:
+            exp_name = generate_exp_name(
+                self.component.upper(), f"{self._config.logger.exp_name}"
+            )
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         wandb_kwargs = {
@@ -458,6 +552,23 @@ class LoggingManager:
             "group": self._config.logger.group_name,
             "dir": str(self.run_dir),
         }
+        if backend == "wandb":
+            run_name, run_tags = _build_wandb_identity(
+                self._config.logger.exp_name, self.run_dir
+            )
+            wandb_kwargs["name"] = run_name
+            wandb_kwargs["tags"] = run_tags
+        # Walltime-segmented chains: WANDB_RUN_ID (stable per arm) plus
+        # WANDB_RESUME=allow makes every segment append to ONE W&B run instead
+        # of opening a fresh run that restarts the x-axis. Safe because resumed
+        # segments log at the global frame step (init_metadata seeds
+        # frames_processed from the checkpoint), so steps stay monotonic across
+        # segments. Left entirely to the environment so interactive runs keep
+        # today's one-run-per-launch behavior.
+        run_id = os.environ.get("WANDB_RUN_ID")
+        if run_id:
+            wandb_kwargs["id"] = run_id
+            wandb_kwargs["resume"] = os.environ.get("WANDB_RESUME", "allow")
 
         try:  # noqa: SIM105
             wandb_kwargs["config"] = asdict(self._config)  # type: ignore[assignment]

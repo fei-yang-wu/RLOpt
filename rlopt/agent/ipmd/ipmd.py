@@ -25,6 +25,7 @@ from rlopt.agent.imitation.latent_learning import (
     build_latent_learner,
     held_command_policy_surrogate,
 )
+from rlopt.agent.ipmd.dagger_config import DAggerConfig
 from rlopt.agent.ipmd.utils import (
     IPMD_COMMAND_SOURCES,
     IPMD_REWARD_INPUT_TYPES,
@@ -180,6 +181,42 @@ class IPMDLatentLearningConfig:
     - ``"sin_cos"``: append ``sin(phase), cos(phase)`` within the current hold.
     """
 
+    command_phase_source: str = "hold"
+    """What drives the ``sin_cos`` phase clock.
+
+    - ``"hold"``: position within the current code hold. Informationally dead
+      at ``code_period=1``, where it pins to a constant.
+    - ``"episode"``: env steps since reset modulo ``command_phase_period`` — a
+      live clock for hold-1 interfaces. Requires ``latent_steps_max == 1``.
+    """
+
+    command_phase_period: int = 0
+    """Phase clock period in env steps. ``0`` uses ``code_period``."""
+
+    command_quantizer: str = "none"
+    """Quantize the published command AT THE COMMAND BOUNDARY.
+
+    The encoder stays continuous; only what the tracker observes is snapped to
+    a lattice. This is NOT ``latent_mode="sonic_fsq"``, which makes the encoder
+    itself an FSQ bottleneck at pretrain time.
+
+    - ``"none"``: publish the continuous code (the default).
+    - ``"sonic_fsq"``: SONIC's token space -- per-dimension FSQ, then divide by
+      ``levels // 2`` so values land on the lattice in ``[-1, 1]``. At the
+      default 32 levels that is exact multiples of ``1/16``, which is what
+      every entry of ``gear_sonic``'s ``LATENT_INITIAL_MOTION_TOKEN`` is.
+
+    The phase features, when present, are appended AFTER quantization and are
+    never quantized.
+    """
+
+    command_fsq_levels: list[int] = field(default_factory=lambda: [32] * 64)
+    """Per-dimension levels for ``command_quantizer="sonic_fsq"``.
+
+    SONIC publishes 64 dimensions at 32 levels. The length must equal the code
+    width (``code_latent_dim``), since the quantizer acts per dimension.
+    """
+
     fsq_levels: list[int] = field(default_factory=lambda: [8, 8, 8, 5, 5])
     """Per-dimension level counts for FSQ. Effective codebook size = prod(levels)."""
 
@@ -259,6 +296,21 @@ class IPMDLatentLearningConfig:
             msg = (
                 "ipmd.latent_learning.command_phase_mode must be 'none' or "
                 f"'sin_cos', got {self.command_phase_mode!r}."
+            )
+            raise ValueError(msg)
+
+        self.command_phase_source = str(self.command_phase_source).strip().lower()
+        if self.command_phase_source not in {"hold", "episode"}:
+            msg = (
+                "ipmd.latent_learning.command_phase_source must be 'hold' or "
+                f"'episode', got {self.command_phase_source!r}."
+            )
+            raise ValueError(msg)
+        self.command_phase_period = int(self.command_phase_period or 0)
+        if self.command_phase_period < 0:
+            msg = (
+                "ipmd.latent_learning.command_phase_period must be >= 0, got "
+                f"{self.command_phase_period}."
             )
             raise ValueError(msg)
 
@@ -344,7 +396,24 @@ class IPMDConfig(PPOConfig):
     hl_skill_finetune_enabled: bool = False
     """Enable online policy-gradient finetuning for command_source='hl_skill'."""
 
+    hl_skill_restore_from_checkpoint: bool = True
+    """Restore the command sampler (skill encoder weights, DiffSR, optimizer)
+    from a tracker checkpoint's ``hl_skill_command_sampler_state_dict``.
+
+    ``False`` keeps the encoder loaded from ``hl_skill_checkpoint_path`` when
+    a tracker is fine-tuned onto a DIFFERENT encoder (an encoder swap): the
+    tracker checkpoint's embedded encoder is the old one, and restoring it
+    would silently undo the swap (same width) or fail (new width). The
+    encoder is frozen in that setting, so no sampler state is lost.
+    """
+
     hl_skill_pg_coeff: float = 0.05
+    # Weight of the DiffSR endpoint loss on ACHIEVED windows sampled from the
+    # environment's raw-pose ring (env.achieved_ring_capacity > 0). 0 disables.
+    # This is the no-policy-gradient online-dynamics path: the encoder learns
+    # the transition structure of what the robot actually does, through the
+    # same objective and window convention as its expert pretraining.
+    hl_skill_achieved_coeff: float = 0.0
     """Weight on the second-pass PPO actor objective for the high-level skill encoder."""
 
     hl_skill_offline_diffsr_coeff: float = 1.0
@@ -370,6 +439,16 @@ class IPMDConfig(PPOConfig):
 
     hl_skill_train_diffsr: bool = False
     """Also update the loaded DiffSR model during online high-level skill finetuning."""
+
+    hl_skill_online_objective: str = "legacy"
+    """Online finetune objective. ``legacy`` = PG + offline/achieved DiffSR +
+    anchor (mlp-head JEPA checkpoints, no source history). ``ntp_live_offset``
+    = the checkpoint's own pretraining next-chunk DiffSR loss (diff_chunk head,
+    source history supported) on offline windows moved by the policy's live
+    slot-0 offsets, plus the anchor term; requires hl_skill_pg_coeff=0."""
+
+    hl_skill_live_offset_ring: int = 65536
+    """Capacity of the live slot-0 offset ring read by ``ntp_live_offset``."""
 
     skill_commander_checkpoint_path: str = ""
     """Skill-commander checkpoint used when command_source='skill_commander'."""
@@ -608,8 +687,53 @@ class IPMDConfig(PPOConfig):
     critic_learning_rate: float | None = None
     """Optional critic-specific learning rate for PPO/IPMD."""
 
+    critic_lr_schedule: str = "constant"
+    """Decay shape for the critic group: ``"constant"``, ``"linear"`` or ``"cosine"``.
+
+    The adaptive KL rule owns the ACTOR group only (``adaptive_lr=True``), so the
+    critic learning rate is otherwise fixed for the whole run. A non-constant
+    schedule interpolates ``critic_learning_rate`` -> ``critic_lr_final`` on
+    cumulative environment frames, not on the in-segment iteration counter, so a
+    walltime-chained resume continues the decay instead of restarting it.
+    """
+
+    critic_lr_final: float | None = None
+    """End-of-budget critic learning rate. Required when the schedule is not constant."""
+
+    first_layer_bias_lr_scale: float = 1.0
+    """Learning-rate multiplier for the FIRST linear layer's bias, actor and critic.
+
+    ``1.0`` (default) changes nothing. Any other value moves each network's
+    first-layer bias into its own parameter group at ``scale x`` the parent
+    group's learning rate: ``actor_first_bias`` (adaptive with the actor, so the
+    KL rule keeps the ratio; ``lr_min``/``lr_max`` scaled to match) and
+    ``critic_first_bias`` (follows ``critic_lr_schedule``). Weight decay is the
+    parent group's. Requires split actor/critic learning rates.
+
+    Why this knob exists (2026-09-01): a constant input channel (the hold-1
+    sin/cos phase pair, which is ``(0, 1)`` on every step) has a weight column
+    whose gradient equals the bias gradient, so under Adam the effective
+    first-layer bias moves at exactly twice the rate. This scale reproduces
+    that effect without the channel, to test whether it is what separates the
+    64-D hold-1 arms that train from those that stall.
+    """
+
     def validate(self) -> None:
         self.command_source = normalize_ipmd_command_source(self.command_source)
+        self.first_layer_bias_lr_scale = float(self.first_layer_bias_lr_scale)
+        if self.first_layer_bias_lr_scale <= 0.0:
+            msg = (
+                "ipmd.first_layer_bias_lr_scale must be > 0, got "
+                f"{self.first_layer_bias_lr_scale}."
+            )
+            raise ValueError(msg)
+        if self.first_layer_bias_lr_scale != 1.0 and self.actor_learning_rate is None:
+            msg = (
+                "ipmd.first_layer_bias_lr_scale != 1 requires split actor/critic "
+                "learning rates (ipmd.actor_learning_rate and "
+                "ipmd.critic_learning_rate)."
+            )
+            raise ValueError(msg)
         self.reward_model_type = normalize_ipmd_reward_model_type(
             self.reward_model_type
         )
@@ -901,6 +1025,29 @@ class IPMDConfig(PPOConfig):
                 "configured together."
             )
             raise ValueError(msg)
+        self.critic_lr_schedule = str(self.critic_lr_schedule).strip().lower()
+        if self.critic_lr_schedule not in {"constant", "linear", "cosine"}:
+            msg = (
+                "ipmd.critic_lr_schedule must be 'constant', 'linear' or "
+                f"'cosine', got {self.critic_lr_schedule!r}."
+            )
+            raise ValueError(msg)
+        if self.critic_lr_schedule != "constant":
+            if self.critic_learning_rate is None:
+                msg = (
+                    "ipmd.critic_lr_schedule="
+                    f"{self.critic_lr_schedule!r} requires ipmd.critic_learning_rate "
+                    "(the schedule drives the named critic parameter group, which "
+                    "only exists under split actor/critic learning rates)."
+                )
+                raise ValueError(msg)
+            if self.critic_lr_final is None or self.critic_lr_final <= 0.0:
+                msg = (
+                    "ipmd.critic_lr_final must be > 0 when "
+                    f"ipmd.critic_lr_schedule={self.critic_lr_schedule!r}, got "
+                    f"{self.critic_lr_final!r}."
+                )
+                raise ValueError(msg)
         self.rollout_bc_loss_type = str(self.rollout_bc_loss_type).strip().lower()
         if self.rollout_bc_loss_type not in {"nll", "mse"}:
             msg = (
@@ -946,8 +1093,20 @@ class IPMDConfig(PPOConfig):
 class IPMDRLOptConfig(PPORLOptConfig):
     """IPMD configuration extending PPORLOptConfig (PPO-based)."""
 
+    dagger: DAggerConfig = field(default_factory=DAggerConfig)
+    """Optional frozen-teacher warm start; ordinary IPMD ignores disabled settings."""
+
     ipmd: IPMDConfig = field(default_factory=IPMDConfig)
     """IPMD configuration."""
+
+    abort_on_nonfinite: bool = True
+    """Stop the run the first time a rollout metric or policy weight is not
+    finite.
+
+    A NaN policy keeps training at full speed and silently poisons every later
+    checkpoint; two chains lost about a day each that way (2026-08-23 fsq64,
+    2026-08-24 emastack) before eval caught it. Set false only to reproduce
+    such a failure on purpose."""
 
 
 @dataclass(frozen=True)
@@ -970,6 +1129,20 @@ class GroupedRewardOutput:
     head_inputs: dict[str, Tensor]
 
 
+def _first_linear_bias(module: torch.nn.Module) -> torch.nn.Parameter:
+    """The bias of the first ``nn.Linear`` in ``module.modules()`` order.
+
+    Wrappers (TensorDictModule, the running-mean-std input normalizer) register
+    no linear layers, so the first one met is the first hidden layer of the
+    MLP.
+    """
+    for sub in module.modules():
+        if isinstance(sub, torch.nn.Linear) and sub.bias is not None:
+            return sub.bias
+    msg = "first_layer_bias_lr_scale: no nn.Linear with a bias found in the module."
+    raise ValueError(msg)
+
+
 class IPMD(PPO):
     """IPMD algorithm with PPO as the base RL algorithm.
 
@@ -987,6 +1160,15 @@ class IPMD(PPO):
     @staticmethod
     def _normalize_command_source(command_source: str) -> str:
         return normalize_ipmd_command_source(command_source)
+
+    def _latent_command_consumer_obs_keys(self) -> list[ObsKey]:
+        """Return the observation keys of the policy that consumes the latent.
+
+        Ordinary IPMD publishes the latent to its main policy. Asymmetric
+        variants can override this hook when another policy consumes the same
+        command while the main rollout policy uses a different command view.
+        """
+        return self._policy_obs_keys
 
     def __init__(
         self,
@@ -1087,10 +1269,12 @@ class IPMD(PPO):
                 )
                 msg += self._latent_mode_hint()
                 raise ValueError(msg)
-            if self._latent_key not in self._policy_obs_keys:
+            latent_consumer_keys = self._latent_command_consumer_obs_keys()
+            if self._latent_key not in latent_consumer_keys:
                 msg = (
-                    "IPMD use_latent_command=True requires the policy input keys to "
-                    f"contain {self._latent_key!r}."
+                    "IPMD use_latent_command=True requires the latent-command "
+                    "consumer input keys to contain "
+                    f"{self._latent_key!r}, got {latent_consumer_keys!r}."
                 )
                 msg += self._latent_mode_hint()
                 raise ValueError(msg)
@@ -1252,8 +1436,18 @@ class IPMD(PPO):
                     self.config.ipmd.latent_learning.command_phase_mode
                 ),
                 code_latent_dim=self.config.ipmd.latent_learning.code_latent_dim,
-                phase_period=int(self.config.ipmd.latent_learning.code_period),
+                phase_period=int(
+                    self.config.ipmd.latent_learning.command_phase_period
+                    or self.config.ipmd.latent_learning.code_period
+                ),
+                phase_source=str(self.config.ipmd.latent_learning.command_phase_source),
                 command_mode=str(self.config.ipmd.hl_skill_command_mode),
+                command_quantizer=str(
+                    self.config.ipmd.latent_learning.command_quantizer
+                ),
+                command_fsq_levels=list(
+                    self.config.ipmd.latent_learning.command_fsq_levels
+                ),
                 discover_env_method=self._discover_env_method,
                 device=self._get_device(self.config.device),
                 finetune_enabled=bool(self.config.ipmd.hl_skill_finetune_enabled),
@@ -1262,12 +1456,15 @@ class IPMD(PPO):
                     self.config.ipmd.hl_skill_offline_diffsr_coeff
                 ),
                 anchor_coeff=float(self.config.ipmd.hl_skill_anchor_coeff),
+                achieved_coeff=float(self.config.ipmd.hl_skill_achieved_coeff),
                 z_norm_coeff=self.config.ipmd.hl_skill_z_norm_coeff,
                 lr=float(self.config.ipmd.hl_skill_lr),
                 grad_clip_norm=self.config.ipmd.hl_skill_grad_clip_norm,
                 offline_batch_size=int(self.config.ipmd.hl_skill_offline_batch_size),
                 update_interval=int(self.config.ipmd.hl_skill_update_interval),
                 train_diffsr=bool(self.config.ipmd.hl_skill_train_diffsr),
+                online_objective=str(self.config.ipmd.hl_skill_online_objective),
+                live_offset_ring=int(self.config.ipmd.hl_skill_live_offset_ring),
             )
         if self._use_latent_command and self._command_source == "skill_commander":
             from rlopt.agent.skill_commander import (  # noqa: PLC0415
@@ -1300,6 +1497,13 @@ class IPMD(PPO):
                     self.config.ipmd.skill_commander_diffusion_inference_noise_std
                 )
 
+            if str(self.config.ipmd.latent_learning.command_phase_source) != "hold":
+                msg = (
+                    "command_phase_source='episode' is only wired into the "
+                    "hl_skill command sampler; the skill-commander path still "
+                    "uses the hold clock."
+                )
+                raise ValueError(msg)
             self._hl_skill_command_sampler = FrozenSkillCommanderSampler(
                 env=self.env,
                 checkpoint_path=str(self.config.ipmd.skill_commander_checkpoint_path),
@@ -1806,11 +2010,35 @@ class IPMD(PPO):
         return net
 
     def _compile_components(self) -> None:
-        """Compile reward estimator and update method with torch.compile (if enabled)."""
+        """Compile the loss forward and GAE with torch.compile (if enabled).
+
+        Deliberately narrower than PPO's blanket ``torch.compile(self.update)``:
+        IPMD's ``update()`` interleaves optimizer stepping and host-side
+        bookkeeping (``.item()``), which force Dynamo graph breaks. Compiling
+        ``loss_module`` captures the actor+critic forward that autograd then
+        differentiates; ``adv_module`` covers the GAE scan. The reward
+        estimator is compiled only when reward updates are actually enabled.
+
+        Measured 2026-08-18 on the tuned G1 recipe (8,192 envs, RTX PRO
+        6000): the loss step is GEMM-bound, so the win is small and comes
+        from GAE (80 -> 57 ms); ``update/ppo_terms`` moves ~1%. ``max-autotune``
+        ties ``default`` and its CUDA-graphs variant crashes on latent-sampler
+        tensor reuse -- use ``max-autotune-no-cudagraphs`` if autotuning.
+        """
         if not self.config.compile.compile:
             return
-        super()._compile_components()
-        self.reward_estimator = torch.compile(self.reward_estimator)
+        if not hasattr(self, "adv_module"):
+            # Base-class __init__ calls this hook before PPO.__init__ has
+            # built the advantage module; the second call compiles.
+            return
+        if getattr(self, "_components_compiled", False):
+            return
+        compile_mode = self.config.compile.compile_mode or "default"
+        self.loss_module = torch.compile(self.loss_module, mode=compile_mode)
+        self.adv_module = torch.compile(self.adv_module, mode=compile_mode)
+        if self._reward_update_enabled:
+            self.reward_estimator = torch.compile(self.reward_estimator)
+        self._components_compiled = True
 
     def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
@@ -1827,8 +2055,25 @@ class IPMD(PPO):
         split_actor_critic_lr = self.config.ipmd.actor_learning_rate is not None
         if split_actor_critic_lr:
             assert self.config.ipmd.critic_learning_rate is not None
-            policy_params = list(self.policy.parameters()) + joint_params
+            # The exploration std is a bare nn.Parameter, so AdamW's decoupled
+            # weight decay would pull it toward log_std=0, i.e. sigma toward
+            # 1.0 rad -- against the anneal that carries this recipe. Give it
+            # its own group at weight_decay=0 so optim.weight_decay can be
+            # tuned on the networks alone. The group stays adaptive, so the KL
+            # rule scales it with the rest of the actor.
+            log_std_params = [
+                param
+                for name, param in self.policy.named_parameters()
+                if "log_std" in name
+            ]
+            log_std_ids = {id(param) for param in log_std_params}
+            policy_params = [
+                param
+                for param in list(self.policy.parameters()) + joint_params
+                if id(param) not in log_std_ids
+            ]
             value_params = list(self.value_function.parameters())
+            weight_decay = float(self.config.optim.weight_decay)
             optimizer_params: list[dict[str, Any]] = [
                 {
                     "params": policy_params,
@@ -1836,15 +2081,65 @@ class IPMD(PPO):
                     "adaptive_lr": True,
                     "lr_min": self.config.optim.min_lr,
                     "lr_max": self.config.optim.max_lr,
+                    "weight_decay": weight_decay,
                     "name": "actor",
                 },
                 {
                     "params": value_params,
                     "lr": float(self.config.ipmd.critic_learning_rate),
                     "adaptive_lr": False,
+                    "weight_decay": weight_decay,
                     "name": "critic",
                 },
             ]
+            if log_std_params:
+                optimizer_params.append(
+                    {
+                        "params": log_std_params,
+                        "lr": float(self.config.ipmd.actor_learning_rate),
+                        "adaptive_lr": True,
+                        "lr_min": self.config.optim.min_lr,
+                        "lr_max": self.config.optim.max_lr,
+                        "weight_decay": 0.0,
+                        "name": "actor_log_std",
+                    }
+                )
+            bias_scale = float(self.config.ipmd.first_layer_bias_lr_scale)
+            if bias_scale != 1.0:
+                actor_bias = _first_linear_bias(self.policy)
+                critic_bias = _first_linear_bias(self.value_function)
+                actor_bias_id = id(actor_bias)
+                critic_bias_id = id(critic_bias)
+                optimizer_params[0]["params"] = [
+                    p for p in policy_params if id(p) != actor_bias_id
+                ]
+                optimizer_params[1]["params"] = [
+                    p for p in value_params if id(p) != critic_bias_id
+                ]
+
+                def _scaled(value: float | None) -> float | None:
+                    return None if value is None else float(value) * bias_scale
+
+                optimizer_params.append(
+                    {
+                        "params": [actor_bias],
+                        "lr": float(self.config.ipmd.actor_learning_rate) * bias_scale,
+                        "adaptive_lr": True,
+                        "lr_min": _scaled(self.config.optim.min_lr),
+                        "lr_max": _scaled(self.config.optim.max_lr),
+                        "weight_decay": weight_decay,
+                        "name": "actor_first_bias",
+                    }
+                )
+                optimizer_params.append(
+                    {
+                        "params": [critic_bias],
+                        "lr": float(self.config.ipmd.critic_learning_rate) * bias_scale,
+                        "adaptive_lr": False,
+                        "weight_decay": weight_decay,
+                        "name": "critic_first_bias",
+                    }
+                )
         else:
             optimizer_params = []
 
@@ -2118,8 +2413,9 @@ class IPMD(PPO):
         return torch.zeros((), device=latent_pred.device, dtype=latent_pred.dtype)
 
     def _extra_actor_loss(self, batch: TensorDict) -> tuple[Tensor, dict[str, Tensor]]:
-        del batch
-        return torch.zeros((), device=self.device), {}
+        # The PPO base carries the LCP gradient penalty (ppo.lcp_coeff);
+        # inert at the default 0.0.
+        return super()._extra_actor_loss(batch)
 
     def _refresh_grad_clip_params(self) -> None:
         """Refresh the cached optimizer parameter list used for grad clipping."""
@@ -2217,10 +2513,15 @@ class IPMD(PPO):
             "hl_skill_total_loss",
             "hl_skill_pg_loss",
             "hl_skill_diffsr_loss",
+            "hl_skill_achieved_loss",
             "hl_skill_anchor_loss",
             "hl_skill_z_norm_loss",
             "hl_skill_grad_norm",
             "hl_skill_updates",
+            # ntp_live_offset online objective.
+            "hl_skill_ntp_loss",
+            "hl_skill_live_offset_xy_median",
+            "hl_skill_live_offset_ring_count",
             "hl_skill_z_abs_mean",
             "hl_skill_z_rms",
             "hl_skill_z_dim_std_mean",
@@ -2429,6 +2730,11 @@ class IPMD(PPO):
             else:
                 grad_norm = torch.zeros((), device=self.device)
             optimizer.step()
+            # After the step, never before: a JEPA target encoder is an EMA of
+            # the ONLINE encoder, so it must see the post-step weights.
+            after_step = getattr(sampler, "on_after_finetune_step", None)
+            if callable(after_step):
+                after_step()
             sampler.finetune_updates = int(getattr(sampler, "finetune_updates", 0)) + 1
         finally:
             for param, requires_grad in zip(
@@ -2810,6 +3116,8 @@ class IPMD(PPO):
                 }
             )
 
+        self._abort_on_nonfinite(iteration, metadata)
+
         iteration.metrics.update(self._build_control_metrics(metadata))
         iteration.metrics.update(self._build_timing_metrics(iteration, metadata))
         self._record_env_metrics(iteration)
@@ -2834,6 +3142,53 @@ class IPMD(PPO):
                 path=self.log_dir / self.config.logger.save_path,
                 step=metadata.frames_processed,
             )
+
+    # Watchdog keys: the first quantities to turn non-finite when a rollout
+    # produces NaN. Checked every iteration because a NaN policy keeps training
+    # at full speed and every later checkpoint is unusable -- two chains
+    # (2026-08-23 fsq64, 2026-08-24 emastack) each burned about a day before
+    # anyone noticed. Losses are excluded on purpose: an optimizer can recover
+    # a single bad update, but a non-finite reward or policy parameter cannot.
+    _NONFINITE_WATCH_KEYS: tuple[str, ...] = (
+        "train/step_reward_mean",
+        "episode/return",
+    )
+
+    def _abort_on_nonfinite(
+        self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
+    ) -> None:
+        """Raise as soon as training goes non-finite, before writing a checkpoint.
+
+        Set ``agent.abort_on_nonfinite=false`` to downgrade this to a warning.
+        """
+        offenders = [
+            key
+            for key in self._NONFINITE_WATCH_KEYS
+            if key in iteration.metrics
+            and not math.isfinite(float(iteration.metrics[key]))
+        ]
+        if not offenders:
+            bad_params = [
+                name
+                for name, tensor in (
+                    self.policy.named_parameters() if self.policy else ()
+                )
+                if not torch.isfinite(tensor).all()
+            ]
+            if bad_params:
+                offenders = [f"policy:{bad_params[0]}"]
+        if not offenders:
+            return
+        message = (
+            "Training went non-finite at "
+            f"{metadata.frames_processed} cumulative frames: {offenders}. "
+            "Every later checkpoint would be unusable; aborting so the chain "
+            "can resume from the last good checkpoint."
+        )
+        if not bool(getattr(self.config, "abort_on_nonfinite", True)):
+            self.log.error("%s (abort_on_nonfinite=false, continuing)", message)
+            return
+        raise RuntimeError(message)
 
     def _checkpoint_policy_state_dict(self) -> Mapping[str, Any]:
         """Return the policy payload stored under ``policy_state_dict``."""
@@ -2928,12 +3283,61 @@ class IPMD(PPO):
         ):
             data_to_save["vec_norm_msg"] = self.env.state_dict()
         data_to_save.update(self._extra_checkpoint_state_dict())
+        # Global frame count for walltime-segmented resume. `step` is
+        # metadata.frames_processed, which init_metadata already seeds with the
+        # restored offset, so this is cumulative across segments -- the next
+        # segment reads it and continues the SAME budget instead of restarting.
+        if step is not None:
+            data_to_save["cumulative_env_frames"] = int(step)
+        # Cumulative training wall-clock (trainer.max_train_seconds budget).
+        data_to_save["cumulative_train_seconds"] = self.train_elapsed_seconds()
 
         torch.save(data_to_save, target_path)
+
+    def _load_optimizer_state_dict(self, state_dict: Any) -> None:
+        """Restore optimizer state, tolerating a param-group-count change.
+
+        `torch.optim.Optimizer.load_state_dict` requires the saved and live
+        param groups to match one for one. Any change to how the actor's
+        parameters are split into groups therefore makes every earlier
+        checkpoint unloadable -- for evaluation as well as for resume, even
+        though evaluation needs no optimizer state at all and the policy is
+        already restored by the time this runs.
+
+        A mismatch is reported and skipped rather than raised. The optimizer
+        then starts from its fresh state: for evaluation that is exactly
+        right, and for a resume it means losing the moment estimates, which
+        the log says out loud because it changes the first updates after the
+        restore.
+        """
+        groups = (
+            state_dict.get("param_groups") if isinstance(state_dict, dict) else None
+        )
+        saved_groups = len(groups) if groups is not None else None
+        live_groups = len(self.optim.param_groups)
+        if saved_groups is not None and saved_groups != live_groups:
+            self.log.warning(
+                "Checkpoint optimizer has %d param group(s) but this optimizer "
+                "has %d; skipping the optimizer restore. Evaluation is "
+                "unaffected (the policy is already loaded); a training resume "
+                "continues with fresh optimizer moments.",
+                saved_groups,
+                live_groups,
+            )
+            return
+        self.optim.load_state_dict(state_dict)
 
     def load_model(self, path: str) -> None:
         """Load PPO and reward-estimator state from a checkpoint."""
         data = torch.load(path, map_location=self.device)
+        # Continue the global frame budget on resume. Pre-2026-08-16
+        # checkpoints lack the key; their filename step is segment-local, so
+        # it is deliberately NOT used as a fallback -- treating a local step
+        # as global would silently shrink the remaining budget.
+        resume_frames = data.get("cumulative_env_frames")
+        if resume_frames is not None:
+            self._resume_frame_offset = int(resume_frames)
+        self._restore_train_clock(data)
         self._load_checkpoint_policy_state_dict(data)
         if not self._restore_training_state_from_checkpoint(data):
             self._load_extra_checkpoint_state_dict(data)
@@ -2949,7 +3353,7 @@ class IPMD(PPO):
         if self.q_function and "q_state_dict" in data:
             self.q_function.load_state_dict(data["q_state_dict"])  # type: ignore[arg-type]
         if "optimizer_state_dict" in data:
-            self.optim.load_state_dict(data["optimizer_state_dict"])  # type: ignore[arg-type]
+            self._load_optimizer_state_dict(data["optimizer_state_dict"])
         if "reward_estimator_state_dict" in data:
             self.reward_estimator.load_state_dict(
                 data["reward_estimator_state_dict"]  # type: ignore[arg-type]
@@ -2973,6 +3377,15 @@ class IPMD(PPO):
             if callable(reset_sampler):
                 reset_sampler()
         if (
+            self._hl_skill_command_sampler is not None
+            and "hl_skill_command_sampler_state_dict" in data
+            and not bool(self.config.ipmd.hl_skill_restore_from_checkpoint)
+        ):
+            self.log.info(
+                "hl_skill_restore_from_checkpoint=false: keeping the encoder "
+                "from hl_skill_checkpoint_path, not the tracker checkpoint's."
+            )
+        elif (
             self._hl_skill_command_sampler is not None
             and "hl_skill_command_sampler_state_dict" in data
         ):
@@ -3081,7 +3494,7 @@ class IPMD(PPO):
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
-        self.data_buffer.extend(rollout.reshape(-1))
+        self.data_buffer.extend(self._rollout_for_buffer(rollout))
         return rollout
 
     def _set_reward_policy_condition_from_batch(
@@ -3186,7 +3599,9 @@ class IPMD(PPO):
             else int(updates_completed)
         )
         self.data_buffer.empty()
-        self.data_buffer.extend(rollout_flat)
+        # Route through the shaping helper: with a recurrent actor the buffer
+        # stores [env, T] sequences and a flat extend silently corrupts it.
+        self.data_buffer.extend(self._rollout_for_buffer(rollout_flat))
         try:
             for _epoch_idx in range(metadata.epochs_per_rollout):
                 for batch in self.data_buffer:
@@ -3275,6 +3690,40 @@ class IPMD(PPO):
         """Reward preparation runs in iterate() after pre-PPO reward updates."""
         return
 
+    def _apply_critic_lr_schedule(self, metadata: PPOTrainingMetadata) -> None:
+        """Set the critic group's learning rate for this iteration.
+
+        A no-op under ``ipmd.critic_lr_schedule="constant"``. Progress is
+        cumulative environment frames over the configured frame budget --
+        ``metadata.frames_processed`` is seeded with the resume offset, so a
+        walltime-chained segment continues the decay where the previous one
+        stopped instead of restarting at ``critic_learning_rate``.
+        """
+        schedule = str(self.config.ipmd.critic_lr_schedule)
+        if schedule == "constant":
+            return
+        start = self.config.ipmd.critic_learning_rate
+        end = self.config.ipmd.critic_lr_final
+        if start is None or end is None:
+            return
+        total_frames = float(self.config.collector.total_frames)
+        if total_frames <= 0.0:
+            return
+        progress = float(metadata.frames_processed) / total_frames
+        progress = min(max(progress, 0.0), 1.0)
+        start = float(start)
+        end = float(end)
+        if schedule == "linear":
+            lr = start + (end - start) * progress
+        else:  # cosine
+            lr = end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
+        bias_scale = float(self.config.ipmd.first_layer_bias_lr_scale)
+        for group in self.optim.param_groups:
+            if group.get("name") == "critic":
+                group["lr"] = lr
+            elif group.get("name") == "critic_first_bias":
+                group["lr"] = lr * bias_scale
+
     def iterate(
         self,
         iteration: PPOIterationData,
@@ -3286,6 +3735,7 @@ class IPMD(PPO):
         )
         learn_start = time.perf_counter()
 
+        self._apply_critic_lr_schedule(metadata)
         self.data_buffer.empty()
         self.actor_critic.train()
         self.adv_module.train()
