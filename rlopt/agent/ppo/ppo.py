@@ -49,6 +49,7 @@ from rlopt.base_class import (
     BaseAlgorithm,
     IterationData,
     TrainingMetadata,
+    honours_train_time_budget,
 )
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
@@ -1231,11 +1232,12 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             if metadata.progress_bar_enabled
             else None
         )
+        clock = self._train_clock_metrics(metadata.frames_processed)
         if rate is not None:
-            return {"time/speed": float(rate)}
+            return {"time/speed": float(rate), **clock}
         iter_time = iteration.collect_time + iteration.learn_time
         speed = float(iteration.frames) / iter_time if iter_time > 0.0 else 0.0
-        return {"time/speed": speed}
+        return {"time/speed": speed, **clock}
 
     def _record_env_metrics(self, iteration: PPOIterationData) -> None:
         """Add environment-side scalar metrics when the env exposes them."""
@@ -1347,6 +1349,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             for normalizer in normalizers:
                 normalizer._update(value)
 
+    @honours_train_time_budget
     def train(self) -> None:  # type: ignore
         """Train the agent with the shared on-policy rollout-to-update workflow."""
         self.validate_training()
@@ -1356,6 +1359,9 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             for iteration_idx in range(metadata.total_iterations):
                 # 1) Collect a rollout and create the iteration state.
                 iteration = self.collect(metadata, iteration_idx)
+                # The first batch carries the env cold start; the walltime
+                # budget (trainer.max_train_seconds) starts after it.
+                self._start_train_clock()
 
                 # 2) Let the algorithm reshape rewards or attach extra data.
                 with self._profile_iteration_phase(iteration.phase_times, "prepare"):
@@ -1369,10 +1375,17 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
                 self._update_rollout_normalizers(iteration.rollout)
 
+                # Host clock only; a spent budget makes this the last iteration.
+                metadata.stop_after_iteration = self._train_time_budget_reached()
+
                 # 4) Log, refresh collector weights, and checkpoint if needed.
                 with self._profile_iteration_phase(iteration.phase_times, "record"):
                     self.record(iteration, metadata)
                 self._finish_iteration_profile(metadata, iteration)
+                if metadata.stop_after_iteration:
+                    break
+            if metadata.stop_after_iteration:
+                self._finish_train_time_budget(metadata)
         except KeyboardInterrupt:
             # Walltime/SIGTERM (or a real Ctrl+C): persist the current state so
             # a chained segment resumes from HERE rather than from the last

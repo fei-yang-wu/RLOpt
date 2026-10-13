@@ -448,6 +448,16 @@ class IPMDConfig(PPOConfig):
     hl_skill_train_diffsr: bool = False
     """Also update the loaded DiffSR model during online high-level skill finetuning."""
 
+    hl_skill_online_objective: str = "legacy"
+    """Online finetune objective. ``legacy`` = PG + offline/achieved DiffSR +
+    anchor (mlp-head JEPA checkpoints, no source history). ``ntp_live_offset``
+    = the checkpoint's own pretraining next-chunk DiffSR loss (diff_chunk head,
+    source history supported) on offline windows moved by the policy's live
+    slot-0 offsets, plus the anchor term; requires hl_skill_pg_coeff=0."""
+
+    hl_skill_live_offset_ring: int = 65536
+    """Capacity of the live slot-0 offset ring read by ``ntp_live_offset``."""
+
     skill_commander_checkpoint_path: str = ""
     """Skill-commander checkpoint used when command_source='skill_commander'."""
 
@@ -1662,6 +1672,8 @@ class IPMD(PPO):
                 offline_batch_size=int(self.config.ipmd.hl_skill_offline_batch_size),
                 update_interval=int(self.config.ipmd.hl_skill_update_interval),
                 train_diffsr=bool(self.config.ipmd.hl_skill_train_diffsr),
+                online_objective=str(self.config.ipmd.hl_skill_online_objective),
+                live_offset_ring=int(self.config.ipmd.hl_skill_live_offset_ring),
             )
         if self._use_latent_command and self._command_source == "skill_commander":
             from rlopt.agent.skill_commander import (  # noqa: PLC0415
@@ -2768,6 +2780,10 @@ class IPMD(PPO):
             "hl_skill_z_norm_loss",
             "hl_skill_grad_norm",
             "hl_skill_updates",
+            # ntp_live_offset online objective.
+            "hl_skill_ntp_loss",
+            "hl_skill_live_offset_xy_median",
+            "hl_skill_live_offset_ring_count",
             "hl_skill_z_abs_mean",
             "hl_skill_z_rms",
             "hl_skill_z_dim_std_mean",
@@ -3867,6 +3883,8 @@ class IPMD(PPO):
         # segment reads it and continues the SAME budget instead of restarting.
         if step is not None:
             data_to_save["cumulative_env_frames"] = int(step)
+        # Cumulative training wall-clock (trainer.max_train_seconds budget).
+        data_to_save["cumulative_train_seconds"] = self.train_elapsed_seconds()
 
         torch.save(data_to_save, target_path)
 
@@ -3913,6 +3931,7 @@ class IPMD(PPO):
         resume_frames = data.get("cumulative_env_frames")
         if resume_frames is not None:
             self._resume_frame_offset = int(resume_frames)
+        self._restore_train_clock(data)
         self._load_checkpoint_policy_state_dict(data)
         if not self._restore_training_state_from_checkpoint(data):
             self._load_extra_checkpoint_state_dict(data)

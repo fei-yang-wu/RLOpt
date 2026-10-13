@@ -9,6 +9,7 @@ from rlopt.agent.causal_interface_planner import (
     CausalInterfaceTransformerFlowPlanner,
 )
 from rlopt.agent.fast_td3 import FastTD3, FastTD3RLOptConfig
+from rlopt.agent.flashsac import FlashSAC, FlashSACRLOptConfig
 from rlopt.agent.gail import AMP, GAIL, AMPRLOptConfig, GAILRLOptConfig
 from rlopt.agent.hl_skill_diffsr import (
     FrozenHighLevelSkillCommandSampler,
@@ -52,6 +53,8 @@ __all__ = [
     "IPMDSR",
     "PPO",
     "SAC",
+    "FlashSAC",
+    "FlashSACRLOptConfig",
     "AMPRLOptConfig",
     "ASEConfig",
     "ASERLOptConfig",
