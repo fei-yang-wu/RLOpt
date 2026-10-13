@@ -316,6 +316,81 @@ def _drop_macro_qvel(frames: Tensor) -> Tensor:
 def _head_view(config: HighLevelSkillDiffSRConfig, frames: Tensor) -> Tensor:
     """What phi and the generative heads see of macro frames (``heads_drop_qvel``)."""
     return _drop_macro_qvel(frames) if config.heads_drop_qvel else frames
+
+
+def _apply_planar_offset(frames: Tensor, xy: Tensor, yaw: Tensor) -> Tensor:
+    """Move 38-wide root_qpos macro frames by one planar rigid transform per row.
+
+    ``frames`` is ``[B, ..., 38]``; ``xy [B, 2]`` and ``yaw [B]`` give, per row,
+    ``p' = Rz(yaw) p + [x, y, 0]`` and ``R' = Rz(yaw) R`` for the pelvis pose of
+    every frame. This is exactly how a window anchored at the reference's own
+    slot-0 heading frame (pretraining) turns into the same window anchored at
+    a live robot whose heading frame sits at offset ``(xy, yaw)`` from it
+    (``robot_heading`` rollout): the slot-0 pelvis lands at ``xy`` with heading
+    ``yaw``. Joint angles, heights and tilt are unchanged. The pelvis rot6d is
+    the data plane's row-major interleaved layout ``[r00, r01, r10, r11, r20,
+    r21]``, whose first two rows a yaw rotation mixes.
+    """
+    if int(frames.shape[-1]) != _ROOT_QPOS_FRAME_DIM:
+        msg = (
+            "planar macro offsets are defined for the 38-wide root_qpos frame, "
+            f"got width {int(frames.shape[-1])}."
+        )
+        raise ValueError(msg)
+    view = (int(frames.shape[0]),) + (1,) * (frames.dim() - 2)
+    c = torch.cos(yaw).reshape(view).to(frames.dtype)
+    s = torch.sin(yaw).reshape(view).to(frames.dtype)
+    tx = xy[:, 0].reshape(view).to(frames.dtype)
+    ty = xy[:, 1].reshape(view).to(frames.dtype)
+    x, y, z = frames[..., 29], frames[..., 30], frames[..., 31]
+    r = frames[..., 32:38]
+    rot = torch.stack(
+        [
+            c * r[..., 0] - s * r[..., 2],
+            c * r[..., 1] - s * r[..., 3],
+            s * r[..., 0] + c * r[..., 2],
+            s * r[..., 1] + c * r[..., 3],
+            r[..., 4],
+            r[..., 5],
+        ],
+        dim=-1,
+    )
+    pos = torch.stack([c * x - s * y + tx, s * x + c * y + ty, z], dim=-1)
+    return torch.cat([frames[..., :29], pos, rot], dim=-1)
+
+
+def _macro_slot0_offset(state: Tensor) -> tuple[Tensor, Tensor]:
+    """Pelvis ``xy [B, 2]`` and heading ``yaw [B]`` of 38-wide slot-0 frames."""
+    return state[:, 29:31], torch.atan2(state[:, 34], state[:, 32])
+
+
+def _sample_lognormal_planar_offsets(
+    config: HighLevelSkillDiffSRConfig, batch_size: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """Planar offsets with lognormal radius and |yaw|, uniform direction and sign."""
+    radius = float(config.macro_offset_xy_median) * torch.exp(
+        float(config.macro_offset_xy_log_sigma) * torch.randn(batch_size, device=device)
+    )
+    angle = 2.0 * math.pi * torch.rand(batch_size, device=device)
+    xy = torch.stack([radius * torch.cos(angle), radius * torch.sin(angle)], dim=-1)
+    yaw_abs = math.radians(float(config.macro_offset_yaw_median_deg)) * torch.exp(
+        float(config.macro_offset_yaw_log_sigma) * torch.randn(batch_size, device=device)
+    )
+    sign = torch.where(torch.rand(batch_size, device=device) < 0.5, -1.0, 1.0)
+    return xy, sign * yaw_abs
+
+
+def _offset_jepa_sample(
+    state: Tensor, window: Tensor, source: Tensor, xy: Tensor, yaw: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Apply one planar offset per row to a jepa draw: state, window and phi's source."""
+    batch = int(state.shape[0])
+    width = int(state.shape[-1])
+    return (
+        _apply_planar_offset(state, xy, yaw),
+        _apply_planar_offset(window, xy, yaw),
+        _apply_planar_offset(source.reshape(batch, -1, width), xy, yaw).reshape(batch, -1),
+    )
 # root_qpos + the four end-effector positions in the same anchor frame
 # (`expert_ee_pos_b`: ankles and wrists, 4 x 3), 2026-09-14.
 _ROOT_QPOS_EE_FRAME_DIM = 50
@@ -922,6 +997,22 @@ class HighLevelSkillDiffSRConfig:
     regression_planner_hidden_dims: tuple[int, ...] = (1024, 1024, 512)
     regression_planner_lr: float = 3.0e-4
     macro_qvel_scale: float = 1.0
+    macro_offset_aug: str = "none"
+    """Planar-offset augmentation of pretraining windows (2026-10-10).
+
+    ``"none"`` (default) keeps every pretraining window in its own slot-0
+    heading frame. ``"lognormal"`` moves each training row -- the encoder
+    window, phi's source history and the next-chunk target together -- by one
+    planar rigid offset whose radius and |yaw| are lognormal, so the encoder
+    also learns windows anchored at a live robot that is off the reference
+    (``robot_heading`` rollout). Defaults fit the slot-0 offsets measured on
+    the encoder-ablation-5b ctrl tracker under training-like rollouts
+    (experiments/campaigns/2026-10-10-encoder-anchor-gap): xy median 5 cm,
+    p99 1.5 m; |yaw| median 1.1 deg. root_qpos (38-wide) frames only."""
+    macro_offset_xy_median: float = 0.05
+    macro_offset_xy_log_sigma: float = 1.448
+    macro_offset_yaw_median_deg: float = 1.1
+    macro_offset_yaw_log_sigma: float = 1.10
     heads_drop_qvel: bool = False
     """Encoder-only joint velocities for 67-wide full_body macro frames.
 
@@ -1350,6 +1441,30 @@ class HighLevelSkillDiffSRConfig:
         self.macro_qvel_scale = _require_positive_float(
             "macro_qvel_scale", self.macro_qvel_scale
         )
+        self.macro_offset_aug = str(self.macro_offset_aug).strip().lower()
+        if self.macro_offset_aug not in {"none", "lognormal"}:
+            msg = (
+                "macro_offset_aug must be 'none' or 'lognormal', got "
+                f"{self.macro_offset_aug!r}."
+            )
+            raise ValueError(msg)
+        self.macro_offset_xy_median = _require_positive_float(
+            "macro_offset_xy_median", self.macro_offset_xy_median
+        )
+        self.macro_offset_xy_log_sigma = _require_non_negative_float(
+            "macro_offset_xy_log_sigma", self.macro_offset_xy_log_sigma
+        )
+        self.macro_offset_yaw_median_deg = _require_positive_float(
+            "macro_offset_yaw_median_deg", self.macro_offset_yaw_median_deg
+        )
+        self.macro_offset_yaw_log_sigma = _require_non_negative_float(
+            "macro_offset_yaw_log_sigma", self.macro_offset_yaw_log_sigma
+        )
+        if self.macro_offset_aug != "none" and (
+            self.transition_objective != "jepa_ntp" or self.heads_drop_qvel
+        ):
+            msg = "macro_offset_aug is wired for jepa_ntp on 38-wide root_qpos frames."
+            raise ValueError(msg)
         self.heads_drop_qvel = bool(self.heads_drop_qvel)
         if self.heads_drop_qvel and not (
             self.transition_objective == "jepa_ntp"
@@ -1486,8 +1601,18 @@ class FrozenHighLevelSkillCommandSampler:
         offline_batch_size: int = 8192,
         update_interval: int = 1,
         train_diffsr: bool = False,
+        online_objective: str = "legacy",
+        live_offset_ring: int = 65536,
     ) -> None:
         self.latent_dim = _require_positive_int("latent_dim", latent_dim)
+        self.online_objective = str(online_objective).strip().lower()
+        if self.online_objective not in {"legacy", "ntp_live_offset"}:
+            msg = (
+                "online_objective must be 'legacy' or 'ntp_live_offset', got "
+                f"{online_objective!r}."
+            )
+            raise ValueError(msg)
+        self.live_offset_ring = _require_positive_int("live_offset_ring", live_offset_ring)
         self.latent_steps_min = max(1, int(latent_steps_min))
         self.latent_steps_max = max(self.latent_steps_min, int(latent_steps_max))
         self.finetune_enabled = bool(finetune_enabled)
@@ -1590,10 +1715,39 @@ class FrozenHighLevelSkillCommandSampler:
                 "Live skill commands require source_anchor='current'; "
                 "a past_start checkpoint needs a delayed heading anchor."
             )
-        if self.finetune_enabled and self.config.source_history_steps > 0:
+        if (
+            self.finetune_enabled
+            and self.online_objective == "legacy"
+            and self.config.source_history_steps > 0
+        ):
             raise ValueError(
                 "Online finetuning with source_history_steps > 0 is not supported."
             )
+        if self.finetune_enabled and self.online_objective == "ntp_live_offset":
+            # The pretraining next-chunk DiffSR objective, run on offline
+            # windows moved by the policy's own live slot-0 offsets. Wired for
+            # the merged diff_chunk recipe of the encoder ablations.
+            if not (
+                self.config.transition_objective == "jepa_ntp"
+                and str(self.config.jepa_loss) == "sigreg_ebm"
+                and str(self.config.jepa_ntp_head) == "diff_chunk"
+                and str(self.config.jepa_ntp_chunk_anchor) == "executed"
+                and int(self.config.jepa_context_chunks) == 0
+                and float(self.config.jepa_endpoint_coeff) == 0.0
+                and not self.config.heads_drop_qvel
+                and float(self.config.jepa_reconstruction_coeff) == 0.0
+                and not self.config.cotrain_regression_planner
+            ):
+                raise ValueError(
+                    "online_objective='ntp_live_offset' needs a jepa_ntp / sigreg_ebm "
+                    "/ diff_chunk (executed anchor, context 0, endpoint coeff 0) "
+                    "checkpoint without reconstruction, planner or heads_drop_qvel."
+                )
+            if self.pg_coeff > 0.0:
+                raise ValueError(
+                    "online_objective='ntp_live_offset' trains the encoder on its "
+                    "pretraining loss only; set hl_skill_pg_coeff=0."
+                )
         if self.config.heads_drop_qvel and (
             self.finetune_enabled or _normalize_command_mode(command_mode) != "z"
         ):
@@ -1751,8 +1905,36 @@ class FrozenHighLevelSkillCommandSampler:
         self.jepa_predictor: nn.Module | None = None
         self.jepa_g: nn.Module | None = None
         self.jepa_f: nn.Module | None = None
-        if self.finetune_enabled and self.config.transition_objective == "jepa_ntp":
+        self.jepa_ntp_diffsr: BilinearSR | None = None
+        if (
+            self.finetune_enabled
+            and self.config.transition_objective == "jepa_ntp"
+            and self.online_objective == "legacy"
+        ):
             self._restore_jepa_modules(checkpoint)
+        self._offset_ring_xy: Tensor | None = None
+        self._offset_ring_yaw: Tensor | None = None
+        self._offset_ring_next = 0
+        self._offset_ring_count = 0
+        if self.finetune_enabled and self.online_objective == "ntp_live_offset":
+            jepa_state = checkpoint.get("jepa_state_dict")
+            ntp_state = jepa_state.get("ntp_diffsr") if jepa_state else None
+            if ntp_state is None:
+                raise ValueError(
+                    "online_objective='ntp_live_offset' needs "
+                    "jepa_state_dict['ntp_diffsr'] (the next-chunk DiffSR head)."
+                )
+            self.jepa_ntp_diffsr = _build_diffsr(
+                self.config,
+                self.state_dim,
+                self.device,
+                next_obs_dim=_jepa_ntp_target_dim(self.config, self.state_dim),
+            ).to(self.device)
+            self.jepa_ntp_diffsr.load_state_dict(ntp_state)
+            self.jepa_ntp_diffsr.train(True)
+            self.jepa_ntp_diffsr.requires_grad_(True)
+            self._offset_ring_xy = torch.zeros(self.live_offset_ring, 2, device=self.device)
+            self._offset_ring_yaw = torch.zeros(self.live_offset_ring, device=self.device)
 
         self.optimizer: torch.optim.Optimizer | None = None
         if self.finetune_enabled:
@@ -2009,6 +2191,8 @@ class FrozenHighLevelSkillCommandSampler:
         state = _scale_macro_qvel(state, qvel_scale)
         future_window = _scale_macro_qvel(future_window, qvel_scale)
         target = _scale_macro_qvel(target, qvel_scale)
+        if self._offset_ring_xy is not None:
+            self._record_live_offsets(state)
         if self.command_override is not None:
             z = self.command_override(
                 state,
@@ -2197,7 +2381,7 @@ class FrozenHighLevelSkillCommandSampler:
 
     def _jepa_head_parameters(self) -> list[nn.Parameter]:
         """Trainable JEPA heads; the EMA target encoder is never among them."""
-        heads = [self.jepa_predictor, self.jepa_g, self.jepa_f]
+        heads = [self.jepa_predictor, self.jepa_g, self.jepa_f, self.jepa_ntp_diffsr]
         return [p for head in heads if head is not None for p in head.parameters()]
 
     def on_after_finetune_step(self) -> None:
@@ -2399,6 +2583,95 @@ class FrozenHighLevelSkillCommandSampler:
         )
         return total_loss, metrics
 
+    def _record_live_offsets(self, state: Tensor) -> None:
+        """Push the live slot-0 offsets of this renewal into the ring (no host sync)."""
+        assert self._offset_ring_xy is not None and self._offset_ring_yaw is not None
+        if int(state.shape[-1]) != _ROOT_QPOS_FRAME_DIM:
+            return
+        xy, yaw = _macro_slot0_offset(state.detach())
+        count = min(int(state.shape[0]), self.live_offset_ring)
+        index = (
+            torch.arange(count, device=self.device) + self._offset_ring_next
+        ) % self.live_offset_ring
+        self._offset_ring_xy.index_copy_(0, index, xy[:count].to(self._offset_ring_xy))
+        self._offset_ring_yaw.index_copy_(0, index, yaw[:count].to(self._offset_ring_yaw))
+        self._offset_ring_next = (self._offset_ring_next + count) % self.live_offset_ring
+        self._offset_ring_count = min(self._offset_ring_count + count, self.live_offset_ring)
+
+    def _sample_live_offsets(self, batch_size: int) -> tuple[Tensor, Tensor]:
+        assert self._offset_ring_xy is not None and self._offset_ring_yaw is not None
+        if self._offset_ring_count == 0:
+            zeros = torch.zeros(batch_size, device=self.device)
+            return torch.zeros(batch_size, 2, device=self.device), zeros
+        index = torch.randint(0, self._offset_ring_count, (batch_size,), device=self.device)
+        return self._offset_ring_xy[index], self._offset_ring_yaw[index]
+
+    def _ntp_live_offset_loss(self, batch_size: int) -> tuple[Tensor, dict[str, Tensor]]:
+        """The pretraining next-chunk DiffSR loss on windows at the live offsets.
+
+        One offline draw of two adjacent chunks with phi's source history, as
+        in ``_jepa_train_step``; the whole draw is moved by offsets sampled
+        from the ring of slot-0 offsets the policy's live windows had, so the
+        encoder is trained on what it actually encodes at rollout. Loss terms
+        match pretraining (``jepa_ntp_coeff`` x next-chunk denoising, plus
+        SIGReg and the latent L2 at their checkpoint coefficients); an anchor
+        term pulls the code of the UNMOVED window toward the pretrained
+        encoder's, so the canonical codes stay put while the response to the
+        offset is reshaped.
+        """
+        assert self.jepa_ntp_diffsr is not None
+        assert self._offline_macro_sampler is not None
+        horizon = int(self.config.horizon_steps)
+        # The trainer's sampler reads only `config` and `device`.
+        state, window, source = HighLevelSkillDiffSRTrainer._sample_jepa_window(  # type: ignore[arg-type]
+            self,
+            self._offline_macro_sampler,
+            batch_size=int(batch_size),
+            chunk_steps=2 * horizon,
+            split=self.config.train_split,
+        )
+        offset_xy, offset_yaw = self._sample_live_offsets(int(state.shape[0]))
+        m_state, m_window, m_source = _offset_jepa_sample(
+            state, window, source, offset_xy, offset_yaw
+        )
+        z1, reg_loss, _ = self.skill_encoder.encode(
+            m_state,
+            _encoder_input_window(self.config, m_window[:, :horizon]),
+            step=self.finetune_updates,
+        )
+        span_start = (
+            horizon - 1 if str(self.config.jepa_ntp_chunk_span) == "boundary_next" else horizon
+        )
+        ntp_target = _head_view(self.config, m_window[:, span_start : 2 * horizon]).reshape(
+            int(z1.shape[0]), -1
+        )
+        self.jepa_ntp_diffsr.update_obs_norm(ntp_target.detach())
+        zero_reward = torch.zeros(int(z1.shape[0]), 1, device=self.device)
+        _, ntp, _ = self.jepa_ntp_diffsr.compute_loss(
+            m_source, z1, ntp_target.detach(), zero_reward
+        )
+        loss = float(self.config.jepa_ntp_coeff) * ntp + float(self.config.reg_coeff) * reg_loss
+        sigreg = torch.zeros((), device=self.device)
+        if float(self.config.jepa_sigreg_coeff) > 0.0:
+            sigreg = _sigreg_epps_pulley(z1, num_sketches=int(self.config.jepa_sigreg_sketches))
+            loss = loss + float(self.config.jepa_sigreg_coeff) * sigreg
+        anchor_window = _encoder_input_window(self.config, window[:, :horizon])
+        z_anchor = self.skill_encoder(state, anchor_window)
+        with torch.no_grad():
+            initial_z = self.initial_skill_encoder(state, anchor_window)
+        anchor_loss = F.mse_loss(z_anchor, initial_z)
+        loss = loss + self.anchor_coeff * anchor_loss
+        return loss, {
+            "hl_skill_total_loss": loss.detach(),
+            "hl_skill_ntp_loss": ntp.detach(),
+            "hl_skill_sigreg": sigreg.detach(),
+            "hl_skill_anchor_loss": anchor_loss.detach(),
+            "hl_skill_live_offset_xy_median": offset_xy.norm(dim=-1).median().detach(),
+            "hl_skill_live_offset_ring_count": torch.tensor(
+                float(self._offset_ring_count), device=self.device
+            ),
+        }
+
     def compute_online_finetune_loss(
         self,
         batch: TensorDictBase,
@@ -2409,6 +2682,8 @@ class FrozenHighLevelSkillCommandSampler:
         if not self.finetune_enabled:
             zero = torch.zeros((), device=self.device)
             return zero, {}
+        if self.online_objective == "ntp_live_offset":
+            return self._ntp_live_offset_loss(int(self.offline_batch_size))
 
         pg_loss = torch.zeros((), device=self.device)
         if self.pg_coeff > 0.0:
@@ -2500,6 +2775,10 @@ class FrozenHighLevelSkillCommandSampler:
             state["diffsr_state_dict"] = self.diffsr.state_dict()
         if self.optimizer is not None:
             state["optimizer_state_dict"] = self.optimizer.state_dict()
+        if self.jepa_ntp_diffsr is not None:
+            # ntp_live_offset trains this head with the encoder; a resumed
+            # segment must continue it, not revert to the pretrained head.
+            state["jepa_ntp_diffsr_state_dict"] = self.jepa_ntp_diffsr.state_dict()
         return state
 
     def load_checkpoint_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -2507,6 +2786,8 @@ class FrozenHighLevelSkillCommandSampler:
             self.skill_encoder.load_state_dict(state["skill_encoder_state_dict"])
         if self.train_diffsr and "diffsr_state_dict" in state:
             self.diffsr.load_state_dict(state["diffsr_state_dict"])
+        if self.jepa_ntp_diffsr is not None and "jepa_ntp_diffsr_state_dict" in state:
+            self.jepa_ntp_diffsr.load_state_dict(state["jepa_ntp_diffsr_state_dict"])
         if self.optimizer is not None and "optimizer_state_dict" in state:
             self.optimizer.load_state_dict(state["optimizer_state_dict"])
         self.finetune_updates = int(state.get("finetune_updates", 0))
@@ -2595,7 +2876,7 @@ class FrozenHighLevelSkillCommandSampler:
                 env_ids.to(device=device),
                 self._sample_steps(int(env_ids.numel()), device=device),
             )
-            if self.finetune_enabled:
+            if self.finetune_enabled and self.online_objective == "legacy":
                 macro_ids = self._append_rollout_cache(
                     state=state,
                     future_window=future_window,
@@ -2629,7 +2910,7 @@ class FrozenHighLevelSkillCommandSampler:
             )
             phase = phase / float(self.phase_period)
         latents = self._append_command_phase(self._codes, phase)
-        if self.finetune_enabled:
+        if self.finetune_enabled and self.online_objective == "legacy":
             td.set(
                 ("hl_skill", "macro_id"),
                 self._active_macro_ids.reshape(*td.batch_size),
@@ -3670,6 +3951,16 @@ class HighLevelSkillDiffSRTrainer:
             chunk_steps=total_chunks * horizon,
             split=self.config.train_split,
         )
+        if self.config.macro_offset_aug == "lognormal":
+            # Train rows only (eval keeps the canonical frame): the whole draw
+            # moves together, as it does when the live robot is off the
+            # reference, so every target stays in the executed chunk's frame.
+            offset_xy, offset_yaw = _sample_lognormal_planar_offsets(
+                self.config, int(state.shape[0]), state.device
+            )
+            state, window, source = _offset_jepa_sample(
+                state, window, source, offset_xy, offset_yaw
+            )
 
         def chunk_at(index: int) -> tuple[Tensor, Tensor]:
             """Chunk ``index`` (state, window), anchored on its own state."""
