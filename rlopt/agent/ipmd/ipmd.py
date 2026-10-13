@@ -26,6 +26,7 @@ from rlopt.agent.imitation.latent_learning import (
     held_command_policy_surrogate,
 )
 from rlopt.agent.ipmd.dagger_config import DAggerConfig
+from rlopt.agent.ipmd.reward_averaging import ReservoirFeatureReplay, polyak_update
 from rlopt.agent.ipmd.utils import (
     IPMD_COMMAND_SOURCES,
     IPMD_REWARD_INPUT_TYPES,
@@ -745,6 +746,23 @@ class IPMDConfig(PPOConfig):
     reward_prior_draws: int = 1
     """Noise draws per diffusion level in the ``r_B`` estimate."""
 
+    reward_target_ema_tau: float = 0.0
+    """Polyak rate of an EMA copy of the reward estimator that rewards the
+    policy (``0`` = off: the policy sees the latest estimator). Averaging the
+    reward iterates of the saddle (``rlopt.agent.ipmd.reward_averaging``)."""
+
+    reward_policy_replay_size: int = 0
+    """Rows in a reservoir replay of past policy reward inputs (``0`` = off).
+    The estimator's policy rows then mix the current batch with a uniform
+    sample of all past rows: the classifier fits ``log p_E / p_bar`` against
+    the mixture of past policies (averaging the policy iterates)."""
+
+    reward_policy_replay_fraction: float = 0.5
+    """Fraction of each estimator policy batch drawn from the replay."""
+
+    reward_policy_replay_rows_per_rollout: int = 65536
+    """Non-done rollout rows offered to the replay per rollout (subsampled)."""
+
     reward_prior_transform: str = "log"
     """Fixed map ``h(r_B)`` to [0, 1]: ``"log"`` (graded over the whole range)
     or ``"exp"`` (``exp(r_B / kappa)``)."""
@@ -1246,6 +1264,15 @@ class IPMDConfig(PPOConfig):
                 f"cumulative mean), got {self.reward_moment_momentum!r}."
             )
             raise ValueError(msg)
+        if not 0.0 <= float(self.reward_target_ema_tau) <= 1.0:
+            raise ValueError(
+                "ipmd.reward_target_ema_tau must lie in [0, 1], got "
+                f"{self.reward_target_ema_tau!r}."
+            )
+        if int(self.reward_policy_replay_size) < 0:
+            raise ValueError("ipmd.reward_policy_replay_size must be >= 0.")
+        if not 0.0 <= float(self.reward_policy_replay_fraction) < 1.0:
+            raise ValueError("ipmd.reward_policy_replay_fraction must lie in [0, 1).")
         if self.reward_prior_checkpoint is not None:
             if float(self.reward_prior_kappa) <= 0.0 or int(self.reward_prior_stride) < 1:
                 raise ValueError(
@@ -1554,6 +1581,20 @@ class IPMD(PPO):
 
         # Reward estimator: r(s, a, s') -> scalar
         self.reward_estimator: torch.nn.Module = self._construct_reward_estimator()
+        # Averaging of the reward saddle (2026-10-12): an EMA target that
+        # rewards the policy, and a reservoir replay of past policy inputs.
+        self._reward_target: torch.nn.Module | None = None
+        tau = float(self.config.ipmd.reward_target_ema_tau)
+        if tau > 0.0 and any(True for _ in self.reward_estimator.parameters()):
+            import copy
+
+            self._reward_target = copy.deepcopy(self.reward_estimator).requires_grad_(False)
+        self._reward_target_tau = tau
+        self._reward_replay: ReservoirFeatureReplay | None = None
+        if int(self.config.ipmd.reward_policy_replay_size) > 0:
+            self._reward_replay = ReservoirFeatureReplay(
+                int(self.config.ipmd.reward_policy_replay_size), int(self._reward_input_dim), self.device
+            )
         self.reward_estimator.to(self.device)
         self.reward_optim: torch.optim.Optimizer | None = None
 
@@ -2588,8 +2629,13 @@ class IPMD(PPO):
         detach: bool | None = None,
         requires_grad: bool = False,
         return_input: bool = False,
+        use_target: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        """Compute estimated reward for a batch of transitions."""
+        """Compute estimated reward for a batch of transitions.
+
+        ``use_target`` evaluates the EMA target estimator when one exists
+        (``ipmd.reward_target_ema_tau > 0``); the rollout reward uses it.
+        """
         del batch_role
         if detach is None:
             detach = self._reward_detach_features
@@ -2614,7 +2660,12 @@ class IPMD(PPO):
             detach=detach,
             requires_grad=requires_grad,
         )
-        reward = self._reward_out_fn(self.reward_estimator(x))
+        estimator = (
+            self._reward_target
+            if use_target and self._reward_target is not None
+            else self.reward_estimator
+        )
+        reward = self._reward_out_fn(estimator(x))
         if return_input:
             return reward, x
         return reward
@@ -2840,6 +2891,7 @@ class IPMD(PPO):
                     self._reward_from_td(
                         rollout,
                         batch_role="rollout",
+                        use_target=True,
                     )
                     .detach()  # type: ignore[attr-defined]
                     .clamp(
@@ -3323,6 +3375,15 @@ class IPMD(PPO):
             detach=self._reward_detach_features,
             requires_grad=expert_requires_grad,
         )
+        replay = self._reward_replay
+        if replay is not None and replay.size > 0:
+            rows = int(r_pi_input.shape[0])
+            from_replay = int(round(float(self.config.ipmd.reward_policy_replay_fraction) * rows))
+            if from_replay > 0:
+                r_pi_input = torch.cat(
+                    [r_pi_input[from_replay:], replay.sample(from_replay).to(r_pi_input.dtype)],
+                    dim=0,
+                )
         return r_pi_input, r_exp_input
 
     def _backward_logistic_ratio_reward_terms(
@@ -3585,6 +3646,10 @@ class IPMD(PPO):
                     self._reward_max_grad_norm,
                 )
                 self.reward_optim.step()
+                if self._reward_target is not None:
+                    polyak_update(
+                        self._reward_target, self.reward_estimator, self._reward_target_tau
+                    )
             for key, value in step_metrics.items():
                 metrics[key] = metrics[key] + value
             metrics["reward_grad_norm"] = (
@@ -3856,6 +3921,8 @@ class IPMD(PPO):
             )
         if self.reward_optim is not None:
             data_to_save["reward_optimizer_state_dict"] = self.reward_optim.state_dict()
+        if self._reward_target is not None:
+            data_to_save["reward_target_state_dict"] = self._reward_target.state_dict()
         if self.lr_scheduler is not None:
             data_to_save["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
         if self._latent_learner is not None:
@@ -3956,6 +4023,15 @@ class IPMD(PPO):
             self.reward_optim.load_state_dict(
                 data["reward_optimizer_state_dict"]  # type: ignore[arg-type]
             )
+        if self._reward_target is not None:
+            if "reward_target_state_dict" in data:
+                self._reward_target.load_state_dict(
+                    data["reward_target_state_dict"]  # type: ignore[arg-type]
+                )
+            elif "reward_estimator_state_dict" in data:
+                self._reward_target.load_state_dict(
+                    data["reward_estimator_state_dict"]  # type: ignore[arg-type]
+                )
         if self.lr_scheduler is not None and "lr_scheduler_state_dict" in data:
             self.lr_scheduler.load_state_dict(data["lr_scheduler_state_dict"])
         if self.config.feature_extractor and "feature_extractor_state_dict" in data:
@@ -4175,6 +4251,20 @@ class IPMD(PPO):
         metrics["reward_grad_norm"] = torch.zeros((), device=self.device)
         return metrics
 
+    @torch.no_grad()
+    def _offer_rollout_to_reward_replay(self, rollout_flat: TensorDict) -> None:
+        """Offer up to ``reward_policy_replay_rows_per_rollout`` non-done rows."""
+        assert self._reward_replay is not None
+        rows = self._reward_input_from_td(rollout_flat, detach=True, requires_grad=False)
+        rows = rows.reshape(-1, rows.shape[-1])
+        done = rollout_done_mask(rollout_flat, rows[..., :1])
+        if done is not None:
+            rows = rows[~done.reshape(-1)]
+        limit = int(self.config.ipmd.reward_policy_replay_rows_per_rollout)
+        if rows.shape[0] > limit:
+            rows = rows[torch.randperm(rows.shape[0], device=rows.device)[:limit]]
+        self._reward_replay.add(rows)
+
     def _run_pre_policy_reward_updates(
         self,
         rollout_flat: TensorDict,
@@ -4183,9 +4273,12 @@ class IPMD(PPO):
         """Update the reward estimator before PPO reward and advantage computation."""
         if not self._reward_update_enabled:
             return {}
+        if self._reward_replay is not None:
+            self._offer_rollout_to_reward_replay(rollout_flat)
 
         metrics = self._empty_reward_update_metrics()
         minibatch_slots = 0
+        updated_slots = 0
         updates_completed = metadata.updates_completed
         start_update_idx = (
             int(updates_completed.item())
@@ -4210,6 +4303,7 @@ class IPMD(PPO):
                             expert_batch,
                             policy_update_idx=policy_update_idx,
                         )
+                        updated_slots += 1
                     else:
                         step_metrics = self._empty_reward_update_metrics()
                     for key, value in step_metrics.items():
@@ -4220,8 +4314,13 @@ class IPMD(PPO):
 
         if minibatch_slots == 0:
             return metrics
-        scale = float(minibatch_slots)
+        # Estimator metrics are means over the slots that ran a reward step;
+        # averaging over every slot would scale them by the fraction of due
+        # slots (reward_update_interval > 1). `reward_updates_applied` stays a
+        # per-slot rate.
+        due = float(max(updated_slots, 1))
         for key in tuple(metrics.keys()):
+            scale = float(minibatch_slots) if key == "reward_updates_applied" else due
             metrics[key] = metrics[key] / scale
         return metrics
 
