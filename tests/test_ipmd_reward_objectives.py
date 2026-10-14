@@ -852,3 +852,95 @@ def test_current_rows_auc_excludes_replay_rows() -> None:
     mixed = metrics["reward_separation_auc"].item()
     assert current > 0.8
     assert current - mixed > 0.1
+
+
+def test_absorbing_terminal_pays_the_floor_forever_on_terminated_rows() -> None:
+    """Signed estimate clamped to [-4, 4]: a terminated row pays
+    scale * (-4) / (1 - gamma); a truncated row keeps the done mask (0)."""
+    agent, env = _make_agent(
+        reward_loss_coeff=0.0,
+        use_estimated_rewards_for_ppo=True,
+        reward_ppo_squash="none",
+        estimated_reward_clamp_min=-4.0,
+        estimated_reward_clamp_max=4.0,
+        estimated_reward_scale=0.075,
+        est_reward_weight=1.0,
+        env_reward_weight=0.0,
+        reward_mask_done_rows=True,
+        reward_absorbing_terminal=True,
+    )
+    gamma = float(agent.config.loss.gamma)
+    env_reward = torch.zeros(4, 1)
+    done = torch.tensor([[False], [True], [False], [True]])
+    truncated = torch.tensor([[False], [False], [False], [True]])
+    rollout = _rollout(agent, env, env_reward=env_reward, done=done, truncated=truncated)
+    _patch_reward(agent, torch.tensor([[2.0], [9.0], [-1.0], [2.0]]))
+    agent._prepare_rollout_rewards(rollout)
+    est = rollout.get(("next", "est_reward"))
+    expected = torch.tensor([[0.15], [0.075 * -4.0 / (1.0 - gamma)], [-0.075], [0.0]])
+    assert torch.allclose(est, expected)
+
+
+def test_absorbing_terminal_is_zero_under_the_sigmoid_squash() -> None:
+    agent, env = _make_agent(
+        reward_objective="logistic_ratio",
+        reward_output_activation="none",
+        reward_loss_coeff=0.0,
+        use_estimated_rewards_for_ppo=True,
+        estimated_reward_scale=0.3,
+        reward_mask_done_rows=True,
+        reward_absorbing_terminal=True,
+    )
+    done = torch.tensor([[True], [False]])
+    rollout = _rollout(agent, env, env_reward=torch.zeros(2, 1), done=done)
+    _patch_reward(agent, torch.tensor([[5.0], [0.0]]))
+    agent._prepare_rollout_rewards(rollout)
+    est = rollout.get(("next", "est_reward"))
+    assert torch.allclose(est, torch.tensor([[0.0], [0.15]]))
+
+
+def test_absorbing_terminal_needs_a_finite_floor_without_squash() -> None:
+    agent, env = _make_agent(
+        reward_loss_coeff=0.0,
+        use_estimated_rewards_for_ppo=True,
+        reward_ppo_squash="none",
+        reward_absorbing_terminal=True,
+    )
+    rollout = _rollout(agent, env, env_reward=torch.zeros(2, 1), done=torch.tensor([[True], [False]]))
+    _patch_reward(agent, torch.tensor([[1.0], [1.0]]))
+    with pytest.raises(ValueError, match="finite"):
+        agent._prepare_rollout_rewards(rollout)
+
+
+def test_prioritized_fifo_replay_trains_and_refreshes_priorities() -> None:
+    """Policy side drawn entirely from the FIFO replay with PER weights; the
+    drawn rows' priorities become their per-row loss."""
+    agent, _ = _make_agent(
+        reward_objective="logistic_ratio",
+        reward_output_activation="none",
+        reward_policy_replay_size=4096,
+        reward_policy_replay_mode="fifo",
+        reward_policy_replay_fraction=1.0,
+        reward_policy_replay_priority_alpha=0.6,
+    )
+    replay = agent._reward_replay
+    assert replay is not None and replay.alpha == pytest.approx(0.6)
+    generator = torch.Generator().manual_seed(0)
+    policy_like = torch.cat([torch.randn(4096, 1, generator=generator) - 1.0, torch.zeros(4096, 2)], dim=-1)
+    replay.add(policy_like)
+    assert torch.all(replay.priority == 1.0)
+    metrics = _train_objective(agent, steps=200, batch=512, seed=1)
+    assert metrics["reward_separation_auc"].item() > 0.8
+    assert metrics["reward_separation_auc_current"].item() > 0.8
+    assert not torch.all(replay.priority == 1.0)
+    assert float(replay.max_priority) >= float(replay.priority.max()) - 1e-6
+
+
+def test_prioritized_replay_requires_fifo_and_logistic() -> None:
+    with pytest.raises(ValueError, match="fifo"):
+        _make_agent(
+            reward_objective="logistic_ratio",
+            reward_output_activation="none",
+            reward_policy_replay_size=16,
+            reward_policy_replay_priority_alpha=0.6,
+        )

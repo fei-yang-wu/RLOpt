@@ -26,7 +26,11 @@ from rlopt.agent.imitation.latent_learning import (
     held_command_policy_surrogate,
 )
 from rlopt.agent.ipmd.dagger_config import DAggerConfig
-from rlopt.agent.ipmd.reward_averaging import ReservoirFeatureReplay, polyak_update
+from rlopt.agent.ipmd.reward_averaging import (
+    PrioritizedFifoFeatureReplay,
+    ReservoirFeatureReplay,
+    polyak_update,
+)
 from rlopt.agent.ipmd.utils import (
     IPMD_COMMAND_SOURCES,
     IPMD_REWARD_INPUT_TYPES,
@@ -763,6 +767,30 @@ class IPMDConfig(PPOConfig):
     reward_policy_replay_rows_per_rollout: int = 65536
     """Non-done rollout rows offered to the replay per rollout (subsampled)."""
 
+    reward_policy_replay_mode: str = "reservoir"
+    """``"reservoir"``: uniform sample of the whole history. ``"fifo"``: old
+    rows leave first-in-first-out (a SAC-style window of the last
+    ``size / rows_per_rollout`` rollouts) and rows are drawn by prioritized
+    replay on the per-row classifier loss
+    (``rlopt.agent.ipmd.reward_averaging.PrioritizedFifoFeatureReplay``)."""
+
+    reward_policy_replay_priority_alpha: float = 0.0
+    """FIFO replay: ``P(i) ∝ (loss_i + eps)^alpha``; ``0`` = uniform."""
+
+    reward_policy_replay_priority_beta: float = 1.0
+    """FIFO replay: importance weight ``(N P(i))^-beta``; ``1`` keeps the
+    weighted classifier loss unbiased for the uniform-over-window loss."""
+
+    reward_absorbing_terminal: bool = False
+    """Terminated (non-truncated) rows enter an absorbing state (Kostrikov et
+    al. 2019, DAC). The absorbing state is never visited by the reference, so
+    its reward is the floor ``r_floor`` of the estimate's range (0 for the
+    sigmoid/amp/affine squashes, ``estimated_reward_clamp_min`` for
+    ``"none"``). The estimate on a terminated row becomes
+    ``scale * r_floor / (1 - gamma)``: the floor for the terminal transition
+    plus ``gamma * r_floor / (1 - gamma)`` for the absorbing tail. Applied after
+    the done mask; reward shifts become policy-invariant under termination."""
+
     reward_prior_transform: str = "log"
     """Fixed map ``h(r_B)`` to [0, 1]: ``"log"`` (graded over the whole range)
     or ``"exp"`` (``exp(r_B / kappa)``)."""
@@ -1271,8 +1299,32 @@ class IPMDConfig(PPOConfig):
             )
         if int(self.reward_policy_replay_size) < 0:
             raise ValueError("ipmd.reward_policy_replay_size must be >= 0.")
-        if not 0.0 <= float(self.reward_policy_replay_fraction) < 1.0:
-            raise ValueError("ipmd.reward_policy_replay_fraction must lie in [0, 1).")
+        if not 0.0 <= float(self.reward_policy_replay_fraction) <= 1.0:
+            raise ValueError("ipmd.reward_policy_replay_fraction must lie in [0, 1].")
+        if self.reward_policy_replay_mode not in {"reservoir", "fifo"}:
+            raise ValueError(
+                "ipmd.reward_policy_replay_mode must be 'reservoir' or 'fifo', got "
+                f"{self.reward_policy_replay_mode!r}."
+            )
+        alpha = float(self.reward_policy_replay_priority_alpha)
+        if alpha < 0.0 or not 0.0 <= float(self.reward_policy_replay_priority_beta) <= 1.0:
+            raise ValueError(
+                "ipmd.reward_policy_replay_priority_alpha must be >= 0 and "
+                "ipmd.reward_policy_replay_priority_beta in [0, 1]."
+            )
+        if alpha > 0.0 and (
+            self.reward_policy_replay_mode != "fifo"
+            or normalize_ipmd_reward_objective(self.reward_objective) != "logistic_ratio"
+        ):
+            raise ValueError(
+                "Prioritized replay (reward_policy_replay_priority_alpha > 0) needs "
+                "reward_policy_replay_mode='fifo' and reward_objective='logistic_ratio'."
+            )
+        if self.reward_absorbing_terminal and float(self.estimated_reward_done_penalty) != 0.0:
+            raise ValueError(
+                "ipmd.reward_absorbing_terminal replaces estimated_reward_done_penalty; "
+                "set the penalty to 0."
+            )
         if self.reward_prior_checkpoint is not None:
             if float(self.reward_prior_kappa) <= 0.0 or int(self.reward_prior_stride) < 1:
                 raise ValueError(
@@ -1590,12 +1642,27 @@ class IPMD(PPO):
 
             self._reward_target = copy.deepcopy(self.reward_estimator).requires_grad_(False)
         self._reward_target_tau = tau
-        self._reward_replay: ReservoirFeatureReplay | None = None
-        self._reward_current_policy_rows: int | None = None
-        if int(self.config.ipmd.reward_policy_replay_size) > 0:
-            self._reward_replay = ReservoirFeatureReplay(
-                int(self.config.ipmd.reward_policy_replay_size), int(self._reward_input_dim), self.device
-            )
+        self._reward_replay: ReservoirFeatureReplay | PrioritizedFifoFeatureReplay | None = None
+        # Set by _reward_pair_inputs when the replay is on: the current batch's
+        # policy rows (for the current-rows AUC) and, for the FIFO replay, the
+        # drawn slots and importance weights of the replay rows.
+        self._reward_current_policy_input: Tensor | None = None
+        self._reward_replay_slots: Tensor | None = None
+        self._reward_replay_weights: Tensor | None = None
+        cfg_replay = self.config.ipmd
+        if int(cfg_replay.reward_policy_replay_size) > 0:
+            if cfg_replay.reward_policy_replay_mode == "fifo":
+                self._reward_replay = PrioritizedFifoFeatureReplay(
+                    int(cfg_replay.reward_policy_replay_size),
+                    int(self._reward_input_dim),
+                    self.device,
+                    alpha=float(cfg_replay.reward_policy_replay_priority_alpha),
+                    beta=float(cfg_replay.reward_policy_replay_priority_beta),
+                )
+            else:
+                self._reward_replay = ReservoirFeatureReplay(
+                    int(cfg_replay.reward_policy_replay_size), int(self._reward_input_dim), self.device
+                )
         self.reward_estimator.to(self.device)
         self.reward_optim: torch.optim.Optimizer | None = None
 
@@ -2911,6 +2978,8 @@ class IPMD(PPO):
                 est_reward = self._apply_reward_done_controls(
                     rollout, est_reward, r_hat, scale=scale, driving=driving
                 )
+                if bool(cfg.reward_absorbing_terminal):
+                    est_reward = self._apply_absorbing_terminal(rollout, est_reward, scale=scale)
 
             if self._use_estimated_rewards_for_ppo:
                 assert est_reward is not None
@@ -3033,6 +3102,35 @@ class IPMD(PPO):
         if done is None:
             return est_reward
         return torch.where(done, torch.zeros_like(est_reward), est_reward)
+
+    def _reward_hat_floor(self) -> float:
+        """Lower bound of ``r_hat``: the absorbing state's reward (DAC)."""
+        if self._reward_ppo_squash in {"sigmoid", "amp", "affine_frozen"}:
+            return 0.0
+        floor = self.config.ipmd.estimated_reward_clamp_min
+        if floor is None or not math.isfinite(float(floor)):
+            raise ValueError(
+                "reward_absorbing_terminal with reward_ppo_squash='none' needs a finite "
+                "ipmd.estimated_reward_clamp_min (the floor of the reward class)."
+            )
+        return float(floor)
+
+    def _apply_absorbing_terminal(
+        self, rollout: TensorDict, est_reward: Tensor, *, scale: float
+    ) -> Tensor:
+        """Terminated rows pay ``scale * r_floor / (1 - gamma)``; truncated rows untouched."""
+        done = rollout_done_mask(rollout, est_reward)
+        if done is None:
+            return est_reward
+        truncated_key: BatchKey = ("next", "truncated")
+        if truncated_key in rollout.keys(True):
+            truncated = rollout[truncated_key].to(device=est_reward.device, dtype=torch.bool)
+            while truncated.ndim < est_reward.ndim:
+                truncated = truncated.unsqueeze(-1)
+            done = done & ~truncated
+        gamma = float(self.config.loss.gamma)
+        value = scale * self._reward_hat_floor() / (1.0 - gamma)
+        return torch.where(done, torch.full_like(est_reward, value), est_reward)
 
     def _effective_est_reward_weight(self) -> float:
         """``est_reward_weight`` under the linear ramp (unit: driving rollouts)."""
@@ -3361,10 +3459,14 @@ class IPMD(PPO):
         metrics["expert_reward_std"] = r_exp.std()
         metrics["reward_separation_auc"] = reward_separation_auc(r_exp, r_pi)
         # The policy side mixes in replay rows when the replay is on; this AUC
-        # reads only the current rollout's rows, so arms with and without the
-        # replay stay comparable. Current rows come first (_reward_pair_inputs).
-        current = self._reward_current_policy_rows
-        r_pi_current = r_pi.reshape(-1)[:current] if current is not None else r_pi
+        # scores the current batch's own policy rows (one extra forward pass),
+        # so arms with and without the replay stay comparable.
+        current_input = self._reward_current_policy_input
+        if current_input is None:
+            r_pi_current = r_pi
+        else:
+            with torch.no_grad():
+                r_pi_current = self.reward_estimator(current_input).reshape(-1)
         metrics["reward_separation_auc_current"] = reward_separation_auc(r_exp, r_pi_current)
         metrics["reward_saturation_frac"] = reward_saturation_fraction(
             torch.cat([r_pi.reshape(-1), r_exp.reshape(-1)], dim=0)
@@ -3384,14 +3486,24 @@ class IPMD(PPO):
             requires_grad=expert_requires_grad,
         )
         replay = self._reward_replay
-        self._reward_current_policy_rows = None
+        self._reward_current_policy_input = None
+        self._reward_replay_slots = None
+        self._reward_replay_weights = None
         if replay is not None and replay.size > 0:
             rows = int(r_pi_input.shape[0])
             from_replay = int(round(float(self.config.ipmd.reward_policy_replay_fraction) * rows))
             if from_replay > 0:
-                self._reward_current_policy_rows = rows - from_replay
+                self._reward_current_policy_input = r_pi_input.detach()
+                if isinstance(replay, PrioritizedFifoFeatureReplay):
+                    replay_rows, slots, weights = replay.sample(from_replay)
+                    self._reward_replay_slots = slots
+                    self._reward_replay_weights = weights
+                else:
+                    replay_rows = replay.sample(from_replay)
+                # Current rows first, replay rows last: the loss and the
+                # priority update index the replay rows as the tail.
                 r_pi_input = torch.cat(
-                    [r_pi_input[from_replay:], replay.sample(from_replay).to(r_pi_input.dtype)],
+                    [r_pi_input[from_replay:], replay_rows.to(r_pi_input.dtype)],
                     dim=0,
                 )
         return r_pi_input, r_exp_input
@@ -3421,10 +3533,31 @@ class IPMD(PPO):
         eps = float(self.config.ipmd.reward_label_smoothing)
         target_exp = torch.full_like(logits_exp, 1.0 - eps)
         target_pi = torch.full_like(logits_pi, eps)
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            torch.cat([logits_exp.reshape(-1), logits_pi.reshape(-1)], dim=0),
-            torch.cat([target_exp.reshape(-1), target_pi.reshape(-1)], dim=0),
-        )
+        replay_weights = self._reward_replay_weights
+        if replay_weights is None:
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                torch.cat([logits_exp.reshape(-1), logits_pi.reshape(-1)], dim=0),
+                torch.cat([target_exp.reshape(-1), target_pi.reshape(-1)], dim=0),
+            )
+        else:
+            # Prioritized FIFO replay: the tail of the policy rows came from
+            # the replay; weight them by their importance weights (mean 1) and
+            # refresh their priorities with their per-row loss.
+            per_row_pi = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits_pi.reshape(-1), target_pi.reshape(-1), reduction="none"
+            )
+            per_row_exp = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits_exp.reshape(-1), target_exp.reshape(-1), reduction="none"
+            )
+            tail = int(replay_weights.shape[0])
+            pi_weights = torch.ones_like(per_row_pi)
+            pi_weights[-tail:] = replay_weights.to(pi_weights.dtype)
+            bce = torch.cat([per_row_exp, pi_weights * per_row_pi]).mean()
+            assert self._reward_replay_slots is not None
+            assert isinstance(self._reward_replay, PrioritizedFifoFeatureReplay)
+            self._reward_replay.update_priorities(
+                self._reward_replay_slots, per_row_pi[-tail:].detach()
+            )
         if penalized:
             r1_expert = reward_grad_penalty_from_input(logits_exp, r_exp_input)
         else:

@@ -85,4 +85,95 @@ class ReservoirFeatureReplay(nn.Module):
         return self.rows[index]
 
 
-__all__ = ["ReservoirFeatureReplay", "polyak_update"]
+class PrioritizedFifoFeatureReplay(nn.Module):
+    """First-in-first-out replay of policy reward inputs with PER sampling (2026-10-14).
+
+    The reservoir keeps a uniform sample of the whole history, so the
+    classifier's optimum ``log p_E / p_bar`` never forgets the earliest
+    policies. Here old rows leave first-in-first-out, as in a SAC replay, so
+    ``p_bar`` is the mixture of the policies of the last
+    ``capacity / rows_per_rollout`` rollouts and approaches the current policy
+    as training slows down.
+
+    Sampling follows prioritized experience replay (Schaul et al. 2016) with
+    the per-row classifier loss in place of the TD error:
+
+        P(i) = p_i^alpha / sum_j p_j^alpha,     p_i = loss_i + eps
+        w_i  = (N P(i))^-beta,  normalized to mean 1 over the drawn batch
+
+    New rows enter at the running maximum priority so each is likely drawn
+    at least once. With ``beta = 1`` the weighted loss is an unbiased estimate
+    of the uniform-over-buffer loss, so prioritizing changes which rows the
+    gradient sees, not the optimum. ``alpha = 0`` is uniform FIFO sampling.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        dim: int,
+        device: torch.device | str,
+        *,
+        alpha: float = 0.0,
+        beta: float = 1.0,
+        eps: float = 1e-3,
+    ) -> None:
+        super().__init__()
+        if capacity <= 0 or dim <= 0:
+            raise ValueError("capacity and dim must be positive.")
+        if alpha < 0.0 or not 0.0 <= beta <= 1.0 or eps <= 0.0:
+            raise ValueError("need alpha >= 0, beta in [0, 1] and eps > 0.")
+        self.capacity = int(capacity)
+        self.dim = int(dim)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.eps = float(eps)
+        self.register_buffer("rows", torch.zeros(self.capacity, self.dim, device=device))
+        self.register_buffer("priority", torch.ones(self.capacity, device=device))
+        self.register_buffer("max_priority", torch.ones((), device=device))
+        self.register_buffer("seen", torch.zeros((), dtype=torch.long, device=device))
+
+    @property
+    def size(self) -> int:
+        return int(min(int(self.seen.item()), self.capacity))
+
+    @torch.no_grad()
+    def add(self, rows: Tensor) -> None:
+        rows = rows.detach().reshape(-1, self.dim).to(self.rows.device, self.rows.dtype)
+        if rows.shape[0] > self.capacity:
+            rows = rows[-self.capacity :]
+        count = int(rows.shape[0])
+        if count == 0:
+            return
+        slots = (int(self.seen.item()) + torch.arange(count, device=rows.device)) % self.capacity
+        self.rows[slots] = rows
+        self.priority[slots] = self.max_priority
+        self.seen += count
+
+    @torch.no_grad()
+    def sample(self, count: int) -> tuple[Tensor, Tensor, Tensor]:
+        """``(rows, slots, weights)``; weights have mean 1 over the batch."""
+        size = self.size
+        if size == 0:
+            raise RuntimeError("PrioritizedFifoFeatureReplay.sample called on an empty buffer.")
+        count = int(count)
+        if self.alpha == 0.0:
+            slots = torch.randint(0, size, (count,), device=self.rows.device)
+            return self.rows[slots], slots, torch.ones(count, device=self.rows.device)
+        scaled = self.priority[:size].pow(self.alpha)
+        cdf = torch.cumsum(scaled, dim=0)
+        total = cdf[-1]
+        draws = torch.rand(count, device=self.rows.device) * total
+        slots = torch.searchsorted(cdf, draws).clamp_max(size - 1)
+        prob = scaled[slots] / total
+        weights = (size * prob).pow(-self.beta)
+        weights = weights / weights.mean()
+        return self.rows[slots], slots, weights
+
+    @torch.no_grad()
+    def update_priorities(self, slots: Tensor, loss: Tensor) -> None:
+        priority = loss.detach().reshape(-1).float().clamp_min(0.0) + self.eps
+        self.priority[slots] = priority
+        self.max_priority.copy_(torch.maximum(self.max_priority, priority.max()))
+
+
+__all__ = ["PrioritizedFifoFeatureReplay", "ReservoirFeatureReplay", "polyak_update"]
