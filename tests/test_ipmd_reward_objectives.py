@@ -830,3 +830,25 @@ def test_ipmd_diff_objective_is_bitwise_the_historical_path() -> None:
     assert metrics["reward_separation_auc"].item() == 0.0
     assert metrics["reward_saturation_frac"].item() == 0.0
     assert metrics["loss_reward_objective"].item() == 0.0
+
+
+def test_current_rows_auc_excludes_replay_rows() -> None:
+    """With the replay on, ``reward_separation_auc_current`` reads only the
+    current rollout's policy rows, while ``reward_separation_auc`` also sees
+    the replay rows. A replay holding expert-like rows lowers the mixed AUC
+    but not the current-rows AUC."""
+    agent, _ = _make_agent(
+        reward_objective="logistic_ratio",
+        reward_output_activation="none",
+        reward_policy_replay_size=4096,
+        reward_policy_replay_fraction=0.5,
+    )
+    assert agent._reward_replay is not None
+    generator = torch.Generator().manual_seed(0)
+    expert_like = torch.cat([torch.randn(4096, 1, generator=generator) + 1.0, torch.zeros(4096, 2)], dim=-1)
+    agent._reward_replay.add(expert_like)
+    metrics = _train_objective(agent, steps=200, batch=512, seed=1)
+    current = metrics["reward_separation_auc_current"].item()
+    mixed = metrics["reward_separation_auc"].item()
+    assert current > 0.8
+    assert current - mixed > 0.1

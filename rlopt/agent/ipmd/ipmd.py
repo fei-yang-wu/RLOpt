@@ -1591,6 +1591,7 @@ class IPMD(PPO):
             self._reward_target = copy.deepcopy(self.reward_estimator).requires_grad_(False)
         self._reward_target_tau = tau
         self._reward_replay: ReservoirFeatureReplay | None = None
+        self._reward_current_policy_rows: int | None = None
         if int(self.config.ipmd.reward_policy_replay_size) > 0:
             self._reward_replay = ReservoirFeatureReplay(
                 int(self.config.ipmd.reward_policy_replay_size), int(self._reward_input_dim), self.device
@@ -2748,6 +2749,7 @@ class IPMD(PPO):
         """Metrics every objective reports on its update batch (plan 5.4 B2)."""
         return [
             "reward_separation_auc",
+            "reward_separation_auc_current",
             "reward_saturation_frac",
             "loss_reward_objective",
             "reward_linear_delta_norm",
@@ -3358,6 +3360,12 @@ class IPMD(PPO):
         metrics["expert_reward_mean"] = r_exp.mean()
         metrics["expert_reward_std"] = r_exp.std()
         metrics["reward_separation_auc"] = reward_separation_auc(r_exp, r_pi)
+        # The policy side mixes in replay rows when the replay is on; this AUC
+        # reads only the current rollout's rows, so arms with and without the
+        # replay stay comparable. Current rows come first (_reward_pair_inputs).
+        current = self._reward_current_policy_rows
+        r_pi_current = r_pi.reshape(-1)[:current] if current is not None else r_pi
+        metrics["reward_separation_auc_current"] = reward_separation_auc(r_exp, r_pi_current)
         metrics["reward_saturation_frac"] = reward_saturation_fraction(
             torch.cat([r_pi.reshape(-1), r_exp.reshape(-1)], dim=0)
         )
@@ -3376,10 +3384,12 @@ class IPMD(PPO):
             requires_grad=expert_requires_grad,
         )
         replay = self._reward_replay
+        self._reward_current_policy_rows = None
         if replay is not None and replay.size > 0:
             rows = int(r_pi_input.shape[0])
             from_replay = int(round(float(self.config.ipmd.reward_policy_replay_fraction) * rows))
             if from_replay > 0:
+                self._reward_current_policy_rows = rows - from_replay
                 r_pi_input = torch.cat(
                     [r_pi_input[from_replay:], replay.sample(from_replay).to(r_pi_input.dtype)],
                     dim=0,
