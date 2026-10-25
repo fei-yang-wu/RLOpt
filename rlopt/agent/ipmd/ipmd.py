@@ -700,6 +700,32 @@ class IPMDConfig(PPOConfig):
     critic_lr_final: float | None = None
     """End-of-budget critic learning rate. Required when the schedule is not constant."""
 
+    critic_extra_epochs: int = 0
+    """Critic-only passes over the rollout AFTER the joint PPO epochs.
+
+    ``0`` (default) changes nothing. Each pass shuffles the collected rollout
+    into ``critic_extra_minibatches`` minibatches and, per minibatch, steps the
+    main optimizer on the PPO critic loss alone (the recipe's
+    ``loss.loss_critic_type``, ``ppo.clip_value`` and ``ppo.critic_coeff``,
+    against the GAE ``value_target`` computed once for this rollout, with the
+    collected ``state_value`` as the clip anchor). The actor's parameters get no
+    gradient, so the joint epochs -- and therefore the actor update, the KL
+    learning-rate rule and the reported PPO loss metrics -- are unchanged. The
+    critic's input normalizers are frozen during these passes so their running
+    statistics still see each transition exactly as many times as before.
+
+    Why this knob exists (2026-10-25): the full-batch recipe gives the critic
+    3 optimizer steps per 393k-frame rollout, the WMBPTT critic gets 20 per
+    41k-frame iteration. This isolates "more, smaller critic steps on the same
+    targets" as the one PPO-side change. Requires split actor/critic learning
+    rates (the critic parameter group). Extra steps are NOT counted in
+    ``updates_completed``, so reward/BC/HL-skill cadences keyed on it are
+    unaffected.
+    """
+
+    critic_extra_minibatches: int = 1
+    """Minibatches per critic-only pass (``critic_extra_epochs``). ``1`` = full batch."""
+
     first_layer_bias_lr_scale: float = 1.0
     """Learning-rate multiplier for the FIRST linear layer's bias, actor and critic.
 
@@ -1048,6 +1074,23 @@ class IPMDConfig(PPOConfig):
                     f"{self.critic_lr_final!r}."
                 )
                 raise ValueError(msg)
+        if int(self.critic_extra_epochs) < 0:
+            msg = (
+                "ipmd.critic_extra_epochs must be >= 0, got "
+                f"{self.critic_extra_epochs!r}."
+            )
+            raise ValueError(msg)
+        self.critic_extra_epochs = int(self.critic_extra_epochs)
+        self.critic_extra_minibatches = require_positive_int(
+            "ipmd.critic_extra_minibatches", self.critic_extra_minibatches
+        )
+        if self.critic_extra_epochs > 0 and self.critic_learning_rate is None:
+            msg = (
+                "ipmd.critic_extra_epochs > 0 requires ipmd.critic_learning_rate "
+                "(the critic-only steps drive the named critic parameter group, "
+                "which only exists under split actor/critic learning rates)."
+            )
+            raise ValueError(msg)
         self.rollout_bc_loss_type = str(self.rollout_bc_loss_type).strip().lower()
         if self.rollout_bc_loss_type not in {"nll", "mse"}:
             msg = (
@@ -3832,7 +3875,78 @@ class IPMD(PPO):
                 # optim.kl_adapt_step="iteration"; a no-op otherwise.
                 self._flush_kl_lr_adaptation(self.config.optim)
 
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/critic_extra_updates"
+            ):
+                critic_extra_metrics = self._run_critic_extra_updates(
+                    iteration.rollout
+                )
+            iteration.metrics.update(
+                {f"train/{key}": value for key, value in critic_extra_metrics.items()}
+            )
+
         iteration.learn_time = time.perf_counter() - learn_start
         losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
         for key, value in losses_mean.items():  # type: ignore[attr-defined]
             iteration.metrics[f"train/{key}"] = value.item()  # type: ignore[attr-defined]
+
+    def _run_critic_extra_updates(self, rollout: TensorDict) -> dict[str, float]:
+        """Critic-only minibatch steps on this rollout's fixed GAE targets.
+
+        See :attr:`IPMDConfig.critic_extra_epochs`. ``rollout`` is the
+        post-``pre_iteration_compute`` rollout (``value_target`` and the
+        collected ``state_value`` present). Returns per-iteration means of the
+        critic loss, the value-clip fraction and the gradient norm over the
+        extra steps, plus the step count; ``{}`` when the knob is off.
+        """
+        epochs = int(self.config.ipmd.critic_extra_epochs)
+        if epochs <= 0:
+            return {}
+        num_minibatches = int(self.config.ipmd.critic_extra_minibatches)
+        flat = rollout if rollout.batch_dims == 1 else rollout.reshape(-1)
+        total = int(flat.batch_size[0])
+        if total <= 0:
+            return {}
+        # The compiled wrapper exposes the original module; ``loss_critic`` is
+        # a plain method call on it (not traced), so minibatch shapes are free.
+        loss_module = getattr(self.loss_module, "_orig_mod", self.loss_module)
+        loss_sum = torch.zeros((), device=self.device)
+        clip_sum = torch.zeros((), device=self.device)
+        grad_sum = torch.zeros((), device=self.device)
+        steps = 0
+        with self._freeze_value_normalizer_updates():
+            for _epoch_idx in range(epochs):
+                perm = torch.randperm(total, device=flat.device)
+                for index in perm.chunk(num_minibatches):
+                    if index.numel() == 0:
+                        continue
+                    batch = flat[index]
+                    self.optim.zero_grad(set_to_none=True)
+                    loss_critic, clip_fraction, _explained = loss_module.loss_critic(
+                        batch
+                    )
+                    if loss_critic.ndim > 0:
+                        loss_critic = loss_critic.mean()
+                    loss_critic.backward()
+                    # Only the critic's parameters carry gradients here; the
+                    # optimizer skips parameters whose ``.grad`` is None, so
+                    # the actor groups (and their Adam moments) stay put.
+                    grad_norm = clip_grad_norm_(
+                        self._grad_clip_params, self._max_grad_norm
+                    )
+                    self.optim.step()
+                    loss_sum = loss_sum + loss_critic.detach()
+                    if clip_fraction is not None:
+                        clip_sum = clip_sum + clip_fraction.detach().float().mean()
+                    grad_sum = grad_sum + grad_norm.detach()
+                    steps += 1
+        self.optim.zero_grad(set_to_none=True)
+        if steps == 0:
+            return {}
+        scale = float(steps)
+        return {
+            "critic_extra_steps": float(steps),
+            "critic_extra_loss_critic": (loss_sum / scale).item(),
+            "critic_extra_value_clip_fraction": (clip_sum / scale).item(),
+            "critic_extra_grad_norm": (grad_sum / scale).item(),
+        }

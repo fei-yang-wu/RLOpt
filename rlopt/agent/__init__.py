@@ -34,6 +34,7 @@ from rlopt.agent.ipmd import (
 )
 from rlopt.agent.ppo import PPO, PPORLOptConfig
 from rlopt.agent.sac import SAC, FastSAC, FastSACRLOptConfig, SACRLOptConfig
+from rlopt.agent.wm_bptt import WMBPTT, WMBPTTConfig, WMBPTTRLOptConfig
 from rlopt.agent.skill_commander import (
     DiffusionSkillCommander,
     DiTLatentSkillCommander,
@@ -45,6 +46,9 @@ from rlopt.agent.skill_commander import (
 )
 
 __all__ = [
+    "WMBPTT",
+    "WMBPTTConfig",
+    "WMBPTTRLOptConfig",
     "AMP",
     "ASE",
     "GAIL",
