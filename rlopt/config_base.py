@@ -297,6 +297,17 @@ class OptimizerConfig:
     actually assumes. Left at ``"update"`` so existing runs are unchanged.
     """
 
+    kl_sample_size: int | None = None
+    """Rows of each minibatch the post-update KL diagnostic is evaluated on.
+
+    ``None`` (default) evaluates the whole minibatch, unchanged. A positive
+    value draws a fresh uniform subset of that many rows (leading batch
+    dimension) per update from a dedicated generator seeded from ``seed``, so
+    the global RNG stream is untouched, and runs the extra no-grad policy
+    forward on that subset only. It changes the KL that feeds the adaptive-LR
+    rule from a full-batch mean to a subsample estimate.
+    """
+
     min_lr: float | None = 1e-6
     """Lower bound for adaptive learning rate. None disables clamping."""
 

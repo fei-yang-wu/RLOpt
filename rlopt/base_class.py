@@ -1452,11 +1452,48 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         ) or "scale" not in sampled_tensordict.keys(True):
             msg = "Expected 'loc' and 'scale' in sampled_tensordict for KL computation."
             raise KeyError(msg)
+        sample_rows = self._kl_sample_rows(sampled_tensordict)
+        if sample_rows is not None:
+            # Gather only what the diagnostic reads (optim.kl_sample_size).
+            sampled_tensordict = sampled_tensordict.select(
+                *policy_op.in_keys, "loc", "scale"
+            )[sample_rows]
+            obs_td = sampled_tensordict.select(*policy_op.in_keys).detach()
         return {
             "obs_td": obs_td,
             "old_loc": sampled_tensordict.get("loc").detach(),
             "old_scale": sampled_tensordict.get("scale").detach(),
         }
+
+    def _kl_sample_rows(self, sampled_tensordict: TensorDict) -> Tensor | None:
+        """Row indices for the KL diagnostic, or None for the whole minibatch.
+
+        ``optim.kl_sample_size`` rows of the leading batch dimension, drawn
+        uniformly without replacement from a generator owned by this method
+        (seeded from ``config.seed``), so enabling it does not shift any other
+        consumer of the global RNG.
+        """
+        optim_cfg = getattr(self.config, "optim", None)
+        size = getattr(optim_cfg, "kl_sample_size", None)
+        if size is None:
+            return None
+        size = int(size)
+        if size <= 0:
+            msg = f"optim.kl_sample_size must be positive or None; got {size}."
+            raise ValueError(msg)
+        if sampled_tensordict.batch_dims == 0:
+            return None
+        rows = int(sampled_tensordict.batch_size[0])
+        if rows <= size:
+            return None
+        device = torch.device(sampled_tensordict.device or self.device)
+        generator = getattr(self, "_kl_sample_generator", None)
+        if generator is None or self._kl_sample_generator_device != device:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(getattr(self.config, "seed", 0)) + 0x4B4C)
+            self._kl_sample_generator = generator
+            self._kl_sample_generator_device = device
+        return torch.randperm(rows, device=device, generator=generator)[:size]
 
     def _compute_kl_after_update(
         self, kl_context: dict[str, Tensor], policy_op: TensorDictModule

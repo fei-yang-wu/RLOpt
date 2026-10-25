@@ -574,6 +574,12 @@ class LoggingManager:
             wandb_kwargs["config"] = asdict(self._config)  # type: ignore[assignment]
         except Exception:  # pragma: no cover - defensive
             pass
+        if isinstance(wandb_kwargs.get("config"), dict):
+            from rlopt.collect_fastpath import describe as _collect_fastpath_state
+
+            # Opt-in, bit-exact collection fast paths: recorded so a run's
+            # collection code path is traceable from its W&B config.
+            wandb_kwargs["config"]["rlopt_collect_fastpath"] = _collect_fastpath_state()
 
         # TorchRL's get_logger routes the file-backed loggers to ``logger_name``
         # and ignores the ``log_dir`` kwarg entirely, so passing the component

@@ -1156,6 +1156,10 @@ class IPMD(PPO):
     _REWARD_MODEL_TYPES = IPMD_REWARD_MODEL_TYPES
     _REWARD_OUTPUT_ACTIVATIONS = IPMD_REWARD_OUTPUT_ACTIVATIONS
     _COMMAND_SOURCES = IPMD_COMMAND_SOURCES
+    # `update` -> `_backward_ppo_terms` evaluates the PPO loss through
+    # `_update_loss_forward`, so `ppo.update_amp_dtype` applies to it. BC,
+    # reward, latent-posterior and HL-skill terms stay float32.
+    _update_amp_aware = True
 
     @staticmethod
     def _normalize_command_source(command_source: str) -> str:
@@ -1184,6 +1188,14 @@ class IPMD(PPO):
     ):
         self.config: IPMDRLOptConfig = config
         self.config.ipmd.validate()
+        if getattr(self.config.ipmd, "update_amp_dtype", None) is not None:
+            # IPMDConfig inherits every PPOConfig field, but the update reads
+            # the `ppo` section; refuse the copy that would be ignored.
+            msg = (
+                "ipmd.update_amp_dtype is not read; set ppo.update_amp_dtype "
+                "(Hydra: agent.ppo.update_amp_dtype=bf16) instead."
+            )
+            raise ValueError(msg)
         if bool(self.config.ipmd.hl_skill_finetune_enabled) and bool(
             self.config.compile.compile
         ):
@@ -2657,7 +2669,7 @@ class IPMD(PPO):
                         renewal_mask,
                     ),
                 )
-        loss: TensorDict = self.loss_module(batch)
+        loss: TensorDict = self._update_loss_forward(batch)
         extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
         (
             loss["loss_critic"]
@@ -3494,7 +3506,11 @@ class IPMD(PPO):
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
-        self.data_buffer.extend(self._rollout_for_buffer(rollout))
+        # ppo.update_amp_dtype: the bf16 old log-prob for the PPO ratio is
+        # attached here, before any optimizer step of the iteration.
+        self.data_buffer.extend(
+            self._attach_amp_old_log_prob(self._rollout_for_buffer(rollout))
+        )
         return rollout
 
     def _set_reward_policy_condition_from_batch(
@@ -3812,9 +3828,12 @@ class IPMD(PPO):
                         if self.lr_scheduler and self.lr_scheduler_step == "update":
                             self.lr_scheduler.step()
                         if kl_context is not None:
-                            kl_approx = self._compute_kl_after_update(
-                                kl_context, metadata.policy_operator
-                            )
+                            with self._profile_iteration_phase(
+                                iteration.phase_times, "learn/policy_updates/kl_after"
+                            ):
+                                kl_approx = self._compute_kl_after_update(
+                                    kl_context, metadata.policy_operator
+                                )
                             if kl_approx is not None:
                                 loss.set("kl_approx", kl_approx.detach())
                                 self._record_kl_for_lr_adaptation(
