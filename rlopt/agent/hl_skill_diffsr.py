@@ -24,6 +24,7 @@ from rlopt.agent.hl_skill_encoder import (
     build_skill_encoder,
 )
 from rlopt.agent.ipmd.module import BilinearSR, build_bilinear_sr
+from rlopt.collect_fastpath import COLLECT_FASTPATH
 from rlopt.env_interface import require_imitation_interface
 
 if TYPE_CHECKING:  # skill_commander imports this module; keep the planner lazy.
@@ -2167,9 +2168,14 @@ class FrozenHighLevelSkillCommandSampler:
     def _encode_current_macro_batch(
         self,
         env_ids: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        *,
+        with_initial_z: bool = True,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
         # Keep the five-tensor return contract used by planner adapters. Only
         # phi modes need the past source; z deployment retains its old gather.
+        # ``with_initial_z=False`` skips the frozen anchor encoder and returns
+        # ``None`` in its place; `sample_for_step` passes it when nothing reads
+        # the anchor latent.
         history_steps = (
             int(self.config.source_history_steps) if self.command_mode != "z" else 0
         )
@@ -2202,9 +2208,13 @@ class FrozenHighLevelSkillCommandSampler:
             )
         else:
             z = self.skill_encoder(state, _encoder_input_window(self.config, future_window))
-        initial_z = self.initial_skill_encoder(
-            state,
-            _encoder_input_window(self.config, future_window),
+        initial_z = (
+            self.initial_skill_encoder(
+                state,
+                _encoder_input_window(self.config, future_window),
+            )
+            if with_initial_z
+            else None
         )
         if history_steps > 0:
             state_history = _macro_batch_state_history(
@@ -2856,9 +2866,27 @@ class FrozenHighLevelSkillCommandSampler:
                 torch.nonzero(renew_mask, as_tuple=False).reshape(-1) if renew else None
             )
         if renew:
-            z, state, future_window, target, initial_z = (
-                self._encode_current_macro_batch(env_ids.to(self.device))
+            encode = self._encode_current_macro_batch
+            # The anchor latent feeds only the legacy finetuning cache. When
+            # nothing reads it -- and the encode step is this class's own
+            # method, not a planner adapter's replacement or a subclass
+            # override that may use it -- skip the frozen encoder's forward.
+            # That forward has no state or random draws, so skipping it leaves
+            # every command and rollout tensor unchanged.
+            skip_initial_z = (
+                COLLECT_FASTPATH
+                and not (self.finetune_enabled and self.online_objective == "legacy")
+                and getattr(encode, "__func__", None)
+                is FrozenHighLevelSkillCommandSampler._encode_current_macro_batch
             )
+            if skip_initial_z:
+                z, state, future_window, target, initial_z = encode(
+                    env_ids.to(self.device), with_initial_z=False
+                )
+            else:
+                z, state, future_window, target, initial_z = encode(
+                    env_ids.to(self.device)
+                )
             source = state
             if self.command_mode != "z" and self.config.source_history_steps > 0:
                 assert self._current_command_source is not None

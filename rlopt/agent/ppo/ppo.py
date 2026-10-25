@@ -45,6 +45,12 @@ from torchrl.objectives.value.advantages import GAE
 from torchrl.record.loggers import Logger
 from tqdm.rich import tqdm
 
+from rlopt.agent.ppo.mixed_precision import (
+    AMP_OLD_LOG_PROB_KEY,
+    install_update_amp_boundaries,
+    resolve_update_amp_dtype,
+    update_autocast,
+)
 from rlopt.base_class import (
     BaseAlgorithm,
     IterationData,
@@ -287,6 +293,22 @@ class PPOConfig:
     rnn_num_layers: int = 1
     """Number of LSTM layers when ``rnn_hidden_size > 0``."""
 
+    update_amp_dtype: str | None = None
+    """Autocast dtype for the actor-critic loss forward of each gradient step.
+
+    ``None`` (default) keeps the whole update in float32 and is bit-identical
+    to the code before the key existed. ``"bf16"`` runs the PPO loss-module
+    forward (actor and critic MLP trunks) under ``torch.autocast`` with
+    bfloat16; the backward follows. Master weights, optimizer state, the
+    running input normalizers, each trunk's output projection, the
+    log-prob / entropy / ratio / critic-loss math, GAE, the collector and the
+    post-update KL diagnostic stay float32 -- see
+    ``rlopt/agent/ppo/mixed_precision.py``. ``"fp16"`` is rejected (it needs
+    a gradient scaler). Honoured by ``PPO.update`` and IPMD's PPO terms; an
+    algorithm that overrides those without opting in raises at construction
+    instead of ignoring the key.
+    """
+
 
 @dataclass
 class PPORLOptConfig(RLOptConfig):
@@ -346,6 +368,13 @@ class PPOIterationData(IterationData):
 
 
 class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
+    # This class's ``update`` runs its loss forward through
+    # ``_update_loss_forward``, so it honours ``ppo.update_amp_dtype``. A class
+    # that overrides ``update`` (or IPMD's ``_backward_ppo_terms``) must set
+    # this in its own body after routing through the helper; otherwise
+    # ``_validate_update_amp_support`` refuses the key instead of ignoring it.
+    _update_amp_aware = True
+
     def __init__(
         self,
         env: TransformedEnv,
@@ -377,6 +406,16 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self._grad_clip_params: list[Tensor] = [  # type: ignore[attr-defined]
             param for group in self.optim.param_groups for param in group["params"]
         ]
+
+        # Opt-in mixed precision for the update forward (ppo.update_amp_dtype).
+        # Unset, nothing is installed and the update is unchanged.
+        self._update_amp_dtype = resolve_update_amp_dtype(
+            getattr(self.config.ppo, "update_amp_dtype", None)
+        )
+        self._update_amp_hooks: list[Any] = []
+        if self._update_amp_dtype is not None:
+            self._validate_update_amp_support()
+            self._update_amp_hooks = self._install_update_amp_boundaries()
 
         # Compile if requested
         self._compile_components()
@@ -881,6 +920,163 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             penalty = sum(g.pow(2).sum(dim=-1) for g in grads).mean()
         return coeff * penalty, {"loss_lcp_penalty": penalty.detach()}
 
+    def _validate_update_amp_support(self) -> None:
+        """Refuse ``ppo.update_amp_dtype`` on an update path that would ignore it.
+
+        The class that defines each update entry point this agent uses must
+        declare ``_update_amp_aware = True`` in its own body, i.e. route its
+        loss forward through :meth:`_update_loss_forward`.
+        """
+        for name in ("update", "_backward_ppo_terms"):
+            owner = next(
+                (cls for cls in type(self).__mro__ if name in cls.__dict__), None
+            )
+            if owner is None:
+                continue
+            if not owner.__dict__.get("_update_amp_aware", False):
+                msg = (
+                    "ppo.update_amp_dtype is set, but "
+                    f"{owner.__name__}.{name} does not run its loss forward "
+                    "through _update_loss_forward; the key would be inert. "
+                    "Unset it for this algorithm."
+                )
+                raise ValueError(msg)
+        ppo_cfg = getattr(getattr(self, "config", None), "ppo", None)
+        if int(getattr(ppo_cfg, "rnn_hidden_size", 0) or 0) > 0:
+            # The old log-prob re-evaluation (_attach_amp_old_log_prob) runs
+            # flat row chunks; recurrent minibatches are [env, T] sequences.
+            msg = "ppo.update_amp_dtype is not supported with a recurrent actor."
+            raise ValueError(msg)
+
+    def _install_update_amp_boundaries(self) -> list[Any]:
+        """Hook float32 boundaries onto the networks the PPO loss evaluates."""
+        actor = self.loss_module.actor_network
+        heads = [m for m in actor.modules() if isinstance(m, GaussianPolicyHead)]
+        if not heads:
+            msg = (
+                "ppo.update_amp_dtype needs the actor's GaussianPolicyHead to "
+                "return float32 loc/scale; none was found in the loss actor."
+            )
+            raise ValueError(msg)
+        output_modules: list[torch.nn.Module] = list(heads)
+        trunks: list[torch.nn.Module] = [head.base for head in heads]
+        critic = getattr(self.loss_module, "critic_network", None)
+        if critic is not None:
+            value_operators = [
+                m for m in critic.modules() if isinstance(m, ValueOperator)
+            ]
+            if not value_operators:
+                msg = (
+                    "ppo.update_amp_dtype needs a ValueOperator critic so the "
+                    "state value can be returned as float32; none was found."
+                )
+                raise ValueError(msg)
+            for operator in value_operators:
+                output_modules.append(operator.module)
+                trunks.append(operator.module)
+        return install_update_amp_boundaries(output_modules, trunks)
+
+    @contextmanager
+    def _frozen_policy_normalizers(self):
+        """Normalize actor inputs without moving their running statistics."""
+        actor = self.loss_module.actor_network
+        normalizers = [
+            m for m in actor.modules() if isinstance(m, RunningMeanStdCatInputs)
+        ]
+        training_states = [m.training for m in normalizers]
+        try:
+            for module in normalizers:
+                module.eval()
+            yield
+        finally:
+            for module, training in zip(normalizers, training_states, strict=True):
+                module.train(training)
+
+    def _attach_amp_old_log_prob(self, buffer_td: TensorDict) -> TensorDict:
+        """Store the bf16 re-evaluation of the old log-prob for the PPO ratio.
+
+        A no-op unless ``ppo.update_amp_dtype`` is set. Called on the rows
+        about to enter the replay buffer, i.e. before the first optimizer step
+        of the iteration, so the weights are still the collection weights.
+        The forward runs exactly as the autocast loss forward does
+        (``ClipPPOLoss._get_cur_log_prob`` under the same autocast and float32
+        boundaries) in chunks of exactly ``loss.mini_batch_size`` rows: the
+        GEMM kernels and their rounding depend on the row count, so a
+        different chunking leaves the noise in. The stored behaviour
+        log-prob, ``loc`` and ``scale`` are not modified.
+        """
+        amp_dtype = getattr(self, "_update_amp_dtype", None)
+        if amp_dtype is None:
+            return buffer_td
+        loss_module = self.loss_module
+        log_prob_key = loss_module.tensor_keys.sample_log_prob
+        action_key = loss_module.tensor_keys.action
+        stored = buffer_td.get(log_prob_key)
+        if not isinstance(stored, Tensor) or buffer_td.batch_dims != 1:
+            msg = (
+                "ppo.update_amp_dtype needs flat rollout rows with a tensor "
+                f"{log_prob_key!r}; got batch dims {buffer_td.batch_dims}."
+            )
+            raise RuntimeError(msg)
+        in_keys = [
+            key
+            for key in loss_module.actor_network.in_keys
+            if key not in ("loc", "scale")
+        ]
+        rows = int(buffer_td.batch_size[0])
+        chunk = max(1, min(int(self.config.loss.mini_batch_size), rows))
+        old_log_prob = torch.empty_like(stored)
+        with (
+            torch.no_grad(),
+            self._frozen_policy_normalizers(),
+            update_autocast(self.device, amp_dtype),
+        ):
+            for start in range(0, rows, chunk):
+                # Only the actor inputs and the action: the actor writes its
+                # loc/scale into this small tensordict, not into the rollout.
+                part = buffer_td[start : start + chunk].select(*in_keys, action_key)
+                log_prob, _dist, is_composite = loss_module._get_cur_log_prob(part)
+                if is_composite or not isinstance(log_prob, Tensor):
+                    msg = (
+                        "ppo.update_amp_dtype does not support composite "
+                        "action distributions."
+                    )
+                    raise RuntimeError(msg)
+                old_log_prob[start : start + chunk] = log_prob.reshape(
+                    old_log_prob[start : start + chunk].shape
+                ).to(old_log_prob.dtype)
+        buffer_td.set(AMP_OLD_LOG_PROB_KEY, old_log_prob)
+        return buffer_td
+
+    def _update_loss_forward(self, batch: TensorDict) -> TensorDict:
+        """Evaluate the PPO loss module for a gradient step.
+
+        Runs under bf16 autocast when ``ppo.update_amp_dtype`` is set and is
+        a plain ``self.loss_module(batch)`` call otherwise. Under autocast the
+        PPO ratio's old log-prob is the bf16 re-evaluation stored by
+        :meth:`_attach_amp_old_log_prob`, swapped in on a shallow copy so the
+        batch itself keeps the behaviour log-prob. Call ``backward`` outside
+        this method, i.e. outside the autocast region.
+        """
+        amp_dtype = getattr(self, "_update_amp_dtype", None)
+        if amp_dtype is None:
+            return self.loss_module(batch)
+        # TensorDict refuses bare `in`; membership goes through keys().
+        if AMP_OLD_LOG_PROB_KEY not in batch.keys():  # noqa: SIM118
+            msg = (
+                f"ppo.update_amp_dtype: the batch has no {AMP_OLD_LOG_PROB_KEY!r}; "
+                "it is attached when the rollout enters the replay buffer "
+                "(_attach_amp_old_log_prob)."
+            )
+            raise RuntimeError(msg)
+        loss_batch = batch.clone(False)
+        loss_batch.set(
+            self.loss_module.tensor_keys.sample_log_prob,
+            batch.get(AMP_OLD_LOG_PROB_KEY),
+        )
+        with update_autocast(self.device, amp_dtype):
+            return self.loss_module(loss_batch)
+
     def update(
         self, batch: TensorDict, num_network_updates: int
     ) -> tuple[TensorDict, int]:
@@ -888,7 +1084,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self.optim.zero_grad(set_to_none=True)
 
         # Forward pass PPO loss
-        loss: TensorDict = self.loss_module(batch)
+        loss: TensorDict = self._update_loss_forward(batch)
         critic_loss = loss["loss_critic"]
         extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
         actor_loss = loss["loss_objective"] + loss["loss_entropy"] + extra_actor_loss
@@ -1054,7 +1250,9 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
 
-        self.data_buffer.extend(self._rollout_for_buffer(rollout))
+        self.data_buffer.extend(
+            self._attach_amp_old_log_prob(self._rollout_for_buffer(rollout))
+        )
         return rollout
 
     def _rollout_for_buffer(self, rollout: TensorDict) -> TensorDict:
@@ -1181,9 +1379,12 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                         if self.lr_scheduler and self.lr_scheduler_step == "update":
                             self.lr_scheduler.step()
                         if kl_context is not None:
-                            kl_approx = self._compute_kl_after_update(
-                                kl_context, metadata.policy_operator
-                            )
+                            with self._profile_iteration_phase(
+                                iteration.phase_times, "learn/policy_updates/kl_after"
+                            ):
+                                kl_approx = self._compute_kl_after_update(
+                                    kl_context, metadata.policy_operator
+                                )
                             if kl_approx is not None:
                                 loss.set("kl_approx", kl_approx.detach())
                                 self._record_kl_for_lr_adaptation(
