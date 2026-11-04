@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from rlopt.agent.wm_bptt.agent import lambda_returns
+from rlopt.agent.wm_bptt.agent import lambda_returns, real_window_masks, real_window_targets, score_function_surrogate
 from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
 from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel, RunningNorm
 from rlopt.agent.wm_bptt.replay import SequenceReplay
@@ -74,6 +74,65 @@ def test_replay_history_backfills_from_episode_start() -> None:
     assert h["hist_actions"][0, :, 0].tolist() == [4.0, 4.0, 4.0, 5.0]
     h = rp.history(torch.tensor([9]), torch.tensor([1]), 4)
     assert h["hist_states"][0, :, 0].tolist() == [6.0, 7.0, 8.0, 9.0]
+
+
+def test_replay_window_carries_the_env_outcome_of_each_row() -> None:
+    rp = _filled_replay()
+    rp.add(torch.zeros(2, 2), torch.zeros(2, 1), torch.zeros(2, 1), torch.zeros(2, 1),
+           torch.zeros(2, dtype=torch.long), torch.zeros(2, dtype=torch.long),
+           torch.tensor([6, 10]), torch.zeros(2, dtype=torch.bool))
+    rp.set_outcome(torch.tensor([0.5, 0.25]), torch.tensor([True, False]))
+    win = rp.window(torch.tensor([9]), torch.tensor([0]), 2)  # rows 9, 10
+    assert win["env_reward"][0].tolist() == [0.0, 0.5]
+    assert win["terminated"][0].tolist() == [False, True]
+
+
+def test_real_window_masks_and_targets_handle_episode_ends() -> None:
+    """Three windows of H = 3: no end, a termination on transition 1, a
+    timeout on transition 1 (the state after each end is another episode)."""
+    gamma, lam = 0.9, 0.8
+    same = torch.tensor([[True, True, True], [True, False, True], [True, False, True]])
+    terminated = torch.tensor([[False, False, False], [False, True, False], [False, False, False]])
+    inep, term, trunc = real_window_masks(same, terminated)
+    assert inep.tolist() == [[1, 1, 1, 1], [1, 1, 0, 0], [1, 1, 0, 0]]
+    assert term.tolist() == [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
+    assert trunc.tolist() == [[0, 0, 0], [0, 0, 0], [0, 1, 0]]
+    r = torch.tensor([[1.0, 2.0, 3.0]] * 3)
+    env_r = torch.full((3, 3), 7.0)
+    v = torch.tensor([[10.0, 20.0, 30.0, 40.0]] * 3)
+    tg = real_window_targets(r, env_r, v, inep, term, trunc, gamma, lam)
+    # no end: the ordinary lambda-return
+    assert torch.allclose(tg[0], lambda_returns(r[:1], v[:1], torch.ones(1, 3), gamma, lam)[0])
+    # termination: the last transition earns the env's reward, then nothing
+    assert tg[1, 1].item() == pytest.approx(7.0)
+    assert tg[1, 0].item() == pytest.approx(1.0 + gamma * ((1 - lam) * 20.0 + lam * 7.0))
+    # timeout: the unknown last transition is replaced by V(s_1)
+    assert tg[2, 1].item() == pytest.approx(20.0)
+    assert tg[2, 0].item() == pytest.approx(1.0 + gamma * 20.0)
+
+
+def test_noise_inference_step_replays_data_at_the_collecting_policy() -> None:
+    """a = pi_theta(x) + eta, x' = x + f(x, a) + xi with the recorded noise
+    eta = a_rec - mu_old(x), xi = (s' - s) - f(s, a_rec): the collecting
+    policy reproduces the recording, another policy moves the forward pass,
+    and the gradient is the model's and actor's."""
+    def f(x: torch.Tensor, a: torch.Tensor) -> torch.Tensor:  # model increment
+        return -0.1 * x + 2.0 * a
+
+    s, s_next, theta_old = torch.tensor(1.0), torch.tensor(1.7), 0.3
+    a_rec = torch.tensor(theta_old * 1.0 + 0.05)  # collector's mean plus noise
+    eta = a_rec - theta_old * s
+    xi = (s_next - s) - f(s, a_rec)
+
+    def step(theta: torch.Tensor) -> torch.Tensor:
+        return s + f(s, theta * s + eta) + xi
+
+    assert step(torch.tensor(theta_old)).item() == pytest.approx(1.7)
+    theta = torch.tensor(theta_old + 0.1, requires_grad=True)
+    nxt = step(theta)
+    assert nxt.item() == pytest.approx(1.7 + 2.0 * 0.1)  # the model's response
+    nxt.backward()
+    assert theta.grad.item() == pytest.approx(2.0 * 1.0)  # df/da * dpi/dtheta
 
 
 @pytest.fixture(autouse=True)
@@ -157,6 +216,19 @@ def test_diffsr_dynamics_readout_and_samples_fit_a_linear_system() -> None:
     assert torch.isfinite(draws).all()
 
 
+def test_diffsr_readout_carries_the_action_gradient_only_when_phi_is_attached() -> None:
+    torch.manual_seed(0)
+    gains = {}
+    for detach in (True, False):
+        model = DiffSRDynamics(6, 3, (2, 4), feature_dim=8, embed_dim=16, g_hidden_dims=(16,), mu_hidden_dims=(16,), num_noises=4, readout_detach_phi=detach)
+        torch.nn.init.normal_(model.readout.weight)
+        x = torch.randn(5, 6, requires_grad=True)
+        y = model(x)
+        gains[detach] = torch.autograd.grad(y.sum(), x, allow_unused=True)[0] if y.requires_grad else None
+    assert gains[True] is None or gains[True].abs().sum() == 0
+    assert gains[False][:, 2:4].abs().sum() > 0
+
+
 def test_actor_and_critic_take_named_activations() -> None:
     actor = Actor(4, 2, [8, 8], out_gain=0.01, act="silu")
     critic = Critic(4, [8], act="SiLU")
@@ -211,3 +283,94 @@ def test_bptt_through_learned_model_improves_return() -> None:
             x = x + 0.1 * actor(x)
             true_ret = true_ret + (0.99**t) * -(x.square().squeeze(-1))
     assert float(true_ret.mean()) > 0.5 * before
+
+
+def _point_mass_rollout(actor: Actor, x0: torch.Tensor, eps: torch.Tensor, *, detach_action: bool):
+    """x' = x + 0.1 a, reward -x'^2, a = mu(x) + eps; returns per-step
+    actions, means and rewards (B, H, .) as ``_imagine`` collects them."""
+    x = x0
+    acts, mus, rews = [], [], []
+    for t in range(eps.shape[1]):
+        mu = actor(x)
+        a = mu + eps[:, t]
+        if detach_action:
+            a = a.detach()
+        x = x + 0.1 * a
+        acts.append(a)
+        mus.append(mu)
+        rews.append(-x.square().squeeze(-1))
+        if detach_action:
+            x = x.detach()
+    return torch.stack(acts, 1), torch.stack(mus, 1), torch.stack(rews, 1)
+
+
+def test_score_function_surrogate_is_unbiased_for_the_reparameterized_gradient() -> None:
+    """On the point mass the likelihood-ratio gradient of the sampled-action
+    return agrees in expectation with the reparameterized pathwise gradient of
+    the same objective (same samples), at far lower signal-to-noise."""
+    torch.manual_seed(0)
+    B, H, std, gamma = 4096, 6, 0.3, 0.97
+    actor = Actor(1, 1, [16], out_gain=0.3)
+    actor.obs_norm.update(torch.randn(1024, 1) * 2)
+    params = list(actor.net.parameters())
+
+    def flat(loss):
+        return torch.cat([g.reshape(-1) for g in torch.autograd.grad(loss, params)])
+
+    pw, sf = [], []
+    for k in range(40):
+        g = torch.Generator().manual_seed(100 + k)
+        x0 = torch.randn(B, 1, generator=g) * 2
+        eps = std * torch.randn(B, H, 1, generator=g)
+        _, _, r = _point_mass_rollout(actor, x0, eps, detach_action=False)
+        disc = gamma ** torch.arange(H)
+        pw.append(flat(-(r * disc).sum(1).mean()))
+        a, mu, r = _point_mass_rollout(actor, x0, eps, detach_action=True)
+        ones = torch.ones(B, H)
+        values = torch.zeros(B, H + 1)
+        surrogate, adv = score_function_surrogate(a, mu, r, values, ones, ones, std, gamma, 1.0, normalize=False)
+        assert adv.shape == (B, H)
+        sf.append(flat(-surrogate.mean()))
+    pw, sf = torch.stack(pw), torch.stack(sf)
+    cos = torch.nn.functional.cosine_similarity(pw.mean(0), sf.mean(0), dim=0)
+    assert float(cos) > 0.95
+    rel = (pw.mean(0) - sf.mean(0)).norm() / pw.mean(0).norm()
+    assert float(rel) < 0.25
+
+    def snr(g):
+        return g.mean(0).norm() / (g - g.mean(0)).square().sum(1).mean().sqrt()
+
+    assert snr(pw) > 5 * snr(sf)
+    # actor_steps masks the later steps out of the sum
+    short, _ = score_function_surrogate(a, mu, r, values, ones, ones, std, gamma, 1.0, normalize=False, actor_steps=2)
+    full, _ = score_function_surrogate(a, mu, r, values, ones, ones, std, gamma, 1.0, normalize=False)
+    assert not torch.allclose(short, full)
+
+
+def test_score_function_actor_update_improves_the_point_mass_return() -> None:
+    torch.manual_seed(1)
+    B, H, std, gamma = 2048, 8, 0.3, 0.97
+    actor = Actor(1, 1, [16], out_gain=0.01)
+    actor.obs_norm.update(torch.randn(1024, 1) * 2)
+    opt = torch.optim.Adam(actor.net.parameters(), lr=3e-3)
+
+    def true_return(x0):
+        with torch.no_grad():
+            x, ret = x0, 0.0
+            for t in range(H):
+                x = x + 0.1 * actor(x)
+                ret = ret + (gamma**t) * -(x.square().squeeze(-1))
+        return float(ret.mean())
+
+    start = torch.randn(512, 1) * 2
+    before = true_return(start)
+    ones = torch.ones(B, H)
+    for _ in range(300):
+        x0 = torch.randn(B, 1) * 2
+        eps = std * torch.randn(B, H, 1)
+        a, mu, r = _point_mass_rollout(actor, x0, eps, detach_action=True)
+        surrogate, _ = score_function_surrogate(a, mu, r, torch.zeros(B, H + 1), ones, ones, std, gamma, 0.95)
+        opt.zero_grad()
+        (-surrogate.mean()).backward()
+        opt.step()
+    assert true_return(start) > 0.5 * before

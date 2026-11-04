@@ -11,7 +11,9 @@ One iteration:
 3. **Improve the actor**: from replay states (history rebuilt as the env's
    buffer holds it), imagine H steps through the frozen model with fresh sensor
    noise and backpropagate J = sum_t gamma^t c_t r_t + gamma^H c_H V(s_H),
-   c_{t+1} = c_t (1 - d_{t+1}), through the model's Jacobians.
+   c_{t+1} = c_t (1 - d_{t+1}), through the model's Jacobians (or, with
+   ``actor_estimator=score_function``, estimate the same gradient by the
+   likelihood ratio of sampled actions on the same rollouts, model detached).
 4. **Fit the critic** to GAE(lambda) targets of the detached imagined rollout.
 
 The task model (``task.WorldModelTask``) supplies states, features, reward and
@@ -38,6 +40,7 @@ from torch import Tensor, nn
 from torchrl.envs import TransformedEnv
 
 from rlopt.agent.wm_bptt.config import WMBPTTRLOptConfig
+from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
 from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel
 from rlopt.agent.wm_bptt.replay import SequenceReplay
 from rlopt.agent.wm_bptt.task import WorldModelTask, load_task
@@ -91,6 +94,76 @@ def lambda_returns(rewards: Tensor, values: Tensor, notdone: Tensor, gamma: floa
     return targets
 
 
+def score_function_surrogate(
+    actions: Tensor,
+    mus: Tensor,
+    rewards: Tensor,
+    values: Tensor,
+    notdone: Tensor,
+    alive: Tensor,
+    std: float,
+    gamma: float,
+    lam: float,
+    *,
+    normalize: bool = True,
+    actor_steps: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Likelihood-ratio surrogate of an imagined rollout, (B,).
+
+    ``actions`` (B, H, A) were sampled as ``mu + std * eps``; ``mus`` carry the
+    actor's gradient, everything else is treated as constant. Its gradient is
+    ``sum_t gamma^t c_t A_t grad log N(a_t; mu_t, std^2)`` with ``c_t`` =
+    ``alive`` (B, H), the probability the imagined episode is still running
+    when step t is taken, and ``A_t`` = TD(lambda) target - V(s_t) from
+    ``values`` (B, H + 1). ``actor_steps`` limits the sum to the first N steps
+    (the actor-horizon ablation). Returns the surrogate and the advantages.
+    """
+    H = rewards.shape[1]
+    with torch.no_grad():
+        targets = lambda_returns(rewards, values, notdone, gamma, lam)
+        adv = targets - values[:, :H]
+        if normalize:
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        disc = gamma ** torch.arange(H, device=rewards.device, dtype=rewards.dtype)
+        w = disc * alive
+        if actor_steps is not None and actor_steps < H:
+            w = w * (torch.arange(H, device=w.device) < actor_steps)
+    logp = -((actions.detach() - mus).square().sum(-1)) / (2 * std * std)
+    return (w * adv * logp).sum(1), adv
+
+
+def real_window_masks(same: Tensor, terminated: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Episode bookkeeping of recorded windows.
+
+    ``same`` (B, H): transition t stays in one episode; ``terminated`` (B, H):
+    the env terminated (not timed out) on transition t. Returns ``inep``
+    (B, H + 1), 1 while state t belongs to the window's first episode, and
+    ``term`` / ``trunc`` (B, H), 1 on the transition that ends that episode by
+    a termination / any other reset (timeout).
+    """
+    H = same.shape[1]
+    s = same.float()
+    inep = torch.cat((torch.ones_like(s[:, :1]), torch.cumprod(s, 1)), 1)
+    end = inep[:, :H] * (1 - s)
+    term = end * terminated.float()
+    return inep, term, end - term
+
+
+def real_window_targets(
+    rewards: Tensor, env_reward: Tensor, values: Tensor, inep: Tensor, term: Tensor, trunc: Tensor, gamma: float, lam: float
+) -> Tensor:
+    """TD(lambda) targets (B, H) over recorded windows (``real_window_masks``).
+
+    Transitions inside the episode use ``rewards``; a terminating transition
+    contributes the env's reward and no continuation; a timed-out transition
+    is unknown (its next state is the reset row), so its state's value V(s_t)
+    stands in for it. Entries past the episode are 0 and must not be fit.
+    """
+    H = rewards.shape[1]
+    r = inep[:, 1:] * rewards + term * env_reward + trunc * values[:, :H]
+    return lambda_returns(r, values, inep[:, 1:], gamma, lam)
+
+
 class WMPolicy(nn.Module):
     """Deployed policy: env observation tensors -> deterministic action."""
 
@@ -124,19 +197,54 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._iteration = 0
         self._step_acc = 0.0
         self.replay: SequenceReplay | None = None
+        for name in ("actor_source", "critic_source"):
+            if getattr(wm, name) not in ("imagined", "real"):
+                msg = f"wm.{name} must be 'imagined' or 'real', got {getattr(wm, name)!r}."
+                raise ValueError(msg)
+        if wm.actor_source == "real" and 0 < wm.actor_horizon < wm.horizon:
+            msg = "wm.actor_source=real uses the window length wm.horizon; leave wm.actor_horizon at 0."
+            raise ValueError(msg)
+        if wm.actor_estimator not in ("pathwise", "score_function"):
+            msg = f"wm.actor_estimator must be 'pathwise' or 'score_function', got {wm.actor_estimator!r}."
+            raise ValueError(msg)
+        if wm.actor_estimator == "score_function" and wm.actor_source == "real":
+            msg = "wm.actor_estimator=score_function runs on imagined rollouts only (actor_source=imagined)."
+            raise ValueError(msg)
         super().__init__(env=env, config=config, logger=logger, **kwargs)
 
     # ------------------------------------------------------------ construction
     def _construct_policy(self) -> TensorDictModule:
         wm = self.config.wm
         t = self.task
-        self.dynamics = DynamicsModel(t.wm_input_dim, t.increment_dim, wm.wm_hidden).to(self.device)
+        self.dynamics = self._construct_dynamics().to(self.device)
         self.actor = Actor(
             t.policy_obs_dim, t.action_dim, wm.actor_hidden, wm.actor_output_scale, wm.actor_activation
         ).to(self.device)
         self.critic = Critic(t.critic_obs_dim, wm.critic_hidden, wm.critic_activation).to(self.device)
         self.policy_net = WMPolicy(t, self.actor, wm.bf16)
         return TensorDictModule(self.policy_net, in_keys=list(t.policy_in_keys), out_keys=["action"])
+
+    def _construct_dynamics(self) -> nn.Module:
+        wm, t = self.config.wm, self.task
+        if wm.dynamics_model == "mlp":
+            return DynamicsModel(t.wm_input_dim, t.increment_dim, wm.wm_hidden)
+        if wm.dynamics_model != "diffsr":
+            msg = f"wm.dynamics_model must be 'mlp' or 'diffsr', got {wm.dynamics_model!r}."
+            raise ValueError(msg)
+        # The world-model input is (state features, action, sim context).
+        hi = t.wm_input_dim - t.context_dim
+        return DiffSRDynamics(
+            t.wm_input_dim,
+            t.increment_dim,
+            (hi - t.action_dim, hi),
+            feature_dim=wm.diffsr_feature_dim,
+            embed_dim=wm.diffsr_embed_dim,
+            num_noises=wm.diffsr_num_noises,
+            readout_detach_phi=False,  # the read-out is f: gradients must reach (s, a)
+        )
+
+    def _dynamics_parameters(self) -> list[nn.Parameter]:
+        return [p for p in self.dynamics.parameters() if p.requires_grad]
 
     def _construct_feature_extractor(self) -> TensorDictModule:
         msg = "WMBPTT has no feature extractor."
@@ -162,7 +270,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     def _configure_optimizers(self):  # type: ignore[override]
         wm = self.config.wm
-        self.wm_optim = torch.optim.AdamW(self.dynamics.net.parameters(), lr=wm.wm_lr, weight_decay=wm.wm_weight_decay)
+        self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=wm.wm_lr, weight_decay=wm.wm_weight_decay)
         self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=wm.actor_lr, betas=tuple(wm.actor_betas))
         self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=wm.critic_lr)
         self.lr_scheduler = None
@@ -197,8 +305,13 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     # ------------------------------------------------------------ collection
     def _policy_features(self, rows: dict[str, Tensor]) -> Tensor:
+        """The collector's policy input; its sensor noise is keyed to the
+        replay row this step writes (``_real_rollout`` regenerates it)."""
+        assert self.replay is not None
+        step = torch.full_like(self._env_ids, self.replay.steps)
         return self.task.policy_obs(
-            rows["hist_states"], rows["hist_actions"], rows["context"], rows["rank"], rows["frame"]
+            rows["hist_states"], rows["hist_actions"], rows["context"], rows["rank"], rows["frame"],
+            noise_key=(self._noise_seed, self._env_ids, step),
         )
 
     @torch.no_grad()
@@ -207,7 +320,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         rows = self.task.read_obs(obs[self.task.obs_group])
         feat = self._policy_features(rows)
         self.actor.obs_norm.update(feat)
-        action = self.actor(feat, bf16=wm.bf16)
+        mean_action = self.actor(feat, bf16=wm.bf16)
+        action = mean_action
         if wm.action_noise_std > 0:
             action = action + wm.action_noise_std * torch.randn_like(action)
         action = action.clamp(-wm.action_clip, wm.action_clip)
@@ -215,8 +329,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self.replay.add(
             rows["state"], action, rows["hist_actions"][:, -1], rows["context"],
             rows["rank"], rows["frame"], rows["episode_step"], rows["push"],
+            policy_action=mean_action,
         )
-        obs, reward, _, _, extras = self._isaac.step(action)
+        obs, reward, terminated, _, extras = self._isaac.step(action)
+        self.replay.set_outcome(reward.reshape(-1), terminated.reshape(-1).bool())
         stats["env_reward"].append(reward.mean())
         log = extras.get("log") if isinstance(extras, dict) else None
         if log:
@@ -275,9 +391,14 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             errs, mask = self._wm_rollout(win, k, grad=True)
             per = (errs / scale).square().mean(-1)  # (B, k)
             loss = (per * mask).sum() / mask[:, 0].sum().clamp_min(1.0)
+            if wm.dynamics_model == "diffsr":
+                denoise = self._denoising_loss(win, k)
+                metrics["wm/readout_loss"].append(loss.detach())
+                metrics["wm/denoise_loss"].append(denoise.detach())
+                loss = loss + wm.diffsr_denoise_coeff * denoise
             self.wm_optim.zero_grad(set_to_none=True)
             loss.backward()
-            gn = nn.utils.clip_grad_norm_(self.dynamics.net.parameters(), wm.wm_grad_clip_norm)
+            gn = nn.utils.clip_grad_norm_(self._dynamics_parameters(), wm.wm_grad_clip_norm)
             if torch.isfinite(gn):
                 self.wm_optim.step()
             metrics["wm/loss"].append(loss.detach())
@@ -286,6 +407,18 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if self.dynamics.out_norm.count >= wm.norm_freeze_samples:
             self.dynamics.in_norm.frozen.fill_(True)
             self.dynamics.out_norm.frozen.fill_(True)
+
+    def _denoising_loss(self, win: dict[str, Tensor], k: int) -> Tensor:
+        """DiffSR's one-step loss on every valid transition of the windows,
+        teacher-forced on the logged states."""
+        t, wm = self.task, self.config.wm
+        B = win["state"].shape[0]
+        s0 = win["state"][:, :k].reshape(B * k, -1)
+        s1 = win["state"][:, 1 : k + 1].reshape(B * k, -1)
+        ctx = win["context"][:, :1].expand(B, k, -1).reshape(B * k, -1)
+        x = t.wm_input(s0, win["action"][:, :k].reshape(B * k, -1), ctx)
+        loss, _ = self.dynamics.denoising_loss(x, t.increment(s0, s1), win["valid"][:, :k].reshape(-1), bf16=wm.bf16)
+        return loss
 
     @torch.no_grad()
     def _wm_eval(self) -> dict[str, float]:
@@ -318,18 +451,35 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     # ------------------------------------------------------------ imagination
     def _imagine_step(
-        self, state: Tensor, prop: Tensor, prev_action: Tensor, ctx: Tensor, rank: Tensor, frame: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """One imagined control step: act, predict, score, extend the history."""
+        self,
+        state: Tensor,
+        prop: Tensor,
+        prev_action: Tensor,
+        ctx: Tensor,
+        rank: Tensor,
+        frame: Tensor,
+        eps: Tensor,
+        detach_action: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """One imagined control step: act, predict, score, extend the history.
+
+        ``eps`` (B, A) is the pre-scaled action noise (zeros for the
+        deterministic actor); ``detach_action`` cuts the gradient between the
+        actor's output and the model (score-function estimator). Returns the
+        executed action and the actor's mean separately.
+        """
         t, wm = self.task, self.config.wm
         obs = t.policy_obs_from_parts(prop, state, rank, frame)
-        action = self.actor(obs, bf16=wm.bf16)
+        mu = self.actor(obs, bf16=wm.bf16)
+        action = mu + eps
+        if detach_action:
+            action = action.detach()
         inc = self.dynamics(t.wm_input(state, action, ctx), bf16=wm.bf16)
         nxt = t.integrate(state, inc)
         r, d = t.reward_and_termination(nxt, action, prev_action, ctx, rank, frame)
-        new_prop = t.proprio(nxt, action, ctx, t.sensor_noise if hasattr(t, "sensor_noise") else True)
+        new_prop = t.proprio(nxt, action, ctx, getattr(t, "sensor_noise", True))
         prop = torch.cat((prop[:, 1:], new_prop.unsqueeze(1)), 1)
-        return action, nxt, r, d, prop
+        return action, mu, nxt, r, d, prop
 
     def _step_fn(self):
         fn = getattr(self, "_compiled_step", None)
@@ -340,15 +490,48 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self._compiled_step = fn
         return fn
 
-    def _imagine(self, batch: int, *, grad: bool) -> dict[str, Tensor]:
+    def _imagine(
+        self,
+        batch: int,
+        *,
+        grad: bool,
+        estimator: str | None = None,
+        horizon: int | None = None,
+        starts: tuple[Tensor, Tensor] | None = None,
+        std: float | None = None,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, Tensor]:
+        """Imagined H-step rollouts from replay states.
+
+        ``estimator`` selects what ``objective`` differentiates to: ``pathwise``
+        (deterministic actor, gradient through the model), ``reparam`` (actions
+        ``mu + std eps``, gradient through the sample and the model) or
+        ``score_function`` (same samples, gradient through ``log pi`` only;
+        the model is traversed without gradient). None: the configured
+        ``actor_estimator`` when ``grad``, else pathwise. ``horizon`` and
+        ``starts`` (replay rows ``tau`` and env indices) override the config
+        and the uniform start sampling (gradient probes); ``generator`` draws
+        the action noise.
+        """
         wm = self.config.wm
         t = self.task
         assert self.replay is not None
+        H = int(horizon or wm.horizon)
+        est = estimator or (wm.actor_estimator if grad else "pathwise")
+        if est not in ("pathwise", "reparam", "score_function"):
+            msg = f"unknown estimator {est!r}"
+            raise ValueError(msg)
+        sf = est == "score_function"
+        sigma = float(wm.sf_action_std if std is None else std)
         h = t.history
-        lo = self.replay.oldest + h - 1
-        hi = self.replay.steps - 1
-        tau = torch.randint(lo, hi + 1, (batch,), device=self.device)
-        env = torch.randint(0, self._num_envs, (batch,), device=self.device)
+        if starts is None:
+            lo = self.replay.oldest + h - 1
+            hi = self.replay.steps - 1
+            tau = torch.randint(lo, hi + 1, (batch,), device=self.device, generator=generator)
+            env = torch.randint(0, self._num_envs, (batch,), device=self.device, generator=generator)
+        else:
+            tau, env = starts
+            batch = int(tau.shape[0])
         start = self.replay.history(tau, env, h)
         ctx, rank, frame = start["context"], start["rank"], start["frame"]
         noise = getattr(t, "sensor_noise", True)
@@ -361,14 +544,23 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             state, prop, prev_action = (
                 x.detach().contiguous().requires_grad_(True) for x in (state, prop, prev_action)
             )
+        zero_eps = torch.zeros(batch, t.action_dim, device=self.device)
         alive = torch.ones(batch, device=self.device)
         ret = torch.zeros(batch, device=self.device)
         states, rewards, dones, cont = [state], [], [], []
+        actions, mus, alives = [], [], []
         step_fn = self._step_fn()
-        actor_h = wm.actor_horizon if 0 < wm.actor_horizon < wm.horizon else wm.horizon
+        actor_h = wm.actor_horizon if 0 < wm.actor_horizon < H else H
         actor_objective = None
-        for step in range(wm.horizon):
-            action, nxt, r, d, prop = step_fn(state, prop, prev_action, ctx, rank, frame)
+        for step in range(H):
+            if est == "pathwise":
+                eps = zero_eps
+            else:
+                eps = sigma * torch.randn(batch, t.action_dim, device=self.device, generator=generator)
+            alives.append(alive)
+            action, mu, nxt, r, d, prop = step_fn(state, prop, prev_action, ctx, rank, frame, eps, sf)
+            actions.append(action)
+            mus.append(mu)
             end = t.clip_end(rank, frame).float()
             if not wm.imagine_termination:
                 # Ablation: the imagined episode survives every tracking
@@ -388,38 +580,248 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             frame = frame + 1
             if not grad:
                 state, prev_action, prop = state.detach(), prev_action.detach(), prop.detach()
-            elif step + 1 == actor_h and actor_h < wm.horizon:
-                # The actor's objective ends here (bootstrapped with V); the
-                # remaining steps only feed the critic's targets, so the
-                # gradient path is cut. Re-wrapping keeps the compiled step's
-                # requires_grad pattern unchanged (no recompile).
-                v_a = self.critic(t.critic_obs(state, ctx, rank, frame), bf16=wm.bf16)
-                actor_objective = ret + (wm.gamma**actor_h) * alive * v_a if wm.critic_bootstrap else ret
+            elif sf or (step + 1 == actor_h and actor_h < H):
+                # Score function: the model is never differentiated, so the
+                # path is cut after every step. Pathwise with a shorter actor
+                # horizon: the actor's objective ends here (bootstrapped with
+                # V); the remaining steps only feed the critic's targets.
+                # Re-wrapping keeps the compiled step's requires_grad pattern
+                # unchanged (no recompile).
+                if not sf and step + 1 == actor_h:
+                    if wm.critic_bootstrap:
+                        v_a = self.critic(t.critic_obs(state, ctx, rank, frame), bf16=wm.bf16)
+                        actor_objective = ret + (wm.gamma**actor_h) * alive * v_a
+                    else:
+                        actor_objective = ret
                 state, prop, prev_action = (
                     x.detach().contiguous().requires_grad_(True) for x in (state, prop, prev_action)
                 )
-        v_last = self.critic(t.critic_obs(state, ctx, rank, frame), bf16=wm.bf16)
-        objective = ret + (wm.gamma**wm.horizon) * alive * v_last if wm.critic_bootstrap else ret
+        if wm.critic_bootstrap:
+            v_last = self.critic(t.critic_obs(state, ctx, rank, frame), bf16=wm.bf16)
+            objective = ret + (wm.gamma**H) * alive * v_last
+        else:
+            objective = ret
         if actor_objective is not None:
             objective = actor_objective
-        return {
+        out = {
             "objective": objective,
+            "J": objective.detach(),
             "states": torch.stack(states, 1),
             "rewards": torch.stack(rewards, 1),
             "dones": torch.stack(dones, 1),
             "cont": torch.stack(cont, 1),
             "alive_H": alive,
+            "actions": torch.stack(actions, 1),
+            "mus": torch.stack(mus, 1),
+            "alives": torch.stack(alives, 1),
             "ctx": ctx,
             "rank": rank,
             "frame0": start["frame"],
         }
+        if sf and grad:
+            with torch.no_grad():
+                values = self._critic_values(out) if wm.critic_bootstrap else torch.zeros(batch, H + 1, device=self.device)
+                notdone = (1 - out["dones"].detach()) * out["cont"]
+            surrogate, adv = score_function_surrogate(
+                out["actions"], out["mus"], out["rewards"].detach(), values, notdone, out["alives"],
+                sigma, wm.gamma, wm.gae_lambda, normalize=wm.sf_normalize_advantage,
+                actor_steps=actor_h if actor_h < H else None,
+            )
+            out["objective"] = surrogate
+            out["advantages"] = adv
+        return out
+
+    # ------------------------------------------------------------ real windows
+    def _real_step(
+        self,
+        state: Tensor,
+        prop: Tensor,
+        prev_action: Tensor,
+        ctx: Tensor,
+        rank: Tensor,
+        frame: Tensor,
+        eta: Tensor,
+        xi: Tensor,
+        prop_noise: Tensor,
+        goal_noise: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """One re-simulated recorded step: the current actor on the clean
+        proprio history plus the collector's sensor noise of this row
+        (``prop_noise``, ``goal_noise``) and the recorded action noise ``eta``,
+        the model's increment plus the recorded residual ``xi``. At the
+        collecting policy this is the recorded transition."""
+        t, wm = self.task, self.config.wm
+        obs = t.policy_obs_from_parts(prop + prop_noise, state, rank, frame, goal_noise)
+        action = self.actor(obs, bf16=wm.bf16) + eta
+        inc = self.dynamics(t.wm_input(state, action, ctx), bf16=wm.bf16)
+        nxt = t.integrate(state, inc + xi)
+        r, _ = t.reward(nxt, action, prev_action, ctx, rank, frame)
+        new_prop = t.proprio(nxt, action, ctx, False)
+        prop = torch.cat((prop[:, 1:], new_prop.unsqueeze(1)), 1)
+        return action, nxt, r, prop, obs
+
+    def _real_step_fn(self):
+        fn = getattr(self, "_compiled_real_step", None)
+        if fn is None:
+            fn = self._real_step
+            if self.config.wm.compile:
+                fn = torch.compile(self._real_step, dynamic=False)
+            self._compiled_real_step = fn
+        return fn
+
+    def _real_rollout(
+        self,
+        batch: int,
+        *,
+        grad: bool,
+        track_noise: bool = False,
+        zero_noise: bool = False,
+        starts: tuple[Tensor, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
+        """H-step recorded windows (``actor_source`` / ``critic_source`` real).
+
+        With ``grad`` the window is re-simulated under the current actor with
+        the recorded noise held fixed (SVG noise inference): the action noise
+        eta_t = a_t - mu_old(o_t) of the collector, and the model residual
+        xi_t = increment(s_t, s_{t+1}) - f(s_t, a_t) in increment space. The
+        forward pass equals the recording at the collecting policy and moves
+        with the actor; the gradient runs through the model's Jacobians.
+        Without ``grad`` only the recorded states and their analytic rewards
+        are produced (critic data).
+        """
+        wm = self.config.wm
+        t = self.task
+        rp = self.replay
+        assert rp is not None
+        H, h = wm.horizon, t.history
+        hi = rp.steps - 1 - H
+        lo = max(rp.oldest + h - 1, hi - wm.real_window_recent_steps + 1)
+        if hi < lo:
+            msg = f"replay holds {rp.steps} steps; real windows of {H} need more."
+            raise RuntimeError(msg)
+        if starts is None:
+            tau = torch.randint(lo, hi + 1, (batch,), device=self.device)
+            env = torch.randint(0, self._num_envs, (batch,), device=self.device)
+        else:
+            tau, env = starts
+        win = rp.window(tau, env, H + 1)
+        es = win["episode_step"]
+        same = es[:, 1:] == es[:, :-1] + 1
+        inep, term, trunc = real_window_masks(same, win["terminated"][:, :H])
+        env_reward = win["env_reward"][:, :H]
+        ctx, rank, frame0 = win["context"][:, 0], win["rank"][:, 0], win["frame"][:, 0]
+        steps = torch.arange(H + 1, device=self.device)
+        frames = frame0.unsqueeze(1) + steps  # (B, H + 1), as imagination counts them
+        if grad:
+            with torch.no_grad():
+                B, S = win["state"].shape[0], win["state"].shape[-1]
+                s_now = win["state"][:, :H].reshape(B * H, S)
+                s_next = win["state"][:, 1:].reshape(B * H, S)
+                a_rec = win["action"][:, :H].reshape(B * H, -1)
+                inc_rec = self.dynamics(t.wm_input(s_now, a_rec, ctx.repeat_interleave(H, 0)), bf16=wm.bf16)
+                xi = (t.increment(s_now, s_next) - inc_rec).reshape(B, H, -1) * same.unsqueeze(-1)
+                eta = win["action"][:, :H] - win["policy_action"][:, :H]
+            eta_recorded = eta
+            if zero_noise:
+                eta = torch.zeros_like(eta)  # the policy's mean path, residuals kept
+            if track_noise:
+                # d objective / d eta_t is the SVG action gradient of step t.
+                eta = eta.detach().contiguous().requires_grad_(True)
+            start = rp.history(tau, env, h)
+            # Clean history; each step adds the collector's keyed noise of its row.
+            prop = t.proprio(start["hist_states"], start["hist_actions"], ctx.unsqueeze(1), False)
+            state, prev_action = win["state"][:, 0], start["hist_actions"][:, -1]
+            # One requires_grad pattern for every compiled step (see _imagine).
+            state, prop, prev_action = (
+                x.detach().contiguous().requires_grad_(True) for x in (state, prop, prev_action)
+            )
+            step_fn = self._real_step_fn()
+            states, rewards, actions, actor_obs = [state], [], [], []
+            for i in range(H):
+                with torch.no_grad():
+                    key = (self._noise_seed, env, tau + i)
+                    prop_noise = t.keyed_proprio_noise(*key)
+                    goal_noise = t.keyed_goal_noise(*key)
+                prev_action, state, r, prop, obs_i = step_fn(
+                    state, prop, prev_action, ctx, rank, frames[:, i], eta[:, i], xi[:, i], prop_noise, goal_noise
+                )
+                actor_obs.append(obs_i)
+                states.append(state)
+                rewards.append(r)
+                actions.append(prev_action)
+            states_t, rewards_t = torch.stack(states, 1), torch.stack(rewards, 1)
+            with torch.no_grad():
+                # How far the re-simulated window leaves the recording (task
+                # state starts with the pelvis position), and its first action
+                # the recorded one (zero at the collecting policy).
+                dev = (states_t[..., :3] - win["state"][..., :3]).norm(dim=-1)
+                dev_mm = 1000 * (dev * inep).sum() / inep.sum().clamp_min(1.0)
+                act_dev0 = (actions[0] - win["action"][:, 0]).norm(dim=-1).mean()
+        else:
+            states_t = win["state"]
+            B, S = states_t.shape[0], states_t.shape[-1]
+            r, _ = t.reward(
+                states_t[:, 1:].reshape(B * H, S),
+                win["action"][:, :H].reshape(B * H, -1),
+                win["prev_action"][:, :H].reshape(B * H, -1),
+                ctx.repeat_interleave(H, 0),
+                rank.repeat_interleave(H, 0),
+                frames[:, :H].reshape(-1),
+            )
+            rewards_t = r.reshape(B, H)
+        out = {
+            "states": states_t,
+            "rewards": rewards_t,
+            "env_reward": env_reward,
+            "inep": inep,
+            "term": term,
+            "trunc": trunc,
+            "ctx": ctx,
+            "rank": rank,
+            "frame0": frame0,
+        }
+        if grad:
+            if track_noise:
+                out["eta"] = eta
+                out["eta_recorded"] = eta_recorded
+                out["actor_obs"] = torch.stack(actor_obs, 1).detach()
+                out["recorded_states"] = win["state"]
+                out["recorded_action"] = win["action"][:, :H]
+                out["tau"], out["env"] = tau, env
+            out["pelvis_dev_mm"] = dev_mm
+            out["action_dev0"] = act_dev0
+            gam = wm.gamma ** steps.float()
+            objective = (gam[:H] * (inep[:, 1:] * rewards_t + term * env_reward)).sum(1)
+            if wm.critic_bootstrap:
+                values = self._critic_values(out)
+                weights = torch.cat((gam[:H] * trunc, (gam[H] * inep[:, H]).unsqueeze(1)), 1)
+                objective = objective + (weights * values).sum(1)
+            out["objective"] = objective
+        return out
+
+    def _critic_obs_seq(self, out: dict[str, Tensor]) -> Tensor:
+        """Critic inputs (B * (H + 1), D) of a rollout's states."""
+        states = out["states"]
+        B, H1, S = states.shape
+        frames = out["frame0"].unsqueeze(1) + torch.arange(H1, device=self.device)
+        rank = out["rank"].unsqueeze(1).expand(B, H1)
+        ctx = out["ctx"].unsqueeze(1).expand(B, H1, out["ctx"].shape[-1])
+        return self.task.critic_obs(states.reshape(B * H1, S), ctx.reshape(B * H1, -1), rank.reshape(-1), frames.reshape(-1))
+
+    def _critic_values(self, out: dict[str, Tensor]) -> Tensor:
+        B, H1 = out["states"].shape[:2]
+        return self.critic(self._critic_obs_seq(out), bf16=self.config.wm.bf16).reshape(B, H1)
 
     def _update_actor_critic(self, metrics: dict[str, list]) -> None:
         wm = self.config.wm
+        real_actor = wm.actor_source == "real"
         self.dynamics.requires_grad_(False)
         self.critic.requires_grad_(False)
         try:
-            out = self._imagine(wm.imagine_batch, grad=True)
+            if real_actor:
+                out = self._real_rollout(wm.imagine_batch, grad=True)
+            else:
+                out = self._imagine(wm.imagine_batch, grad=True)
             loss = -out["objective"].mean()
             self.actor_optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -431,13 +833,49 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         nn.utils.clip_grad_value_(params, wm.actor_grad_clip_value)
         if torch.isfinite(gn):
             self.actor_optim.step()
-        metrics["actor/objective"].append(out["objective"].detach().mean())
+        metrics["actor/objective"].append(out.get("J", out["objective"].detach()).mean())
         metrics["actor/grad_norm"].append(gn.detach())
-        metrics["imagine/alive_H"].append(out["alive_H"].detach().mean())
-        metrics["imagine/reward_mean"].append(out["rewards"].detach().mean())
-        metrics["imagine/done_mean"].append(out["dones"].detach().mean())
-        if self._iteration % max(1, wm.critic_update_every) == 0:
-            self._update_critic(out, metrics)
+        if "advantages" in out:
+            metrics["actor/sf_surrogate"].append(out["objective"].detach().mean())
+            metrics["actor/sf_adv_std"].append(out["advantages"].std())
+        if real_actor:
+            metrics["real/alive_H"].append(out["inep"][:, -1].mean())
+            metrics["real/term_frac"].append(out["term"].sum(1).mean())
+            metrics["real/trunc_frac"].append(out["trunc"].sum(1).mean())
+            # In-episode steps only: past an episode end the re-simulation
+            # runs on without a recording (masked out of the objective).
+            inep1 = out["inep"][:, 1:]
+            metrics["real/reward_mean"].append((out["rewards"].detach() * inep1).sum() / inep1.sum().clamp_min(1.0))
+            metrics["real/pelvis_dev_mm"].append(out["pelvis_dev_mm"])
+            metrics["real/action_dev0"].append(out["action_dev0"])
+        else:
+            metrics["imagine/alive_H"].append(out["alive_H"].detach().mean())
+            metrics["imagine/reward_mean"].append(out["rewards"].detach().mean())
+            metrics["imagine/done_mean"].append(out["dones"].detach().mean())
+        if wm.critic_fit and self._iteration % max(1, wm.critic_update_every) == 0:
+            if wm.critic_source == "real":
+                # The recorded states, not the actor's re-simulated ones.
+                self._update_critic_real(self._real_rollout(wm.imagine_batch, grad=False), metrics)
+            else:
+                self._update_critic(self._imagine(wm.imagine_batch, grad=False) if real_actor else out, metrics)
+
+    def _update_critic_real(self, out: dict[str, Tensor], metrics: dict[str, list]) -> None:
+        wm = self.config.wm
+        with torch.no_grad():
+            states = out["states"].detach()
+            B, H1 = states.shape[:2]
+            H = H1 - 1
+            cobs = self._critic_obs_seq({**out, "states": states})
+            fit = (out["inep"][:, :H] * (1 - out["trunc"])).reshape(-1) > 0
+            self.critic.obs_norm.update(cobs.reshape(B, H1, -1)[:, :H].reshape(B * H, -1)[fit])
+            values = self.critic(cobs, bf16=wm.bf16).reshape(B, H1)
+            targets = real_window_targets(
+                out["rewards"].detach(), out["env_reward"], values, out["inep"], out["term"], out["trunc"],
+                wm.gamma, wm.gae_lambda,
+            )
+            cobs = cobs.reshape(B, H1, -1)[:, :H].reshape(B * H, -1)[fit]
+            targets = targets.reshape(-1)[fit]
+        self._fit_critic(cobs, targets, metrics)
 
     def _update_critic(self, out: dict[str, Tensor], metrics: dict[str, list]) -> None:
         wm = self.config.wm
@@ -456,7 +894,14 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             targets = lambda_returns(out["rewards"].detach(), values, notdone, wm.gamma, wm.gae_lambda)
             cobs = cobs.reshape(B, H1, -1)[:, :H].reshape(B * H, -1)
             targets = targets.reshape(-1)
+        self._fit_critic(cobs, targets, metrics)
+
+    def _fit_critic(self, cobs: Tensor, targets: Tensor, metrics: dict[str, list]) -> None:
+        """``critic_epochs`` x ``critic_minibatches`` regression steps."""
+        wm = self.config.wm
         n = targets.shape[0]
+        if n == 0:
+            return
         mb = max(1, n // wm.critic_minibatches)
         losses = []
         for _ in range(wm.critic_epochs):
@@ -494,12 +939,23 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def _checkpoint_dir(self) -> Path:
         return self.log_dir / self.config.logger.save_path
 
+    def ensure_replay(self) -> SequenceReplay:
+        """Allocate the per-env replay on first use (training, or an offline
+        probe that collects with ``_collect_step``)."""
+        if self.replay is None:
+            wm, t = self.config.wm, self.task
+            self.replay = SequenceReplay(self._num_envs, wm.replay_steps, t.state_dim, t.action_dim, t.context_dim, self.device)
+            # Collection draws its sensor noise as a function of (seed, env,
+            # replay row), so a real-window re-simulation sees the same noise.
+            self._noise_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+            self._env_ids = torch.arange(self._num_envs, device=self.device)
+        return self.replay
+
     @honours_train_time_budget
     def train(self) -> None:  # type: ignore[override]
         wm = self.config.wm
         t = self.task
-        if self.replay is None:
-            self.replay = SequenceReplay(self._num_envs, wm.replay_steps, t.state_dim, t.action_dim, t.context_dim, self.device)
+        self.ensure_replay()
         total_frames = int(self.config.collector.total_frames)
         self.log.info("WMBPTT task: %s", t.describe())
         obs, _ = self._isaac.reset()
@@ -554,6 +1010,13 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                         flushed.get("imagine/alive_H", float("nan")), flushed.get("env/env_reward", float("nan")),
                         flushed.get("perf/iteration_s", float("nan")),
                     )
+                    if "real/pelvis_dev_mm" in flushed:
+                        self.log.info(
+                            "real windows: pelvis_dev=%.1fmm action_dev0=%.4f alive_H=%.3f reward=%.4f",
+                            flushed["real/pelvis_dev_mm"], flushed.get("real/action_dev0", float("nan")),
+                            flushed.get("real/alive_H", float("nan")),
+                            flushed.get("real/reward_mean", float("nan")),
+                        )
                     if "perf/collect_s" in flushed:
                         self.log.info(
                             "phases: collect=%.3fs world_model=%.3fs actor_critic=%.3fs",

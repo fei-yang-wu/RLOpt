@@ -56,6 +56,16 @@ class WMBPTTConfig:
     wm_grad_clip_norm: float = 1.0
     wm_warmup_iters: int = 500
     """World-model-only iterations before the first policy update."""
+    dynamics_model: str = "mlp"
+    """``mlp``: SuperMimic's ``DynamicsModel``. ``diffsr``: ``DiffSRDynamics``
+    with its mean read-out W phi + b as f, phi trained by the denoising loss on
+    every window transition plus the k-step loss on the read-out (the
+    ``diffsr_k8`` arm of ``dynamics_compare``)."""
+    diffsr_feature_dim: int = 128
+    diffsr_embed_dim: int = 512
+    diffsr_num_noises: int = 16
+    diffsr_denoise_coeff: float = 1.0
+    """Weight of the denoising loss beside the k-step read-out loss."""
     min_replay_steps: int = 40
     """Steps per env in the replay before the first world-model update."""
     norm_freeze_samples: float = 2.0e8
@@ -78,12 +88,51 @@ class WMBPTTConfig:
     critic_bootstrap: bool = True
     """Add gamma^H * alive_H * V(s_H) to the imagined return. False trains the
     actor on the H-step return alone (ablation; the critic is still fit)."""
+    critic_fit: bool = True
+    """Fit the critic each policy iteration. False skips the fit and, with
+    ``critic_bootstrap=False``, every critic forward: no value function at all,
+    so the iteration time carries no critic cost (ablation)."""
     actor_horizon: int = 0
     """Steps of the imagined rollout the actor's objective (and so its BPTT
     gradient) covers, bootstrapped with V at that step; 0 means ``horizon``.
     The rollout still runs ``horizon`` steps for the critic's TD(lambda)
     targets, so a smaller value shortens only the actor's gradient path
     (ablation: ``horizon`` alone shortens both)."""
+    actor_estimator: str = "pathwise"
+    """``pathwise``: the actor's gradient flows through the model's Jacobians
+    (SuperMimic, SVG). ``score_function``: the same imagined rollouts run on
+    sampled actions ``a_t = mu(o_t) + sigma eps_t`` (``sf_action_std``) and the
+    actor is updated by the likelihood-ratio estimator
+    ``sum_t gamma^t c_t A_t grad log N(a_t; mu(o_t), sigma^2)`` with per-step
+    advantages ``A_t = TD(lambda) target - V(s_t)`` from the same critic
+    (REINFORCE with a GAE baseline, one gradient step per rollout, no
+    clipping); the model is stepped without gradient. Ablation: same model,
+    critic, data, horizon and compute, estimator only."""
+    sf_action_std: float = 0.1
+    """Sampling std of the score-function actor (the collection noise)."""
+    sf_normalize_advantage: bool = True
+    """Standardize the per-step advantages over the batch (PPO's practice)."""
+    actor_source: str = "imagined"
+    """``imagined``: the actor's H-step objective runs on the model's own
+    rollout from a replay state (SuperMimic). ``real``: it runs along an
+    H-step replay window re-simulated with the recorded noise held fixed
+    (SVG noise inference): ``a_t = pi(o_t) + eta_t`` with the collector's
+    action noise ``eta_t = a_t - mu_old(o_t)``, ``o_t`` carrying the
+    collector's own sensor noise (keyed to the replay row), and
+    ``x_{t+1} = integrate(x_t, f(x_t, a_t) + xi_t)`` with the model residual
+    ``xi_t = increment(s_t, s_{t+1}) - f(s_t, a_t)``. At the collecting policy
+    the forward pass is the recording; the gradient flows through the model's
+    Jacobians. Episode ends are the env's: a termination cuts the return (with
+    the env's reward for the last transition), a timeout bootstraps V at the
+    last state."""
+    critic_source: str = "imagined"
+    """``imagined``: TD(lambda) targets on the imagined rollout. ``real``:
+    targets on recorded replay windows (the behaviour policy's returns, with
+    the env's episode ends as for ``actor_source=real``)."""
+    real_window_recent_steps: int = 50
+    """Real windows start within the newest N rows per env, so the recorded
+    actions come from recent policies (50 rows = 20 iterations at 2.5 env
+    steps per iteration)."""
     actor_hidden: list[int] = field(default_factory=lambda: [1024, 1024, 512, 256])
     actor_activation: str = "elu"
     """MLP activation by name (elu, silu, relu, gelu, tanh)."""
