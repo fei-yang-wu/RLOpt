@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import time
 from collections.abc import Iterator
@@ -64,6 +65,17 @@ from rlopt.utils import get_activation_class
 
 PpoCfgT = TypeVar("PpoCfgT", bound="PPORLOptConfig")
 
+UPDATE_SCHEDULE_KEYS: tuple[str, ...] = (
+    "actor_learning_rate",
+    "critic_learning_rate",
+    "critic_lr_schedule",
+    "critic_lr_final",
+    "critic_extra_epochs",
+    "critic_extra_minibatches",
+    "first_layer_bias_lr_scale",
+)
+"""``PPOConfig`` fields that shape the main optimizer and its schedule."""
+
 
 def _normalize_advantage_over_rollout(advantage: Tensor) -> Tensor:
     """Normalize advantages over every rollout batch dimension once."""
@@ -75,6 +87,20 @@ def _normalize_advantage_over_rollout(advantage: Tensor) -> Tensor:
         correction=1,
     )
     return (advantage - advantage_mean) / (advantage_std + 1.0e-8)
+
+
+def _first_linear_bias(module: torch.nn.Module) -> torch.nn.Parameter:
+    """The bias of the first ``nn.Linear`` in ``module.modules()`` order.
+
+    Wrappers (TensorDictModule, the running-mean-std input normalizer) register
+    no linear layers, so the first one met is the first hidden layer of the
+    MLP.
+    """
+    for sub in module.modules():
+        if isinstance(sub, torch.nn.Linear) and sub.bias is not None:
+            return sub.bias
+    msg = "first_layer_bias_lr_scale: no nn.Linear with a bias found in the module."
+    raise ValueError(msg)
 
 
 class CatInputs(torch.nn.Module):
@@ -309,6 +335,170 @@ class PPOConfig:
     instead of ignoring the key.
     """
 
+    actor_learning_rate: float | None = None
+    """Optional actor-specific learning rate.
+
+    When set together with ``critic_learning_rate``, the main optimizer uses
+    separate actor and critic parameter groups. The adaptive KL schedule updates
+    only the actor group, matching asymmetric actor/critic PPO recipes. Unset,
+    one group at ``optim.lr`` holds both networks and the KL rule moves the
+    critic's rate too.
+    """
+
+    critic_learning_rate: float | None = None
+    """Optional critic-specific learning rate."""
+
+    critic_lr_schedule: str = "constant"
+    """Decay shape for the critic group: ``"constant"``, ``"linear"`` or ``"cosine"``.
+
+    The adaptive KL rule owns the ACTOR group only (``adaptive_lr=True``), so the
+    critic learning rate is otherwise fixed for the whole run. A non-constant
+    schedule interpolates ``critic_learning_rate`` -> ``critic_lr_final`` on
+    cumulative environment frames, not on the in-segment iteration counter, so a
+    walltime-chained resume continues the decay instead of restarting it.
+    """
+
+    critic_lr_final: float | None = None
+    """End-of-budget critic learning rate. Required when the schedule is not constant."""
+
+    critic_extra_epochs: int = 0
+    """Critic-only passes over the rollout AFTER the joint PPO epochs.
+
+    ``0`` (default) changes nothing. Each pass shuffles the collected rollout
+    into ``critic_extra_minibatches`` minibatches and, per minibatch, steps the
+    main optimizer on the PPO critic loss alone (the recipe's
+    ``loss.loss_critic_type``, ``ppo.clip_value`` and ``ppo.critic_coeff``,
+    against the GAE ``value_target`` computed once for this rollout, with the
+    collected ``state_value`` as the clip anchor). The actor's parameters get no
+    gradient, so the joint epochs -- and therefore the actor update, the KL
+    learning-rate rule and the reported PPO loss metrics -- are unchanged. The
+    critic's input normalizers are frozen during these passes so their running
+    statistics still see each transition exactly as many times as before.
+
+    Why this knob exists (2026-10-25): the full-batch recipe gives the critic
+    3 optimizer steps per 393k-frame rollout, the WMBPTT critic gets 20 per
+    41k-frame iteration. This isolates "more, smaller critic steps on the same
+    targets" as the one PPO-side change. Requires split actor/critic learning
+    rates (the critic parameter group). Extra steps are NOT counted in
+    ``updates_completed``, so reward/BC/HL-skill cadences keyed on it are
+    unaffected.
+    """
+
+    critic_extra_minibatches: int = 1
+    """Minibatches per critic-only pass (``critic_extra_epochs``). ``1`` = full batch."""
+
+    first_layer_bias_lr_scale: float = 1.0
+    """Learning-rate multiplier for the FIRST linear layer's bias, actor and critic.
+
+    ``1.0`` (default) changes nothing. Any other value moves each network's
+    first-layer bias into its own parameter group at ``scale x`` the parent
+    group's learning rate: ``actor_first_bias`` (adaptive with the actor, so the
+    KL rule keeps the ratio; ``lr_min``/``lr_max`` scaled to match) and
+    ``critic_first_bias`` (follows ``critic_lr_schedule``). Weight decay is the
+    parent group's. Requires split actor/critic learning rates.
+
+    Why this knob exists (2026-09-01): a constant input channel (the hold-1
+    sin/cos phase pair, which is ``(0, 1)`` on every step) has a weight column
+    whose gradient equals the bias gradient, so under Adam the effective
+    first-layer bias moves at exactly twice the rate. This scale reproduces
+    that effect without the channel, to test whether it is what separates the
+    64-D hold-1 arms that train from those that stall.
+    """
+
+    def validate_update_schedule(self, section: str = "ppo") -> None:
+        """Normalize and check the optimizer-schedule keys of one config section.
+
+        ``section`` names the key in error messages: IPMD inherits these fields
+        and reads them from ``ipmd``, plain PPO from ``ppo``.
+        """
+        self.first_layer_bias_lr_scale = float(self.first_layer_bias_lr_scale)
+        if self.first_layer_bias_lr_scale <= 0.0:
+            msg = (
+                f"{section}.first_layer_bias_lr_scale must be > 0, got "
+                f"{self.first_layer_bias_lr_scale}."
+            )
+            raise ValueError(msg)
+        if self.first_layer_bias_lr_scale != 1.0 and self.actor_learning_rate is None:
+            msg = (
+                f"{section}.first_layer_bias_lr_scale != 1 requires split "
+                f"actor/critic learning rates ({section}.actor_learning_rate and "
+                f"{section}.critic_learning_rate)."
+            )
+            raise ValueError(msg)
+        if self.actor_learning_rate is not None and self.actor_learning_rate <= 0.0:
+            msg = (
+                f"{section}.actor_learning_rate must be > 0 when configured, got "
+                f"{self.actor_learning_rate!r}."
+            )
+            raise ValueError(msg)
+        if self.critic_learning_rate is not None and self.critic_learning_rate <= 0.0:
+            msg = (
+                f"{section}.critic_learning_rate must be > 0 when configured, got "
+                f"{self.critic_learning_rate!r}."
+            )
+            raise ValueError(msg)
+        if (self.actor_learning_rate is None) != (self.critic_learning_rate is None):
+            msg = (
+                f"{section}.actor_learning_rate and {section}.critic_learning_rate "
+                "must be configured together."
+            )
+            raise ValueError(msg)
+        self.critic_lr_schedule = str(self.critic_lr_schedule).strip().lower()
+        if self.critic_lr_schedule not in {"constant", "linear", "cosine"}:
+            msg = (
+                f"{section}.critic_lr_schedule must be 'constant', 'linear' or "
+                f"'cosine', got {self.critic_lr_schedule!r}."
+            )
+            raise ValueError(msg)
+        if self.critic_lr_schedule != "constant":
+            if self.critic_learning_rate is None:
+                msg = (
+                    f"{section}.critic_lr_schedule="
+                    f"{self.critic_lr_schedule!r} requires "
+                    f"{section}.critic_learning_rate (the schedule drives the "
+                    "named critic parameter group, which only exists under split "
+                    "actor/critic learning rates)."
+                )
+                raise ValueError(msg)
+            if self.critic_lr_final is None or self.critic_lr_final <= 0.0:
+                msg = (
+                    f"{section}.critic_lr_final must be > 0 when "
+                    f"{section}.critic_lr_schedule={self.critic_lr_schedule!r}, got "
+                    f"{self.critic_lr_final!r}."
+                )
+                raise ValueError(msg)
+        if int(self.critic_extra_epochs) < 0:
+            msg = (
+                f"{section}.critic_extra_epochs must be >= 0, got "
+                f"{self.critic_extra_epochs!r}."
+            )
+            raise ValueError(msg)
+        self.critic_extra_epochs = int(self.critic_extra_epochs)
+        self.critic_extra_minibatches = int(self.critic_extra_minibatches)
+        if self.critic_extra_minibatches <= 0:
+            msg = (
+                f"{section}.critic_extra_minibatches must be > 0, got "
+                f"{self.critic_extra_minibatches!r}."
+            )
+            raise ValueError(msg)
+        if self.critic_extra_epochs > 0 and self.critic_learning_rate is None:
+            msg = (
+                f"{section}.critic_extra_epochs > 0 requires "
+                f"{section}.critic_learning_rate (the critic-only steps drive the "
+                "named critic parameter group, which only exists under split "
+                "actor/critic learning rates)."
+            )
+            raise ValueError(msg)
+
+    def changed_update_schedule_keys(self) -> list[str]:
+        """Update-schedule keys that differ from their defaults."""
+        default = PPOConfig()
+        return [
+            key
+            for key in UPDATE_SCHEDULE_KEYS
+            if getattr(self, key) != getattr(default, key)
+        ]
+
 
 @dataclass
 class PPORLOptConfig(RLOptConfig):
@@ -320,6 +510,15 @@ class PPORLOptConfig(RLOptConfig):
     use_value_function: bool = True
     """PPO always trains a value function; declared so the resolved config
     carries no undeclared attributes."""
+
+    abort_on_nonfinite: bool = True
+    """Stop the run the first time a rollout metric or policy weight is not
+    finite.
+
+    A NaN policy keeps training at full speed and silently poisons every later
+    checkpoint; two chains lost about a day each that way (2026-08-23 fsq64,
+    2026-08-24 emastack) before eval caught it. Set false only to reproduce
+    such a failure on purpose."""
 
     def __post_init__(self):
         self.use_value_function = True
@@ -368,6 +567,21 @@ class PPOIterationData(IterationData):
 
 
 class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
+    """On-policy PPO. This class owns the training loop.
+
+    Optimizer groups, the critic schedule, the KL rule, the running input
+    statistics, the epoch/minibatch loop, recording, the non-finite watchdog and
+    checkpoint resume all live here. IPMD subclasses this and adds only its
+    reward, latent and BC terms through the hooks (``_pre_advantage_phase``,
+    ``_update_inputs``, ``_extra_actor_parameters``, ``_compile_extra_components``)
+    so PPO and IPMD with those terms off are the same loop, bit for bit
+    (``tests/test_ppo_ipmd_loop_parity.py``). Add a loop feature here, not in a
+    subclass.
+    """
+
+    # Config section holding the update-schedule keys (UPDATE_SCHEDULE_KEYS).
+    _update_cfg_section = "ppo"
+
     # This class's ``update`` runs its loss forward through
     # ``_update_loss_forward``, so it honours ``ppo.update_amp_dtype``. A class
     # that overrides ``update`` (or IPMD's ``_backward_ppo_terms``) must set
@@ -387,6 +601,11 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         feature_extractor_net: torch.nn.Module | None = None,
         **kwargs,
     ):
+        # Before super(): BaseAlgorithm.__init__ builds the optimizer from these.
+        self.config = config
+        self._update_cfg.validate_update_schedule(self._update_cfg_section)
+        self._max_grad_norm: float = self._resolve_max_grad_norm()
+
         super().__init__(
             env=env,
             config=config,
@@ -403,9 +622,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self.adv_module = self._construct_adv_module()
 
         # Cache optimizer parameters for compile-friendly grad clipping.
-        self._grad_clip_params: list[Tensor] = [  # type: ignore[attr-defined]
-            param for group in self.optim.param_groups for param in group["params"]
-        ]
+        self._refresh_grad_clip_params()
 
         # Opt-in mixed precision for the update forward (ppo.update_amp_dtype).
         # Unset, nothing is installed and the update is unchanged.
@@ -422,6 +639,25 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
         # Initialize total network updates
         self.total_network_updates = 0
+
+    @property
+    def _update_cfg(self) -> PPOConfig:
+        """The config section holding the update-schedule keys."""
+        return getattr(self.config, self._update_cfg_section)
+
+    def _resolve_max_grad_norm(self) -> float:
+        """Clip threshold; a large finite value when clipping is disabled.
+
+        Clipping always runs so ``grad_norm`` is reported either way.
+        """
+        max_grad = self.config.optim.max_grad_norm
+        return float(max_grad) if max_grad is not None and max_grad > 0 else 1e10
+
+    def _refresh_grad_clip_params(self) -> None:
+        """Refresh the cached optimizer parameter list used for grad clipping."""
+        self._grad_clip_params = [  # type: ignore[attr-defined]
+            param for group in self.optim.param_groups for param in group["params"]
+        ]
 
     def _construct_feature_extractor(
         self, feature_extractor_net: torch.nn.Module | None = None
@@ -789,9 +1025,102 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
     def _set_optimizers(  # type: ignore[override]
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
-        """Create optimizer for actor-critic parameters."""
-        # For PPO, we use a single optimizer for both policy and value
-        return [optimizer_cls(self.actor_critic.parameters(), **optimizer_kwargs)]
+        """Create the main optimizer: one group, or split actor/critic groups."""
+        if self._update_cfg.actor_learning_rate is not None:
+            return [optimizer_cls(self._split_lr_param_groups(), **optimizer_kwargs)]
+        params = list(self.actor_critic.parameters()) + self._extra_actor_parameters()
+        return [optimizer_cls(params, **optimizer_kwargs)]
+
+    def _extra_actor_parameters(self) -> list[torch.nn.Parameter]:
+        """Parameters trained by the actor loss that live outside ``self.policy``."""
+        return []
+
+    def _split_lr_param_groups(self) -> list[dict[str, Any]]:
+        """Actor, critic and log-std groups for asymmetric learning rates."""
+        cfg = self._update_cfg
+        assert cfg.critic_learning_rate is not None
+        actor_lr = float(cfg.actor_learning_rate)
+        critic_lr = float(cfg.critic_learning_rate)
+        # The exploration std is a bare nn.Parameter, so AdamW's decoupled
+        # weight decay would pull it toward log_std=0, i.e. sigma toward
+        # 1.0 rad -- against the anneal that carries this recipe. Give it
+        # its own group at weight_decay=0 so optim.weight_decay can be
+        # tuned on the networks alone. The group stays adaptive, so the KL
+        # rule scales it with the rest of the actor.
+        log_std_params = [
+            param for name, param in self.policy.named_parameters() if "log_std" in name
+        ]
+        log_std_ids = {id(param) for param in log_std_params}
+        policy_params = [
+            param
+            for param in list(self.policy.parameters()) + self._extra_actor_parameters()
+            if id(param) not in log_std_ids
+        ]
+        value_params = list(self.value_function.parameters())
+        weight_decay = float(self.config.optim.weight_decay)
+        min_lr = self.config.optim.min_lr
+        max_lr = self.config.optim.max_lr
+        groups: list[dict[str, Any]] = [
+            {
+                "params": policy_params,
+                "lr": actor_lr,
+                "adaptive_lr": True,
+                "lr_min": min_lr,
+                "lr_max": max_lr,
+                "weight_decay": weight_decay,
+                "name": "actor",
+            },
+            {
+                "params": value_params,
+                "lr": critic_lr,
+                "adaptive_lr": False,
+                "weight_decay": weight_decay,
+                "name": "critic",
+            },
+        ]
+        if log_std_params:
+            groups.append(
+                {
+                    "params": log_std_params,
+                    "lr": actor_lr,
+                    "adaptive_lr": True,
+                    "lr_min": min_lr,
+                    "lr_max": max_lr,
+                    "weight_decay": 0.0,
+                    "name": "actor_log_std",
+                }
+            )
+        bias_scale = float(cfg.first_layer_bias_lr_scale)
+        if bias_scale != 1.0:
+            actor_bias = _first_linear_bias(self.policy)
+            critic_bias = _first_linear_bias(self.value_function)
+            groups[0]["params"] = [p for p in policy_params if p is not actor_bias]
+            groups[1]["params"] = [p for p in value_params if p is not critic_bias]
+
+            def _scaled(value: float | None) -> float | None:
+                return None if value is None else float(value) * bias_scale
+
+            groups.append(
+                {
+                    "params": [actor_bias],
+                    "lr": actor_lr * bias_scale,
+                    "adaptive_lr": True,
+                    "lr_min": _scaled(min_lr),
+                    "lr_max": _scaled(max_lr),
+                    "weight_decay": weight_decay,
+                    "name": "actor_first_bias",
+                }
+            )
+            groups.append(
+                {
+                    "params": [critic_bias],
+                    "lr": critic_lr * bias_scale,
+                    "adaptive_lr": False,
+                    "weight_decay": weight_decay,
+                    "name": "critic_first_bias",
+                }
+            )
+        return groups
 
     def _construct_data_buffer(self) -> ReplayBuffer:
         """Construct data buffer"""
@@ -829,25 +1158,39 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             compilable=cfg.compile.compile,
         )
 
-    def _compile_components(self):
-        """Compile components"""
+    def _compile_components(self) -> None:
+        """Compile the loss forward and GAE with torch.compile (if enabled).
+
+        Deliberately narrower than ``torch.compile(self.update)``: ``update``
+        interleaves optimizer stepping and host-side bookkeeping, which force
+        Dynamo graph breaks, and the optimizer's Python-float learning rates
+        would guard-fail on every KL adaptation. Compiling ``loss_module``
+        captures the actor+critic forward that autograd then differentiates;
+        ``adv_module`` covers the GAE scan.
+
+        Measured 2026-08-18 on the tuned G1 recipe (8,192 envs, RTX PRO
+        6000): the loss step is GEMM-bound, so the win is small and comes
+        from GAE (80 -> 57 ms); ``update/ppo_terms`` moves ~1%. ``max-autotune``
+        ties ``default`` and its CUDA-graphs variant crashes on latent-sampler
+        tensor reuse -- use ``max-autotune-no-cudagraphs`` if autotuning.
+        """
+        if not self.config.compile.compile:
+            return
         if not hasattr(self, "adv_module"):
+            # Base-class __init__ calls this hook before PPO.__init__ has
+            # built the advantage module; the second call compiles.
             return
         if getattr(self, "_components_compiled", False):
             return
-        compile_mode = None
-        cfg = self.config
-        if cfg.compile.compile:
-            compile_mode = cfg.compile.compile_mode
-            if compile_mode in ("", None):
-                if cfg.compile.cudagraphs:
-                    compile_mode = "default"
-                else:
-                    compile_mode = "reduce-overhead"
+        compile_mode = self.config.compile.compile_mode or "default"
+        self.loss_module = torch.compile(self.loss_module, mode=compile_mode)
+        self.adv_module = torch.compile(self.adv_module, mode=compile_mode)
+        self._compile_extra_components()
+        self._components_compiled = True
 
-            self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore
-            self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore
-            self._components_compiled = True  # type: ignore[attr-defined]
+    def _compile_extra_components(self) -> None:
+        """Compile algorithm-specific modules alongside the loss and GAE."""
+        return
 
     @staticmethod
     def _policy_action_from_dist(dist: Any) -> Tensor | None:
@@ -1080,40 +1423,32 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
     def update(
         self, batch: TensorDict, num_network_updates: int
     ) -> tuple[TensorDict, int]:
-        """Update function"""
+        """One optimizer step on the joint actor-critic PPO objective."""
         self.optim.zero_grad(set_to_none=True)
+        output_loss = self._backward_ppo_terms(batch)
 
-        # Forward pass PPO loss
-        loss: TensorDict = self._update_loss_forward(batch)
-        critic_loss = loss["loss_critic"]
-        extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
-        actor_loss = loss["loss_objective"] + loss["loss_entropy"] + extra_actor_loss
-        total_loss = critic_loss + actor_loss
-        # Backward pass
-        total_loss.backward()  # type: ignore
+        # Gradient clipping -- always call for a fixed graph
+        grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
-        output_loss = loss.detach()  # type: ignore
-        for key, value in extra_actor_metrics.items():
-            metric = (
-                value
-                if isinstance(value, Tensor)
-                else torch.tensor(value, device=self.device, dtype=torch.float32)
-            )
-            output_loss.set(key, metric.detach())
-
-        max_grad_norm = self.config.optim.max_grad_norm
-        if max_grad_norm is not None and max_grad_norm > 0:
-            grad_norm_tensor = clip_grad_norm_(
-                self._grad_clip_params, float(max_grad_norm)
-            )
-        else:
-            grad_norm_tensor = torch.zeros((), device=self.device)
-
-        # Update the networks
         self.optim.step()
-        output_loss.set("alpha", torch.tensor(1.0, device=self.device))  # type: ignore
-        output_loss.set("grad_norm", grad_norm_tensor.detach())  # type: ignore
-        return output_loss, num_network_updates + 1  # type: ignore
+        output_loss.set("alpha", torch.ones((), device=self.device))
+        output_loss.set("grad_norm", grad_norm_tensor.detach())
+        return output_loss, num_network_updates + 1
+
+    def _backward_ppo_terms(self, batch: TensorDict) -> TensorDict:
+        """Backpropagate the PPO objective and return detached update metrics."""
+        loss: TensorDict = self._update_loss_forward(batch)
+        extra_actor_loss, extra_actor_metrics = self._extra_actor_loss(batch)
+        (
+            loss["loss_critic"]
+            + loss["loss_objective"]
+            + loss["loss_entropy"]
+            + extra_actor_loss
+        ).backward()
+        output_loss = loss.clone().detach_()
+        for key, value in extra_actor_metrics.items():
+            output_loss.set(key, value.detach())
+        return output_loss
 
     def _collector_iter(self) -> Iterator[TensorDict]:
         """Yield data from the collector while enforcing NaN guards per batch."""
@@ -1347,11 +1682,15 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         )
         learn_start = time.perf_counter()
 
+        self._apply_critic_lr_schedule(metadata)
         self.data_buffer.empty()
         self.actor_critic.train()
         self.adv_module.train()
 
         with timeit("training"):
+            # Algorithm-specific work that must precede the advantage estimate.
+            self._pre_advantage_phase(iteration, metadata)
+
             # Pre-iteration compute GAE, once per rollout
             with self._profile_iteration_phase(
                 iteration.phase_times, "learn/advantage_and_buffer"
@@ -1371,10 +1710,11 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                                 batch, metadata.policy_operator
                             )
 
-                        loss, metadata.updates_completed = self.update(
-                            batch, metadata.updates_completed
-                        )
-                        loss = loss.clone()
+                        update_inputs = self._update_inputs(batch)
+                        with timeit("training/update"):
+                            loss, metadata.updates_completed = self.update(
+                                batch, metadata.updates_completed, *update_inputs
+                            )
 
                         if self.lr_scheduler and self.lr_scheduler_step == "update":
                             self.lr_scheduler.step()
@@ -1402,10 +1742,126 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 # optim.kl_adapt_step="iteration"; a no-op otherwise.
                 self._flush_kl_lr_adaptation(self.config.optim)
 
+            with self._profile_iteration_phase(
+                iteration.phase_times, "learn/critic_extra_updates"
+            ):
+                critic_extra_metrics = self._run_critic_extra_updates(iteration.rollout)
+            iteration.metrics.update(
+                {f"train/{key}": value for key, value in critic_extra_metrics.items()}
+            )
+
         iteration.learn_time = time.perf_counter() - learn_start
         losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
         for key, value in losses_mean.items():  # type: ignore[attr-defined]
             iteration.metrics[f"train/{key}"] = value.item()  # type: ignore[attr-defined]
+
+    def _pre_advantage_phase(
+        self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
+    ) -> None:
+        """Hook: mutate the rollout after collection, before GAE reads it."""
+        del iteration, metadata
+
+    def _update_inputs(self, batch: TensorDict) -> tuple[Any, ...]:
+        """Hook: extra positional arguments for ``update`` on one minibatch."""
+        del batch
+        return ()
+
+    def _apply_critic_lr_schedule(self, metadata: PPOTrainingMetadata) -> None:
+        """Set the critic group's learning rate for this iteration.
+
+        A no-op under ``critic_lr_schedule="constant"``. Progress is cumulative
+        environment frames over the configured frame budget --
+        ``metadata.frames_processed`` is seeded with the resume offset, so a
+        walltime-chained segment continues the decay where the previous one
+        stopped instead of restarting at ``critic_learning_rate``.
+        """
+        cfg = self._update_cfg
+        schedule = str(cfg.critic_lr_schedule)
+        if schedule == "constant":
+            return
+        start = cfg.critic_learning_rate
+        end = cfg.critic_lr_final
+        if start is None or end is None:
+            return
+        total_frames = float(self.config.collector.total_frames)
+        if total_frames <= 0.0:
+            return
+        progress = float(metadata.frames_processed) / total_frames
+        progress = min(max(progress, 0.0), 1.0)
+        start = float(start)
+        end = float(end)
+        if schedule == "linear":
+            lr = start + (end - start) * progress
+        else:  # cosine
+            lr = end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
+        bias_scale = float(cfg.first_layer_bias_lr_scale)
+        for group in self.optim.param_groups:
+            if group.get("name") == "critic":
+                group["lr"] = lr
+            elif group.get("name") == "critic_first_bias":
+                group["lr"] = lr * bias_scale
+
+    def _run_critic_extra_updates(self, rollout: TensorDict) -> dict[str, float]:
+        """Critic-only minibatch steps on this rollout's fixed GAE targets.
+
+        See :attr:`PPOConfig.critic_extra_epochs`. ``rollout`` is the
+        post-``pre_iteration_compute`` rollout (``value_target`` and the
+        collected ``state_value`` present). Returns per-iteration means of the
+        critic loss, the value-clip fraction and the gradient norm over the
+        extra steps, plus the step count; ``{}`` when the knob is off.
+        """
+        cfg = self._update_cfg
+        epochs = int(cfg.critic_extra_epochs)
+        if epochs <= 0:
+            return {}
+        num_minibatches = int(cfg.critic_extra_minibatches)
+        flat = rollout if rollout.batch_dims == 1 else rollout.reshape(-1)
+        total = int(flat.batch_size[0])
+        if total <= 0:
+            return {}
+        # The compiled wrapper exposes the original module; ``loss_critic`` is
+        # a plain method call on it (not traced), so minibatch shapes are free.
+        loss_module = getattr(self.loss_module, "_orig_mod", self.loss_module)
+        loss_sum = torch.zeros((), device=self.device)
+        clip_sum = torch.zeros((), device=self.device)
+        grad_sum = torch.zeros((), device=self.device)
+        steps = 0
+        with self._freeze_value_normalizer_updates():
+            for _epoch_idx in range(epochs):
+                perm = torch.randperm(total, device=flat.device)
+                for index in perm.chunk(num_minibatches):
+                    if index.numel() == 0:
+                        continue
+                    batch = flat[index]
+                    self.optim.zero_grad(set_to_none=True)
+                    loss_critic, clip_fraction, _explained = loss_module.loss_critic(
+                        batch
+                    )
+                    if loss_critic.ndim > 0:
+                        loss_critic = loss_critic.mean()
+                    loss_critic.backward()
+                    # Only the critic's parameters carry gradients here; the
+                    # optimizer skips parameters whose ``.grad`` is None, so
+                    # the actor groups (and their Adam moments) stay put.
+                    grad_norm = clip_grad_norm_(
+                        self._grad_clip_params, self._max_grad_norm
+                    )
+                    self.optim.step()
+                    loss_sum = loss_sum + loss_critic.detach()
+                    if clip_fraction is not None:
+                        clip_sum = clip_sum + clip_fraction.detach().float().mean()
+                    grad_sum = grad_sum + grad_norm.detach()
+                    steps += 1
+        self.optim.zero_grad(set_to_none=True)
+        if steps == 0:
+            return {}
+        scale = float(steps)
+        return {
+            "critic_extra_steps": float(steps),
+            "critic_extra_loss_critic": (loss_sum / scale).item(),
+            "critic_extra_value_clip_fraction": (clip_sum / scale).item(),
+            "critic_extra_grad_norm": (grad_sum / scale).item(),
+        }
 
     def _build_control_metrics(self, metadata: PPOTrainingMetadata) -> dict[str, Any]:
         """Report optimizer and scheduler-controlled scalars for the current run."""
@@ -1457,15 +1913,25 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         """Flush metrics, refresh progress, and handle checkpoint cadence."""
         rollout = iteration.rollout
 
-        step_rewards = rollout["next", "reward"]
-        iteration.metrics.update(
-            {
-                "train/step_reward_mean": step_rewards.mean().item(),  # type: ignore
-                "train/step_reward_std": step_rewards.std().item(),  # type: ignore
-                "train/step_reward_max": step_rewards.max().item(),  # type: ignore
-                "train/step_reward_min": step_rewards.min().item(),  # type: ignore
-            }
-        )
+        if "train/step_reward_mean" not in iteration.metrics and (
+            "next",
+            "reward",
+        ) in rollout.keys(True):
+            step_rewards = rollout["next", "reward"]
+            iteration.metrics.update(
+                {
+                    "train/step_reward_mean": step_rewards.mean().item(),
+                    "train/step_reward_std": step_rewards.std().item(),
+                    "train/step_reward_max": step_rewards.max().item(),
+                    "train/step_reward_min": step_rewards.min().item(),
+                }
+            )
+        # Plain PPO optimizes the env reward, so the series every algorithm
+        # shares is this same number; IPMD set its own from the unmixed reward.
+        if "train/step_reward_mean" in iteration.metrics:
+            iteration.metrics.setdefault(
+                "train/env_reward_mean", iteration.metrics["train/step_reward_mean"]
+            )
 
         episode_rewards = rollout["next", "episode_reward"][rollout["next", "done"]]
         if len(episode_rewards) > 0:
@@ -1481,6 +1947,8 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                     "train/reward": float(np.mean(episode_reward_values)),
                 }
             )
+
+        self._abort_on_nonfinite(iteration, metadata)
 
         iteration.metrics.update(self._build_control_metrics(metadata))
         iteration.metrics.update(self._build_timing_metrics(iteration, metadata))
@@ -1510,6 +1978,53 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                     path=checkpoint_dir,
                     step=metadata.frames_processed,
                 )
+
+    # Watchdog keys: the first quantities to turn non-finite when a rollout
+    # produces NaN. Checked every iteration because a NaN policy keeps training
+    # at full speed and every later checkpoint is unusable -- two chains
+    # (2026-08-23 fsq64, 2026-08-24 emastack) each burned about a day before
+    # anyone noticed. Losses are excluded on purpose: an optimizer can recover
+    # a single bad update, but a non-finite reward or policy parameter cannot.
+    _NONFINITE_WATCH_KEYS: tuple[str, ...] = (
+        "train/step_reward_mean",
+        "episode/return",
+    )
+
+    def _abort_on_nonfinite(
+        self, iteration: PPOIterationData, metadata: PPOTrainingMetadata
+    ) -> None:
+        """Raise as soon as training goes non-finite, before writing a checkpoint.
+
+        Set ``agent.abort_on_nonfinite=false`` to downgrade this to a warning.
+        """
+        offenders = [
+            key
+            for key in self._NONFINITE_WATCH_KEYS
+            if key in iteration.metrics
+            and not math.isfinite(float(iteration.metrics[key]))
+        ]
+        if not offenders:
+            bad_params = [
+                name
+                for name, tensor in (
+                    self.policy.named_parameters() if self.policy else ()
+                )
+                if not torch.isfinite(tensor).all()
+            ]
+            if bad_params:
+                offenders = [f"policy:{bad_params[0]}"]
+        if not offenders:
+            return
+        message = (
+            "Training went non-finite at "
+            f"{metadata.frames_processed} cumulative frames: {offenders}. "
+            "Every later checkpoint would be unusable; aborting so the chain "
+            "can resume from the last good checkpoint."
+        )
+        if not bool(getattr(self.config, "abort_on_nonfinite", True)):
+            self.log.error("%s (abort_on_nonfinite=false, continuing)", message)
+            return
+        raise RuntimeError(message)
 
     @torch.no_grad()
     def _update_rollout_normalizers(self, rollout: TensorDict) -> None:
