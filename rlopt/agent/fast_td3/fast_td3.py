@@ -30,7 +30,6 @@ from tqdm.std import tqdm as Tqdm
 from rlopt.base_class import BaseAlgorithm
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import log_info
 from rlopt.agent.fast_td3.utils import EmpiricalNormalization
 
 
@@ -833,18 +832,18 @@ class FastTD3(BaseAlgorithm[FastTD3RLOptConfig]):
                     metrics_to_log["train/obs_std"] = self.obs_normalizer.std.mean().item()
                     metrics_to_log["train/obs_count"] = self.obs_normalizer.count.item()
 
-            # IsaacLab-specific logging
-            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                log_info(log_info_dict, metrics_to_log)
-
             metrics_to_log.update(timeit.todict(prefix="time"))
             rate = pbar.format_dict.get("rate")
             if rate is not None:
                 metrics_to_log["time/speed"] = rate
 
             if collected_frames % (10 * num_envs) == 0:
-                self.log_metrics(metrics_to_log, step=collected_frames)
+                self.log_training_metrics(
+                    metrics_to_log,
+                    frames=collected_frames,
+                    iteration=collected_frames // frames_in_batch,
+                    log_python=None,
+                )
 
                 postfix = {}
                 if "episode/return" in metrics_to_log:
@@ -868,6 +867,15 @@ class FastTD3(BaseAlgorithm[FastTD3RLOptConfig]):
 
         pbar.close()
         self.collector.shutdown()
+
+    def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
+        """Return the metrics printed for non-progress-bar training runs."""
+        return (
+            ("train/step_reward_mean", "r_step"),
+            ("episode/length", "ep_len"),
+            ("episode/return", "r_ep"),
+            ("time/speed", "fps"),
+        )
 
     def predict(self, td: TensorDict) -> Tensor:
         self._actor_net.eval()

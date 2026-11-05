@@ -143,6 +143,19 @@ class DiffSRDynamics(nn.Module):
         """Mean increment by the linear read-out (``DynamicsModel`` signature)."""
         return self.readout_from_phi(self.phi(x, bf16=bf16))
 
+    def denoised(self, x: Tensor, d_t: Tensor, step: int, *, bf16: bool = False) -> Tensor:
+        """Denormalized posterior mean E[d_0 | d_t, s, a] at diffusion step
+        ``step`` (Tweedie), one denoiser pass. For a fixed ``d_t`` it is affine
+        in phi(s, a) with the row's own matrix mu(d_t, t): the model's own
+        linear read-out, no probe head."""
+        src, act = self._split(x)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and x.is_cuda):
+            phi = self.sr.forward_phi(src, act)
+        t = torch.full((x.shape[0],), int(step), dtype=torch.long, device=x.device)
+        eps_hat = self._eps(phi.float(), src, d_t, t, bf16)
+        abar = self.sr.alphabars[int(step)]
+        return self.denormalize_increment((d_t - (1 - abar).sqrt() * eps_hat) / abar.sqrt())
+
     # ------------------------------------------------------------ sampling
     def sample(
         self,

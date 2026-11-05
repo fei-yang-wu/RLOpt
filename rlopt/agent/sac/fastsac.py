@@ -24,7 +24,6 @@ from rlopt.agent.fast_td3.utils import EmpiricalNormalization, SimpleReplayBuffe
 from rlopt.base_class import BaseAlgorithm, IterationData, TrainingMetadata
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import log_info
 
 
 # ---------------------------------------------------------------------------
@@ -1076,24 +1075,17 @@ class FastSAC(BaseAlgorithm[FastSACRLOptConfig]):
                     metrics["episode/length"] = float(np.mean(self.episode_lengths))
                     metrics["episode/return"] = float(np.mean(self.episode_rewards))
 
-        # IsaacLab environment-specific metrics
-        if "Isaac" in cfg.env.env_name and hasattr(self.env, "log_infos"):
-            log_info_dict = self.env.log_infos.popleft()
-            log_info(log_info_dict, metrics)
-
         metrics.update(timeit.todict(prefix="time"))
         rate = getattr(metadata.progress_bar, "format_dict", {}).get("rate")
         if rate is not None:
             metrics["time/speed"] = rate
 
-        # Log all metrics to W&B / file without printing to console.
         # _refresh_progress_display below handles the filtered console summary.
-        if self._should_log_iteration(metadata, iteration):
-            self.log_metrics(
-                metrics,
-                step=metadata.frames_processed,
-                log_python=False,
-            )
+        self.log_training_metrics(
+            metrics,
+            frames=metadata.frames_processed,
+            iteration=iteration.iteration_idx + 1,
+        )
         self._refresh_progress_display(metadata, iteration)
 
         # save_interval is in *samples* (same unit as log_interval and total_frames).

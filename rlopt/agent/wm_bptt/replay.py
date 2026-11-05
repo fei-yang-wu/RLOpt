@@ -37,6 +37,11 @@ class SequenceReplay:
         self.frame = torch.zeros(T, N, dtype=torch.long, **f)
         self.episode_step = torch.full((T, N), -10, dtype=torch.long, **f)
         self.push = torch.zeros(T, N, dtype=torch.bool, **f)
+        # The collecting actor's deterministic output (action minus its noise).
+        self.policy_action = torch.zeros(T, N, action_dim, **f)
+        # Outcome of the transition out of each row (set after the env step).
+        self.env_reward = torch.zeros(T, N, **f)
+        self.terminated = torch.zeros(T, N, dtype=torch.bool, **f)
         self.steps = 0  # absolute steps written
 
     def add(
@@ -49,8 +54,10 @@ class SequenceReplay:
         frame: Tensor,
         episode_step: Tensor,
         push: Tensor,
+        policy_action: Tensor | None = None,
     ) -> None:
         i = self.steps % self.capacity
+        self.policy_action[i] = action if policy_action is None else policy_action
         self.state[i] = state
         self.action[i] = action
         self.prev_action[i] = prev_action
@@ -59,7 +66,16 @@ class SequenceReplay:
         self.frame[i] = frame
         self.episode_step[i] = episode_step
         self.push[i] = push
+        self.env_reward[i] = 0.0
+        self.terminated[i] = False
         self.steps += 1
+
+    def set_outcome(self, env_reward: Tensor, terminated: Tensor) -> None:
+        """Record the env's reward and termination (not timeout) of the step
+        taken from the newest row."""
+        i = (self.steps - 1) % self.capacity
+        self.env_reward[i] = env_reward
+        self.terminated[i] = terminated
 
     @property
     def oldest(self) -> int:
@@ -88,12 +104,15 @@ class SequenceReplay:
         out = {
             "state": self.state[slot, e],
             "action": self.action[slot, e],
+            "policy_action": self.policy_action[slot, e],
             "prev_action": self.prev_action[slot, e],
             "context": self.context[slot, e],
             "rank": self.rank[slot, e],
             "frame": self.frame[slot, e],
             "episode_step": self.episode_step[slot, e],
             "push": self.push[slot, e],
+            "env_reward": self.env_reward[slot, e],
+            "terminated": self.terminated[slot, e],
         }
         es = out["episode_step"]
         out["valid"] = (es[:, 1:] == es[:, :-1] + 1) & ~out["push"][:, 1:]
@@ -115,4 +134,5 @@ class SequenceReplay:
             "context": self.context[self._slot(tau), env],
             "rank": self.rank[self._slot(tau), env],
             "frame": self.frame[self._slot(tau), env],
+            "episode_step": es_now,
         }

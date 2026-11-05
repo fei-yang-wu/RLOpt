@@ -65,7 +65,7 @@ from rlopt.config_utils import (
 )
 from rlopt.expert import build_offline_expert_sampler
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import get_activation_class, log_info
+from rlopt.utils import get_activation_class
 
 
 @dataclass
@@ -3071,17 +3071,6 @@ class IPMD(PPO):
             metrics[key] = value
         return metrics
 
-    def _record_env_metrics(self, iteration: PPOIterationData) -> None:
-        """Record IsaacLab env metrics while draining the env log queue."""
-        if (
-            "Isaac" in self.config.env.env_name
-            and hasattr(self.env, "log_infos")
-            and len(self.env.log_infos) > 0
-        ):
-            log_info_dict: dict[str, Tensor] = self.env.log_infos.pop()
-            self.env.log_infos.clear()
-            log_info(log_info_dict, iteration.metrics)
-
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         return (
             ("train/step_reward_mean", "r_step"),
@@ -3163,15 +3152,11 @@ class IPMD(PPO):
 
         iteration.metrics.update(self._build_control_metrics(metadata))
         iteration.metrics.update(self._build_timing_metrics(iteration, metadata))
-        self._record_env_metrics(iteration)
         iteration.metrics.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
-        # Always stream scalar metrics to the configured backend (e.g. WandB).
-        # Sparse terminal/file summaries remain controlled by
-        # ``trainer.log_interval`` via ``_refresh_progress_display`` below.
-        self.log_metrics(
+        self.log_training_metrics(
             iteration.metrics,
-            step=metadata.frames_processed,
-            log_python=False,
+            frames=metadata.frames_processed,
+            iteration=metadata.frames_processed // iteration.frames,
         )
         self._log_iteration_file_summary(metadata, iteration)
         self.collector.update_policy_weights_()

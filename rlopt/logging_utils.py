@@ -25,10 +25,17 @@ except Exception:  # pragma: no cover
 
 
 __all__ = [
+    "ELAPSED_ENTRY",
+    "FRAMES_ENTRY",
+    "ITERATION_ENTRY",
+    "REQUIRED_TRAINING_ENTRIES",
     "ROOT_LOGGER_NAME",
+    "STEP_REWARD_ENTRY",
+    "THROUGHPUT_ENTRY",
     "LoggingManager",
     "MetricReporter",
     "log_to_file_only",
+    "missing_training_entries",
     "resolve_log_level",
 ]
 
@@ -68,6 +75,23 @@ def resolve_log_level(level: str | int | None, *, default: int = logging.INFO) -
 # shared-mode run plots against a bare log-call index, which is not comparable
 # with a non-shared run and does not survive a resume offset.
 _STEP_METRIC = "env_frames"
+
+# The training-row contract: every row a training loop writes carries these,
+# whatever the algorithm (see ``BaseAlgorithm.log_training_metrics``, the one
+# write path, and wiki/logging-contract.md). Environments declare their own
+# required entries through ``env.required_log_entries``.
+ELAPSED_ENTRY = "time/train_elapsed_s"
+FRAMES_ENTRY = "train/cumulative_env_frames"
+ITERATION_ENTRY = "train/iteration"
+THROUGHPUT_ENTRY = "time/speed"
+STEP_REWARD_ENTRY = "train/step_reward_mean"
+REQUIRED_TRAINING_ENTRIES: tuple[str, ...] = (
+    ELAPSED_ENTRY,
+    FRAMES_ENTRY,
+    ITERATION_ENTRY,
+    THROUGHPUT_ENTRY,
+    STEP_REWARD_ENTRY,
+)
 
 
 def _wandb_is_shared(experiment: Any) -> bool:
@@ -162,6 +186,15 @@ def _coerce_metric_value(value: Any) -> float | int | None:
         return None
 
     return None
+
+
+def missing_training_entries(
+    row: Mapping[str, Any],
+    required: Iterable[str] = REQUIRED_TRAINING_ENTRIES,
+) -> list[str]:
+    """Required entries that are absent from ``row`` or have no scalar value."""
+
+    return [key for key in required if _coerce_metric_value(row.get(key)) is None]
 
 
 def _format_metric_for_console(value: float | int) -> str:
@@ -361,6 +394,10 @@ class MetricReporter:
         self._metrics_logger = metrics_logger
         self._python_logger = python_logger
         self._step_metric_declared = False
+        self._next_wandb_step = 0
+        # Rows handed to the metrics backend; a configured backend at zero
+        # while training progresses means metrics are not arriving.
+        self.rows_written = 0
 
     def _declare_step_metric(self, experiment: Any) -> None:
         """Make :data:`_STEP_METRIC` the wandb x-axis. Idempotent, once per run."""
@@ -379,6 +416,22 @@ class MetricReporter:
                 self._python_logger.debug(
                     "Could not declare %s as the wandb x-axis.", _STEP_METRIC
                 )
+
+    def _accepted_wandb_step(self, experiment: Any, record_step: int) -> int:
+        """Lowest step at or above ``record_step`` that wandb will keep.
+
+        wandb discards a row whose step is below its current step, and a
+        committed row leaves the current step one past it. So a second row at
+        the same frame count (``profile/*``, ``train/stopped_by_time_budget``)
+        or a resumed segment starting below the run's last step is lost with
+        only a console warning. ``_STEP_METRIC`` is the x-axis and stays exact;
+        only the native step moves.
+        """
+
+        current = int(getattr(experiment, "step", 0) or 0)
+        accepted = max(record_step, self._next_wandb_step, current)
+        self._next_wandb_step = accepted + 1
+        return accepted
 
     def log_scalars(
         self,
@@ -437,10 +490,15 @@ class MetricReporter:
                 if _wandb_is_shared(experiment):
                     experiment.log(payload, commit=True)
                 else:
-                    experiment.log(payload, step=record_step, commit=True)
+                    experiment.log(
+                        payload,
+                        step=self._accepted_wandb_step(experiment, record_step),
+                        commit=True,
+                    )
             else:
                 for key, value in sanitized.items():
                     self._metrics_logger.log_scalar(key, value, record_step)
+            self.rows_written += 1
 
         if log_python and self._python_logger is not None:
             message = " | ".join(
@@ -526,6 +584,13 @@ class LoggingManager:
 
         # Metrics logger setup
         self.metrics_logger = metrics_logger or self._build_metrics_logger()
+        backend = config.logger.backend
+        if self.metrics_logger is None and backend not in (None, ""):
+            msg = (
+                f"logger.backend={backend!r} produced no metrics logger; "
+                "training would drop every metric."
+            )
+            raise RuntimeError(msg)
         self.metric_reporter = MetricReporter(self.metrics_logger, self.logger)
         self.metrics = self.metric_reporter
         self.video_enabled = bool(config.logger.video)

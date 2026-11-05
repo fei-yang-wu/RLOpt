@@ -19,7 +19,6 @@ from torchrl.record.loggers import Logger
 
 from rlopt.agent.ipmd.ipmd import IPMD, IPMDRLOptConfig
 from rlopt.agent.ipmd.network import DDPM
-from rlopt.utils import log_info
 
 
 @dataclass
@@ -478,12 +477,12 @@ class IPMDDiffSR(IPMD):
             rate = pbar.format_dict.get("rate")
             if rate is not None:
                 metrics_to_log["time/speed"] = rate
-            if metrics_to_log:
-                self.log_metrics(metrics_to_log, step=collected_frames)
-
-            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                log_info(log_info_dict, metrics_to_log)
+            self.log_training_metrics(
+                metrics_to_log,
+                frames=collected_frames,
+                iteration=collected_frames // frames_in_batch,
+                log_python=None,
+            )
 
             if metrics_to_log:
                 postfix = {}

@@ -115,3 +115,38 @@ def load_task(spec: str, env: Any, device: torch.device, **kwargs: Any) -> World
         msg = f"{spec} does not implement the WorldModelTask interface."
         raise TypeError(msg)
     return task
+
+
+def task_proprio(
+    task: WorldModelTask, state: Tensor, action: Tensor, context: Tensor,
+    rank: Tensor, frame: Tensor, noise: bool,
+) -> Tensor:
+    """Build one observation, including reference-time features when supported.
+
+    The optional ``proprio_at`` capability extends the original state-only
+    interface without changing existing tasks or their saved policies.
+    """
+    at = getattr(task, "proprio_at", None)
+    if at is not None:
+        return at(state, action, context, rank, frame, noise)
+    return task.proprio(state, action, context, noise)
+
+
+def history_proprio(task: WorldModelTask, rows: Mapping[str, Tensor], noise: bool) -> Tensor:
+    """Reconstruct history with each observation's original reference cursor.
+
+    Before an asynchronous episode's first frame, repeat that frame exactly,
+    just as replay.history repeats the reset state and previous action.
+    """
+    if getattr(task, "proprio_at", None) is None:
+        return task.proprio(rows["hist_states"], rows["hist_actions"], rows["context"].unsqueeze(1), noise)
+    back = torch.arange(task.history - 1, -1, -1, device=rows["frame"].device)
+    back = torch.minimum(back.unsqueeze(0), rows["episode_step"].clamp_min(0).unsqueeze(1))
+    prop = task_proprio(
+        task, rows["hist_states"], rows["hist_actions"], rows["context"].unsqueeze(1),
+        rows["rank"].unsqueeze(1), rows["frame"].unsqueeze(1) - back, noise,
+    )
+    # Reset-filled history repeats one observed frame, including its single
+    # noise draw. Only real subsequent frames receive independent noise.
+    slots = task.history - 1 - back
+    return prop.gather(1, slots.unsqueeze(-1).expand_as(prop))
