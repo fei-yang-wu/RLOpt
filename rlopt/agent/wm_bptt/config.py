@@ -1,0 +1,194 @@
+"""Configuration of the world-model BPTT agent (``WMBPTT``)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from rlopt.config_base import RLOptConfig
+
+
+@dataclass
+class WMBPTTConfig:
+    """SuperMimic-style model-based actor-critic (arXiv 2610.28480, Table A.5).
+
+    Each iteration collects a few vectorized simulator steps with the
+    deterministic actor plus Gaussian action noise, fits the dynamics model on
+    k-step autoregressive replay windows, then improves the actor by
+    backpropagating an H-step imagined return through the frozen model, with a
+    critic bootstrapping past H.
+    """
+
+    # -- task model -------------------------------------------------------
+    task_model: str = "imitation_experiments.world_model.g1_task:G1TrackingTask"
+    """``module:Class`` of the task model (state, features, reward, termination)."""
+    task_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Extra keyword arguments for the task model constructor."""
+    goal: str = "explicit"
+    """Policy goal input, the task model's ``goal_mode`` (G1: "explicit"
+    reference frames or "z", a frozen skill encoder's command). Passed only
+    when not "explicit"; a plain field because Hydra cannot override entries
+    of ``task_kwargs``."""
+    goal_encoder: str = ""
+    """Frozen skill-encoder checkpoint for ``goal="z"`` (task kwarg
+    ``skill_encoder``)."""
+    sensor_noise: bool = True
+    """Add the task's sensor noise to policy features (collection, imagination
+    and the deployed policy alike)."""
+
+    # -- data collection ----------------------------------------------------
+    env_steps_per_iter: float = 2.5
+    """Vectorized env steps per iteration; the fraction carries over."""
+    action_noise_std: float = 0.1
+    """Std of the Gaussian noise added to collected actions (model-fit only)."""
+    action_clip: float = 10.0
+    """Clamp on executed actions."""
+    replay_steps: int = 1000
+    """Ring length per env."""
+
+    # -- world model --------------------------------------------------------
+    wm_hidden: list[int] = field(default_factory=lambda: [2048, 2048, 2048])
+    wm_window: int = 8
+    wm_batches_per_iter: int = 10
+    wm_batch_size: int = 2048
+    wm_lr: float = 2.0e-4
+    wm_weight_decay: float = 0.0
+    wm_grad_clip_norm: float = 1.0
+    wm_warmup_iters: int = 500
+    """World-model-only iterations before the first policy update."""
+    dynamics_model: str = "mlp"
+    """``mlp``: SuperMimic's ``DynamicsModel``. ``diffsr``: ``DiffSRDynamics``
+    with its mean read-out W phi + b as f, phi trained by the denoising loss on
+    every window transition plus the k-step loss on the read-out (the
+    ``diffsr_k8`` arm of ``dynamics_compare``)."""
+    diffsr_feature_dim: int = 128
+    diffsr_embed_dim: int = 512
+    diffsr_num_noises: int = 16
+    diffsr_denoise_coeff: float = 1.0
+    """Weight of the denoising loss beside the k-step read-out loss."""
+    min_replay_steps: int = 40
+    """Steps per env in the replay before the first world-model update."""
+    norm_freeze_samples: float = 2.0e8
+    """Stop updating the input/increment normalizers after this many samples."""
+
+    # -- imagination / actor --------------------------------------------------
+    horizon: int = 32
+    imagine_batch: int = 4096
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    imagine_termination: bool = True
+    """Cut the imagined return (and the critic's TD targets) with the task's
+    soft tracking termination. False keeps only the clip end: an ablation of
+    the differentiable terminal cost; the env's real terminations still shape
+    the replay the way they do for PPO."""
+    termination_gradient: bool = True
+    """Let the soft termination carry gradient to the actor. False detaches
+    it: the imagined return is still cut at a failure, but the actor learns
+    nothing from the threshold itself (ablation)."""
+    critic_bootstrap: bool = True
+    """Add gamma^H * alive_H * V(s_H) to the imagined return. False trains the
+    actor on the H-step return alone (ablation; the critic is still fit)."""
+    critic_fit: bool = True
+    """Fit the critic each policy iteration. False skips the fit and, with
+    ``critic_bootstrap=False``, every critic forward: no value function at all,
+    so the iteration time carries no critic cost (ablation)."""
+    actor_horizon: int = 0
+    """Steps of the imagined rollout the actor's objective (and so its BPTT
+    gradient) covers, bootstrapped with V at that step; 0 means ``horizon``.
+    The rollout still runs ``horizon`` steps for the critic's TD(lambda)
+    targets, so a smaller value shortens only the actor's gradient path
+    (ablation: ``horizon`` alone shortens both)."""
+    actor_estimator: str = "pathwise"
+    """``pathwise``: the actor's gradient flows through the model's Jacobians
+    (SuperMimic, SVG). ``score_function``: the same imagined rollouts run on
+    sampled actions ``a_t = mu(o_t) + sigma eps_t`` (``sf_action_std``) and the
+    actor is updated by the likelihood-ratio estimator
+    ``sum_t gamma^t c_t A_t grad log N(a_t; mu(o_t), sigma^2)`` with per-step
+    advantages ``A_t = TD(lambda) target - V(s_t)`` from the same critic
+    (REINFORCE with a GAE baseline, one gradient step per rollout, no
+    clipping); the model is stepped without gradient. Ablation: same model,
+    critic, data, horizon and compute, estimator only."""
+    rebar_weight: float = 1.0
+    """``actor_estimator=rebar``: scale of the score-function correction added to
+    the mean-path SVG(H) gradient (``wm_bptt/rebar.py``). Needs
+    ``actor_source=real``."""
+    rebar_ema_rate: float = 0.05
+    """Rate of the correction's running mean, about 2 / rate iterations."""
+    rebar_norm_cap: float = 0.5
+    """The applied correction never exceeds this multiple of the SVG gradient."""
+    rebar_clip_eps: float = 0.2
+    """PPO ratio clip on the score term."""
+    rebar_shuffle: bool = False
+    """Control: permute the residuals across rows, which keeps the correction's
+    size and noise and removes its signal."""
+    sf_action_std: float = 0.1
+    """Sampling std of the score-function actor (the collection noise)."""
+    sf_normalize_advantage: bool = True
+    """Standardize the per-step advantages over the batch (PPO's practice)."""
+    actor_source: str = "imagined"
+    """``imagined``: the actor's H-step objective runs on the model's own
+    rollout from a replay state (SuperMimic). ``real``: it runs along an
+    H-step replay window re-simulated with the recorded noise held fixed
+    (SVG noise inference): ``a_t = pi(o_t) + eta_t`` with the collector's
+    action noise ``eta_t = a_t - mu_old(o_t)``, ``o_t`` carrying the
+    collector's own sensor noise (keyed to the replay row), and
+    ``x_{t+1} = integrate(x_t, f(x_t, a_t) + xi_t)`` with the model residual
+    ``xi_t = increment(s_t, s_{t+1}) - f(s_t, a_t)``. At the collecting policy
+    the forward pass is the recording; the gradient flows through the model's
+    Jacobians. Episode ends are the env's: a termination cuts the return (with
+    the env's reward for the last transition), a timeout bootstraps V at the
+    last state."""
+    critic_source: str = "imagined"
+    """``imagined``: TD(lambda) targets on the imagined rollout. ``real``:
+    targets on recorded replay windows (the behaviour policy's returns, with
+    the env's episode ends as for ``actor_source=real``)."""
+    real_window_recent_steps: int = 50
+    """Real windows start within the newest N rows per env, so the recorded
+    actions come from recent policies (50 rows = 20 iterations at 2.5 env
+    steps per iteration)."""
+    actor_hidden: list[int] = field(default_factory=lambda: [1024, 1024, 512, 256])
+    actor_activation: str = "elu"
+    """MLP activation by name (elu, silu, relu, gelu, tanh)."""
+    actor_lr: float = 2.0e-4
+    actor_betas: list[float] = field(default_factory=lambda: [0.9, 0.95])
+    actor_grad_clip_norm: float = 1.0
+    actor_grad_clip_value: float = 0.1
+    actor_output_scale: float = 0.01
+    """Gain on the actor's last-layer initialization."""
+
+    # -- critic -----------------------------------------------------------------
+    critic_hidden: list[int] = field(default_factory=lambda: [512, 256])
+    critic_activation: str = "elu"
+    critic_lr: float = 2.0e-4
+    critic_epochs: int = 5
+    critic_minibatches: int = 4
+    critic_update_every: int = 1
+    """Fit the critic every N policy iterations (on that iteration's imagined
+    rollout). With ``critic_epochs`` / ``critic_minibatches`` this sets the
+    critic's gradient steps per env frame; 10 / 3 / 1 reproduces PPO
+    combo50b's 3 full-batch steps per 24-step rollout (ablation)."""
+    critic_grad_clip_norm: float = 1.0
+
+    # -- schedule ---------------------------------------------------------------
+    lr_cosine_iters: int = 250_000
+    lr_final_ratio: float = 0.03
+    bf16: bool = True
+    """bf16 autocast for the MLP matmuls (integration, FK, reward stay fp32)."""
+    compile: bool = False
+    """``torch.compile`` the imagined control step (actor, model, reward)."""
+    log_interval_iters: int = 50
+    eval_window: int = 32
+    """Open-loop window used for the logged k-step prediction error."""
+    eval_batch: int = 1024
+
+
+@dataclass
+class WMBPTTRLOptConfig(RLOptConfig):
+    """RLOpt config wrapper; the agent's hyperparameters live under ``wm``."""
+
+    wm: WMBPTTConfig = field(default_factory=WMBPTTConfig)
+
+    def __post_init__(self) -> None:
+        # The agent builds its own actor, critic and dynamics model from
+        # ``wm``; the generic value-function slot stays empty.
+        self.value_function = None

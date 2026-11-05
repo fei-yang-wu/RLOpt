@@ -626,6 +626,7 @@ def test_flush_reports_learner_time_and_memory(tmp_path):
         agent.iterate(it, run)
     assert agent._learn_events_used > 0
     metrics = agent._flush_metrics(run)
+    agent.log_training_metrics(metrics, frames=run.frames_processed, iteration=30)
     assert metrics["time/learner_ms_per_update"] > 0.0
     assert metrics["perf/cuda_max_memory_allocated_gib"] > 0.0
     assert "time/train_elapsed_s" in metrics

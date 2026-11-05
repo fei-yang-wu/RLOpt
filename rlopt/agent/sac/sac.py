@@ -43,7 +43,7 @@ from rlopt.base_class import BaseAlgorithm
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import get_activation_class, log_info
+from rlopt.utils import get_activation_class
 
 
 @dataclass
@@ -673,21 +673,16 @@ class SAC(BaseAlgorithm[SACRLOptConfig]):
                         )
                         metrics_to_log["train/alpha"] = alpha
 
-                # for IsaacLab, we need to log the metrics from the environment
-                if "Isaac" in self.config.env.env_name and hasattr(
-                    self.env, "log_infos"
-                ):
-                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                    log_info(log_info_dict, metrics_to_log)
-
                 metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
                 rate = pbar.format_dict.get("rate")
                 if rate is not None:
                     metrics_to_log["time/speed"] = rate
 
-                if metrics_to_log:
-                    # Use the shared base-class helper for consistent metrics emission
-                    self.log_metrics(metrics_to_log, step=collected_frames, log_python=False)
+                self.log_training_metrics(
+                    metrics_to_log,
+                    frames=collected_frames,
+                    iteration=collected_frames // frames_in_batch,
+                )
 
                 # Save model periodically (save_interval is in samples)
                 if (

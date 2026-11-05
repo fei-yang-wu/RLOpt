@@ -376,6 +376,105 @@ def test_ipmd_split_learning_rates_must_be_configured_together():
         cfg.ipmd.validate()
 
 
+def test_critic_extra_updates_validate_counts_and_split_learning_rates():
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.critic_extra_epochs = -1
+    with pytest.raises(ValueError, match=r"critic_extra_epochs must be >= 0"):
+        cfg.ipmd.validate()
+
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.critic_extra_minibatches = 0
+    with pytest.raises(ValueError, match=r"critic_extra_minibatches"):
+        cfg.ipmd.validate()
+
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.critic_extra_epochs = 2
+    with pytest.raises(ValueError, match=r"requires ipmd\.critic_learning_rate"):
+        cfg.ipmd.validate()
+
+    cfg = _rlopt().IPMDRLOptConfig()
+    cfg.ipmd.actor_learning_rate = 2.0e-5
+    cfg.ipmd.critic_learning_rate = 1.0e-3
+    cfg.ipmd.critic_extra_epochs = 2
+    cfg.ipmd.critic_extra_minibatches = 4
+    cfg.ipmd.validate()
+    assert cfg.ipmd.critic_extra_epochs == 2
+    assert cfg.ipmd.critic_extra_minibatches == 4
+
+
+def _gae_rollout_for(agent, num_rows: int) -> TensorDict:
+    """A fake rollout with GAE outputs attached, as iterate() hands to the critic."""
+    rollout = agent.env.fake_tensordict().expand(num_rows).clone()
+    torch.manual_seed(0)
+    rollout.set("observation", torch.randn_like(rollout.get("observation")))
+    rollout.set(
+        ("next", "observation"), torch.randn_like(rollout.get(("next", "observation")))
+    )
+    rollout.set(("next", "reward"), torch.randn_like(rollout.get(("next", "reward"))))
+    with torch.no_grad():
+        rollout = agent.adv_module(rollout)
+    assert "value_target" in rollout.keys()
+    return rollout
+
+
+def test_critic_extra_updates_are_a_no_op_when_off():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        assert agent.config.ipmd.critic_extra_epochs == 0
+        rollout = _gae_rollout_for(agent, 8)
+        before = [p.detach().clone() for p in agent.actor_critic.parameters()]
+        assert agent._run_critic_extra_updates(rollout) == {}
+        for p, q in zip(agent.actor_critic.parameters(), before, strict=True):
+            assert torch.equal(p, q)
+    finally:
+        env.close()
+
+
+def test_critic_extra_updates_move_only_the_critic():
+    agent, env = _make_env_reward_only_ipmd_agent(split_actor_critic_lr=True)
+    try:
+        agent.config.ipmd.critic_extra_epochs = 2
+        agent.config.ipmd.critic_extra_minibatches = 2
+        rollout = _gae_rollout_for(agent, 8)
+        actor_before = [p.detach().clone() for p in agent.policy.parameters()]
+        critic_before = [p.detach().clone() for p in agent.value_function.parameters()]
+        actor_state_before = copy.deepcopy(
+            [
+                agent.optim.state.get(p, {})
+                for p in agent.policy.parameters()
+            ]
+        )
+
+        metrics = agent._run_critic_extra_updates(rollout)
+
+        # 2 passes x 2 minibatches = 4 critic-only optimizer steps.
+        assert metrics["critic_extra_steps"] == 4.0
+        assert set(metrics) == {
+            "critic_extra_steps",
+            "critic_extra_loss_critic",
+            "critic_extra_value_clip_fraction",
+            "critic_extra_grad_norm",
+        }
+        assert metrics["critic_extra_grad_norm"] > 0.0
+        for p, q in zip(agent.policy.parameters(), actor_before, strict=True):
+            assert torch.equal(p, q), "the actor must not move on critic-only steps"
+        # No actor parameter acquired optimizer state either (no step was
+        # applied to a group whose grads were None).
+        actor_state_after = [agent.optim.state.get(p, {}) for p in agent.policy.parameters()]
+        assert [bool(s) for s in actor_state_after] == [
+            bool(s) for s in actor_state_before
+        ]
+        moved = any(
+            not torch.equal(p, q)
+            for p, q in zip(agent.value_function.parameters(), critic_before, strict=True)
+        )
+        assert moved, "the critic must move on critic-only steps"
+        # Gradients are cleared on exit so the next joint update starts clean.
+        assert all(p.grad is None for p in agent.actor_critic.parameters())
+    finally:
+        env.close()
+
+
 def test_silu_activation_is_available():
     from rlopt.utils import get_activation_class
 
