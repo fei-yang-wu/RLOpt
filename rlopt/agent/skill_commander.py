@@ -2478,6 +2478,7 @@ class FrozenSkillCommanderSampler(FrozenHighLevelSkillCommandSampler):
                 obs_norm.load_state_dict(feature_norm_state)
             self.diffsr.eval()
             self.diffsr.requires_grad_(False)
+            self.command_diffsr = self.diffsr
 
         if self.condition_on_language:
             from rlopt.env_interface import resolve_imitation_interface, supports
