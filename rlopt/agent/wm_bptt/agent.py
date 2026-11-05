@@ -42,8 +42,20 @@ from torchrl.envs import TransformedEnv
 from rlopt.agent.wm_bptt.config import WMBPTTRLOptConfig
 from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
 from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel
+from rlopt.agent.wm_bptt.rebar import (
+    CorrectionAverage,
+    clipped_score_surrogate,
+    linearized_return,
+    masked_center,
+    shuffle_rows,
+)
 from rlopt.agent.wm_bptt.replay import SequenceReplay
-from rlopt.agent.wm_bptt.task import WorldModelTask, load_task
+from rlopt.agent.wm_bptt.task import (
+    WorldModelTask,
+    history_proprio,
+    load_task,
+    task_proprio,
+)
 from rlopt.base_class import BaseAlgorithm, TrainingMetadata, honours_train_time_budget
 
 ARCH_TAG = "wmbptt-v1"
@@ -204,9 +216,13 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if wm.actor_source == "real" and 0 < wm.actor_horizon < wm.horizon:
             msg = "wm.actor_source=real uses the window length wm.horizon; leave wm.actor_horizon at 0."
             raise ValueError(msg)
-        if wm.actor_estimator not in ("pathwise", "score_function"):
-            msg = f"wm.actor_estimator must be 'pathwise' or 'score_function', got {wm.actor_estimator!r}."
+        if wm.actor_estimator not in ("pathwise", "score_function", "rebar"):
+            msg = f"wm.actor_estimator must be 'pathwise', 'score_function' or 'rebar', got {wm.actor_estimator!r}."
             raise ValueError(msg)
+        if wm.actor_estimator == "rebar" and wm.actor_source != "real":
+            msg = "wm.actor_estimator=rebar corrects the real-window gradient (actor_source=real)."
+            raise ValueError(msg)
+        self._rebar = CorrectionAverage(wm.rebar_ema_rate, wm.rebar_norm_cap) if wm.actor_estimator == "rebar" else None
         if wm.actor_estimator == "score_function" and wm.actor_source == "real":
             msg = "wm.actor_estimator=score_function runs on imagined rollouts only (actor_source=imagined)."
             raise ValueError(msg)
@@ -309,9 +325,12 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         replay row this step writes (``_real_rollout`` regenerates it)."""
         assert self.replay is not None
         step = torch.full_like(self._env_ids, self.replay.steps)
+        kwargs = {}
+        if getattr(self.task, "proprio_at", None) is not None:
+            kwargs["episode_step"] = rows["episode_step"]
         return self.task.policy_obs(
             rows["hist_states"], rows["hist_actions"], rows["context"], rows["rank"], rows["frame"],
-            noise_key=(self._noise_seed, self._env_ids, step),
+            noise_key=(self._noise_seed, self._env_ids, step), **kwargs,
         )
 
     @torch.no_grad()
@@ -331,8 +350,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             rows["rank"], rows["frame"], rows["episode_step"], rows["push"],
             policy_action=mean_action,
         )
-        obs, reward, terminated, _, extras = self._isaac.step(action)
+        obs, reward, terminated, truncated, extras = self._isaac.step(action)
         self.replay.set_outcome(reward.reshape(-1), terminated.reshape(-1).bool())
+        self._track_episodes(reward.reshape(-1), (terminated | truncated).reshape(-1).bool())
         stats["env_reward"].append(reward.mean())
         log = extras.get("log") if isinstance(extras, dict) else None
         if log:
@@ -342,6 +362,18 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 stats[k].append(torch.as_tensor(value, device=self.device, dtype=torch.float32))
         self._frames_processed += self._num_envs
         return obs
+
+    @torch.no_grad()
+    def _track_episodes(self, reward: Tensor, done: Tensor) -> None:
+        """Device-side sums behind ``episode/length`` and ``episode/return``."""
+        self._episode_length += 1
+        self._episode_return += reward
+        ended = (self._episode_length, self._episode_return)
+        self._episode_sums += torch.stack(
+            (done.sum(), *(torch.where(done, x, 0.0).sum() for x in ended))
+        )
+        for x in ended:
+            x.masked_fill_(done, 0.0)
 
     # ------------------------------------------------------------ world model
     def _wm_step(self, state: Tensor, action: Tensor, ctx: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
@@ -477,7 +509,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         inc = self.dynamics(t.wm_input(state, action, ctx), bf16=wm.bf16)
         nxt = t.integrate(state, inc)
         r, d = t.reward_and_termination(nxt, action, prev_action, ctx, rank, frame)
-        new_prop = t.proprio(nxt, action, ctx, getattr(t, "sensor_noise", True))
+        new_prop = task_proprio(t, nxt, action, ctx, rank, frame + 1, getattr(t, "sensor_noise", True))
         prop = torch.cat((prop[:, 1:], new_prop.unsqueeze(1)), 1)
         return action, mu, nxt, r, d, prop
 
@@ -489,6 +521,53 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 fn = torch.compile(self._imagine_step, dynamic=False)
             self._compiled_step = fn
         return fn
+
+    def _filter_imagination_starts(
+        self,
+        tau: Tensor,
+        env: Tensor,
+        horizon: int,
+        *,
+        resample: bool,
+        generator: torch.Generator | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Apply a task's optional ``valid_imagination_start`` capability.
+
+        Eight rejection rounds keep the usual case small. If valid rows are
+        scarce, enumerate the eligible ring once rather than loop forever
+        or fail because random proposals missed them. Both paths sample
+        uniformly over valid (row, env) pairs. Explicit probe starts fail
+        validation instead of silently changing the requested experiment.
+        """
+        rp = self.replay
+        assert rp is not None
+        predicate = self.task.valid_imagination_start
+        lo, hi = rp.oldest + self.task.history - 1, rp.steps - 1
+        for attempt in range(8):
+            slot = rp._slot(tau)
+            valid = predicate(rp.rank[slot, env], rp.frame[slot, env], horizon)
+            if valid.all():
+                return tau, env
+            if not resample:
+                msg = f"Explicit imagination starts are invalid for horizon {horizon}."
+                raise ValueError(msg)
+            if attempt < 7:
+                next_tau = torch.randint(lo, hi + 1, tau.shape, device=self.device, generator=generator)
+                next_env = torch.randint(0, self._num_envs, env.shape, device=self.device, generator=generator)
+                tau = torch.where(valid, tau, next_tau)
+                env = torch.where(valid, env, next_env)
+        rows = torch.arange(lo, hi + 1, device=self.device)
+        slot = rp._slot(rows)
+        candidates = predicate(rp.rank[slot], rp.frame[slot], horizon).nonzero()
+        if candidates.shape[0] == 0:
+            msg = (
+                f"No valid imagination starts for horizon {horizon} in replay rows {lo}..{hi}; "
+                "collect eligible reference frames or reduce the requested horizon."
+            )
+            raise RuntimeError(msg)
+        pick = torch.randint(0, candidates.shape[0], tau.shape, device=self.device, generator=generator)
+        chosen = candidates[pick]
+        return torch.where(valid, tau, rows[chosen[:, 0]]), torch.where(valid, env, chosen[:, 1])
 
     def _imagine(
         self,
@@ -532,10 +611,14 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         else:
             tau, env = starts
             batch = int(tau.shape[0])
+        if getattr(t, "valid_imagination_start", None) is not None:
+            tau, env = self._filter_imagination_starts(
+                tau, env, H, resample=starts is None, generator=generator,
+            )
         start = self.replay.history(tau, env, h)
         ctx, rank, frame = start["context"], start["rank"], start["frame"]
         noise = getattr(t, "sensor_noise", True)
-        prop = t.proprio(start["hist_states"], start["hist_actions"], ctx.unsqueeze(1), noise)
+        prop = history_proprio(t, start, noise)
         prev_action = start["hist_actions"][:, -1]
         state = start["hist_states"][:, -1]
         if grad:
@@ -656,7 +739,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         inc = self.dynamics(t.wm_input(state, action, ctx), bf16=wm.bf16)
         nxt = t.integrate(state, inc + xi)
         r, _ = t.reward(nxt, action, prev_action, ctx, rank, frame)
-        new_prop = t.proprio(nxt, action, ctx, False)
+        new_prop = task_proprio(t, nxt, action, ctx, rank, frame + 1, False)
         prop = torch.cat((prop[:, 1:], new_prop.unsqueeze(1)), 1)
         return action, nxt, r, prop, obs
 
@@ -729,7 +812,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 eta = eta.detach().contiguous().requires_grad_(True)
             start = rp.history(tau, env, h)
             # Clean history; each step adds the collector's keyed noise of its row.
-            prop = t.proprio(start["hist_states"], start["hist_actions"], ctx.unsqueeze(1), False)
+            prop = history_proprio(t, start, False)
             state, prev_action = win["state"][:, 0], start["hist_actions"][:, -1]
             # One requires_grad pattern for every compiled step (see _imagine).
             state, prop, prev_action = (
@@ -740,7 +823,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             for i in range(H):
                 with torch.no_grad():
                     key = (self._noise_seed, env, tau + i)
-                    prop_noise = t.keyed_proprio_noise(*key)
+                    if getattr(t, "proprio_at", None) is not None:
+                        prop_noise = t.keyed_proprio_noise(*key, episode_step=start["episode_step"] + i)
+                    else:
+                        prop_noise = t.keyed_proprio_noise(*key)
                     goal_noise = t.keyed_goal_noise(*key)
                 prev_action, state, r, prop, obs_i = step_fn(
                     state, prop, prev_action, ctx, rank, frames[:, i], eta[:, i], xi[:, i], prop_noise, goal_noise
@@ -782,6 +868,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         }
         if grad:
             if track_noise:
+                out["actions"] = torch.stack(actions, 1)
                 out["eta"] = eta
                 out["eta_recorded"] = eta_recorded
                 out["actor_obs"] = torch.stack(actor_obs, 1).detach()
@@ -812,19 +899,103 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         B, H1 = out["states"].shape[:2]
         return self.critic(self._critic_obs_seq(out), bf16=self.config.wm.bf16).reshape(B, H1)
 
+    @torch.no_grad()
+    def _recorded_actor_obs(self, tau: Tensor, env: Tensor, H: int) -> Tensor:
+        """Actor inputs (B, H, D) of the recorded rows, with the collector's keyed
+        sensor noise: the observations the recorded actions were sampled from."""
+        rp, t = self.replay, self.task
+        assert rp is not None
+        rows = []
+        for i in range(H):
+            hist = rp.history(tau + i, env, t.history)
+            kwargs = {"episode_step": hist["episode_step"]} if getattr(t, "proprio_at", None) is not None else {}
+            rows.append(
+                t.policy_obs(
+                    hist["hist_states"], hist["hist_actions"], hist["context"], hist["rank"], hist["frame"],
+                    noise_key=(self._noise_seed, env, tau + i), **kwargs,
+                )
+            )
+        return torch.stack(rows, 1)
+
+    def _rebar_gradient(self, metrics: dict[str, list]) -> dict[str, Tensor]:
+        """Fill the actor's ``.grad`` with mean-path SVG(H) plus the averaged
+        score correction (``wm_bptt/rebar.py``); returns the rollout."""
+        wm = self.config.wm
+        assert self._rebar is not None
+        params = [p for p in self.actor.net.parameters() if p.requires_grad]
+        out = self._real_rollout(wm.imagine_batch, grad=True, track_noise=True, zero_noise=True)
+        B, H = out["eta"].shape[:2]
+        *svg, d_eta = torch.autograd.grad(-out["objective"].mean(), [*params, out["eta"]], allow_unused=True)
+        svg_flat = torch.cat([(g if g is not None else torch.zeros_like(p)).reshape(-1) for g, p in zip(svg, params)])
+        disc = wm.gamma ** torch.arange(H, device=self.device, dtype=torch.float32)
+        with torch.no_grad():
+            slopes = -d_eta * B / disc.view(1, H, 1)  # d J / d eta in the units of the advantage at t
+            eta = out["eta_recorded"]
+            action = out["recorded_action"]
+            rec = self._real_rollout(B, grad=False, starts=(out["tau"], out["env"]))
+            values = self._critic_values(rec)
+            targets = real_window_targets(
+                rec["rewards"], rec["env_reward"], values, rec["inep"], rec["term"], rec["trunc"], wm.gamma, wm.gae_lambda
+            )
+            # The env clamps: on a clipped row a - mu is not the Gaussian draw.
+            unclipped = ~action.abs().ge(wm.action_clip).any(-1)
+            mask = rec["inep"][:, :H] * (1 - rec["trunc"]) * unclipped.float()
+            adv = masked_center(targets - values[:, :H], mask)
+            lin = linearized_return(slopes, eta, mask, wm.gamma * wm.gae_lambda)
+            rho = adv - lin
+            if wm.rebar_shuffle:
+                rho = shuffle_rows(rho, mask > 0)
+            obs = self._recorded_actor_obs(out["tau"], out["env"], H)
+        mu = self.actor(obs.reshape(B * H, -1), bf16=wm.bf16).reshape(B, H, -1)
+        mu_old = action - eta
+        surrogate, clip_frac = clipped_score_surrogate(
+            mu, mu_old, action, rho, disc * mask, wm.action_noise_std, wm.rebar_clip_eps
+        )
+        corr = torch.autograd.grad(-surrogate, params, allow_unused=True)
+        corr_flat = torch.cat([(g if g is not None else torch.zeros_like(p)).reshape(-1) for g, p in zip(corr, params)])
+        applied, scale = self._rebar.update(corr_flat.detach(), svg_flat.detach())
+        total = svg_flat + wm.rebar_weight * applied
+        offset = 0
+        for p in params:
+            n = p.numel()
+            p.grad = total[offset : offset + n].view_as(p).clone()
+            offset += n
+        with torch.no_grad():
+            keep = mask > 0
+            a_k, l_k = adv[keep], lin[keep]
+            ac, lc = a_k - a_k.mean(), l_k - l_k.mean()
+            metrics["rebar/corr_adv_noise_effect"].append((ac * lc).mean() / (ac.std() * lc.std()).clamp_min(1e-12))
+            metrics["rebar/residual_var_ratio"].append(rho[keep].var() / a_k.var().clamp_min(1e-12))
+            metrics["rebar/adv_std"].append(a_k.std())
+            metrics["rebar/noise_effect_std"].append(l_k.std())
+            metrics["rebar/svg_norm"].append(svg_flat.norm())
+            metrics["rebar/correction_norm"].append(corr_flat.norm())
+            metrics["rebar/applied_norm"].append(applied.norm())
+            metrics["rebar/cap_scale"].append(scale)
+            metrics["rebar/cos_applied_svg"].append(
+                (applied @ svg_flat) / (applied.norm() * svg_flat.norm()).clamp_min(1e-12)
+            )
+            metrics["rebar/ratio_clip_frac"].append(clip_frac)
+            metrics["rebar/action_clip_frac"].append(1 - unclipped.float().mean())
+            metrics["rebar/mu_dev"].append((mu.detach() - mu_old).norm(dim=-1)[keep].mean())
+        return out
+
     def _update_actor_critic(self, metrics: dict[str, list]) -> None:
         wm = self.config.wm
         real_actor = wm.actor_source == "real"
         self.dynamics.requires_grad_(False)
         self.critic.requires_grad_(False)
         try:
-            if real_actor:
-                out = self._real_rollout(wm.imagine_batch, grad=True)
-            else:
-                out = self._imagine(wm.imagine_batch, grad=True)
-            loss = -out["objective"].mean()
             self.actor_optim.zero_grad(set_to_none=True)
-            loss.backward()
+            if self._rebar is not None:
+                out = self._rebar_gradient(metrics)
+            else:
+                if real_actor:
+                    out = self._real_rollout(wm.imagine_batch, grad=True)
+                else:
+                    out = self._imagine(wm.imagine_batch, grad=True)
+                loss = -out["objective"].mean()
+                loss.backward()
         finally:
             self.dynamics.requires_grad_(True)
             self.critic.requires_grad_(True)
@@ -930,11 +1101,23 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 out[name] = float(torch.stack(values).mean())
             src.clear()
         out.update(self._wm_eval())
-        out.update(self._train_clock_metrics(self._frames_processed))
-        out["train/iteration"] = float(self._iteration)
         out["train/lr_factor"] = self._lr_factor()
         out["perf/iteration_s"] = it_time
+        if "env/env_reward" in out:
+            out["train/step_reward_mean"] = out["env/env_reward"]
+        count, length, reward = self._episode_sums.tolist()
+        self._episode_sums.zero_()
+        if count > 0:
+            out["episode/length"] = length / count
+            out["episode/return"] = reward / count
         return out
+
+    def _env_log_metrics(self) -> dict[str, Any]:
+        """The env's live scalars; ``_collect_step`` averages ``extras["log"]`` itself."""
+        reader = self._env_attribute("live_log_metrics", None)
+        if not callable(reader):
+            return {}
+        return {key: float(value) for key, value in reader().items()}
 
     def _checkpoint_dir(self) -> Path:
         return self.log_dir / self.config.logger.save_path
@@ -949,6 +1132,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             # replay row), so a real-window re-simulation sees the same noise.
             self._noise_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
             self._env_ids = torch.arange(self._num_envs, device=self.device)
+            self._episode_length = torch.zeros(self._num_envs, device=self.device)
+            self._episode_return = torch.zeros(self._num_envs, device=self.device)
+            self._episode_sums = torch.zeros(3, device=self.device)
         return self.replay
 
     @honours_train_time_budget
@@ -1001,7 +1187,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                     now = time.monotonic()
                     flushed = self._flush(metrics, stats, (now - last_log) / max(1, iters_since_log))
                     last_log, iters_since_log = now, 0
-                    self.log_metrics(flushed, step=self._frames_processed, log_python=False)
+                    self.log_training_metrics(flushed, frames=self._frames_processed, iteration=self._iteration)
                     self.log.info(
                         "it=%d frames=%d t=%.0fs wm=%.4f k8_root=%.1fmm k8_joint=%.2fdeg obj=%.3f alive_H=%.3f env_r=%.4f it_s=%.3f",
                         self._iteration, self._frames_processed, self.train_elapsed_seconds(),
@@ -1073,6 +1259,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             "cumulative_env_frames": frames,
             "cumulative_train_seconds": self.train_elapsed_seconds(),
         }
+        if self._rebar is not None:
+            payload["rebar"] = self._rebar.state_dict()
         tmp = target.with_name(target.name + ".tmp")
         torch.save(payload, tmp)
         tmp.replace(target)
@@ -1109,6 +1297,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         for name, opt in (("wm", self.wm_optim), ("actor", self.actor_optim), ("critic", self.critic_optim)):
             if name in opts:
                 opt.load_state_dict(opts[name])
+        if self._rebar is not None and "rebar" in data:
+            self._rebar.load_state_dict(data["rebar"])
         self._iteration = int(data.get("iteration", 0))
         frames = data.get("cumulative_env_frames")
         if frames is not None:

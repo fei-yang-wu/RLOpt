@@ -30,7 +30,6 @@ from rlopt.config_utils import (
     obs_key_feature_dim,
     obs_key_feature_ndim,
 )
-from rlopt.utils import log_info
 
 from .discriminator import Discriminator
 
@@ -1164,16 +1163,16 @@ class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
                 )
             metrics_to_log["train/clip_epsilon"] = clip_epsilon_value
 
-            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                log_info(log_info_dict, metrics_to_log)
-
             metrics_to_log.update(timeit.todict(prefix="time"))
             rate = pbar.format_dict.get("rate")
             if rate is not None:
                 metrics_to_log["time/speed"] = rate
 
-            self.log_metrics(metrics_to_log, step=collected_frames, log_python=False)
+            self.log_training_metrics(
+                metrics_to_log,
+                frames=collected_frames,
+                iteration=collected_frames // frames_in_batch,
+            )
             self.collector.update_policy_weights_()
 
             if (

@@ -898,6 +898,7 @@ class L2T(BaseAlgorithm[L2TRLOptConfig]):
             frames_in_batch = data.numel()
             collected_frames += frames_in_batch
             pbar.update(frames_in_batch)
+            metrics_to_log["train/step_reward_mean"] = data["next", "reward"].mean().item()
 
             # Get training rewards and episode lengths
             episode_rewards = data["next", "episode_reward"][data["next", "done"]]
@@ -974,39 +975,15 @@ class L2T(BaseAlgorithm[L2TRLOptConfig]):
                 }
             )
 
-            # for IsaacLab, we need to log the metrics from the environment
-            if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-                for _ in range(len(self.env.log_infos)):
-                    log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-                    # log all the keys
-                    for key, value in log_info_dict.items():
-                        if "/" in key:
-                            metrics_to_log.update(
-                                {
-                                    key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
-                        else:
-                            metrics_to_log.update(
-                                {
-                                    "Episode/" + key: (
-                                        value.item()
-                                        if isinstance(value, Tensor)
-                                        else value
-                                    )
-                                }
-                            )
-
-            # Log metrics
-            if self.logger:
-                metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-                metrics_to_log["time/speed"] = pbar.format_dict["rate"]
-                for key, value in metrics_to_log.items():
-                    self.logger.log_scalar(key, value, collected_frames)  # type: ignore
+            metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
+            rate = pbar.format_dict.get("rate")
+            if rate is not None:
+                metrics_to_log["time/speed"] = rate
+            self.log_training_metrics(
+                metrics_to_log,
+                frames=collected_frames,
+                iteration=collected_frames // frames_in_batch,
+            )
 
             self.collector.update_policy_weights_()
 

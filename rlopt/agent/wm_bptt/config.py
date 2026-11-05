@@ -108,6 +108,19 @@ class WMBPTTConfig:
     (REINFORCE with a GAE baseline, one gradient step per rollout, no
     clipping); the model is stepped without gradient. Ablation: same model,
     critic, data, horizon and compute, estimator only."""
+    rebar_weight: float = 1.0
+    """``actor_estimator=rebar``: scale of the score-function correction added to
+    the mean-path SVG(H) gradient (``wm_bptt/rebar.py``). Needs
+    ``actor_source=real``."""
+    rebar_ema_rate: float = 0.05
+    """Rate of the correction's running mean, about 2 / rate iterations."""
+    rebar_norm_cap: float = 0.5
+    """The applied correction never exceeds this multiple of the SVG gradient."""
+    rebar_clip_eps: float = 0.2
+    """PPO ratio clip on the score term."""
+    rebar_shuffle: bool = False
+    """Control: permute the residuals across rows, which keeps the correction's
+    size and noise and removes its signal."""
     sf_action_std: float = 0.1
     """Sampling std of the score-function actor (the collection noise)."""
     sf_normalize_advantage: bool = True

@@ -374,3 +374,70 @@ def test_score_function_actor_update_improves_the_point_mass_return() -> None:
         (-surrogate.mean()).backward()
         opt.step()
     assert true_return(start) > 0.5 * before
+
+
+def test_reference_aware_history_uses_each_frames_cursor_and_reset_fill() -> None:
+    """A moving reference must stay aligned across an asynchronous reset."""
+    from types import SimpleNamespace
+
+    from rlopt.agent.wm_bptt.task import history_proprio, task_proprio
+
+    rp = _filled_replay()
+    rows = rp.history(torch.tensor([5, 9]), torch.tensor([0, 1]), 4)
+    assert rows["episode_step"].tolist() == [1, 9]
+
+    def at(state, action, context, rank, frame, noise):
+        del action, context, rank, noise
+        return state[..., :1] - frame.unsqueeze(-1)
+
+    task = SimpleNamespace(history=4, proprio_at=at)
+    # The synthetic replay's state coordinate equals its reference cursor,
+    # even though env0 reset mid-sequence. A current-cursor-only history
+    # incorrectly produces [-1,-1,-1,0] and [-3,-2,-1,0].
+    prop = history_proprio(task, rows, False)
+    assert torch.equal(prop, torch.zeros(2, 4, 1))
+    next_state = torch.tensor([[6.0, 0.0], [10.0, 1.0]], requires_grad=True)
+    next_prop = task_proprio(task, next_state, torch.zeros(2, 1), rows["context"],
+                             rows["rank"], rows["frame"] + 1, False)
+    assert torch.equal(next_prop, torch.zeros(2, 1))
+    next_prop.sum().backward()
+    assert torch.equal(next_state.grad[:, 0], torch.ones(2))
+
+
+def test_reference_aware_extension_preserves_state_only_task_features() -> None:
+    from types import SimpleNamespace
+
+    from rlopt.agent.wm_bptt.task import history_proprio, task_proprio
+
+    def proprio(state, action, context, noise):
+        del context, noise
+        return torch.cat((state, action), -1)
+
+    task = SimpleNamespace(history=4, proprio=proprio)
+    rows = _filled_replay().history(torch.tensor([5]), torch.tensor([0]), 4)
+    expected = proprio(rows["hist_states"], rows["hist_actions"], rows["context"].unsqueeze(1), False)
+    assert torch.equal(history_proprio(task, rows, False), expected)
+    state, action = rows["hist_states"][:, -1], rows["hist_actions"][:, -1]
+    assert torch.equal(task_proprio(task, state, action, rows["context"], rows["rank"], rows["frame"], False),
+                       proprio(state, action, rows["context"], False))
+
+
+def test_reference_history_noise_repeats_reset_draw_only() -> None:
+    from types import SimpleNamespace
+
+    from rlopt.agent.wm_bptt.task import history_proprio
+
+    rows = _filled_replay().history(torch.tensor([5, 9]), torch.tensor([0, 1]), 4)
+
+    def at(state, action, context, rank, frame, noise):
+        del action, context, rank
+        assert noise
+        # A distinct deterministic noise marker per draw exposes which slots
+        # share the first actual observation without a statistical assertion.
+        draw = torch.arange(4, dtype=state.dtype).view(1, 4, 1).expand(2, -1, -1)
+        return torch.cat((state[..., :1] - frame.unsqueeze(-1), draw), -1)
+
+    prop = history_proprio(SimpleNamespace(history=4, proprio_at=at), rows, True)
+    assert prop[0, :, 1].tolist() == [2, 2, 2, 3]
+    assert prop[1, :, 1].tolist() == [0, 1, 2, 3]
+    assert torch.equal(prop[..., 0], torch.zeros(2, 4))

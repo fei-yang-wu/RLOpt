@@ -935,7 +935,6 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
         metrics["health/nonfinite_metrics"] = float(len(nonfinite))
         if learner_ms is not None:
             metrics["time/learner_ms_per_update"] = learner_ms
-        metrics.update(self._train_clock_metrics(run.frames_processed))
         run.interval_start_time = now
         run.interval_start_frames = run.frames_processed
         run.interval_start_updates = self.learner.update_count
@@ -971,8 +970,12 @@ class FlashSAC(BaseAlgorithm[CfgT], Generic[CfgT]):
                 metrics["train/step_reward_mean"] *= (
                     fs.log_interval_steps / steps_in_window
                 )
+            self.log_training_metrics(
+                metrics,
+                frames=metadata.frames_processed,
+                iteration=metadata.frames_processed // iteration.frames,
+            )
             iteration.metrics.update(metrics)
-            self.log_metrics(metrics, step=metadata.frames_processed, log_python=False)
             self.log.info(
                 self._format_iteration_summary(
                     metadata, iteration, self._progress_summary_fields()

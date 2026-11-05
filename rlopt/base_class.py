@@ -35,13 +35,19 @@ from rlopt.config_base import (
 )
 from rlopt.config_utils import ObsKey
 from rlopt.logging_utils import (
+    ELAPSED_ENTRY,
+    FRAMES_ENTRY,
+    ITERATION_ENTRY,
+    REQUIRED_TRAINING_ENTRIES,
     ROOT_LOGGER_NAME,
+    THROUGHPUT_ENTRY,
     LoggingManager,
     MetricReporter,
     log_to_file_only,
+    missing_training_entries,
 )
 from rlopt.type_aliases import OptimizerClass, SchedulerClass
-from rlopt.utils import as_float
+from rlopt.utils import as_float, log_info
 
 CfgT = TypeVar("CfgT", bound=RLOptConfig)
 
@@ -170,6 +176,10 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     # time restored from a checkpoint (``cumulative_train_seconds``).
     _train_clock_start: float | None = None
     _train_seconds_offset: float = 0.0
+    # (host time, frames) of the previous training row, for ``time/speed``.
+    _last_training_row: tuple[float, int] | None = None
+    # Required entries already warned about, so a gap warns once, not per row.
+    _reported_missing_entries: frozenset[str] = frozenset()
 
     @property
     def supports_train_time_budget(self) -> bool:
@@ -211,8 +221,8 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     def _train_clock_metrics(self, frames_processed: int) -> dict[str, float]:
         """Time-axis metrics logged with every flush (host values only)."""
         metrics = {
-            "time/train_elapsed_s": self.train_elapsed_seconds(),
-            "train/cumulative_env_frames": float(frames_processed),
+            ELAPSED_ENTRY: self.train_elapsed_seconds(),
+            FRAMES_ENTRY: float(frames_processed),
         }
         if self.device.type == "cuda":
             # Host-side allocator statistic: no device synchronisation.
@@ -1033,6 +1043,13 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         """
 
         if self.metrics is None:
+            backend = self.config.logger.backend
+            if backend not in (None, ""):
+                msg = (
+                    f"logger.backend={backend!r} is configured but no metric "
+                    "reporter exists; the metrics would be dropped."
+                )
+                raise RuntimeError(msg)
             return
 
         should_log_python = (
@@ -1046,6 +1063,89 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             log_python=should_log_python,
             python_level=python_level,
         )
+
+    def _env_attribute(self, name: str, default: Any) -> Any:
+        """``env.<name>`` by capability.
+
+        A ``SerialEnv`` that is not running has no member envs, and its
+        ``__getattr__`` recurses looking for them. The check cannot be
+        ``env.is_closed``: the collector closes the env at the frame budget,
+        before the last row, whose payload is still in ``log_infos``.
+        """
+        try:
+            return getattr(self.env, name, default)
+        except RecursionError:
+            return default
+
+    def _env_log_metrics(self) -> dict[str, Any]:
+        """Newest env log payload as scalars; ``{}`` for envs without one.
+
+        ``env.log_infos`` holds the payload of the latest step, detached on the
+        device. Reading it here is the only host transfer, once per row.
+        """
+        log_infos = self._env_attribute("log_infos", None)
+        if not isinstance(log_infos, deque) or not log_infos:
+            return {}
+        payload = log_infos.pop()
+        log_infos.clear()
+        metrics: dict[str, Any] = {}
+        log_info(payload, metrics)
+        return metrics
+
+    def _required_training_entries(self) -> tuple[str, ...]:
+        """Contract entries of this run: the algorithm's plus the env's own."""
+        declared = self._env_attribute("required_log_entries", ())
+        return (*REQUIRED_TRAINING_ENTRIES, *declared)
+
+    def _interval_frame_rate(self, frames: int) -> float:
+        """Frames per second since the previous training row; 0.0 on the first."""
+        now = time.monotonic()
+        previous, self._last_training_row = self._last_training_row, (now, frames)
+        if previous is None or now <= previous[0]:
+            return 0.0
+        return (frames - previous[1]) / (now - previous[0])
+
+    def log_training_metrics(
+        self,
+        metrics: MutableMapping[str, Any],
+        *,
+        frames: int,
+        iteration: int,
+        log_python: bool | None = False,
+    ) -> None:
+        """Write one training row: the only path from a training loop to the backend.
+
+        The loop passes what it measured, at its own flush cadence. This merges
+        the env log payload, stamps the entries every row must carry (in place,
+        so the loop's text summaries see them), warns about any required entry
+        still absent, and writes at ``step=frames``. Do not gate the call on the
+        console cadence: ``trainer.log_interval`` and the progress bar govern
+        text output only.
+
+        Args:
+            metrics: The row. Keys the env payload also defines keep this value.
+            frames: Cumulative environment frames at this row.
+            iteration: Completed outer-loop iterations.
+            log_python: Forwarded to :meth:`log_metrics`.
+        """
+        frames = int(frames)
+        self._start_train_clock()
+        for key, value in self._env_log_metrics().items():
+            metrics.setdefault(key, value)
+        metrics.update(self._train_clock_metrics(frames))
+        metrics[ITERATION_ENTRY] = float(iteration)
+        rate = self._interval_frame_rate(frames)
+        metrics.setdefault(THROUGHPUT_ENTRY, rate)
+        missing = missing_training_entries(metrics, self._required_training_entries())
+        unreported = frozenset(missing) - self._reported_missing_entries
+        if unreported:
+            self._reported_missing_entries |= unreported
+            self.log.warning(
+                "Training row at frame %d omits required entries: %s",
+                frames,
+                sorted(unreported),
+            )
+        self.log_metrics(metrics, step=frames, log_python=log_python)
 
     @abstractmethod
     def train(self) -> None:
@@ -1615,7 +1715,12 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     def _should_log_iteration(
         self, metadata: TrainingMetadata, iteration: IterationData
     ) -> bool:
-        """Return whether this iteration should emit periodic logs."""
+        """Return whether this iteration prints a periodic text summary.
+
+        Console cadence only. Metric rows go through
+        :meth:`log_training_metrics` regardless: with the progress bar on this
+        is False until the last iteration.
+        """
         if metadata.stop_after_iteration:
             return True
         if metadata.progress_bar_enabled:
@@ -1726,6 +1831,17 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             return
         if not self._should_log_iteration_to_file(metadata, iteration):
             return
+        if (
+            self.config.logger.backend
+            and self.metrics is not None
+            and self.metrics.rows_written == 0
+        ):
+            self.log.warning(
+                "logger.backend=%s has received no metric rows after %d frames; "
+                "the loop is not reaching log_training_metrics.",
+                self.config.logger.backend,
+                metadata.frames_processed,
+            )
 
         header, row = self._format_iteration_table_summary(
             metadata,

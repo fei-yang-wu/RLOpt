@@ -134,4 +134,5 @@ class SequenceReplay:
             "context": self.context[self._slot(tau), env],
             "rank": self.rank[self._slot(tau), env],
             "frame": self.frame[self._slot(tau), env],
+            "episode_step": es_now,
         }

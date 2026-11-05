@@ -60,7 +60,7 @@ from rlopt.base_class import (
 from rlopt.config_base import NetworkConfig, RLOptConfig
 from rlopt.models import GaussianPolicyHead
 from rlopt.type_aliases import OptimizerClass
-from rlopt.utils import get_activation_class, log_info
+from rlopt.utils import get_activation_class
 
 PpoCfgT = TypeVar("PpoCfgT", bound="PPORLOptConfig")
 
@@ -1433,18 +1433,11 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             if metadata.progress_bar_enabled
             else None
         )
-        clock = self._train_clock_metrics(metadata.frames_processed)
         if rate is not None:
-            return {"time/speed": float(rate), **clock}
+            return {"time/speed": float(rate)}
         iter_time = iteration.collect_time + iteration.learn_time
         speed = float(iteration.frames) / iter_time if iter_time > 0.0 else 0.0
-        return {"time/speed": speed, **clock}
-
-    def _record_env_metrics(self, iteration: PPOIterationData) -> None:
-        """Add environment-side scalar metrics when the env exposes them."""
-        if "Isaac" in self.config.env.env_name and hasattr(self.env, "log_infos"):
-            log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
-            log_info(log_info_dict, iteration.metrics)
+        return {"time/speed": speed}
 
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         """Return the metrics printed for non-progress-bar training runs."""
@@ -1491,14 +1484,12 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
 
         iteration.metrics.update(self._build_control_metrics(metadata))
         iteration.metrics.update(self._build_timing_metrics(iteration, metadata))
-        self._record_env_metrics(iteration)
         iteration.metrics.update(timeit.todict(prefix="time"))  # type: ignore[arg-type]
-        if self._should_log_iteration(metadata, iteration):
-            self.log_metrics(
-                iteration.metrics,
-                step=metadata.frames_processed,
-                log_python=False,
-            )
+        self.log_training_metrics(
+            iteration.metrics,
+            frames=metadata.frames_processed,
+            iteration=metadata.frames_processed // iteration.frames,
+        )
         self._log_iteration_file_summary(metadata, iteration)
         self.collector.update_policy_weights_()
         self._refresh_progress_display(metadata, iteration)
