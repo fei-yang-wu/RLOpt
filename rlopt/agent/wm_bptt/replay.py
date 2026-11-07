@@ -84,19 +84,26 @@ class SequenceReplay:
         self.steps = 0  # absolute steps written
         # ``wm.update_graphs``: a device copy of ``steps`` (``use_device_head``).
         self.steps_t: Tensor | None = None
+        self.device_fill = False
 
-    def use_device_head(self) -> None:
+    def use_device_head(self, *, fill: bool = False) -> None:
         """``wm.update_graphs``: keep a device copy of the write head, which ``add``
         advances, and draw sampling bounds from it. A draw captured in a CUDA graph
-        then follows the ring. The number of rows to draw from is still a host
-        value: it is fixed once the ring is full, which is when the graphs capture."""
+        then follows the ring. The number of rows to draw from stays a host value,
+        fixed once the ring is full, which is when the graphs capture; ``fill``
+        (``wm.graph_early``) takes it from the device head too, so a graph captured
+        before the ring is full follows its fill level."""
         self.steps_t = torch.full((), self.steps, dtype=torch.long, device=self.device)
+        self.device_fill = fill
 
     def uniform_rows(self, batch: int, low: int, high: int, generator: torch.Generator | None = None) -> Tensor:
         """``batch`` uniform rows tau with ``oldest + low <= tau <= steps - 1 - high``.
 
         With the device head the lower bound is a device value: ``randint(0, n) + lo``,
-        which is ``randint(lo, lo + n)`` value for value on the same random stream."""
+        which is ``randint(lo, lo + n)`` value for value on the same random stream.
+        With the device fill level the count n is a device value too, and the draw is
+        ``min(floor(u n), n - 1)`` for uniform float32 u (NDM Gym's ``--graph_early``):
+        the same distribution up to the float32 grid of u, another random stream."""
         count = self.steps - self.oldest - low - high
         if count < 1:
             msg = f"replay holds {self.steps} steps; rows {low} after the oldest and {high} before the newest need more."
@@ -105,6 +112,10 @@ class SequenceReplay:
             lo = self.oldest + low
             return torch.randint(lo, lo + count, (batch,), device=self.device, generator=generator)
         lo_t = (self.steps_t - self.capacity).clamp_min(0) + low
+        if self.device_fill:
+            n = self.steps_t.clamp_max(self.capacity) - low - high
+            u = torch.rand(batch, device=self.device, generator=generator)
+            return lo_t + torch.minimum((u * n).long(), n - 1)
         return torch.randint(0, count, (batch,), device=self.device, generator=generator) + lo_t
 
     def add(

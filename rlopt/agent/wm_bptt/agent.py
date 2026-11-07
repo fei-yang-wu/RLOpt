@@ -1445,7 +1445,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             if wm.fit_terminal_transitions or wm.norm_from_collection:
                 self._unpublished_ends = torch.zeros((), dtype=torch.long, device=self.device)
             if wm.update_graphs:
-                self.replay.use_device_head()
+                self.replay.use_device_head(fill=wm.graph_early)
                 self._build_update_graphs()
         return self.replay
 
@@ -1453,26 +1453,28 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def _build_update_graphs(self) -> None:
         """``wm.update_graphs``: the two updates as ``GraphedUpdate``s on one memory
         pool, replayed in the order they capture: world model, then actor-critic.
-        Both wait for a full ring, where the sampling bounds stop changing size; the
+        Both wait for a full ring, where the sampling bounds stop changing size, or
+        with ``wm.graph_early`` for nothing, the fill level being on the device; the
         actor-critic update also waits for the policy average's first copy, which is
         a host branch."""
         rp = self.replay
         assert rp is not None
         pool = torch.cuda.graph_pool_handle()
+        early = self.config.wm.graph_early
 
-        def ring_full() -> bool:
-            return rp.steps >= rp.capacity
+        def sampling_capturable() -> bool:
+            return early or rp.steps >= rp.capacity
 
         def average_started() -> bool:
             return self.actor_avg is None or self.actor_avg.updates > 0
 
         self._graphs = {
             "world_model": GraphedUpdate(
-                lambda: _stacked(self._update_world_model), ring_full, "the world-model update",
+                lambda: _stacked(self._update_world_model), sampling_capturable, "the world-model update",
                 pool=pool, log=self.log.info,
             ),
             "actor_critic": GraphedUpdate(
-                lambda: _stacked(self._update_actor_critic), lambda: ring_full() and average_started(),
+                lambda: _stacked(self._update_actor_critic), lambda: sampling_capturable() and average_started(),
                 "the actor-critic update", pool=pool, on_replay=self._count_average_step, log=self.log.info,
             ),
         }

@@ -267,6 +267,12 @@ class WMBPTTConfig:
     share one memory pool. A checkpoint load recaptures them. Needs ``no_sync``,
     ``fused_adam`` and a CUDA device; refused with ``critic_update_every`` > 1 (a host
     branch), the score-function estimator and the DiffSR model (not tested)."""
+    graph_early: bool = False
+    """With ``update_graphs``: the graphs do not wait for a full ring, so they warm up
+    and capture at the first updates (NDM Gym's ``--graph_early``). The replay's fill
+    level then lives on the device too, and sampling scales uniform floats by it
+    (``rand * n``): the same distribution as ``torch.randint``, another random stream,
+    so a run is not bit for bit the one without it."""
     log_interval_iters: int = 50
     ckpt_light: bool = False
     """Periodic checkpoints (``save_interval``) hold only the deployed policy and
@@ -374,6 +380,9 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         if "real" in (wm.actor_source, wm.critic_source):
             msg = "wm.no_sync covers imagined rollouts: real windows select rows on the host (actor_source, critic_source)."
             raise ValueError(msg)
+    if wm.graph_early and not wm.update_graphs:
+        msg = "wm.graph_early sets when wm.update_graphs captures; set wm.update_graphs."
+        raise ValueError(msg)
     if wm.update_graphs:
         if not (wm.no_sync and wm.fused_adam):
             msg = "wm.update_graphs captures the no_sync loop with capturable fused optimizers; set wm.no_sync and wm.fused_adam."

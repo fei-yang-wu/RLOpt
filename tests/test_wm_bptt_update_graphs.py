@@ -51,6 +51,7 @@ def config(device: str = "cuda:0", **wm: Any) -> WMBPTTRLOptConfig:
         ({**GRAPHS, "critic_update_every": 2}, "critic_update_every"),
         ({**GRAPHS, "actor_estimator": "score_function"}, "pathwise"),
         ({**GRAPHS, "dynamics_model": "diffsr"}, "MLP world model"),
+        ({**NO_SYNC, "graph_early": True}, "set wm.update_graphs"),
     ],
 )
 def test_refused_combinations(wm: dict[str, Any], match: str) -> None:
@@ -101,6 +102,47 @@ def test_device_head_draws_equal_host_randint(device: str) -> None:
         torch.manual_seed(1)
         b = head.sample_starts(256, 8)
         assert all(torch.equal(x, y) for x, y in zip(a, b, strict=True))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_device_fill_draws_are_uniform_over_the_rows(device: str) -> None:
+    """``graph_early``'s ``rand * n`` form: inside the bounds, and uniform over them
+    (chi-square) before the ring is full, when it fills and after it wrapped."""
+    rp = ring(device)
+    rp.use_device_head(fill=True)
+    gen = torch.Generator(device=device).manual_seed(2)
+    for n in (12, 38, 30):
+        add_rows(rp, n)
+        for low, high in ((0, 8), (9, 0)):
+            lo, hi = rp.oldest + low, rp.steps - 1 - high
+            rows = rp.uniform_rows(200_000, low, high, gen)
+            assert int(rows.min()) == lo
+            assert int(rows.max()) == hi
+            counts = torch.bincount(rows - lo, minlength=hi - lo + 1).double()
+            cells = counts.numel()
+            expected = rows.numel() / cells
+            chi2 = float(((counts - expected) ** 2 / expected).sum())
+            assert chi2 < cells + 5 * (2 * cells) ** 0.5, (chi2, cells)
+
+
+@cuda
+def test_a_captured_device_fill_draw_follows_the_ring() -> None:
+    """Captured once while the ring fills, the draw keeps covering exactly the rows
+    the ring holds, as it fills and after it wraps."""
+    rp = ring("cuda:0")
+    rp.use_device_head(fill=True)
+    add_rows(rp, 20)
+    for _ in range(2):
+        rp.uniform_rows(65_536, 4, 3)  # warm-up allocations
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rows = rp.uniform_rows(65_536, 4, 3)
+    for n in (0, 10, 25, 40):
+        add_rows(rp, n)
+        graph.replay()
+        assert int(rows.min()) == rp.oldest + 4
+        assert int(rows.max()) == rp.steps - 1 - 3
 
 
 def test_a_ring_too_short_for_the_bounds_raises() -> None:
@@ -227,6 +269,40 @@ def test_replayed_graphs_equal_the_eager_updates(wm: dict[str, Any], env_cls: ty
     assert set(got) >= {"wm/loss", "actor/objective", "critic/loss"}
     per_iteration = {k: graph_agent.config.wm.wm_batches_per_iter if k.startswith("wm/") else 1 for k in got}
     assert all(v.numel() == calls * per_iteration[k] for k, v in got.items())
+
+
+@cuda
+@pytest.mark.parametrize("wm", [{}, {"actor_opt": "muon", "wm_opt": "muon", "actor_ema": 0.99, "compile": True}], ids=["adam", "muon_ema_compile"])
+def test_early_graphs_equal_the_eager_updates_while_the_ring_fills(wm: dict[str, Any]) -> None:
+    """``graph_early``: captured with 45 of 80 rows, the graphs follow the fill level
+    on the device while collection fills the ring and wraps it: bit for bit the
+    same agent's eager updates."""
+    early = {**GRAPHS, "graph_early": True, **wm}
+    graph_agent, eager_agent = filled(45, **early), filled(45, **early)
+    for agent in (graph_agent, eager_agent):
+        if agent.actor_avg is not None:
+            run(agent, eager, 1, schedule=True)
+    got = run(graph_agent, graphed, 8, schedule=True, collect=6)
+    want = run(eager_agent, eager, 8, schedule=True, collect=6)
+    rp = graph_agent.replay
+    assert rp is not None
+    assert rp.steps > rp.capacity  # the ring filled under the captured graphs
+    assert [g.captures for g in graph_agent._graphs.values()] == [1, 1]  # type: ignore[union-attr]
+    assert harness.state_equal(training_state(graph_agent), training_state(eager_agent))
+    assert harness.state_equal(got, want)
+
+
+@cuda
+@pytest.mark.parametrize("early", [False, True])
+def test_graph_early_captures_before_the_ring_is_full(early: bool) -> None:
+    """Eight iterations hold 57 of the 80 rows: only ``graph_early`` captures."""
+    agent = harness.make_agent(device="cuda:0", frames=harness.frames_for(8), **GRAPHS, graph_early=early)
+    agent.train()
+    rp = agent.replay
+    assert rp is not None
+    assert rp.steps < rp.capacity
+    assert [g.captures for g in agent._graphs.values()] == ([1, 1] if early else [0, 0])  # type: ignore[union-attr]
+    assert all(torch.isfinite(p).all() for p in agent.actor.parameters())
 
 
 @cuda
