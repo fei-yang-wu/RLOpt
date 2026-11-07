@@ -1,6 +1,6 @@
-# ``set_terminal`` and ``rollout_mask`` are adapted from NDM Gym (https://github.com/Frank-ZY-Dou/ndm-gym @ 05ea9f3:
-# ndm_gym/buffer.py), which ports it from BlinkMimic (https://github.com/fuyichen0725/blinkmimic @ d264658), under the
-# MIT License:
+# ``set_terminal``, ``rollout_mask`` and the device write head (``use_device_head``, ``uniform_rows``) are adapted from
+# NDM Gym (https://github.com/Frank-ZY-Dou/ndm-gym @ 05ea9f3: ndm_gym/buffer.py), which ports it from BlinkMimic
+# (https://github.com/fuyichen0725/blinkmimic @ d264658), under the MIT License:
 #
 # Copyright (c) 2026 NDM Gym Contributors
 # Copyright (c) 2026 ETH Zurich, Chong Zhang
@@ -36,6 +36,9 @@ the ring's write head.
 ``terminal_states`` (``wm.fit_terminal_transitions``) keeps what row tau + 1
 cannot hold: the true state after an episode's last transition, which the env's
 reset overwrote. A window then fits that transition and stops after it.
+
+``use_device_head`` (``wm.update_graphs``) keeps a device copy of the write head,
+so sampling captured in a CUDA graph follows the ring.
 """
 
 from __future__ import annotations
@@ -79,6 +82,30 @@ class SequenceReplay:
         self.terminal_state = torch.zeros(T, N, state_dim, **f) if terminal_states else None
         self.has_terminal = torch.zeros(T, N, dtype=torch.bool, **f) if terminal_states else None
         self.steps = 0  # absolute steps written
+        # ``wm.update_graphs``: a device copy of ``steps`` (``use_device_head``).
+        self.steps_t: Tensor | None = None
+
+    def use_device_head(self) -> None:
+        """``wm.update_graphs``: keep a device copy of the write head, which ``add``
+        advances, and draw sampling bounds from it. A draw captured in a CUDA graph
+        then follows the ring. The number of rows to draw from is still a host
+        value: it is fixed once the ring is full, which is when the graphs capture."""
+        self.steps_t = torch.full((), self.steps, dtype=torch.long, device=self.device)
+
+    def uniform_rows(self, batch: int, low: int, high: int, generator: torch.Generator | None = None) -> Tensor:
+        """``batch`` uniform rows tau with ``oldest + low <= tau <= steps - 1 - high``.
+
+        With the device head the lower bound is a device value: ``randint(0, n) + lo``,
+        which is ``randint(lo, lo + n)`` value for value on the same random stream."""
+        count = self.steps - self.oldest - low - high
+        if count < 1:
+            msg = f"replay holds {self.steps} steps; rows {low} after the oldest and {high} before the newest need more."
+            raise RuntimeError(msg)
+        if self.steps_t is None:
+            lo = self.oldest + low
+            return torch.randint(lo, lo + count, (batch,), device=self.device, generator=generator)
+        lo_t = (self.steps_t - self.capacity).clamp_min(0) + low
+        return torch.randint(0, count, (batch,), device=self.device, generator=generator) + lo_t
 
     def add(
         self,
@@ -107,6 +134,8 @@ class SequenceReplay:
         if self.has_terminal is not None:
             self.has_terminal[i] = False
         self.steps += 1
+        if self.steps_t is not None:
+            self.steps_t.fill_(self.steps)
 
     def set_outcome(self, env_reward: Tensor, terminated: Tensor) -> None:
         """Record the env's reward and termination (not timeout) of the step
@@ -137,7 +166,10 @@ class SequenceReplay:
         if hi < lo:
             msg = f"replay holds {self.steps} steps; a span of {span} needs more."
             raise RuntimeError(msg)
-        tau = torch.randint(lo, hi + 1, (batch,), device=self.device, generator=generator)
+        if self.steps_t is None:
+            tau = torch.randint(lo, hi + 1, (batch,), device=self.device, generator=generator)
+        else:
+            tau = self.uniform_rows(batch, 0, span, generator)
         env = torch.randint(0, self.num_envs, (batch,), device=self.device, generator=generator)
         return tau, env
 

@@ -56,6 +56,7 @@ from rlopt.agent.wm_bptt.speed_options import (
     ActorAverage,
     ActorLR,
     CheckpointWriter,
+    GraphedUpdate,
     apply_compile_options,
     atomic_save,
     cpu_snapshot,
@@ -118,6 +119,14 @@ def _plain(value: Any) -> Any:
     if isinstance(value, str):
         return str(value)
     return value
+
+
+def _stacked(update: Callable[[dict[str, list]], None]) -> dict[str, Tensor]:
+    """``update``'s metrics, one stacked device tensor per name: the outputs a
+    captured update returns (``wm.update_graphs``)."""
+    metrics: dict[str, list] = defaultdict(list)
+    update(metrics)
+    return {key: torch.stack(values) for key, values in metrics.items()}
 
 
 def lambda_returns(rewards: Tensor, values: Tensor, notdone: Tensor, gamma: float, lam: float) -> Tensor:
@@ -230,6 +239,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     _device_counts: Tensor | None = None
     _unpublished_ends: Tensor | None = None
     _checkpoint_writer: CheckpointWriter | None = None
+    _graphs: dict[str, GraphedUpdate] | None = None
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -325,6 +335,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     def _configure_optimizers(self):  # type: ignore[override]
         wm = self.config.wm
+        if wm.update_graphs:
+            self._configure_capturable_optimizers()
+            return
         adam_kw = {"fused": True} if wm.fused_adam else {}
         if wm.wm_opt == "muon":
             self.wm_optim = MuonAdam(self.dynamics, [self.dynamics.net], lr=wm.wm_lr, betas=(0.9, 0.999), **adam_kw)
@@ -337,6 +350,47 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=wm.actor_lr, betas=betas, **adam_kw)
         self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=wm.critic_lr, **adam_kw)
         self.lr_scheduler = None
+
+    def _configure_capturable_optimizers(self) -> None:
+        """``wm.update_graphs``: the same optimizers as capturable fused kernels, each
+        with its own 0-dim device learning rate (one shared tensor would give every
+        optimizer one rate), which ``set_lr`` fills in place for the graphs."""
+        wm = self.config.wm
+
+        def lr(value: float) -> Tensor:
+            return torch.tensor(float(value), device=self.device)
+
+        cap = {"fused": True, "capturable": True}
+        if wm.wm_opt == "muon":
+            self.wm_optim = MuonAdam(self.dynamics, [self.dynamics.net], lr=wm.wm_lr, betas=(0.9, 0.999), capturable=True)
+        else:
+            self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=lr(wm.wm_lr), weight_decay=wm.wm_weight_decay, **cap)
+        betas = tuple(wm.actor_betas)
+        if wm.actor_opt == "muon":
+            self.actor_optim = MuonAdam(self.actor.net, [self.actor.net], lr=wm.actor_lr, betas=betas, capturable=True)
+        else:
+            self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=lr(wm.actor_lr), betas=betas, **cap)
+        self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=lr(wm.critic_lr), **cap)
+        self.lr_scheduler = None
+
+    def _conform_loaded_optimizers(self) -> None:
+        """After ``load_state_dict``, which takes each group's settings from the
+        checkpoint: the learning-rate form and ``capturable`` this agent's
+        ``wm.update_graphs`` needs, so a checkpoint resumes with the option switched
+        either way. A float rate left in a captured step would freeze there."""
+        graphs = self.config.wm.update_graphs
+        for opt in (self.wm_optim, self.actor_optim, self.critic_optim):
+            parts = (opt.muon, opt.adam) if isinstance(opt, MuonAdam) else (opt,)
+            for part in parts:
+                adam = not isinstance(part, torch.optim.Muon)
+                for group in part.param_groups:
+                    value = group["lr"]
+                    if graphs and not torch.is_tensor(value):
+                        group["lr"] = torch.tensor(float(value), device=self.device)
+                    elif not graphs and torch.is_tensor(value):
+                        group["lr"] = float(value)
+                    if adam and "capturable" in group:
+                        group["capturable"] = graphs
 
     def _compile_components(self) -> None:
         self.compile_mode = None
@@ -741,8 +795,11 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         ``batch`` are valid; ``_flush`` raises if one did."""
         rp = self.replay
         assert rp is not None
-        lo, hi = rp.oldest + self.task.history - 1, rp.steps - 1
-        tau = torch.randint(lo, hi + 1, (2 * batch,), device=self.device, generator=generator)
+        if rp.steps_t is None:
+            lo, hi = rp.oldest + self.task.history - 1, rp.steps - 1
+            tau = torch.randint(lo, hi + 1, (2 * batch,), device=self.device, generator=generator)
+        else:  # ``wm.update_graphs``: bounds from the device head, the same draw
+            tau = rp.uniform_rows(2 * batch, self.task.history - 1, 0, generator)
         env = torch.randint(0, self._num_envs, (2 * batch,), device=self.device, generator=generator)
         slot = rp._slot(tau)
         invalid = ~self.task.valid_imagination_start(rp.rank[slot, env], rp.frame[slot, env], horizon)
@@ -789,9 +846,12 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             tau, env = self._device_starts(batch, H, generator)
         else:
             if starts is None:
-                lo = self.replay.oldest + h - 1
-                hi = self.replay.steps - 1
-                tau = torch.randint(lo, hi + 1, (batch,), device=self.device, generator=generator)
+                if self.replay.steps_t is None:
+                    lo = self.replay.oldest + h - 1
+                    hi = self.replay.steps - 1
+                    tau = torch.randint(lo, hi + 1, (batch,), device=self.device, generator=generator)
+                else:  # ``wm.update_graphs``: bounds from the device head, the same draw
+                    tau = self.replay.uniform_rows(batch, h - 1, 0, generator)
                 env = torch.randint(0, self._num_envs, (batch,), device=self.device, generator=generator)
             else:
                 tau, env = starts
@@ -1384,7 +1444,51 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 self._device_counts = torch.zeros(len(DEVICE_COUNTS), device=self.device)
             if wm.fit_terminal_transitions or wm.norm_from_collection:
                 self._unpublished_ends = torch.zeros((), dtype=torch.long, device=self.device)
+            if wm.update_graphs:
+                self.replay.use_device_head()
+                self._build_update_graphs()
         return self.replay
+
+    # ------------------------------------------------------------ update graphs
+    def _build_update_graphs(self) -> None:
+        """``wm.update_graphs``: the two updates as ``GraphedUpdate``s on one memory
+        pool, replayed in the order they capture: world model, then actor-critic.
+        Both wait for a full ring, where the sampling bounds stop changing size; the
+        actor-critic update also waits for the policy average's first copy, which is
+        a host branch."""
+        rp = self.replay
+        assert rp is not None
+        pool = torch.cuda.graph_pool_handle()
+
+        def ring_full() -> bool:
+            return rp.steps >= rp.capacity
+
+        def average_started() -> bool:
+            return self.actor_avg is None or self.actor_avg.updates > 0
+
+        self._graphs = {
+            "world_model": GraphedUpdate(
+                lambda: _stacked(self._update_world_model), ring_full, "the world-model update",
+                pool=pool, log=self.log.info,
+            ),
+            "actor_critic": GraphedUpdate(
+                lambda: _stacked(self._update_actor_critic), lambda: ring_full() and average_started(),
+                "the actor-critic update", pool=pool, on_replay=self._count_average_step, log=self.log.info,
+            ),
+        }
+
+    def _count_average_step(self) -> None:
+        """The captured policy average's step leaves its host counter behind."""
+        if self.actor_avg is not None:
+            self.actor_avg.updates += 1
+
+    def _run_update(self, name: str, update: Callable[[dict[str, list]], None], metrics: dict[str, list]) -> None:
+        """``update`` eagerly, or through its graph with ``wm.update_graphs``."""
+        if self._graphs is None:
+            update(metrics)
+            return
+        for key, values in self._graphs[name]().items():
+            metrics[key].extend(values.unbind(0))
 
     @honours_train_time_budget
     def train(self) -> None:  # type: ignore[override]
@@ -1427,10 +1531,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                     refresh()  # e.g. curriculum-moved termination thresholds
                 if self.replay.steps - self.replay.oldest > max(wm.wm_window, t.history) + 2:
                     with self._profile_iteration_phase(phase, "world_model"):
-                        self._update_world_model(metrics)
+                        self._run_update("world_model", self._update_world_model, metrics)
                     if self._iteration >= wm.wm_warmup_iters:
                         with self._profile_iteration_phase(phase, "actor_critic"):
-                            self._update_actor_critic(metrics)
+                            self._run_update("actor_critic", self._update_actor_critic, metrics)
                 for name, sec in phase.items():
                     metrics[f"perf/{name}_s"].append(torch.tensor(sec))
                 self._iteration += 1
@@ -1639,6 +1743,11 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self.critic.load_state_dict(data["critic_state_dict"])
         for name, opt in (("wm", self.wm_optim), ("actor", self.actor_optim), ("critic", self.critic_optim)):
             opt.load_state_dict(data["optimizers"][name])
+        self._conform_loaded_optimizers()
+        if self._graphs is not None:
+            # The loaded optimizer state is new tensors, which a captured graph does not
+            # read: new graphs, on a new pool, warm up and capture again.
+            self._build_update_graphs()
         if self._rebar is not None and "rebar" in data:
             self._rebar.load_state_dict(data["rebar"])
         self._actor_lr.load_state_dict(data)

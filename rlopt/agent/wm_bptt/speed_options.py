@@ -29,7 +29,8 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
@@ -173,6 +174,77 @@ def zero_nonfinite_grads(params: Iterable[Tensor], finite: Tensor) -> None:
     for p in params:
         if p.grad is not None:
             p.grad.copy_(torch.where(finite, p.grad, 0.0))
+
+
+class GraphedUpdate:
+    """``wm.update_graphs`` (NDM Gym's ``Graphed``): one update as a CUDA graph.
+
+    ``fn`` returns a dict of device tensors. It runs eagerly until ``ready()``; then
+    eagerly on a side stream for ``warmup`` calls, which create every optimizer
+    state, compiled function and library workspace the update touches; the next
+    call captures it and every later call replays it. Each call returns the
+    outputs, cloned out of the graph's memory. ``on_replay`` runs on the host after
+    each replay, for host state that the update advances (a captured call runs
+    ``fn``'s Python once, at capture, and never again). Graphs captured into one
+    ``pool`` share its memory and must replay in the order of their capture. A
+    graph reads the tensors it captured: state that is replaced rather than
+    written in place (a loaded optimizer's) needs a new ``GraphedUpdate``."""
+
+    def __init__(
+        self,
+        fn: Callable[[], dict[str, Tensor]],
+        ready: Callable[[], bool],
+        name: str,
+        *,
+        pool: Any = None,
+        on_replay: Callable[[], None] | None = None,
+        log: Callable[[str], None] | None = None,
+        warmup: int = 3,
+    ) -> None:
+        self.fn, self.ready, self.name, self.pool = fn, ready, name, pool
+        self.on_replay, self.log, self.warmup = on_replay, log, warmup
+        self.calls = 0
+        self.captures = 0
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.out: dict[str, Tensor] = {}
+        self._side: torch.cuda.Stream | None = None  # one stream, so warm-up calls reuse its cached blocks
+
+    def __call__(self) -> dict[str, Tensor]:
+        if self.graph is None:
+            if not self.ready():
+                return self.fn()
+            self.calls += 1
+            if self.calls <= self.warmup:
+                if self._side is None:
+                    self._side = torch.cuda.Stream()
+                self._side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._side):
+                    out = self.fn()
+                torch.cuda.current_stream().wait_stream(self._side)
+                return out
+            self._capture()
+        else:
+            self.graph.replay()
+            if self.on_replay is not None:
+                self.on_replay()
+        return {key: value.clone() for key, value in self.out.items()}
+
+    def _capture(self) -> None:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()  # the eager phase's cached blocks back, before the graph takes its pool
+        start = time.monotonic()
+        graph = torch.cuda.CUDAGraph()
+        # thread_local: an unrelated thread's CUDA call (a checkpoint writer, a library) does not void the capture.
+        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
+            self.out = self.fn()
+        torch.cuda.synchronize()
+        self.graph = graph
+        self.captures += 1
+        # Capture records the work; this replay does it once, for the call that captured.
+        graph.replay()
+        if self.log is not None:
+            gib = torch.cuda.memory_reserved() / 2**30
+            self.log(f"wm.update_graphs: captured {self.name} in {time.monotonic() - start:.1f} s, {gib:.1f} GiB reserved")
 
 
 class ActorAverage:

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+
 from rlopt.config_base import RLOptConfig
 
 
@@ -249,6 +251,22 @@ class WMBPTTConfig:
     candidates; a log row raises if an invalid one survived, which needs fewer
     than half of the replay's rows valid. Needs ``fused_adam``. Log rows still read
     the device."""
+    update_graphs: bool = False
+    """Capture the world-model update (every batch, from sampling to the optimizer
+    step) and the actor-critic update (imagination, actor step, policy average,
+    critic targets and every critic step) as one CUDA graph each, and replay them:
+    two graph launches per iteration instead of thousands of kernel launches. Each
+    update runs eagerly until it is ready (the replay ring full and the policy
+    average started), then eagerly three more times on a side stream, then it is
+    captured. The replay's write head lives
+    on the device, and the optimizers are the capturable fused kernels with one
+    device learning rate each, written in place every iteration, so the schedule and
+    ``actor_lr_mult`` reach the graphs. The arithmetic is the ``no_sync`` loop's,
+    except that a device learning rate is float32 where the plain fused kernel reads
+    a float64, and Muon's step is the capturable form of ``MuonAdam``. The two graphs
+    share one memory pool. A checkpoint load recaptures them. Needs ``no_sync``,
+    ``fused_adam`` and a CUDA device; refused with ``critic_update_every`` > 1 (a host
+    branch), the score-function estimator and the DiffSR model (not tested)."""
     log_interval_iters: int = 50
     ckpt_light: bool = False
     """Periodic checkpoints (``save_interval``) hold only the deployed policy and
@@ -355,6 +373,23 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
             raise ValueError(msg)
         if "real" in (wm.actor_source, wm.critic_source):
             msg = "wm.no_sync covers imagined rollouts: real windows select rows on the host (actor_source, critic_source)."
+            raise ValueError(msg)
+    if wm.update_graphs:
+        if not (wm.no_sync and wm.fused_adam):
+            msg = "wm.update_graphs captures the no_sync loop with capturable fused optimizers; set wm.no_sync and wm.fused_adam."
+            raise ValueError(msg)
+        device = str(config.device)
+        if not (device.startswith("cuda") or (device == "auto" and torch.cuda.is_available())):
+            msg = f"wm.update_graphs captures CUDA graphs; the device is {device!r}."
+            raise ValueError(msg)
+        if wm.critic_update_every != 1:
+            msg = "wm.update_graphs captures the critic fit with the actor; wm.critic_update_every must be 1."
+            raise ValueError(msg)
+        if wm.actor_estimator != "pathwise":
+            msg = f"wm.update_graphs is tested with the pathwise actor only, not actor_estimator={wm.actor_estimator!r}."
+            raise ValueError(msg)
+        if wm.dynamics_model != "mlp":
+            msg = f"wm.update_graphs is tested with the MLP world model only, not dynamics_model={wm.dynamics_model!r}."
             raise ValueError(msg)
     # Muon skips each MLP's first and last Linear: one hidden layer leaves it nothing.
     for name, hidden, opt in (("wm_hidden", wm.wm_hidden, wm.wm_opt), ("actor_hidden", wm.actor_hidden, wm.actor_opt)):
