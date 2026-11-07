@@ -269,6 +269,46 @@ class WMPolicy(nn.Module):
         return action
 
 
+def deployed_policy(env: Any, data: dict[str, Any], device: torch.device | str) -> TensorDictModule:
+    """The policy ``WMBPTT.load_policy`` deploys from the checkpoint payload ``data``,
+    built without an agent: the task of ``policy_meta["task_model"]`` on ``env`` with
+    the checkpoint's sensor noise, the checkpoint's actor shape, bf16 and residual, and
+    ``policy_state_dict`` loaded strictly. The interface checks are ``load_policy``'s.
+
+    ``wm.eprobe_share``'s worker acts with it, so a sweep runs the policy path that an
+    evaluator scores (the policy average, deterministic, the residual setpoint). A
+    later sweep loads new weights into it with ``load_state_dict``.
+    """
+    meta = data.get("policy_meta") or {}
+    if meta.get("arch") != ARCH_TAG:
+        msg = f"not a {ARCH_TAG} policy (arch={meta.get('arch')!r})."
+        raise ValueError(msg)
+    task = load_task(str(meta["task_model"]), env, device, sensor_noise=bool(meta.get("sensor_noise", True)))
+    expected: dict[str, Any] = {
+        "in_keys": [list(k) for k in task.policy_in_keys], "policy_obs_dim": task.policy_obs_dim, "action_dim": task.action_dim,
+    }
+    if meta.get("goal_binding") is not None:
+        expected["goal_binding"] = _plain(task.goal_binding()) if hasattr(task, "goal_binding") else None
+    for key, value in expected.items():
+        if meta.get(key) != value:
+            msg = f"policy_meta[{key!r}]={meta.get(key)!r} != the task's {value!r}"
+            raise ValueError(msg)
+    shape = actor_shape(meta)
+    actor = build_actor(
+        shape["actor_arch"], task.policy_obs_dim, task.action_dim, shape["actor_hidden"], 1.0, shape["actor_activation"],
+        goal_dim=shape.get("actor_goal_dim"), latent_dim=int(shape.get("actor_latent_dim") or 32),
+    ).to(device)
+    residual = bool(meta.get("actor_residual", False))
+    if residual:
+        validate_residual(task)
+        task.bind_reference_setpoint()  # type: ignore[attr-defined]
+    bf16 = bool(meta.get("bf16", (data.get("wm_config") or {}).get("bf16", True)))
+    policy = TensorDictModule(WMPolicy(task, actor, bf16, residual), in_keys=list(task.policy_in_keys), out_keys=["action"])
+    policy.load_state_dict(data["policy_state_dict"], strict=True)
+    policy.eval()
+    return policy
+
+
 class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     """Model-based BPTT tracker (see the module docstring)."""
 
@@ -283,6 +323,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     _residual: bool = False
     _structured: bool = False
     _mirror_rows: int = 0
+    _eprobe: Any = None
+    """``wm.eprobe_share``: the env's evaluation probe, from ``train`` to its end."""
+    _eprobe_resume: dict[str, Any] | None = None
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -1490,6 +1533,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if count > 0:
             out["episode/length"] = length / count
             out["episode/return"] = reward / count
+        if self._eprobe is not None:
+            out.update(self._eprobe.log_metrics())  # host values, set once per sweep
         return out
 
     def _check_final_obs(self) -> None:
@@ -1630,7 +1675,12 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         writer = self._checkpoint_writer = CheckpointWriter() if wm.ckpt_light else None
         self._last_full_seconds = self.train_elapsed_seconds()
         try:
+            if wm.eprobe_share > 0:
+                self._start_eprobe()
             while True:
+                if self._eprobe is not None:
+                    # NDM Gym's ``probe.tick(it, ...)``: before this iteration's collection.
+                    self._eprobe.tick(self._iteration, self._deployed_payload)
                 self._step_acc += wm.env_steps_per_iter
                 n_steps = int(self._step_acc)
                 self._step_acc -= n_steps
@@ -1703,6 +1753,20 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self._checkpoint_writer = None
             if writer is not None:
                 writer.close()
+            if self._eprobe is not None:
+                self._eprobe.close()
+                self._eprobe = None
+
+    def _start_eprobe(self) -> None:
+        """``wm.eprobe_share``: the env's probe, with a resumed run's probe state."""
+        self._eprobe = self._isaac.make_eval_probe(self.config.wm, self.log_dir)
+        if self._eprobe_resume is not None:
+            self._eprobe.load_state_dict(self._eprobe_resume)
+            self._eprobe_resume = None
+
+    def _deployed_payload(self) -> dict[str, Any]:
+        """What a probe sweep runs: the checkpoint's policy entries, copied to the CPU."""
+        return cpu_snapshot({"policy_state_dict": self.collector_policy.state_dict(), "policy_meta": self.policy_meta()})
 
     def _save_end(self, meta: TrainingMetadata) -> None:
         if self._train_time_budget_reached():
@@ -1765,6 +1829,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             payload["policy_live_state_dict"] = self.policy.state_dict()
             payload["actor_ema_updates"] = self.actor_avg.updates
         payload.update(self._actor_lr.state_dict())
+        if self._eprobe is not None:
+            payload["eprobe"] = self._eprobe.state_dict()  # NDM Gym's eprobe_fail, eprobe_focus, eprobe_focus_share
         return payload
 
     def save_model(self, path: str | Path | None = None, step: int | None = None) -> None:
@@ -1872,6 +1938,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if missing:
             msg = f"{path} has no {missing}: it cannot resume training. Use load_policy to score it."
             raise ValueError(msg)
+        if wm.eprobe_share > 0 and data.get("eprobe") is None:
+            msg = f"{path} holds no probe state (eprobe): it cannot resume wm.eprobe_share; resume it with the option off."
+            raise ValueError(msg)
         saved = data.get("wm_config") or {}
         for name, before_the_field in RESUME_MATCH.items():
             if saved.get(name, before_the_field) != getattr(wm, name):
@@ -1896,6 +1965,11 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if self._rebar is not None and "rebar" in data:
             self._rebar.load_state_dict(data["rebar"])
         self._actor_lr.load_state_dict(data)
+        if wm.eprobe_share > 0:
+            self._eprobe_resume = data["eprobe"]
+            if self._eprobe is not None:  # a load during training
+                self._eprobe.load_state_dict(self._eprobe_resume)
+                self._eprobe_resume = None
         self._iteration = int(data.get("iteration", 0))
         frames = data.get("cumulative_env_frames")
         if frames is not None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -345,6 +346,87 @@ class WMBPTTConfig:
     """Open-loop window used for the logged k-step prediction error."""
     eval_batch: int = 1024
 
+    # -- evaluation-guided resets (NDM Gym's ``--eprobe_*``, from BlinkMimic) ---------
+    eprobe_share: float = 0.0
+    """Share of the env's training resets drawn from the bins before the places where
+    the deployed policy (the average of ``actor_ema``, deterministic, the residual of
+    ``actor_residual``) fails in a sweep of every clip under evaluation conditions; 0
+    is off. The env runs the sweeps in a worker process (``make_eval_probe``; G1-v3):
+    from iteration ``eprobe_start``, every ``eprobe_every`` iterations, one world per
+    ``eprobe_tile`` frames of each clip starts a random lead of ``eprobe_lead_min`` to
+    ``eprobe_lead_max`` frames earlier and runs to its tile's end. First failures add
+    to per-bin counts that decay by ``eprobe_decay`` per sweep; each bin weighs its own
+    count and the next ``eprobe_win`` bins of its clip. Needs ``actor_ema``. Training
+    and evaluation share the clips, so evaluation outcomes on them feed the resets."""
+    eprobe_tile: int = 300
+    eprobe_lead_min: int = 200
+    eprobe_lead_max: int = 450
+    eprobe_every: int = 250
+    eprobe_start: int = 1250
+    eprobe_win: int = 10
+    eprobe_decay: float = 0.5
+    eprobe_graph: bool = False
+    """The worker replays its env step as CUDA graphs (``Isaac-Imitation-G1-Graph-v3``)
+    and runs all lead + tile steps of a sweep; without it, the eager step of
+    ``Isaac-Imitation-G1-v3`` until every probe is done."""
+    eprobe_async: int = 0
+    """A sweep's failures apply ``ceil(steps / eprobe_async)`` iterations after it
+    starts (steps = lead + tile; the first sweep three fewer, BlinkMimic's warm-up),
+    before that iteration's collection, waiting for the worker if needed; 0 applies
+    them at the start iteration. Needs ``eprobe_graph``."""
+
+
+#: ``wm.eprobe_*`` fields that only ``eprobe_share`` > 0 reads.
+EPROBE_FIELDS = (
+    "eprobe_tile", "eprobe_lead_min", "eprobe_lead_max", "eprobe_every", "eprobe_start",
+    "eprobe_win", "eprobe_decay", "eprobe_graph", "eprobe_async",
+)
+
+
+def validate_eprobe(wm: WMBPTTConfig, task: Any) -> None:
+    """``wm.eprobe_*``: NDM Gym's ``check_eprobe_args``, plus what this port needs.
+
+    Off, every other ``eprobe_*`` field must keep its default (a setting nothing
+    reads); NDM Gym refuses only ``--eprobe_graph`` and ``--eprobe_async`` there.
+    On, the task's env must offer ``make_eval_probe`` and the goal be explicit,
+    because the worker builds the explicit G1-v3 policy.
+    """
+    if not 0.0 <= wm.eprobe_share < 1.0:
+        msg = f"wm.eprobe_share must be in [0, 1), got {wm.eprobe_share}."
+        raise ValueError(msg)
+    if wm.eprobe_share == 0:
+        default = WMBPTTConfig()
+        changed = [name for name in EPROBE_FIELDS if getattr(wm, name) != getattr(default, name)]
+        if changed:
+            msg = f"wm.{changed[0]} sets the evaluation-guided resets; set wm.eprobe_share."
+            raise ValueError(msg)
+        return
+    if wm.actor_ema <= 0:
+        msg = "wm.eprobe_share sweeps the policy average: set wm.actor_ema."
+        raise ValueError(msg)
+    if wm.eprobe_tile < 1 or wm.eprobe_every < 1 or wm.eprobe_win < 0 or not 0 <= wm.eprobe_lead_min <= wm.eprobe_lead_max:
+        msg = "wm.eprobe_tile >= 1, wm.eprobe_every >= 1, wm.eprobe_win >= 0, 0 <= wm.eprobe_lead_min <= wm.eprobe_lead_max."
+        raise ValueError(msg)
+    if wm.eprobe_start < 0:
+        msg = f"wm.eprobe_start is an iteration, at least 0; got {wm.eprobe_start}."
+        raise ValueError(msg)
+    if not 0.0 <= wm.eprobe_decay <= 1.0:
+        msg = f"wm.eprobe_decay must be in [0, 1], got {wm.eprobe_decay}."
+        raise ValueError(msg)
+    if wm.eprobe_async < 0 or (wm.eprobe_async and not wm.eprobe_graph):
+        msg = "wm.eprobe_async needs wm.eprobe_graph."
+        raise ValueError(msg)
+    if wm.eprobe_async and math.ceil((wm.eprobe_lead_max + wm.eprobe_tile) / wm.eprobe_async) >= wm.eprobe_every:
+        msg = "wm.eprobe_async too small: a sweep would not apply before the next one starts."
+        raise ValueError(msg)
+    if str(wm.goal) != "explicit" or str(wm.goal_encoder):
+        msg = "wm.eprobe_share: the probe worker builds the explicit-goal G1-v3 policy; a latent goal has none."
+        raise ValueError(msg)
+    env = getattr(task, "isaac_env", None)
+    if getattr(env, "make_eval_probe", None) is None:
+        msg = "wm.eprobe_share needs an env with an evaluation probe (make_eval_probe; G1-v3)."
+        raise ValueError(msg)
+
 
 @dataclass
 class WMBPTTRLOptConfig(RLOptConfig):
@@ -535,6 +617,7 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         if wm.actor_latent_dim < 1:
             msg = f"wm.actor_latent_dim must be at least 1, got {wm.actor_latent_dim}."
             raise ValueError(msg)
+    validate_eprobe(wm, task)
     # Muon skips each MLP's first and last Linear: one hidden layer leaves it nothing.
     for name, hidden, opt in (("wm_hidden", wm.wm_hidden, wm.wm_opt), ("actor_hidden", wm.actor_hidden, wm.actor_opt)):
         if opt == "muon" and len(hidden) < 2:
