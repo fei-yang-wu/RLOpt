@@ -29,6 +29,7 @@ import dataclasses
 import math
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,7 @@ from torchrl.envs import TransformedEnv
 from rlopt.agent.wm_bptt.config import WMBPTTRLOptConfig, validate_options
 from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
 from rlopt.agent.wm_bptt.muon import MuonAdam
-from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel
+from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel, RunningNorm
 from rlopt.agent.wm_bptt.rebar import (
     CorrectionAverage,
     clipped_score_surrogate,
@@ -58,7 +59,10 @@ from rlopt.agent.wm_bptt.speed_options import (
     atomic_save,
     cpu_snapshot,
     full_checkpoint_due,
+    gated_step,
     set_lr,
+    update_norm_on_device,
+    zero_nonfinite_grads,
 )
 from rlopt.agent.wm_bptt.task import (
     WorldModelTask,
@@ -73,6 +77,8 @@ RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0, "fused_adam": False, "actor_op
 """``wm`` fields a resumed run must share with its checkpoint, with the value a
 checkpoint from before the field implies: they set which optimizers and which
 policy entries the checkpoint holds."""
+DEVICE_COUNTS = ("wm/nonfinite", "actor/nonfinite", "imagine/invalid_starts")
+"""``wm.no_sync``: what the loop counts on the device, read at each log row."""
 LIGHT_CHECKPOINT_KEYS = (
     "policy_state_dict",
     "policy_meta",
@@ -369,12 +375,18 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             noise_key=(self._noise_seed, self._env_ids, step), **kwargs,
         )
 
+    def _update_norm(self, norm: RunningNorm, x: Tensor) -> None:
+        if self.config.wm.no_sync:
+            update_norm_on_device(norm, x)
+        else:
+            norm.update(x)
+
     @torch.no_grad()
     def _collect_step(self, obs: dict[str, Any], stats: dict[str, list]) -> dict[str, Any]:
         wm = self.config.wm
         rows = self.task.read_obs(obs[self.task.obs_group])
         feat = self._policy_features(rows)
-        self.actor.obs_norm.update(feat)
+        self._update_norm(self.actor.obs_norm, feat)
         mean_action = self.actor(feat, bf16=wm.bf16)
         action = mean_action
         if wm.action_noise_std > 0:
@@ -395,7 +407,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             for k, value in log.items():
                 if isinstance(value, torch.Tensor):
                     value = value.float().mean()  # noqa: PLW2901
-                stats[k].append(torch.as_tensor(value, device=self.device, dtype=torch.float32))
+                # ``_flush`` moves a host value to the device at the log row.
+                stats[k].append(value if wm.no_sync else torch.as_tensor(value, device=self.device, dtype=torch.float32))
         self._frames_processed += self._num_envs
         return obs
 
@@ -462,7 +475,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         for _ in range(wm.wm_batches_per_iter):
             tau, env = self.replay.sample_starts(wm.wm_batch_size, k)
             win = self.replay.window(tau, env, k + 1)
-            if self.dynamics.out_norm.count < wm.norm_freeze_samples:
+            if wm.no_sync:
+                self._update_wm_norms_on_device(win)
+                scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
+            elif self.dynamics.out_norm.count < wm.norm_freeze_samples:
                 v = win["valid"][:, 0]
                 if v.any():
                     s0, s1 = win["state"][v, 0], win["state"][v, 1]
@@ -480,14 +496,38 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self.wm_optim.zero_grad(set_to_none=True)
             loss.backward()
             gn = nn.utils.clip_grad_norm_(self._dynamics_parameters(), wm.wm_grad_clip_norm)
-            if torch.isfinite(gn):
+            if wm.no_sync:
+                self._step_if_finite(self.wm_optim, self._dynamics_parameters(), gn, "wm/nonfinite")
+            elif torch.isfinite(gn):
                 self.wm_optim.step()
             metrics["wm/loss"].append(loss.detach())
             metrics["wm/grad_norm"].append(gn.detach())
             metrics["wm/valid_window_frac"].append(mask[:, -1].mean())
-        if self.dynamics.out_norm.count >= wm.norm_freeze_samples:
+        if wm.no_sync:
+            full = self.dynamics.out_norm.count >= wm.norm_freeze_samples
+            self.dynamics.in_norm.frozen.logical_or_(full)
+            self.dynamics.out_norm.frozen.logical_or_(full)
+        elif self.dynamics.out_norm.count >= wm.norm_freeze_samples:
             self.dynamics.in_norm.frozen.fill_(True)
             self.dynamics.out_norm.frozen.fill_(True)
+
+    def _update_wm_norms_on_device(self, win: dict[str, Tensor]) -> None:
+        """``wm.no_sync``: the world model's normalizers on a batch's first
+        transitions, the invalid ones masked, until they hold enough samples."""
+        wm, d = self.config.wm, self.dynamics
+        live = d.out_norm.count < wm.norm_freeze_samples
+        valid = win["valid"][:, 0]
+        s0, s1 = win["state"][:, 0], win["state"][:, 1]
+        update_norm_on_device(d.in_norm, self.task.wm_input(s0, win["action"][:, 0], win["context"][:, 0]), valid, live)
+        update_norm_on_device(d.out_norm, self.task.increment(s0, s1), valid, live)
+
+    def _step_if_finite(self, optimizer: Any, params: Iterable[Tensor], grad_norm: Tensor, count: str) -> None:
+        """``wm.no_sync``: ``optimizer``'s step unless ``grad_norm`` is non-finite,
+        decided on the device; a skip adds one to the named device count."""
+        finite = torch.isfinite(grad_norm)
+        self._device_counts[DEVICE_COUNTS.index(count)] += ~finite
+        zero_nonfinite_grads(params, finite)
+        gated_step(optimizer, finite)
 
     def _denoising_loss(self, win: dict[str, Tensor], k: int) -> Tensor:
         """DiffSR's one-step loss on every valid transition of the windows,
@@ -618,6 +658,23 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         chosen = candidates[pick]
         return torch.where(valid, tau, rows[chosen[:, 0]]), torch.where(valid, env, chosen[:, 1])
 
+    def _device_starts(self, batch: int, horizon: int, generator: torch.Generator | None) -> tuple[Tensor, Tensor]:
+        """``wm.no_sync``: uniform valid starts with no host read. Of 2 * ``batch``
+        uniform candidates, the first ``batch`` valid ones stay, which a stable sort
+        finds. Their distribution is that of ``_filter_imagination_starts``, but the
+        random stream differs. An invalid candidate survives only when fewer than
+        ``batch`` are valid; ``_flush`` raises if one did."""
+        rp = self.replay
+        assert rp is not None
+        lo, hi = rp.oldest + self.task.history - 1, rp.steps - 1
+        tau = torch.randint(lo, hi + 1, (2 * batch,), device=self.device, generator=generator)
+        env = torch.randint(0, self._num_envs, (2 * batch,), device=self.device, generator=generator)
+        slot = rp._slot(tau)
+        invalid = ~self.task.valid_imagination_start(rp.rank[slot, env], rp.frame[slot, env], horizon)
+        idx = torch.sort(invalid.to(torch.uint8), stable=True).indices[:batch]
+        self._device_counts[DEVICE_COUNTS.index("imagine/invalid_starts")] += invalid[idx].sum()
+        return tau[idx], env[idx]
+
     def _imagine(
         self,
         batch: int,
@@ -652,18 +709,22 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         sf = est == "score_function"
         sigma = float(wm.sf_action_std if std is None else std)
         h = t.history
-        if starts is None:
-            lo = self.replay.oldest + h - 1
-            hi = self.replay.steps - 1
-            tau = torch.randint(lo, hi + 1, (batch,), device=self.device, generator=generator)
-            env = torch.randint(0, self._num_envs, (batch,), device=self.device, generator=generator)
+        checked = getattr(t, "valid_imagination_start", None) is not None
+        if starts is None and checked and wm.no_sync:
+            tau, env = self._device_starts(batch, H, generator)
         else:
-            tau, env = starts
-            batch = int(tau.shape[0])
-        if getattr(t, "valid_imagination_start", None) is not None:
-            tau, env = self._filter_imagination_starts(
-                tau, env, H, resample=starts is None, generator=generator,
-            )
+            if starts is None:
+                lo = self.replay.oldest + h - 1
+                hi = self.replay.steps - 1
+                tau = torch.randint(lo, hi + 1, (batch,), device=self.device, generator=generator)
+                env = torch.randint(0, self._num_envs, (batch,), device=self.device, generator=generator)
+            else:
+                tau, env = starts
+                batch = int(tau.shape[0])
+            if checked:
+                tau, env = self._filter_imagination_starts(
+                    tau, env, H, resample=starts is None, generator=generator,
+                )
         start = self.replay.history(tau, env, h)
         ctx, rank, frame = start["context"], start["rank"], start["frame"]
         noise = getattr(t, "sensor_noise", True)
@@ -1051,7 +1112,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         params = list(self.actor.net.parameters())
         gn = nn.utils.clip_grad_norm_(params, wm.actor_grad_clip_norm)
         nn.utils.clip_grad_value_(params, wm.actor_grad_clip_value)
-        if torch.isfinite(gn):
+        if wm.no_sync:
+            self._step_if_finite(self.actor_optim, params, gn, "actor/nonfinite")
+        elif torch.isfinite(gn):
             self.actor_optim.step()
         if self.actor_avg is not None:
             self.actor_avg.update()
@@ -1110,7 +1173,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             rank = out["rank"].unsqueeze(1).expand(B, H1)
             ctx = out["ctx"].unsqueeze(1).expand(B, H1, out["ctx"].shape[-1])
             cobs = t.critic_obs(states.reshape(B * H1, S), ctx.reshape(B * H1, -1), rank.reshape(-1), frames.reshape(-1))
-            self.critic.obs_norm.update(cobs)
+            self._update_norm(self.critic.obs_norm, cobs)
             values = self.critic(cobs, bf16=wm.bf16).reshape(B, H1)
             notdone = (1 - out["dones"].detach()) * out["cont"].detach()
             targets = lambda_returns(out["rewards"].detach(), values, notdone, wm.gamma, wm.gae_lambda)
@@ -1155,6 +1218,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         out["train/lr_factor"] = self._lr_factor()
         if self._actor_lr.on:
             self._observe_actor_lr(out)
+        if self.config.wm.no_sync:
+            self._read_device_counts(out)
         out["perf/iteration_s"] = it_time
         if "env/env_reward" in out:
             out["train/step_reward_mean"] = out["env/env_reward"]
@@ -1164,6 +1229,18 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             out["episode/length"] = length / count
             out["episode/return"] = reward / count
         return out
+
+    def _read_device_counts(self, row: dict[str, float]) -> None:
+        """``wm.no_sync``: at a log row, the only host read of the device counts."""
+        row.update(zip(DEVICE_COUNTS, self._device_counts.tolist(), strict=True))
+        self._device_counts.zero_()
+        if row["imagine/invalid_starts"] > 0:
+            msg = (
+                f"wm.no_sync: {row['imagine/invalid_starts']:.0f} imagination starts since the last log row had fewer "
+                "than the horizon's frames left, because under half of the candidates were valid. Unset wm.no_sync or "
+                "reduce wm.horizon."
+            )
+            raise RuntimeError(msg)
 
     def _observe_actor_lr(self, row: dict[str, float]) -> None:
         """At a log row, the only host read of the return's device sums."""
@@ -1204,6 +1281,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self._episode_sums = torch.zeros(3, device=self.device)
             if self._actor_lr.watches_return:
                 self._return_sums = torch.zeros(2, device=self.device)
+            if wm.no_sync:
+                self._device_counts = torch.zeros(len(DEVICE_COUNTS), device=self.device)
         return self.replay
 
     @honours_train_time_budget

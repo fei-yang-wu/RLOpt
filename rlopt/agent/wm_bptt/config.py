@@ -203,6 +203,14 @@ class WMBPTTConfig:
     """bf16 autocast for the MLP matmuls (integration, FK, reward stay fp32)."""
     compile: bool = False
     """``torch.compile`` the imagined control step (actor, model, reward)."""
+    no_sync: bool = False
+    """No host read in the update loop. The normalizers freeze on the device, and
+    a window's valid rows are masked rather than indexed. A non-finite world-model
+    or actor step is skipped on the device and counted (``wm/nonfinite``,
+    ``actor/nonfinite``). Imagination starts are the first valid ones of 2B uniform
+    candidates; a log row raises if an invalid one survived, which needs fewer
+    than half of the replay's rows valid. Needs ``fused_adam``. Log rows still read
+    the device."""
     log_interval_iters: int = 50
     ckpt_light: bool = False
     """Periodic checkpoints (``save_interval``) hold only the deployed policy and
@@ -284,6 +292,13 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
             raise ValueError(msg)
         if wm.wm_weight_decay != 0:
             msg = "wm.wm_opt=muon has no weight decay; set wm.wm_weight_decay to 0."
+            raise ValueError(msg)
+    if wm.no_sync:
+        if not wm.fused_adam:
+            msg = "wm.no_sync skips a non-finite step with the fused Adam; set wm.fused_adam."
+            raise ValueError(msg)
+        if "real" in (wm.actor_source, wm.critic_source):
+            msg = "wm.no_sync covers imagined rollouts: real windows select rows on the host (actor_source, critic_source)."
             raise ValueError(msg)
     # Muon skips each MLP's first and last Linear: one hidden layer leaves it nothing.
     for name, hidden, opt in (("wm_hidden", wm.wm_hidden, wm.wm_opt), ("actor_hidden", wm.actor_hidden, wm.actor_opt)):

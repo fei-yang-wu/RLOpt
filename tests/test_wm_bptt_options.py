@@ -49,6 +49,9 @@ REFUSED = [
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.75, "actor_lr_decay_len": 300, "actor_lr_decay_by": 0}, "actor_lr_decay_by"),
     ({"last_every_min": 5.0}, "needs wm.ckpt_light"),
     ({"ckpt_light": True, "last_every_min": -1.0}, "last_every_min"),
+    ({"no_sync": True}, "fused_adam"),
+    ({"no_sync": True, "fused_adam": True, "actor_source": "real"}, "real windows"),
+    ({"no_sync": True, "fused_adam": True, "critic_source": "real"}, "real windows"),
 ]
 
 

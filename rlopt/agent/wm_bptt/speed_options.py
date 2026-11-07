@@ -1,5 +1,5 @@
 # Parts of this file are adapted from NDM Gym (https://github.com/Frank-ZY-Dou/ndm-gym @ 05ea9f3: ndm_gym/algos/common.py,
-# ndm_gym/algos/blinkmimic.py, ndm_gym/train.py), which ports them from BlinkMimic
+# ndm_gym/algos/blinkmimic.py, ndm_gym/core/normalizer.py, ndm_gym/train.py), which ports them from BlinkMimic
 # (https://github.com/fuyichen0725/blinkmimic @ d264658), under the MIT License:
 #
 # Copyright (c) 2026 NDM Gym Contributors
@@ -29,12 +29,16 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import Tensor, nn
+
+from rlopt.agent.wm_bptt.muon import MuonAdam
+from rlopt.agent.wm_bptt.networks import RunningNorm
 
 
 def set_lr(optimizer: Any, lr: float) -> None:
@@ -45,6 +49,72 @@ def set_lr(optimizer: Any, lr: float) -> None:
             group["lr"].fill_(lr)
         else:
             group["lr"] = lr
+
+
+@torch.no_grad()
+def update_norm_on_device(
+    norm: RunningNorm, x: Tensor, valid: Tensor | None = None, gate: Tensor | None = None
+) -> None:
+    """``wm.no_sync``: ``RunningNorm.update`` with no host read.
+
+    The freeze test runs on the device and ``torch.where`` writes the result in
+    place. Without ``valid`` this is the same arithmetic as ``update``, so the
+    statistics match it bit for bit. ``valid`` (rows,) replaces the boolean
+    indexing of the caller: its rows alone count, so the batch moments are masked
+    sums, equal to those of the indexed rows up to reduction order. A batch with
+    no valid row changes nothing. ``gate``, a 0-dim bool, holds the statistics
+    where it is false.
+    """
+    x = x.reshape(-1, x.shape[-1]).float()
+    if x.shape[0] == 0:
+        return
+    live = ~norm.frozen if gate is None else gate & ~norm.frozen
+    if valid is None:
+        n: int | Tensor = x.shape[0]
+        bmean = x.mean(0)
+        bvar = x.var(0, unbiased=False)
+    else:
+        keep = valid.reshape(-1, 1)
+        n = keep.sum(dtype=norm.count.dtype)
+        live = live & (n > 0)
+        rows = n.clamp_min(1.0)
+        # ``where``, not a product: an excluded row may hold a non-finite value.
+        bmean = (torch.where(keep, x, 0.0).sum(0) / rows).to(x.dtype)
+        bvar = (torch.where(keep, x - bmean, 0.0).square().sum(0) / rows).to(x.dtype)
+    tot = norm.count + n
+    delta = bmean - norm.mean
+    mean = norm.mean + (delta * (n / tot)).to(norm.mean.dtype)
+    m2 = norm.var * norm.count + bvar * n + delta.square() * (norm.count * n / tot)
+    norm.mean.copy_(torch.where(live, mean, norm.mean))
+    norm.var.copy_(torch.where(live, (m2 / tot).to(norm.var.dtype), norm.var))
+    norm.count.copy_(torch.where(live, tot, norm.count))
+
+
+def gated_step(optimizer: Any, ok: Tensor) -> None:
+    """``wm.no_sync``: ``optimizer``'s step where the 0-dim bool ``ok`` holds, skipped on
+    the device elsewhere, with parameters and all optimizer state unchanged. The fused
+    Adam's ``found_inf`` does this, and ``MuonAdam`` gates its Muon part. The gradients
+    must be finite (``zero_nonfinite_grads``)."""
+    if isinstance(optimizer, MuonAdam):
+        optimizer.step(ok=ok)
+        return
+    if not optimizer.defaults.get("fused"):
+        msg = "wm.no_sync skips a non-finite step with the fused Adam (wm.fused_adam)."
+        raise ValueError(msg)
+    optimizer.found_inf = (~ok).float()  # the fused kernel skips the step and undoes its step count
+    try:
+        optimizer.step()
+    finally:
+        optimizer.found_inf = None
+
+
+@torch.no_grad()
+def zero_nonfinite_grads(params: Iterable[Tensor], finite: Tensor) -> None:
+    """``wm.no_sync``: every gradient set to zero where the 0-dim bool ``finite`` is
+    false, without a host read."""
+    for p in params:
+        if p.grad is not None:
+            p.grad.copy_(torch.where(finite, p.grad, 0.0))
 
 
 class ActorAverage:
