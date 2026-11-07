@@ -22,7 +22,8 @@ from imitation_experiments.teleop.g1_kinematics import G1_TRACKED_BODY_NAMES, G1
 from imitation_experiments.world_model.g1_v3_math import rotate
 from torch import Tensor
 
-from rlopt.agent.wm_bptt.speed_options import combo_kernels, elementwise_3x3_products
+from rlopt.agent.wm_bptt.config import WMBPTTConfig
+from rlopt.agent.wm_bptt.speed_options import apply_compile_options, combo_kernels, elementwise_3x3_products
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 DEVICE = "cuda:0"
@@ -88,6 +89,16 @@ def check_agent_applies() -> dict[str, Any]:
         "combo": torch._inductor.config.combo_kernels,
         "limit": torch._dynamo.config.recompile_limit,
     }
+
+
+def check_entrypoint_order() -> dict[str, Any]:
+    """The entrypoint applies the options, then the env's helpers compile, then the
+    agent is built: its own call must change nothing and refuse nothing."""
+    apply_compile_options(WMBPTTConfig(compile=True, elementwise_3x3=True))
+    patched = table_entry()
+    torch.compile(lambda x: x + 1, backend="eager")(torch.ones(2))
+    harness.make_agent(compile=True, elementwise_3x3=True)
+    return {"same_entry": table_entry() is patched}
 
 
 def check_late_patch() -> dict[str, Any]:
@@ -217,6 +228,7 @@ CHECKS = {
     "default": check_default,
     "patch": check_patch,
     "agent_applies": check_agent_applies,
+    "entrypoint_order": check_entrypoint_order,
     "late_patch": check_late_patch,
     "products": check_products,
     "cache": check_cache,
@@ -238,6 +250,10 @@ def test_the_patch_applies_once_and_keeps_a_tag() -> None:
 
 def test_construction_applies_the_process_options() -> None:
     assert run("agent_applies") == {"patched": True, "combo": True, "limit": 64}
+
+
+def test_an_entrypoint_may_apply_the_options_before_the_env_compiles() -> None:
+    assert run("entrypoint_order") == {"same_entry": True}
 
 
 def test_the_patch_refuses_a_process_that_has_compiled() -> None:

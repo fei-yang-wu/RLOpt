@@ -56,10 +56,9 @@ from rlopt.agent.wm_bptt.speed_options import (
     ActorAverage,
     ActorLR,
     CheckpointWriter,
+    apply_compile_options,
     atomic_save,
-    combo_kernels,
     cpu_snapshot,
-    elementwise_3x3_products,
     full_checkpoint_due,
     gated_step,
     set_lr,
@@ -343,10 +342,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             # The two compiled steps have a handful of guard variants (train vs
             # eval mode, first call); a low limit silently falls back to eager.
             torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
-        if wm.elementwise_3x3:
-            elementwise_3x3_products()
-        if wm.combo_kernels:
-            combo_kernels()
+        apply_compile_options(wm)
         if wm.compile_eager:
             self.task.compile_collection_reward()  # type: ignore[attr-defined]
 

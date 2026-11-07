@@ -60,7 +60,10 @@ def elementwise_3x3_products() -> None:
     if getattr(default, "elementwise_3x3", False):
         return  # this process has the patch: a second agent, for example
     if counters["frames"]["total"] > 0:
-        msg = "wm.elementwise_3x3 must apply before the first compile: this process has compiled already."
+        msg = (
+            "wm.elementwise_3x3 must apply before the first compile, and this process has compiled already: "
+            "call apply_compile_options before building the env."
+        )
         raise RuntimeError(msg)
     if not hasattr(torch.compiler.config, "cache_key_tag"):
         msg = "wm.elementwise_3x3 needs torch.compiler.config.cache_key_tag, or a cached graph would bypass it."
@@ -84,6 +87,16 @@ def combo_kernels() -> None:
     import torch._inductor.config  # noqa: PLC0415
 
     torch._inductor.config.combo_kernels = True
+
+
+def apply_compile_options(wm: Any) -> None:
+    """The options of ``wm`` that act on the whole process. An entrypoint calls this before
+    it builds the env, because env code can compile. The agent calls it again at construction,
+    where it then changes nothing."""
+    if wm.elementwise_3x3:
+        elementwise_3x3_products()
+    if wm.combo_kernels:
+        combo_kernels()
 
 
 def set_lr(optimizer: Any, lr: float) -> None:
