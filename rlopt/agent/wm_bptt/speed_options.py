@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -324,6 +324,12 @@ class CheckpointWriter:
     def submit(self, payload: dict[str, Any], target: Path) -> None:
         self._collect()
         self._pending.append(self._pool.submit(self._write, payload, target))
+
+    def wait(self) -> None:
+        """Block until every queued write has finished. A failure stays queued, to
+        raise at the next ``submit`` or at ``close``. A synchronous save of the same
+        file would share the temporary name of ``atomic_save``, so it waits first."""
+        wait(self._pending)
 
     def close(self) -> None:
         """Finish every write; the first failure raises after the thread stops."""

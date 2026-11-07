@@ -11,6 +11,7 @@ import pytest
 import torch
 import wm_bptt_harness as harness
 
+from rlopt.agent.wm_bptt import agent as agent_module
 from rlopt.agent.wm_bptt.agent import LIGHT_CHECKPOINT_KEYS
 from rlopt.agent.wm_bptt.speed_options import (
     CheckpointWriter,
@@ -229,6 +230,62 @@ def test_a_slow_disk_holds_the_queue_at_its_limit(tmp_path: Path, monkeypatch: p
     release.set()
     blocked.join(30)
     assert not blocked.is_alive()
+    writer.close()
+
+
+def test_the_final_save_waits_for_a_background_write_of_the_same_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ``last_every_min`` the last periodic checkpoint is the full file the run's
+    end writes too, under the same temporary name: the end must wait for it."""
+    events: list[tuple[str, str, float]] = []
+    write = CheckpointWriter._write
+    save = agent_module.atomic_save
+
+    def slow(payload: dict[str, Any], target: Path) -> None:
+        events.append(("background", target.name, time.monotonic()))
+        time.sleep(0.3)  # the run reaches its end while this write is open
+        write(payload, target)
+        events.append(("background done", target.name, time.monotonic()))
+
+    def synchronous(payload: dict[str, Any], target: Path) -> None:
+        events.append(("end", target.name, time.monotonic()))
+        save(payload, target)
+
+    monkeypatch.setattr(CheckpointWriter, "_write", staticmethod(slow))
+    monkeypatch.setattr(agent_module, "atomic_save", synchronous)
+    # Every iteration crosses a boundary of 8 frames, the last one included.
+    agent = harness.make_agent(frames=FRAMES, save_interval=8, log_dir=tmp_path, ckpt_light=True, last_every_min=1e-9)
+    agent.train()
+    final = f"model_step_{agent._frames_processed}.pt"
+    assert [name for kind, name, _ in events if kind == "end"] == [final]
+    background = [t for kind, name, t in events if kind == "background done" and name == final]
+    assert background, "the last periodic checkpoint should be the end's file"
+    end = next(t for kind, name, t in events if kind == "end")
+    assert end >= background[0]
+    data = torch.load(agent._checkpoint_dir() / final, weights_only=False)
+    assert data["cumulative_env_frames"] == agent._frames_processed
+    assert not list(agent._checkpoint_dir().glob("*.tmp"))
+
+
+def test_a_failed_background_write_still_raises_after_the_end_saved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Waiting does not swallow the failure, and does not cost the run its end file."""
+
+    def fail(_payload: dict[str, Any], target: Path) -> None:
+        if target.name.startswith("policy_step_"):
+            msg = "disk full"
+            raise OSError(msg)
+
+    monkeypatch.setattr(CheckpointWriter, "_write", staticmethod(fail))
+    agent = harness.make_agent(frames=harness.frames_for(2), save_interval=EVERY, log_dir=tmp_path, ckpt_light=True)
+    with pytest.raises(OSError, match="disk full"):
+        agent.train()
+    assert names(agent, "model_step_*.pt") == [f"model_step_{agent._frames_processed}.pt"]
+
+
+def test_the_writer_waits_without_raising(tmp_path: Path) -> None:
+    writer = CheckpointWriter()
+    writer.submit({"i": 0}, tmp_path / "a.pt")
+    writer.wait()
+    assert (tmp_path / "a.pt").exists()
     writer.close()
 
 

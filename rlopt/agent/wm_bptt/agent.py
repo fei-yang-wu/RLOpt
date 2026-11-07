@@ -229,6 +229,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     _actor_lr: ActorLR = ActorLR()
     _device_counts: Tensor | None = None
     _unpublished_ends: Tensor | None = None
+    _checkpoint_writer: CheckpointWriter | None = None
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -1389,7 +1390,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         started = False
         last_log = time.monotonic()
         iters_since_log = 0
-        writer = CheckpointWriter() if wm.ckpt_light else None
+        writer = self._checkpoint_writer = CheckpointWriter() if wm.ckpt_light else None
         self._last_full_seconds = self.train_elapsed_seconds()
         try:
             while True:
@@ -1465,6 +1466,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self.save_model(self._checkpoint_dir(), step=self._frames_processed)
             raise
         finally:
+            self._checkpoint_writer = None
             if writer is not None:
                 writer.close()
 
@@ -1514,6 +1516,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         frames = int(step if step is not None else self._frames_processed)
         target = base if base.suffix == ".pt" else base / f"model_step_{frames}.pt"
         target.parent.mkdir(parents=True, exist_ok=True)
+        if self._checkpoint_writer is not None:
+            # The run's last periodic checkpoint can be a background write of this file.
+            self._checkpoint_writer.wait()
         atomic_save(self._checkpoint_payload(frames), target)
 
     def _write_light_checkpoint(self, writer: CheckpointWriter) -> None:
