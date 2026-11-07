@@ -192,3 +192,30 @@ class WMBPTTRLOptConfig(RLOptConfig):
         # The agent builds its own actor, critic and dynamics model from
         # ``wm``; the generic value-function slot stays empty.
         self.value_function = None
+
+
+def validate_options(config: WMBPTTRLOptConfig) -> None:
+    """Refuse option values and combinations ``WMBPTT`` cannot honour.
+
+    The one place for option dependencies (contract 3 of
+    ``wiki/code-opt-ndm-port.md``): a combination that would do nothing, or do
+    something else than it says, fails here at construction. The default
+    config passes. Env-side pairs belong in ``ImitationG1V3EnvCfg``.
+    """
+    wm = config.wm
+    for name in ("actor_source", "critic_source"):
+        if getattr(wm, name) not in ("imagined", "real"):
+            msg = f"wm.{name} must be 'imagined' or 'real', got {getattr(wm, name)!r}."
+            raise ValueError(msg)
+    if wm.actor_source == "real" and 0 < wm.actor_horizon < wm.horizon:
+        msg = "wm.actor_source=real uses the window length wm.horizon; leave wm.actor_horizon at 0."
+        raise ValueError(msg)
+    if wm.actor_estimator not in ("pathwise", "score_function", "rebar"):
+        msg = f"wm.actor_estimator must be 'pathwise', 'score_function' or 'rebar', got {wm.actor_estimator!r}."
+        raise ValueError(msg)
+    if wm.actor_estimator == "rebar" and wm.actor_source != "real":
+        msg = "wm.actor_estimator=rebar corrects the real-window gradient (actor_source=real)."
+        raise ValueError(msg)
+    if wm.actor_estimator == "score_function" and wm.actor_source == "real":
+        msg = "wm.actor_estimator=score_function runs on imagined rollouts only (actor_source=imagined)."
+        raise ValueError(msg)

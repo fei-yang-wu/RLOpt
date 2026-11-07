@@ -39,7 +39,7 @@ from tensordict.nn import TensorDictModule
 from torch import Tensor, nn
 from torchrl.envs import TransformedEnv
 
-from rlopt.agent.wm_bptt.config import WMBPTTRLOptConfig
+from rlopt.agent.wm_bptt.config import WMBPTTRLOptConfig, validate_options
 from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
 from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel
 from rlopt.agent.wm_bptt.rebar import (
@@ -194,6 +194,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     """Model-based BPTT tracker (see the module docstring)."""
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
+        validate_options(config)
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
         device = torch.device(config.device)
         wm = config.wm
@@ -209,23 +210,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._iteration = 0
         self._step_acc = 0.0
         self.replay: SequenceReplay | None = None
-        for name in ("actor_source", "critic_source"):
-            if getattr(wm, name) not in ("imagined", "real"):
-                msg = f"wm.{name} must be 'imagined' or 'real', got {getattr(wm, name)!r}."
-                raise ValueError(msg)
-        if wm.actor_source == "real" and 0 < wm.actor_horizon < wm.horizon:
-            msg = "wm.actor_source=real uses the window length wm.horizon; leave wm.actor_horizon at 0."
-            raise ValueError(msg)
-        if wm.actor_estimator not in ("pathwise", "score_function", "rebar"):
-            msg = f"wm.actor_estimator must be 'pathwise', 'score_function' or 'rebar', got {wm.actor_estimator!r}."
-            raise ValueError(msg)
-        if wm.actor_estimator == "rebar" and wm.actor_source != "real":
-            msg = "wm.actor_estimator=rebar corrects the real-window gradient (actor_source=real)."
-            raise ValueError(msg)
         self._rebar = CorrectionAverage(wm.rebar_ema_rate, wm.rebar_norm_cap) if wm.actor_estimator == "rebar" else None
-        if wm.actor_estimator == "score_function" and wm.actor_source == "real":
-            msg = "wm.actor_estimator=score_function runs on imagined rollouts only (actor_source=imagined)."
-            raise ValueError(msg)
         super().__init__(env=env, config=config, logger=logger, **kwargs)
 
     # ------------------------------------------------------------ construction
