@@ -92,11 +92,24 @@ def test_both_loads_refuse_another_policy_interface(tmp_path: Path, load: str, k
         getattr(harness.make_agent(), load)(str(path))
 
 
-@pytest.mark.parametrize("load", ["load_policy", "load_model"])
-def test_both_loads_refuse_another_actor(tmp_path: Path, load: str) -> None:
+def test_resume_load_refuses_another_actor(tmp_path: Path) -> None:
     _, path = trained_checkpoint(tmp_path, actor_hidden=[32, 32])
     with pytest.raises(ValueError, match="actor_hidden"):
-        getattr(harness.make_agent(), load)(str(path))
+        harness.make_agent().load_model(str(path))
+
+
+def test_inference_load_builds_the_checkpoints_actor(tmp_path: Path) -> None:
+    """The actor's shape comes from ``policy_meta``, as its action semantics do, so a
+    default evaluator scores an actor of other widths (``wm.actor_arch`` too)."""
+    trained, path = trained_checkpoint(tmp_path, actor_hidden=[32, 32], actor_activation="silu")
+    evaluator = harness.make_agent()
+    evaluator.load_policy(str(path))
+    assert_same_policy(evaluator, trained)
+    meta = evaluator.policy_meta()
+    assert (meta["actor_hidden"], meta["actor_activation"]) == ([32, 32], "silu")
+    obs, _ = evaluator._isaac.reset()
+    feat = evaluator.task.policy_obs_from_env(*(obs["wm"][key] for _, key in evaluator.task.policy_in_keys))
+    torch.testing.assert_close(evaluator.predict(feat), trained.predict(feat), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("missing", ["dynamics_state_dict", "critic_state_dict", "optimizers"])

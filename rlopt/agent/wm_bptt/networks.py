@@ -142,6 +142,88 @@ class Actor(nn.Module):
             a = self.net(z)
         return a.float()
 
+    def muon_mlps(self) -> list[nn.Module]:
+        """The MLPs whose hidden matrices Muon updates (``wm.actor_opt=muon``)."""
+        return [self.net]
+
+
+class EncDecActor(nn.Module):
+    """``wm.actor_arch=enc_dec``: NDM Gym's ``TrackingPolicy`` (paper Table A.4), ported
+    from ``ndm_gym/policies/tracking_policy.py`` at ``05ea9f3`` under the MIT License
+    (Copyright (c) 2026 NDM Gym Contributors; Copyright (c) 2026 ETH Zurich, Chong
+    Zhang; the full text is in ``THIRD_PARTY_NOTICES.md``).
+
+    The last ``goal_dim`` columns of the normalized input, the goal, pass an encoder
+    to a latent bounded by tanh; a decoder maps (latent, the normalized rest, the
+    proprio history) to the action. Both MLPs have the ``hidden`` widths; the
+    decoder's last layer has the gain ``out_gain`` and no bias. The input normalizer
+    is this module's one per-column statistic, as for ``Actor``, where NDM Gym keeps
+    one per-frame statistic for all history slots and one for the goal.
+    ``net.enc`` and ``net.dec`` are the two MLPs.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        goal_dim: int,
+        hidden: Sequence[int],
+        latent_dim: int,
+        out_gain: float,
+        act: str = "elu",
+    ) -> None:
+        super().__init__()
+        if not 0 < goal_dim < in_dim:
+            msg = f"EncDecActor splits {in_dim} input columns; a goal of {goal_dim} leaves no other input."
+            raise ValueError(msg)
+        self.split = in_dim - goal_dim
+        self.obs_norm = RunningNorm(in_dim, eps=1e-2)
+        a = activation(act)
+        self.net = nn.ModuleDict(
+            {
+                "enc": mlp(goal_dim, hidden, latent_dim, act=a),
+                "dec": mlp(latent_dim + self.split, hidden, out_dim, act=a, out_gain=out_gain),
+            }
+        )
+
+    def forward(self, obs: Tensor, *, bf16: bool = False) -> Tensor:
+        z = self.obs_norm(obs)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16 and z.is_cuda):
+            latent = torch.tanh(self.net.enc(z[..., self.split :]).float())
+            a = self.net.dec(torch.cat((latent, z[..., : self.split]), -1))
+        return a.float()
+
+    def muon_mlps(self) -> list[nn.Module]:
+        """Each MLP's own hidden matrices: the encoder's last and the decoder's first
+        layer are the input and output layers of their MLPs."""
+        return [self.net.enc, self.net.dec]
+
+
+ACTOR_ARCHS = ("flat", "enc_dec")
+
+
+def build_actor(
+    arch: str,
+    in_dim: int,
+    out_dim: int,
+    hidden: Sequence[int],
+    out_gain: float,
+    act: str = "elu",
+    *,
+    goal_dim: int | None = None,
+    latent_dim: int = 32,
+) -> nn.Module:
+    """The actor of ``wm.actor_arch``: ``Actor`` (``flat``) or ``EncDecActor``."""
+    if arch == "flat":
+        return Actor(in_dim, out_dim, hidden, out_gain, act)
+    if arch == "enc_dec":
+        if goal_dim is None:
+            msg = "wm.actor_arch=enc_dec needs the goal's width (the task's policy_goal_dim)."
+            raise ValueError(msg)
+        return EncDecActor(in_dim, out_dim, goal_dim, hidden, latent_dim, out_gain, act)
+    msg = f"wm.actor_arch must be one of {ACTOR_ARCHS}, got {arch!r}."
+    raise ValueError(msg)
+
 
 class Critic(nn.Module):
     def __init__(self, in_dim: int, hidden: Sequence[int], act: str = "elu") -> None:

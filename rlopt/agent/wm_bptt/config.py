@@ -203,6 +203,16 @@ class WMBPTTConfig:
     """Real windows start within the newest N rows per env, so the recorded
     actions come from recent policies (50 rows = 20 iterations at 2.5 env
     steps per iteration)."""
+    actor_arch: str = "flat"
+    """``flat``: one MLP over the whole policy observation. ``enc_dec``: NDM Gym's
+    ``TrackingPolicy``: the goal (the task's last ``policy_goal_dim`` observation
+    columns) passes an encoder MLP to a tanh latent of ``actor_latent_dim``, and a
+    decoder MLP maps the latent and the proprio history to the action. Both MLPs
+    have the ``actor_hidden`` widths (NDM Gym: [2048, 1024, 512, 256], 9.1M
+    parameters on G1-v3), and Muon takes each MLP's own hidden matrices.
+    ``policy_meta`` records the shape, so an inference load builds it."""
+    actor_latent_dim: int = 32
+    """``actor_arch=enc_dec``: width of the goal's latent (NDM Gym: 32)."""
     actor_hidden: list[int] = field(default_factory=lambda: [1024, 1024, 512, 256])
     actor_activation: str = "elu"
     """MLP activation by name (elu, silu, relu, gelu, tanh)."""
@@ -510,6 +520,20 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
             raise ValueError(msg)
         if wm.dynamics_model != "mlp":
             msg = f"wm.update_graphs is tested with the MLP world model only, not dynamics_model={wm.dynamics_model!r}."
+            raise ValueError(msg)
+    if wm.actor_arch not in ("flat", "enc_dec"):
+        msg = f"wm.actor_arch must be 'flat' or 'enc_dec', got {wm.actor_arch!r}."
+        raise ValueError(msg)
+    if wm.actor_arch == "enc_dec":
+        goal = getattr(task, "policy_goal_dim", None)
+        if goal is None:
+            msg = "wm.actor_arch=enc_dec splits off the goal by the task's policy_goal_dim (G1V3TrackingTask)."
+            raise ValueError(msg)
+        if not 0 < goal < task.policy_obs_dim:
+            msg = f"wm.actor_arch=enc_dec: a goal of {goal} of {task.policy_obs_dim} columns leaves no other input."
+            raise ValueError(msg)
+        if wm.actor_latent_dim < 1:
+            msg = f"wm.actor_latent_dim must be at least 1, got {wm.actor_latent_dim}."
             raise ValueError(msg)
     # Muon skips each MLP's first and last Linear: one hidden layer leaves it nothing.
     for name, hidden, opt in (("wm_hidden", wm.wm_hidden, wm.wm_opt), ("actor_hidden", wm.actor_hidden, wm.actor_opt)):

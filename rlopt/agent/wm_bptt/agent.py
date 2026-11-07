@@ -47,7 +47,7 @@ from rlopt.agent.wm_bptt.config import (
 )
 from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
 from rlopt.agent.wm_bptt.muon import MuonAdam
-from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel, RunningNorm
+from rlopt.agent.wm_bptt.networks import Critic, DynamicsModel, RunningNorm, build_actor
 from rlopt.agent.wm_bptt.rebar import (
     CorrectionAverage,
     clipped_score_surrogate,
@@ -88,6 +88,8 @@ checkpoint from before the field implies: they set which optimizers and which
 policy entries the checkpoint holds, and what the actor's output means."""
 DEVICE_COUNTS = ("wm/nonfinite", "actor/nonfinite", "imagine/invalid_starts")
 """``wm.no_sync``: what the loop counts on the device, read at each log row."""
+ACTOR_SHAPE_KEYS = ("actor_arch", "actor_hidden", "actor_activation", "actor_latent_dim", "actor_goal_dim")
+"""``policy_meta`` entries that set the actor's shape (``wm.actor_arch``)."""
 LIGHT_CHECKPOINT_KEYS = (
     "policy_state_dict",
     "policy_meta",
@@ -97,6 +99,20 @@ LIGHT_CHECKPOINT_KEYS = (
     "cumulative_env_frames",
     "cumulative_train_seconds",
 )
+
+
+def actor_shape(meta: dict[str, Any]) -> dict[str, Any]:
+    """The actor's shape in ``policy_meta``, with what a checkpoint from before an
+    entry implies: a flat ELU MLP."""
+    shape = {
+        "actor_arch": str(meta.get("actor_arch", "flat")),
+        "actor_hidden": [int(h) for h in meta.get("actor_hidden", [])],
+        "actor_activation": str(meta.get("actor_activation", "elu")).lower(),
+    }
+    if shape["actor_arch"] != "flat":
+        shape["actor_latent_dim"] = meta.get("actor_latent_dim")
+        shape["actor_goal_dim"] = meta.get("actor_goal_dim")
+    return shape
 
 
 def _find_isaac_env(env: Any) -> Any:
@@ -238,7 +254,7 @@ class WMPolicy(nn.Module):
     """Deployed policy: env observation tensors -> deterministic action.
     ``residual`` (``wm.actor_residual``) adds the task's reference setpoint."""
 
-    def __init__(self, task: WorldModelTask, actor: Actor, bf16: bool, residual: bool = False) -> None:
+    def __init__(self, task: WorldModelTask, actor: nn.Module, bf16: bool, residual: bool = False) -> None:
         super().__init__()
         self.task = task
         self.actor = actor
@@ -308,9 +324,15 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         wm = self.config.wm
         t = self.task
         self.dynamics = self._construct_dynamics().to(self.device)
-        self.actor = Actor(
-            t.policy_obs_dim, t.action_dim, wm.actor_hidden, wm.actor_output_scale, wm.actor_activation
-        ).to(self.device)
+        # The flat entries are the baseline's metadata; ``wm.actor_arch=enc_dec`` adds its own.
+        self._actor_meta: dict[str, Any] = {
+            "actor_hidden": list(wm.actor_hidden), "actor_activation": str(wm.actor_activation).lower(),
+        }
+        if wm.actor_arch != "flat":
+            self._actor_meta.update(
+                actor_arch=str(wm.actor_arch), actor_latent_dim=int(wm.actor_latent_dim), actor_goal_dim=int(t.policy_goal_dim)
+            )
+        self.actor = self._build_actor(actor_shape(self._actor_meta))
         self.critic = Critic(t.critic_obs_dim, wm.critic_hidden, wm.critic_activation).to(self.device)
         self.policy_net = WMPolicy(t, self.actor, wm.bf16, self._residual)
         if wm.actor_ema > 0:
@@ -319,6 +341,14 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 WMPolicy(t, self.actor_avg.module, wm.bf16, self._residual), in_keys=list(t.policy_in_keys), out_keys=["action"]
             )
         return TensorDictModule(self.policy_net, in_keys=list(t.policy_in_keys), out_keys=["action"])
+
+    def _build_actor(self, shape: dict[str, Any]) -> nn.Module:
+        """An actor of ``shape`` (``actor_shape``) on this task's observation and action."""
+        t = self.task
+        return build_actor(
+            shape["actor_arch"], t.policy_obs_dim, t.action_dim, shape["actor_hidden"], self.config.wm.actor_output_scale,
+            shape["actor_activation"], goal_dim=shape.get("actor_goal_dim"), latent_dim=int(shape.get("actor_latent_dim") or 32),
+        ).to(self.device)
 
     def _construct_dynamics(self) -> nn.Module:
         wm, t = self.config.wm, self.task
@@ -383,7 +413,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=wm.wm_lr, weight_decay=wm.wm_weight_decay, **adam_kw)
         betas = tuple(wm.actor_betas)
         if wm.actor_opt == "muon":
-            self.actor_optim = MuonAdam(self.actor.net, [self.actor.net], lr=wm.actor_lr, betas=betas, **adam_kw)
+            self.actor_optim = MuonAdam(self.actor.net, self.actor.muon_mlps(), lr=wm.actor_lr, betas=betas, **adam_kw)
         else:
             self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=wm.actor_lr, betas=betas, **adam_kw)
         self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=wm.critic_lr, **adam_kw)
@@ -405,7 +435,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=lr(wm.wm_lr), weight_decay=wm.wm_weight_decay, **cap)
         betas = tuple(wm.actor_betas)
         if wm.actor_opt == "muon":
-            self.actor_optim = MuonAdam(self.actor.net, [self.actor.net], lr=wm.actor_lr, betas=betas, capturable=True)
+            self.actor_optim = MuonAdam(self.actor.net, self.actor.muon_mlps(), lr=wm.actor_lr, betas=betas, capturable=True)
         else:
             self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=lr(wm.actor_lr), betas=betas, **cap)
         self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=lr(wm.critic_lr), **cap)
@@ -1704,8 +1734,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             "in_keys": [list(k) for k in t.policy_in_keys],
             "policy_obs_dim": t.policy_obs_dim,
             "action_dim": t.action_dim,
-            "actor_hidden": list(self.config.wm.actor_hidden),
-            "actor_activation": str(self.config.wm.actor_activation).lower(),
+            **self._actor_meta,
             "task_model": str(self.config.wm.task_model),
             "sensor_noise": bool(self.config.wm.sensor_noise),
             "bf16": bool(self.config.wm.bf16),
@@ -1764,18 +1793,24 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def save(self, path: str | Path) -> None:
         self.save_model(path)
 
-    def _read_checkpoint(self, path: str, map_location: torch.device | str) -> dict[str, Any]:
-        """A checkpoint whose policy interface matches this agent."""
+    def _read_checkpoint(self, path: str, map_location: torch.device | str, *, inference: bool = False) -> dict[str, Any]:
+        """A checkpoint whose policy interface matches this agent, and for a resume
+        (not ``inference``) its actor's shape too."""
         data = torch.load(path, map_location=map_location, weights_only=False)
         meta = data.get("policy_meta") or {}
         if meta.get("arch") != ARCH_TAG:
             msg = f"{path} is not a {ARCH_TAG} checkpoint (arch={meta.get('arch')!r})."
             raise ValueError(msg)
         mine = self.policy_meta()
-        keys = ["in_keys", "policy_obs_dim", "action_dim", "actor_hidden"]
+        keys = ["in_keys", "policy_obs_dim", "action_dim"]
         # Checkpoints written before the activation field were ELU.
         meta.setdefault("actor_activation", "elu")
-        keys.append("actor_activation")
+        if not inference:  # an inference load builds the checkpoint's actor
+            theirs, ours = actor_shape(meta), actor_shape(mine)
+            for key in ACTOR_SHAPE_KEYS:
+                if theirs.get(key) != ours.get(key):
+                    msg = f"checkpoint policy_meta[{key!r}]={theirs.get(key)!r} != agent {ours.get(key)!r}"
+                    raise ValueError(msg)
         # The goal input is bound by what produces it (e.g. the frozen skill
         # encoder's weights), not by its width; older checkpoints predate it.
         if meta.get("goal_binding") is not None:
@@ -1795,9 +1830,12 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         checkpoint, not from that default config. An agent loaded this way
         refuses to train: use ``load_model`` to resume.
         """
-        data = self._read_checkpoint(path, "cpu")
+        data = self._read_checkpoint(path, "cpu", inference=True)
         meta = data["policy_meta"]
         assert self.policy is not None
+        shape = actor_shape(meta)
+        if shape != actor_shape(self.policy_meta()):
+            self._build_inference_actor(shape)
         self.policy.load_state_dict(data["policy_state_dict"], strict=True)
         # Checkpoints written before ``policy_meta["bf16"]`` keep it in ``wm_config``.
         self.policy_net.bf16 = bool(meta.get("bf16", (data.get("wm_config") or {}).get("bf16", self.policy_net.bf16)))
@@ -1808,6 +1846,19 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if self.actor_avg is not None:
             self.actor_avg.updates = 0  # ``self.policy`` now holds what is deployed
         self._inference_loaded = True
+
+    def _build_inference_actor(self, shape: dict[str, Any]) -> None:
+        """``load_policy``: the checkpoint's actor shape in place of this agent's. The
+        agent's own average goes: the loaded ``policy_state_dict`` is what deploys."""
+        goal, task_goal = shape.get("actor_goal_dim"), getattr(self.task, "policy_goal_dim", None)
+        if goal is not None and task_goal is not None and goal != task_goal:
+            msg = f"checkpoint policy_meta['actor_goal_dim']={goal} != the task's goal width {task_goal}"
+            raise ValueError(msg)
+        self.actor = self._build_actor(shape)
+        self.policy_net.actor = self.actor
+        self.actor_avg = None
+        self.policy_avg = None
+        self._actor_meta = {k: v for k, v in shape.items() if (k, v) != ("actor_arch", "flat")}
 
     def load_model(self, path: str) -> None:
         """Resume load: every component, strictly. A checkpoint from another
