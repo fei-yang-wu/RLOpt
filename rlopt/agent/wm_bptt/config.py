@@ -535,6 +535,9 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         if wm.actor_latent_dim < 1:
             msg = f"wm.actor_latent_dim must be at least 1, got {wm.actor_latent_dim}."
             raise ValueError(msg)
+    elif wm.actor_latent_dim != WMBPTTConfig.actor_latent_dim:
+        msg = f"wm.actor_latent_dim={wm.actor_latent_dim} sets the latent of wm.actor_arch=enc_dec; the flat actor has none."
+        raise ValueError(msg)
     # Muon skips each MLP's first and last Linear: one hidden layer leaves it nothing.
     for name, hidden, opt in (("wm_hidden", wm.wm_hidden, wm.wm_opt), ("actor_hidden", wm.actor_hidden, wm.actor_opt)):
         if opt == "muon" and len(hidden) < 2:

@@ -58,6 +58,7 @@ REFUSED = [
     ({"no_sync": True, "fused_adam": True, "critic_source": "real"}, "real windows"),
     ({"imag_start_perturb": -0.15}, "standard deviation"),
     ({"imag_start_perturb": 0.15}, "perturb_start"),
+    ({"actor_latent_dim": 64}, "flat actor has none"),
 ]
 
 
