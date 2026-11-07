@@ -83,3 +83,61 @@ class ActorAverage:
         else:
             self.step()
         self.updates += 1
+
+
+class ActorLR:
+    """``wm.actor_lr_mult``: the actor's learning rate is the schedule's times a multiplier.
+
+    From the log row where the training return first reaches ``decay_return``,
+    or at iteration ``decay_by`` at the latest, the multiplier ramps linearly
+    to 1 over ``decay_len`` iterations. None disables a trigger. The defaults
+    are off: the multiplier is 1 at every iteration.
+    """
+
+    def __init__(
+        self,
+        mult: float = 1.0,
+        decay_return: float | None = None,
+        decay_len: int = 0,
+        decay_by: int | None = None,
+    ) -> None:
+        self.mult, self.decay_return, self.decay_len, self.decay_by = mult, decay_return, decay_len, decay_by
+        self.decay_at: int | None = None
+
+    @property
+    def on(self) -> bool:
+        return self.mult != 1.0
+
+    @property
+    def watches_return(self) -> bool:
+        return self.decay_return is not None
+
+    def at(self, iteration: int) -> float:
+        """The multiplier at ``iteration``."""
+        if self.decay_at is None:
+            return self.mult
+        return self.mult + (1.0 - self.mult) * min(1.0, (iteration - self.decay_at) / self.decay_len)
+
+    def observe(self, iteration: int, ret: float | None) -> str | None:
+        """At a log row, ``iteration`` iterations done and the logged training
+        return ``ret`` (None: no episode ended, the deadline alone): the
+        trigger's message when it fires, which it does once, else None."""
+        if self.decay_return is None or self.decay_at is not None:
+            return None
+        reached = ret is not None and ret >= self.decay_return
+        if not reached and not (self.decay_by is not None and iteration >= self.decay_by):
+            return None
+        self.decay_at = iteration
+        why = f"training return {ret:.3f} >= {self.decay_return}" if reached else f"deadline {self.decay_by}"
+        return f"actor_lr_mult: {why} at iteration {iteration}: x{self.mult:g} -> x1 over {self.decay_len} iterations"
+
+    def state_dict(self) -> dict[str, Any]:
+        """The trigger's iteration for a checkpoint; nothing without a trigger."""
+        return {"actor_lr_decay_at": self.decay_at} if self.watches_return else {}
+
+    def load_state_dict(self, checkpoint: dict[str, Any]) -> None:
+        if self.watches_return:
+            if "actor_lr_decay_at" not in checkpoint:
+                msg = "wm.actor_lr_decay_return: the checkpoint has no trigger state (actor_lr_decay_at)."
+                raise ValueError(msg)
+            self.decay_at = checkpoint["actor_lr_decay_at"]

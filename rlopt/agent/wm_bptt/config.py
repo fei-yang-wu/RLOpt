@@ -158,6 +158,18 @@ class WMBPTTConfig:
     """``adam``: Adam on every parameter. ``muon``: Muon on the actor's hidden
     weight matrices, Adam with ``actor_betas`` on the rest, both at ``actor_lr``."""
     actor_betas: list[float] = field(default_factory=lambda: [0.9, 0.95])
+    actor_lr_mult: float = 1.0
+    """The actor's learning rate is ``actor_lr`` times the schedule times this,
+    on Muon and Adam groups alike. The critic and world model do not get it."""
+    actor_lr_decay_return: float | None = None
+    """Once the training return reaches this at a log row, ``actor_lr_mult``
+    ramps linearly to 1 over ``actor_lr_decay_len`` iterations. The return is
+    an ended episode's mean step reward over the task's ``max_step_reward``,
+    averaged per step, then over the steps that ended an episode."""
+    actor_lr_decay_len: int = 0
+    """Length of that ramp in iterations."""
+    actor_lr_decay_by: int | None = None
+    """The ramp starts at this iteration at the latest."""
     actor_grad_clip_norm: float = 1.0
     actor_grad_clip_value: float = 0.1
     actor_output_scale: float = 0.01
@@ -209,7 +221,7 @@ class WMBPTTRLOptConfig(RLOptConfig):
         self.value_function = None
 
 
-def validate_options(config: WMBPTTRLOptConfig) -> None:
+def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     """Refuse option values and combinations ``WMBPTT`` cannot honour.
 
     The one place for option dependencies (contract 3 of
@@ -221,6 +233,29 @@ def validate_options(config: WMBPTTRLOptConfig) -> None:
     if not 0.0 <= wm.actor_ema < 1.0:
         msg = f"wm.actor_ema must be in [0, 1), got {wm.actor_ema}."
         raise ValueError(msg)
+    if wm.actor_lr_mult <= 0:
+        msg = f"wm.actor_lr_mult must be positive, got {wm.actor_lr_mult}."
+        raise ValueError(msg)
+    if wm.actor_lr_decay_return is None:
+        if wm.actor_lr_decay_by is not None or wm.actor_lr_decay_len != 0:
+            msg = "wm.actor_lr_decay_by and wm.actor_lr_decay_len need wm.actor_lr_decay_return."
+            raise ValueError(msg)
+    else:
+        if wm.actor_lr_mult == 1:
+            msg = "wm.actor_lr_decay_return decays wm.actor_lr_mult, which is 1."
+            raise ValueError(msg)
+        if wm.actor_lr_decay_return <= 0:
+            msg = f"wm.actor_lr_decay_return must be positive, got {wm.actor_lr_decay_return}."
+            raise ValueError(msg)
+        if wm.actor_lr_decay_len < 1:
+            msg = f"wm.actor_lr_decay_len must be at least 1 with a trigger, got {wm.actor_lr_decay_len}."
+            raise ValueError(msg)
+        if wm.actor_lr_decay_by is not None and wm.actor_lr_decay_by < 1:
+            msg = f"wm.actor_lr_decay_by must be at least 1, got {wm.actor_lr_decay_by}."
+            raise ValueError(msg)
+        if getattr(task, "max_step_reward", None) is None:
+            msg = "wm.actor_lr_decay_return needs the task's max_step_reward, which scales the training return."
+            raise ValueError(msg)
     for name in ("actor_opt", "wm_opt"):
         if getattr(wm, name) not in ("adam", "muon"):
             msg = f"wm.{name} must be 'adam' or 'muon', got {getattr(wm, name)!r}."

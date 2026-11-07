@@ -51,7 +51,7 @@ from rlopt.agent.wm_bptt.rebar import (
     shuffle_rows,
 )
 from rlopt.agent.wm_bptt.replay import SequenceReplay
-from rlopt.agent.wm_bptt.speed_options import ActorAverage, set_lr
+from rlopt.agent.wm_bptt.speed_options import ActorAverage, ActorLR, set_lr
 from rlopt.agent.wm_bptt.task import (
     WorldModelTask,
     history_proprio,
@@ -199,8 +199,12 @@ class WMPolicy(nn.Module):
 class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     """Model-based BPTT tracker (see the module docstring)."""
 
+    # Options start off; ``__init__`` and ``_construct_policy`` switch them on.
+    actor_avg: ActorAverage | None = None
+    policy_avg: TensorDictModule | None = None
+    _actor_lr: ActorLR = ActorLR()
+
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
-        validate_options(config)
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
         device = torch.device(config.device)
         wm = config.wm
@@ -210,6 +214,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self.task: WorldModelTask = load_task(
             wm.task_model, env, device, sensor_noise=wm.sensor_noise, **task_kwargs
         )
+        validate_options(config, self.task)
         self._isaac = _find_isaac_env(env)
         self._frames_processed = 0
         self._resume_frame_offset = 0
@@ -217,8 +222,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._step_acc = 0.0
         self.replay: SequenceReplay | None = None
         self._inference_loaded = False
-        self.actor_avg: ActorAverage | None = None
-        self.policy_avg: TensorDictModule | None = None
+        self._actor_lr = ActorLR(wm.actor_lr_mult, wm.actor_lr_decay_return, wm.actor_lr_decay_len, wm.actor_lr_decay_by)
         self._rebar = CorrectionAverage(wm.rebar_ema_rate, wm.rebar_norm_cap) if wm.actor_estimator == "rebar" else None
         super().__init__(env=env, config=config, logger=logger, **kwargs)
 
@@ -330,7 +334,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def _set_lrs(self) -> None:
         f = self._lr_factor()
         wm = self.config.wm
-        for opt, base in ((self.wm_optim, wm.wm_lr), (self.actor_optim, wm.actor_lr), (self.critic_optim, wm.critic_lr)):
+        actor_lr = wm.actor_lr * self._actor_lr.at(self._iteration)
+        for opt, base in ((self.wm_optim, wm.wm_lr), (self.actor_optim, actor_lr), (self.critic_optim, wm.critic_lr)):
             set_lr(opt, base * f)
 
     # ------------------------------------------------------------ collection
@@ -382,12 +387,25 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         """Device-side sums behind ``episode/length`` and ``episode/return``."""
         self._episode_length += 1
         self._episode_return += reward
+        if self._actor_lr.watches_return:
+            self._track_normalized_return(done)
         ended = (self._episode_length, self._episode_return)
         self._episode_sums += torch.stack(
             (done.sum(), *(torch.where(done, x, 0.0).sum() for x in ended))
         )
         for x in ended:
             x.masked_fill_(done, 0.0)
+
+    @torch.no_grad()
+    def _track_normalized_return(self, done: Tensor) -> None:
+        """Device-side sums of the return ``actor_lr_decay_return`` watches: the
+        mean over this step's ended episodes of return / (length * max reward),
+        and the count of steps that ended one. The mean of ratios, so
+        ``episode/return`` over ``episode/length`` would not reproduce it."""
+        ratio = self._episode_return / (self._episode_length * self.task.max_step_reward)
+        ended = done.sum()
+        step_mean = torch.where(done, ratio, 0.0).sum() / ended.clamp_min(1)
+        self._return_sums += torch.stack((step_mean, (ended > 0).float()))
 
     # ------------------------------------------------------------ world model
     def _wm_step(self, state: Tensor, action: Tensor, ctx: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
@@ -1118,6 +1136,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             src.clear()
         out.update(self._wm_eval())
         out["train/lr_factor"] = self._lr_factor()
+        if self._actor_lr.on:
+            self._observe_actor_lr(out)
         out["perf/iteration_s"] = it_time
         if "env/env_reward" in out:
             out["train/step_reward_mean"] = out["env/env_reward"]
@@ -1127,6 +1147,20 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             out["episode/length"] = length / count
             out["episode/return"] = reward / count
         return out
+
+    def _observe_actor_lr(self, row: dict[str, float]) -> None:
+        """At a log row, the only host read of the return's device sums."""
+        ret = None
+        if self._actor_lr.watches_return:
+            total, steps = self._return_sums.tolist()
+            self._return_sums.zero_()
+            if steps > 0:
+                ret = total / steps
+                row["train/normalized_return"] = ret
+        message = self._actor_lr.observe(self._iteration, ret)
+        if message:
+            self.log.info(message)
+        row["train/actor_lr_mult"] = self._actor_lr.at(self._iteration)
 
     def _env_log_metrics(self) -> dict[str, Any]:
         """The env's live scalars; ``_collect_step`` averages ``extras["log"]`` itself."""
@@ -1151,6 +1185,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self._episode_length = torch.zeros(self._num_envs, device=self.device)
             self._episode_return = torch.zeros(self._num_envs, device=self.device)
             self._episode_sums = torch.zeros(3, device=self.device)
+            if self._actor_lr.watches_return:
+                self._return_sums = torch.zeros(2, device=self.device)
         return self.replay
 
     @honours_train_time_budget
@@ -1284,6 +1320,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if self.actor_avg is not None:
             payload["policy_live_state_dict"] = self.policy.state_dict()
             payload["actor_ema_updates"] = self.actor_avg.updates
+        payload.update(self._actor_lr.state_dict())
         tmp = target.with_name(target.name + ".tmp")
         torch.save(payload, tmp)
         tmp.replace(target)
@@ -1364,6 +1401,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             opt.load_state_dict(data["optimizers"][name])
         if self._rebar is not None and "rebar" in data:
             self._rebar.load_state_dict(data["rebar"])
+        self._actor_lr.load_state_dict(data)
         self._iteration = int(data.get("iteration", 0))
         frames = data.get("cumulative_env_frames")
         if frames is not None:
