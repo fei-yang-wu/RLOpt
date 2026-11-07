@@ -116,6 +116,18 @@ def test_an_ema_evaluator_scores_the_average_too(tmp_path: Path) -> None:
     assert harness.state_equal(state, agent.actor_avg.module.state_dict())
 
 
+def test_a_trained_ema_agent_deploys_the_policy_it_loads(tmp_path: Path) -> None:
+    """Its own average is stale once ``load_policy`` replaces the actor."""
+    source, path = trained(tmp_path)
+    agent = harness.make_agent(actor_ema=DECAY, seed=8, **RUN)
+    agent.train()
+    assert agent._deploys_average
+    assert not harness.state_equal(agent.actor_avg.module.state_dict(), source.actor_avg.module.state_dict())
+    agent.load_policy(str(path))
+    assert agent.collector_policy is agent.policy
+    assert harness.state_equal(actor_entries(agent.collector_policy.state_dict()), source.actor_avg.module.state_dict())
+
+
 def test_the_trained_agent_deploys_the_average(tmp_path: Path) -> None:
     agent, _ = trained(tmp_path)
     assert agent.collector_policy is agent.policy_avg

@@ -124,6 +124,21 @@ def test_last_every_min_writes_full_files_at_periodic_checkpoints(tmp_path: Path
     assert steps(agent, "model_step_*.pt") == sorted({*steps(agent, "policy_step_*.pt"), agent._frames_processed})
 
 
+def test_full_files_keep_their_interval_after_the_first(tmp_path: Path) -> None:
+    """A clock of 10 s per iteration and a 30 s interval: periodic checkpoints at
+    iterations 1, 3, 5 and 7, so full files at 3 and 7, each 30 s after the last."""
+    agent = harness.make_agent(frames=FRAMES, save_interval=EVERY, log_dir=tmp_path, ckpt_light=True, last_every_min=0.5)
+    agent.train_elapsed_seconds = lambda: 10.0 * agent._iteration
+    agent.train()
+    light = {
+        int(p.stem.rsplit("_", 1)[1]): torch.load(p, weights_only=False)["iteration"]
+        for p in agent._checkpoint_dir().glob("policy_step_*.pt")
+    }
+    assert sorted(light.values()) == [1, 3, 5, 7]
+    full = [frames for frames, iteration in light.items() if iteration in (3, 7)]
+    assert steps(agent, "model_step_*.pt") == sorted({*full, agent._frames_processed})
+
+
 class Writes:
     """Every ``atomic_save``, from the loop and from the writer's thread. The loop's
     write is slow, so a writer that reaches the same file meanwhile is caught."""
@@ -302,7 +317,8 @@ def test_a_slow_disk_holds_the_queue_at_its_limit(tmp_path: Path, monkeypatch: p
 
     monkeypatch.setattr(CheckpointWriter, "_write", staticmethod(slow))
     writer = CheckpointWriter()
-    limit = CheckpointWriter.MAX_QUEUED
+    limit = 2  # NDM's: two writes wait behind the running one
+    assert limit == CheckpointWriter.MAX_QUEUED
     for i in range(limit):
         writer.submit({}, tmp_path / f"{i}.pt")
     blocked = threading.Thread(target=lambda: [writer.submit({}, tmp_path / f"{i}.pt") for i in range(limit, limit + 2)])

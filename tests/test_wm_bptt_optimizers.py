@@ -267,6 +267,14 @@ def test_the_agent_builds_muon_on_the_actor_and_the_world_model_only() -> None:
     assert type(agent.critic_optim) is torch.optim.Adam
 
 
+def test_the_actor_betas_reach_muons_adam_group() -> None:
+    """Not the default betas, which ``MuonAdam`` would also take without them."""
+    betas = (0.8, 0.99)
+    agent = harness.make_agent(actor_opt="muon", actor_betas=betas)
+    assert agent.actor_optim.adam.defaults["betas"] == betas
+    assert all(group["betas"] == betas for group in agent.actor_optim.adam.param_groups)
+
+
 def test_learning_rates_reach_the_muon_groups() -> None:
     agent = harness.make_agent(actor_opt="muon", wm_opt="muon", actor_lr=1e-3, wm_lr=3e-3, lr_cosine_iters=10)
     agent._iteration = 5
