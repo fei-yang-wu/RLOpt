@@ -29,7 +29,7 @@ import dataclasses
 import math
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -345,6 +345,19 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             # The two compiled steps have a handful of guard variants (train vs
             # eval mode, first call); a low limit silently falls back to eager.
             torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+
+    def _apply_training_compile_options(self) -> None:
+        """The options that change the process or the env, at the first collection
+        (``ensure_replay``), not at construction.
+
+        An agent built only to score (``load_policy``) then changes nothing: an
+        evaluator builds its env first, env setup compiles, and a late
+        ``wm.elementwise_3x3`` would refuse the agent. The env reward stays eager,
+        so a board scores every arm with the same rounding. A training entrypoint
+        applies the options before its env (``apply_compile_options``); here they
+        then change nothing, or refuse a process that compiled without them.
+        """
+        wm = self.config.wm
         apply_compile_options(wm)
         if wm.compile_eager:
             self.task.compile_collection_reward()  # type: ignore[attr-defined]
@@ -1352,6 +1365,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         """Allocate the per-env replay on first use (training, or an offline
         probe that collects with ``_collect_step``)."""
         if self.replay is None:
+            self._apply_training_compile_options()
             wm, t = self.config.wm, self.task
             self.replay = SequenceReplay(
                 self._num_envs, wm.replay_steps, t.state_dim, t.action_dim, t.context_dim, self.device,
@@ -1453,22 +1467,39 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 if self._should_save_checkpoint(frames_processed=self._frames_processed, frames_in_iteration=self._frames_processed - frames_before):
                     if writer is None:
                         self.save_model(self._checkpoint_dir(), step=self._frames_processed)
-                    else:
+                    elif not stop:  # the end's full file holds these frames (NDM: ``not final_ck``)
                         self._write_light_checkpoint(writer)
                 if stop:
                     meta.stop_after_iteration = True
                     break
-            if self._train_time_budget_reached():
-                self._finish_train_time_budget(meta)
-            else:
-                self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+            self._save_after_writer(writer, lambda: self._save_end(meta))
         except KeyboardInterrupt:
-            self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+            self._save_after_writer(writer, lambda: self.save_model(self._checkpoint_dir(), step=self._frames_processed))
             raise
         finally:
             self._checkpoint_writer = None
             if writer is not None:
                 writer.close()
+
+    def _save_end(self, meta: TrainingMetadata) -> None:
+        if self._train_time_budget_reached():
+            self._finish_train_time_budget(meta)
+        else:
+            self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+
+    @staticmethod
+    def _save_after_writer(writer: CheckpointWriter | None, save: Callable[[], None]) -> None:
+        """``save`` on the main thread once ``wm.ckpt_light``'s writer is idle.
+
+        Both can write one ``model_step_<frames>.pt``, and two writes through one
+        temporary name leave a crash and a corrupt file. A failed background
+        write still raises, after ``save``.
+        """
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            save()
 
     # ------------------------------------------------------------ checkpoint
     def policy_meta(self) -> dict[str, Any]:

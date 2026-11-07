@@ -12,6 +12,7 @@ import torch
 import wm_bptt_harness as harness
 
 from rlopt.agent.wm_bptt import agent as agent_module
+from rlopt.agent.wm_bptt import speed_options
 from rlopt.agent.wm_bptt.agent import LIGHT_CHECKPOINT_KEYS
 from rlopt.agent.wm_bptt.speed_options import (
     CheckpointWriter,
@@ -123,6 +124,102 @@ def test_last_every_min_writes_full_files_at_periodic_checkpoints(tmp_path: Path
     assert steps(agent, "model_step_*.pt") == sorted({*steps(agent, "policy_step_*.pt"), agent._frames_processed})
 
 
+def test_full_files_keep_their_interval_after_the_first(tmp_path: Path) -> None:
+    """A clock of 10 s per iteration and a 30 s interval: periodic checkpoints at
+    iterations 1, 3, 5 and 7, so full files at 3 and 7, each 30 s after the last."""
+    agent = harness.make_agent(frames=FRAMES, save_interval=EVERY, log_dir=tmp_path, ckpt_light=True, last_every_min=0.5)
+    agent.train_elapsed_seconds = lambda: 10.0 * agent._iteration
+    agent.train()
+    light = {
+        int(p.stem.rsplit("_", 1)[1]): torch.load(p, weights_only=False)["iteration"]
+        for p in agent._checkpoint_dir().glob("policy_step_*.pt")
+    }
+    assert sorted(light.values()) == [1, 3, 5, 7]
+    full = [frames for frames, iteration in light.items() if iteration in (3, 7)]
+    assert steps(agent, "model_step_*.pt") == sorted({*full, agent._frames_processed})
+
+
+class Writes:
+    """Every ``atomic_save``, from the loop and from the writer's thread. The loop's
+    write is slow, so a writer that reaches the same file meanwhile is caught."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.lock = threading.Lock()
+        self.active: dict[Path, int] = {}
+        self.overlaps: list[str] = []
+        self.by: dict[str, set[str]] = {}
+        real = speed_options.atomic_save
+
+        def save(payload: dict[str, Any], target: Path) -> None:
+            thread = "writer" if threading.current_thread().name.startswith("wm-checkpoint") else "loop"
+            with self.lock:
+                if self.active.get(target):
+                    self.overlaps.append(target.name)
+                self.active[target] = self.active.get(target, 0) + 1
+                self.by.setdefault(target.name, set()).add(thread)
+            try:
+                time.sleep(0.05 if thread == "writer" else 0.5)
+                real(payload, target)
+            finally:
+                with self.lock:
+                    self.active[target] -= 1
+
+        monkeypatch.setattr(speed_options, "atomic_save", save)
+        monkeypatch.setattr(agent_module, "atomic_save", save)
+
+
+def assert_readable_end(agent: Any, writes: Writes) -> None:
+    assert writes.overlaps == []
+    files = sorted(agent._checkpoint_dir().glob("model_step_*.pt"), key=lambda p: int(p.stem.rsplit("_", 1)[1]))
+    assert files, "the run wrote no full file"
+    for path in files:
+        torch.load(path, weights_only=False)  # a corrupt file raises
+    assert not list(agent._checkpoint_dir().glob("*.tmp"))
+    resumed = harness.make_agent(ckpt_light=True, last_every_min=1e-9, save_interval=1)
+    resumed.load_model(str(files[-1]))
+    assert resumed._resume_frame_offset == agent._frames_processed
+
+
+def test_the_end_file_waits_for_the_writer_at_a_frame_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The last iteration is the only periodic one, and a full file is due there:
+    only the loop writes those frames, once."""
+    writes = Writes(monkeypatch)
+    agent = harness.make_agent(frames=FRAMES, save_interval=FRAMES, log_dir=tmp_path, ckpt_light=True, last_every_min=1e-9)
+    agent.train()
+    assert steps(agent, "model_step_*.pt") == [agent._frames_processed]
+    assert writes.by[f"model_step_{agent._frames_processed}.pt"] == {"loop"}
+    assert_readable_end(agent, writes)
+
+
+def test_the_end_file_waits_for_the_writer_at_a_time_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    writes = Writes(monkeypatch)
+    agent = harness.make_agent(frames=10**9, save_interval=1, log_dir=tmp_path, ckpt_light=True, last_every_min=1e-9)
+    agent._train_time_budget_reached = lambda: agent._iteration >= 4
+    agent.train()
+    assert agent._iteration == 4
+    assert writes.by[f"model_step_{agent._frames_processed}.pt"] == {"loop"}
+    assert_readable_end(agent, writes)
+
+
+def test_an_interrupt_saves_after_the_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Interrupted just after a periodic full file was queued: the interrupt's
+    save has the same frames, and starts once the writer is idle."""
+    writes = Writes(monkeypatch)
+    agent = harness.make_agent(frames=10**9, save_interval=1, log_dir=tmp_path, ckpt_light=True, last_every_min=1e-9)
+    write = agent._write_light_checkpoint
+
+    def interrupted(writer: CheckpointWriter) -> None:
+        write(writer)
+        if agent._iteration == 3:
+            raise KeyboardInterrupt
+
+    agent._write_light_checkpoint = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        agent.train()
+    assert writes.by[f"model_step_{agent._frames_processed}.pt"] == {"writer", "loop"}
+    assert_readable_end(agent, writes)
+
+
 def test_a_long_interval_writes_no_full_file_before_the_end(tmp_path: Path) -> None:
     agent = run(tmp_path, ckpt_light=True, last_every_min=60.0)
     assert steps(agent, "model_step_*.pt") == [agent._frames_processed]
@@ -220,7 +317,8 @@ def test_a_slow_disk_holds_the_queue_at_its_limit(tmp_path: Path, monkeypatch: p
 
     monkeypatch.setattr(CheckpointWriter, "_write", staticmethod(slow))
     writer = CheckpointWriter()
-    limit = CheckpointWriter.MAX_QUEUED
+    limit = 2  # NDM's: two writes wait behind the running one
+    assert limit == CheckpointWriter.MAX_QUEUED
     for i in range(limit):
         writer.submit({}, tmp_path / f"{i}.pt")
     blocked = threading.Thread(target=lambda: [writer.submit({}, tmp_path / f"{i}.pt") for i in range(limit, limit + 2)])
@@ -234,8 +332,10 @@ def test_a_slow_disk_holds_the_queue_at_its_limit(tmp_path: Path, monkeypatch: p
 
 
 def test_the_final_save_waits_for_a_background_write_of_the_same_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """With ``last_every_min`` the last periodic checkpoint is the full file the run's
-    end writes too, under the same temporary name: the end must wait for it."""
+    """With ``last_every_min`` the last periodic checkpoint and the run's end can name
+    one full file and share its temporary name. The end iteration schedules no light
+    write (NDM: ``not final_ck``), and the end save waits for any write still queued;
+    either way the end writes its file once, after every background write of it."""
     events: list[tuple[str, str, float]] = []
     write = CheckpointWriter._write
     save = agent_module.atomic_save
@@ -257,10 +357,11 @@ def test_the_final_save_waits_for_a_background_write_of_the_same_file(tmp_path: 
     agent.train()
     final = f"model_step_{agent._frames_processed}.pt"
     assert [name for kind, name, _ in events if kind == "end"] == [final]
-    background = [t for kind, name, t in events if kind == "background done" and name == final]
-    assert background, "the last periodic checkpoint should be the end's file"
     end = next(t for kind, name, t in events if kind == "end")
-    assert end >= background[0]
+    started = [t for kind, name, t in events if kind == "background" and name == final]
+    finished = [t for kind, name, t in events if kind == "background done" and name == final]
+    assert len(started) == len(finished)
+    assert all(end >= t for t in finished)
     data = torch.load(agent._checkpoint_dir() / final, weights_only=False)
     assert data["cumulative_env_frames"] == agent._frames_processed
     assert not list(agent._checkpoint_dir().glob("*.tmp"))
