@@ -222,8 +222,9 @@ class WMBPTTConfig:
     reward, each with ``dynamic=False``. Changes rounding."""
     combo_kernels: bool = False
     """Inductor launches independent kernels of a compiled graph together.
-    Process-wide. Slower on an RTX A4500 at the default sizes (693 against 668 ms
-    per iteration), so measure it on the target GPU."""
+    Process-wide. On an RTX A4500 at the default sizes one measurement had it
+    slower (693 against 668 ms per iteration) and a later one, with no other GPU
+    client, faster (560 against 570), so measure it on the target GPU."""
     no_sync: bool = False
     """No host read in the update loop. The normalizers freeze on the device, and
     a window's valid rows are masked rather than indexed. A non-finite world-model
