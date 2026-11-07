@@ -21,7 +21,12 @@ import wm_bptt_harness as harness
 from tensordict import TensorDict
 
 from rlopt.agent.wm_bptt.agent import deployed_policy
-from rlopt.agent.wm_bptt.config import EPROBE_FIELDS, WMBPTTConfig, WMBPTTRLOptConfig, validate_options
+from rlopt.agent.wm_bptt.config import (
+    EPROBE_FIELDS,
+    WMBPTTConfig,
+    WMBPTTRLOptConfig,
+    validate_options,
+)
 
 EXACT = {"rtol": 0, "atol": 0}
 ON = {"eprobe_share": 0.15, "eprobe_start": 2, "eprobe_every": 2, "actor_ema": 0.9}
@@ -97,7 +102,8 @@ def last_full(agent: Any) -> Path:
 # ------------------------------------------------------------------ off
 def test_off_by_default_builds_no_probe(tmp_path: Path) -> None:
     agent = harness.make_agent(frames=harness.frames_for(4), log_dir=tmp_path, env_cls=ProbeEnv)
-    assert WMBPTTConfig().eprobe_share == 0.0 and agent._eprobe is None
+    assert WMBPTTConfig().eprobe_share == 0.0
+    assert agent._eprobe is None
     agent.train()
     assert agent._isaac.probes == []
     path = last_full(agent)
@@ -112,8 +118,10 @@ def test_the_probe_ticks_before_each_iterations_collection(tmp_path: Path) -> No
     assert [it for it, _ in probe.ticks] == list(range(7))
     # Iteration i's tick sees the steps of iterations 0 .. i - 1 only (frames_for counts env steps x envs).
     assert [steps for _, steps in probe.ticks] == [harness.frames_for(i) // 8 for i in range(7)]
-    assert probe.run_dir == agent.log_dir and probe.wm is agent.config.wm
-    assert probe.closed and agent._eprobe is None
+    assert probe.run_dir == agent.log_dir
+    assert probe.wm is agent.config.wm
+    assert probe.closed
+    assert agent._eprobe is None
 
 
 def test_a_sweep_gets_the_deployed_policy(tmp_path: Path) -> None:
@@ -127,9 +135,10 @@ def test_a_sweep_gets_the_deployed_policy(tmp_path: Path) -> None:
 def test_the_log_row_has_the_probes_numbers(tmp_path: Path) -> None:
     agent = agent_on(tmp_path, 6)
     rows: list[dict[str, Any]] = []
-    agent.log_training_metrics = lambda row, **kw: rows.append(row)  # type: ignore[method-assign]
+    agent.log_training_metrics = lambda row, **_: rows.append(row)  # type: ignore[method-assign]
     agent.train()
-    assert rows and all("eprobe/sweeps" in row for row in rows)
+    assert rows
+    assert all("eprobe/sweeps" in row for row in rows)
 
 
 def test_full_checkpoints_hold_the_probe_state_and_a_resume_restores_it(tmp_path: Path) -> None:
@@ -137,12 +146,14 @@ def test_full_checkpoints_hold_the_probe_state_and_a_resume_restores_it(tmp_path
     agent.train()
     path = last_full(agent)
     saved = torch.load(path, weights_only=False)["eprobe"]
-    assert torch.equal(saved["eprobe_fail"], torch.arange(3.0)) and saved["eprobe_focus"] is None
+    assert torch.equal(saved["eprobe_fail"], torch.arange(3.0))
+    assert saved["eprobe_focus"] is None
     resumed = agent_on(tmp_path / "resumed", 8)
     resumed.load_model(str(path))
     resumed.train()
     (probe,) = resumed._isaac.probes
-    assert probe.loaded is not None and probe.loaded["ticks"] == saved["ticks"]
+    assert probe.loaded is not None
+    assert probe.loaded["ticks"] == saved["ticks"]
     # The probe continues on the iteration count, as NDM Gym's does.
     assert probe.ticks[0][0] == torch.load(path, weights_only=False)["iteration"]
 
@@ -159,7 +170,8 @@ def test_light_checkpoints_leave_the_probe_state_out(tmp_path: Path) -> None:
     agent = agent_on(tmp_path, 8, save_interval=8, ckpt_light=True)
     agent.train()
     light = sorted(agent._checkpoint_dir().glob("policy_step_*.pt"))
-    assert light and all("eprobe" not in torch.load(p, weights_only=False) for p in light)
+    assert light
+    assert all("eprobe" not in torch.load(p, weights_only=False) for p in light)
     full = last_full(agent)
     assert "eprobe" in torch.load(full, weights_only=False)
 
@@ -180,7 +192,8 @@ def test_deployed_policy_is_what_load_policy_deploys(tmp_path: Path, wm: dict[st
     evaluator = harness.make_agent()  # the default config, as an evaluator builds it
     evaluator.load_policy(str(paths[-1]))
     policy = deployed_policy(evaluator._isaac, torch.load(paths[-1], weights_only=False), "cpu")
-    assert not policy.training and policy.module.residual == bool(wm.get("actor_residual"))
+    assert not policy.training
+    assert policy.module.residual == bool(wm.get("actor_residual"))
     obs, _ = evaluator._isaac.reset()
     td = policy_td(obs, evaluator._num_envs)
     with torch.no_grad():
@@ -202,7 +215,7 @@ def test_a_later_sweep_reloads_the_weights_only(tmp_path: Path) -> None:
         torch.testing.assert_close(policy(td.clone())["action"], source.collector_policy(td.clone())["action"], **EXACT)
 
 
-def test_deployed_policy_refuses_another_interface(tmp_path: Path) -> None:
+def test_deployed_policy_refuses_another_interface() -> None:
     source = harness.make_agent()
     data = source._deployed_payload()
     data["policy_meta"]["policy_obs_dim"] = 7
@@ -218,7 +231,7 @@ def config(**wm: Any) -> WMBPTTRLOptConfig:
     return WMBPTTRLOptConfig(wm=WMBPTTConfig(**wm))
 
 
-TASK = SimpleNamespace(isaac_env=SimpleNamespace(make_eval_probe=lambda wm, run_dir: None))
+TASK = SimpleNamespace(isaac_env=SimpleNamespace(make_eval_probe=lambda *_: None))
 PRESET = {"eprobe_share": 0.15, "eprobe_start": 1000, "eprobe_every": 125, "eprobe_decay": 0.7, "eprobe_graph": True, "eprobe_async": 20, "actor_ema": 0.995}
 
 
