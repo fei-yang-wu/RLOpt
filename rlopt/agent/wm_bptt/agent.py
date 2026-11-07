@@ -266,6 +266,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     _graphs: dict[str, GraphedUpdate] | None = None
     _residual: bool = False
     _structured: bool = False
+    _mirror_rows: int = 0
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -286,6 +287,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._structured = bool(wm.wm_structured)
         if self._structured:
             self.task.bind_structured()  # type: ignore[attr-defined]
+        self._mirror_rows = int(wm.wm_batch_size * wm.wm_mirror)
+        if self._mirror_rows:
+            self.task.bind_mirror()  # type: ignore[attr-defined]
         self._isaac = _find_isaac_env(env)
         self._frames_processed = 0
         self._resume_frame_offset = 0
@@ -646,6 +650,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             if not wm.norm_from_collection:
                 self._update_wm_norms(self._first_transition(win), win["valid"][:, 0])
                 scale = self._error_scale()
+            if self._mirror_rows:  # after the normalizers, which never see mirrored data
+                win = self.task.mirror_window(win, self._mirror_rows)  # type: ignore[attr-defined]
             errs, mask = self._wm_rollout(win, k, grad=True)
             per = (errs / scale).square().mean(-1)  # (B, k)
             loss = (per * mask).sum() / mask[:, 0].sum().clamp_min(1.0)

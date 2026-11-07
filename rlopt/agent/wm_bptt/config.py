@@ -102,6 +102,13 @@ class WMBPTTConfig:
     increment layout and the state error are unchanged. Needs a task with
     ``structured_targets`` (G1-v3) and the MLP model; refused with ``actor_source=real``,
     whose model residuals are plain increments."""
+    wm_mirror: float = 0.0
+    """Share of every world-model batch replaced by its left-right mirror image (NDM
+    Gym's ``--wm_mirror``, from BlinkMimic): the first int(``wm_batch_size`` x share)
+    windows, no random draw, on every physical key (``task.mirror_window``), after the
+    normalizers' update, which never sees mirrored data. Only the world-model fit uses
+    it. Needs a task with ``mirror_window`` (G1-v3), whose binding refuses an asset
+    without a symmetric default pose and action scale. 0 is off."""
     norm_from_collection: bool = False
     """Fit the input and increment normalizers on every collected transition of
     every env, as NDM Gym does, not on the first transitions of the sampled windows.
@@ -401,6 +408,17 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     if wm.reference_body_table and getattr(task, "build_reference_tables", None) is None:
         msg = "wm.reference_body_table needs a task with a reference table (G1V3TrackingTask)."
         raise ValueError(msg)
+    if not 0.0 <= wm.wm_mirror <= 1.0:
+        msg = f"wm.wm_mirror must be in [0, 1], got {wm.wm_mirror}."
+        raise ValueError(msg)
+    if wm.wm_mirror > 0:
+        for name in ("mirror_window", "bind_mirror"):
+            if getattr(task, name, None) is None:
+                msg = f"wm.wm_mirror needs the task's {name} (G1V3TrackingTask)."
+                raise ValueError(msg)
+        if int(wm.wm_batch_size * wm.wm_mirror) < 1:
+            msg = f"wm.wm_mirror={wm.wm_mirror} of wm.wm_batch_size={wm.wm_batch_size} mirrors no window."
+            raise ValueError(msg)
     if wm.wm_structured:
         for name in ("structured_targets", "structured_integrate", "bind_structured"):
             if getattr(task, name, None) is None:
