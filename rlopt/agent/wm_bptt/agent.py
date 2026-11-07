@@ -896,6 +896,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         starts: tuple[Tensor, Tensor] | None = None,
         std: float | None = None,
         generator: torch.Generator | None = None,
+        start_perturb: float = 0.0,
     ) -> dict[str, Tensor]:
         """Imagined H-step rollouts from replay states.
 
@@ -907,7 +908,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         ``actor_estimator`` when ``grad``, else pathwise. ``horizon`` and
         ``starts`` (replay rows ``tau`` and env indices) override the config
         and the uniform start sampling (gradient probes); ``generator`` draws
-        the action noise.
+        the action noise. ``start_perturb`` > 0 kicks the start states
+        (``wm.imag_start_perturb``, which the actor update passes).
         """
         wm = self.config.wm
         t = self.task
@@ -945,6 +947,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         prop = history_proprio(t, start, noise)
         prev_action = start["hist_actions"][:, -1]
         state = start["hist_states"][:, -1]
+        if start_perturb > 0:
+            # After ``prop``: the history stays the recorded one, as in NDM Gym.
+            state = t.perturb_start(state, start_perturb, generator)  # type: ignore[attr-defined]
         if grad:
             # Every step then sees the same requires_grad pattern; otherwise the
             # compiled step recompiles between step 0 and the rest.
@@ -1326,7 +1331,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 if real_actor:
                     out = self._real_rollout(wm.imagine_batch, grad=True)
                 else:
-                    out = self._imagine(wm.imagine_batch, grad=True)
+                    out = self._imagine(wm.imagine_batch, grad=True, start_perturb=wm.imag_start_perturb)
                 loss = -out["objective"].mean()
                 loss.backward()
         finally:

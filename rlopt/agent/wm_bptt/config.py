@@ -227,6 +227,15 @@ class WMBPTTConfig:
     ``predict``, and ``policy_meta`` records it, so an inference load acts as the run
     did. Needs a task with ``reference_setpoint`` (G1-v3, explicit goal); refused
     with latent goals, ``actor_source=real`` and ``rebar``."""
+    imag_start_perturb: float = 0.0
+    """Std (m/s) of Gaussian kicks on the root's horizontal linear velocity at the
+    start states of the actor update's imagined rollouts (NDM Gym's
+    ``--imag_start_perturb``), so the actor also learns to recover from a push. The
+    start's observation history stays the recorded one, as in NDM Gym, and the
+    critic fits the kicked rollouts, which are the actor's. Other rollouts (probes,
+    the critic of ``actor_source=real``) are not kicked. Needs a task with
+    ``perturb_start`` (G1-v3); refused with ``actor_source=real``, whose actor runs
+    on recorded windows. 0 is off and draws no random number."""
     actor_ema: float = 0.0
     """Decay of an exponential moving average of the actor, one step per actor
     update; 0 is off. Collection and imagination use the live actor. The
@@ -434,6 +443,16 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         validate_residual(task, goal=str(wm.goal), goal_encoder=str(wm.goal_encoder))
         if wm.actor_source == "real" or wm.actor_estimator == "rebar":
             msg = "wm.actor_residual runs on imagined rollouts; real windows and rebar re-simulate the old actions without it."
+            raise ValueError(msg)
+    if wm.imag_start_perturb < 0:
+        msg = f"wm.imag_start_perturb is a standard deviation; got {wm.imag_start_perturb}."
+        raise ValueError(msg)
+    if wm.imag_start_perturb > 0:
+        if getattr(task, "perturb_start", None) is None:
+            msg = "wm.imag_start_perturb needs the task's perturb_start (G1V3TrackingTask)."
+            raise ValueError(msg)
+        if wm.actor_source == "real":
+            msg = "wm.imag_start_perturb kicks imagined starts; actor_source=real runs the actor on recorded windows."
             raise ValueError(msg)
     for name in ("fit_terminal_transitions", "norm_from_collection"):
         if getattr(wm, name) and not getattr(task, "final_obs_is_post_step", False):
