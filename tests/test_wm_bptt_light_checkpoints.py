@@ -57,8 +57,10 @@ def test_a_light_file_holds_the_policy_and_the_counters_only(tmp_path: Path) -> 
 
 
 def test_light_checkpoints_change_nothing_in_training(tmp_path: Path) -> None:
-    runs = [run(tmp_path / name, **wm) for name, wm in (("off", {}), ("light", {"ckpt_light": True}))]
-    assert harness.fingerprint(runs[0]) == harness.fingerprint(runs[1])
+    arms = (("off", {}), ("light", {"ckpt_light": True}), ("full", {"ckpt_light": True, "last_every_min": 1e-9}))
+    runs = [run(tmp_path / name, **wm) for name, wm in arms]
+    assert len(names(runs[2], "model_step_*.pt")) >= 3  # the full files were written mid-run
+    assert harness.fingerprint(runs[0]) == harness.fingerprint(runs[1]) == harness.fingerprint(runs[2])
 
 
 def test_a_light_file_scores_on_a_default_agent(tmp_path: Path) -> None:
