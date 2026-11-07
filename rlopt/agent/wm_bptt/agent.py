@@ -29,7 +29,7 @@ import dataclasses
 import math
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -1406,21 +1406,38 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 if self._should_save_checkpoint(frames_processed=self._frames_processed, frames_in_iteration=self._frames_processed - frames_before):
                     if writer is None:
                         self.save_model(self._checkpoint_dir(), step=self._frames_processed)
-                    else:
+                    elif not stop:  # the end's full file holds these frames (NDM: ``not final_ck``)
                         self._write_light_checkpoint(writer)
                 if stop:
                     meta.stop_after_iteration = True
                     break
-            if self._train_time_budget_reached():
-                self._finish_train_time_budget(meta)
-            else:
-                self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+            self._save_after_writer(writer, lambda: self._save_end(meta))
         except KeyboardInterrupt:
-            self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+            self._save_after_writer(writer, lambda: self.save_model(self._checkpoint_dir(), step=self._frames_processed))
             raise
         finally:
             if writer is not None:
                 writer.close()
+
+    def _save_end(self, meta: TrainingMetadata) -> None:
+        if self._train_time_budget_reached():
+            self._finish_train_time_budget(meta)
+        else:
+            self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+
+    @staticmethod
+    def _save_after_writer(writer: CheckpointWriter | None, save: Callable[[], None]) -> None:
+        """``save`` on the main thread once ``wm.ckpt_light``'s writer is idle.
+
+        Both can write one ``model_step_<frames>.pt``, and two writes through one
+        temporary name leave a crash and a corrupt file. A failed background
+        write still raises, after ``save``.
+        """
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            save()
 
     # ------------------------------------------------------------ checkpoint
     def policy_meta(self) -> dict[str, Any]:

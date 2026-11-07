@@ -11,6 +11,8 @@ import pytest
 import torch
 import wm_bptt_harness as harness
 
+from rlopt.agent.wm_bptt import agent as agent_module
+from rlopt.agent.wm_bptt import speed_options
 from rlopt.agent.wm_bptt.agent import LIGHT_CHECKPOINT_KEYS
 from rlopt.agent.wm_bptt.speed_options import (
     CheckpointWriter,
@@ -120,6 +122,87 @@ def test_due_logic() -> None:
 def test_last_every_min_writes_full_files_at_periodic_checkpoints(tmp_path: Path) -> None:
     agent = run(tmp_path, ckpt_light=True, last_every_min=1e-9)
     assert steps(agent, "model_step_*.pt") == sorted({*steps(agent, "policy_step_*.pt"), agent._frames_processed})
+
+
+class Writes:
+    """Every ``atomic_save``, from the loop and from the writer's thread. The loop's
+    write is slow, so a writer that reaches the same file meanwhile is caught."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.lock = threading.Lock()
+        self.active: dict[Path, int] = {}
+        self.overlaps: list[str] = []
+        self.by: dict[str, set[str]] = {}
+        real = speed_options.atomic_save
+
+        def save(payload: dict[str, Any], target: Path) -> None:
+            thread = "writer" if threading.current_thread().name.startswith("wm-checkpoint") else "loop"
+            with self.lock:
+                if self.active.get(target):
+                    self.overlaps.append(target.name)
+                self.active[target] = self.active.get(target, 0) + 1
+                self.by.setdefault(target.name, set()).add(thread)
+            try:
+                time.sleep(0.05 if thread == "writer" else 0.5)
+                real(payload, target)
+            finally:
+                with self.lock:
+                    self.active[target] -= 1
+
+        monkeypatch.setattr(speed_options, "atomic_save", save)
+        monkeypatch.setattr(agent_module, "atomic_save", save)
+
+
+def assert_readable_end(agent: Any, writes: Writes) -> None:
+    assert writes.overlaps == []
+    files = sorted(agent._checkpoint_dir().glob("model_step_*.pt"), key=lambda p: int(p.stem.rsplit("_", 1)[1]))
+    assert files, "the run wrote no full file"
+    for path in files:
+        torch.load(path, weights_only=False)  # a corrupt file raises
+    assert not list(agent._checkpoint_dir().glob("*.tmp"))
+    resumed = harness.make_agent(ckpt_light=True, last_every_min=1e-9, save_interval=1)
+    resumed.load_model(str(files[-1]))
+    assert resumed._resume_frame_offset == agent._frames_processed
+
+
+def test_the_end_file_waits_for_the_writer_at_a_frame_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The last iteration is the only periodic one, and a full file is due there:
+    only the loop writes those frames, once."""
+    writes = Writes(monkeypatch)
+    agent = harness.make_agent(frames=FRAMES, save_interval=FRAMES, log_dir=tmp_path, ckpt_light=True, last_every_min=1e-9)
+    agent.train()
+    assert steps(agent, "model_step_*.pt") == [agent._frames_processed]
+    assert writes.by[f"model_step_{agent._frames_processed}.pt"] == {"loop"}
+    assert_readable_end(agent, writes)
+
+
+def test_the_end_file_waits_for_the_writer_at_a_time_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    writes = Writes(monkeypatch)
+    agent = harness.make_agent(frames=10**9, save_interval=1, log_dir=tmp_path, ckpt_light=True, last_every_min=1e-9)
+    agent._train_time_budget_reached = lambda: agent._iteration >= 4
+    agent.train()
+    assert agent._iteration == 4
+    assert writes.by[f"model_step_{agent._frames_processed}.pt"] == {"loop"}
+    assert_readable_end(agent, writes)
+
+
+def test_an_interrupt_saves_after_the_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Interrupted just after a periodic full file was queued: the interrupt's
+    save has the same frames, and starts once the writer is idle."""
+    writes = Writes(monkeypatch)
+    agent = harness.make_agent(frames=10**9, save_interval=1, log_dir=tmp_path, ckpt_light=True, last_every_min=1e-9)
+    write = agent._write_light_checkpoint
+
+    def interrupted(writer: CheckpointWriter) -> None:
+        write(writer)
+        if agent._iteration == 3:
+            raise KeyboardInterrupt
+
+    agent._write_light_checkpoint = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        agent.train()
+    assert writes.by[f"model_step_{agent._frames_processed}.pt"] == {"writer", "loop"}
+    assert_readable_end(agent, writes)
 
 
 def test_a_long_interval_writes_no_full_file_before_the_end(tmp_path: Path) -> None:
