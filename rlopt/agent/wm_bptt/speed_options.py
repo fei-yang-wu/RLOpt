@@ -29,9 +29,20 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import torch
 from torch import Tensor, nn
+
+
+def set_lr(optimizer: Any, lr: float) -> None:
+    """Every group's learning rate; a tensor one (a capturable optimizer's) is
+    written in place, for the CUDA graph that reads it."""
+    for group in optimizer.param_groups:
+        if torch.is_tensor(group["lr"]):
+            group["lr"].fill_(lr)
+        else:
+            group["lr"] = lr
 
 
 class ActorAverage:

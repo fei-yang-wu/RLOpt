@@ -52,6 +52,10 @@ class WMBPTTConfig:
     wm_batches_per_iter: int = 10
     wm_batch_size: int = 2048
     wm_lr: float = 2.0e-4
+    wm_opt: str = "adam"
+    """``adam``: AdamW on every parameter. ``muon``: Muon on the hidden weight
+    matrices of the MLP (``dynamics_model=mlp``), Adam with betas (0.9, 0.999)
+    on the rest, both at ``wm_lr``."""
     wm_weight_decay: float = 0.0
     wm_grad_clip_norm: float = 1.0
     wm_warmup_iters: int = 500
@@ -150,6 +154,9 @@ class WMBPTTConfig:
     actor_activation: str = "elu"
     """MLP activation by name (elu, silu, relu, gelu, tanh)."""
     actor_lr: float = 2.0e-4
+    actor_opt: str = "adam"
+    """``adam``: Adam on every parameter. ``muon``: Muon on the actor's hidden
+    weight matrices, Adam with ``actor_betas`` on the rest, both at ``actor_lr``."""
     actor_betas: list[float] = field(default_factory=lambda: [0.9, 0.95])
     actor_grad_clip_norm: float = 1.0
     actor_grad_clip_value: float = 0.1
@@ -214,6 +221,22 @@ def validate_options(config: WMBPTTRLOptConfig) -> None:
     if not 0.0 <= wm.actor_ema < 1.0:
         msg = f"wm.actor_ema must be in [0, 1), got {wm.actor_ema}."
         raise ValueError(msg)
+    for name in ("actor_opt", "wm_opt"):
+        if getattr(wm, name) not in ("adam", "muon"):
+            msg = f"wm.{name} must be 'adam' or 'muon', got {getattr(wm, name)!r}."
+            raise ValueError(msg)
+    if wm.wm_opt == "muon":
+        if wm.dynamics_model != "mlp":
+            msg = f"wm.wm_opt=muon runs on the MLP world model, not dynamics_model={wm.dynamics_model!r}."
+            raise ValueError(msg)
+        if wm.wm_weight_decay != 0:
+            msg = "wm.wm_opt=muon has no weight decay; set wm.wm_weight_decay to 0."
+            raise ValueError(msg)
+    # Muon skips each MLP's first and last Linear: one hidden layer leaves it nothing.
+    for name, hidden, opt in (("wm_hidden", wm.wm_hidden, wm.wm_opt), ("actor_hidden", wm.actor_hidden, wm.actor_opt)):
+        if opt == "muon" and len(hidden) < 2:
+            msg = f"Muon needs a hidden weight matrix: wm.{name} must have at least two layers, got {list(hidden)}."
+            raise ValueError(msg)
     for name in ("actor_source", "critic_source"):
         if getattr(wm, name) not in ("imagined", "real"):
             msg = f"wm.{name} must be 'imagined' or 'real', got {getattr(wm, name)!r}."

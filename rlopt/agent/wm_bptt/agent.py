@@ -41,6 +41,7 @@ from torchrl.envs import TransformedEnv
 
 from rlopt.agent.wm_bptt.config import WMBPTTRLOptConfig, validate_options
 from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
+from rlopt.agent.wm_bptt.muon import MuonAdam
 from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel
 from rlopt.agent.wm_bptt.rebar import (
     CorrectionAverage,
@@ -50,7 +51,7 @@ from rlopt.agent.wm_bptt.rebar import (
     shuffle_rows,
 )
 from rlopt.agent.wm_bptt.replay import SequenceReplay
-from rlopt.agent.wm_bptt.speed_options import ActorAverage
+from rlopt.agent.wm_bptt.speed_options import ActorAverage, set_lr
 from rlopt.agent.wm_bptt.task import (
     WorldModelTask,
     history_proprio,
@@ -60,7 +61,7 @@ from rlopt.agent.wm_bptt.task import (
 from rlopt.base_class import BaseAlgorithm, TrainingMetadata, honours_train_time_budget
 
 ARCH_TAG = "wmbptt-v1"
-RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0, "fused_adam": False}
+RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0, "fused_adam": False, "actor_opt": "adam", "wm_opt": "adam"}
 """``wm`` fields a resumed run must share with its checkpoint, with the value a
 checkpoint from before the field implies: they set which optimizers and which
 policy entries the checkpoint holds."""
@@ -292,8 +293,15 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def _configure_optimizers(self):  # type: ignore[override]
         wm = self.config.wm
         adam_kw = {"fused": True} if wm.fused_adam else {}
-        self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=wm.wm_lr, weight_decay=wm.wm_weight_decay, **adam_kw)
-        self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=wm.actor_lr, betas=tuple(wm.actor_betas), **adam_kw)
+        if wm.wm_opt == "muon":
+            self.wm_optim = MuonAdam(self.dynamics, [self.dynamics.net], lr=wm.wm_lr, betas=(0.9, 0.999), **adam_kw)
+        else:
+            self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=wm.wm_lr, weight_decay=wm.wm_weight_decay, **adam_kw)
+        betas = tuple(wm.actor_betas)
+        if wm.actor_opt == "muon":
+            self.actor_optim = MuonAdam(self.actor.net, [self.actor.net], lr=wm.actor_lr, betas=betas, **adam_kw)
+        else:
+            self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=wm.actor_lr, betas=betas, **adam_kw)
         self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=wm.critic_lr, **adam_kw)
         self.lr_scheduler = None
 
@@ -323,8 +331,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         f = self._lr_factor()
         wm = self.config.wm
         for opt, base in ((self.wm_optim, wm.wm_lr), (self.actor_optim, wm.actor_lr), (self.critic_optim, wm.critic_lr)):
-            for g in opt.param_groups:
-                g["lr"] = base * f
+            set_lr(opt, base * f)
 
     # ------------------------------------------------------------ collection
     def _policy_features(self, rows: dict[str, Tensor]) -> Tensor:

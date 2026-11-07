@@ -27,6 +27,12 @@ REFUSED = [
     ({"actor_estimator": "score_function", "actor_source": "real"}, "score_function"),
     ({"actor_ema": -0.1}, "actor_ema"),
     ({"actor_ema": 1.0}, "actor_ema"),
+    ({"actor_opt": "sgd"}, "actor_opt"),
+    ({"wm_opt": "sgd"}, "wm_opt"),
+    ({"wm_opt": "muon", "dynamics_model": "diffsr"}, "wm_opt=muon"),
+    ({"wm_opt": "muon", "wm_weight_decay": 0.01}, "wm_weight_decay"),
+    ({"wm_opt": "muon", "wm_hidden": [64]}, "wm_hidden"),
+    ({"actor_opt": "muon", "actor_hidden": [64]}, "actor_hidden"),
 ]
 
 
