@@ -50,6 +50,7 @@ from rlopt.agent.wm_bptt.rebar import (
     shuffle_rows,
 )
 from rlopt.agent.wm_bptt.replay import SequenceReplay
+from rlopt.agent.wm_bptt.speed_options import ActorAverage
 from rlopt.agent.wm_bptt.task import (
     WorldModelTask,
     history_proprio,
@@ -59,6 +60,10 @@ from rlopt.agent.wm_bptt.task import (
 from rlopt.base_class import BaseAlgorithm, TrainingMetadata, honours_train_time_budget
 
 ARCH_TAG = "wmbptt-v1"
+RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0}
+"""``wm`` fields a resumed run must share with its checkpoint, with the value a
+checkpoint from before the field implies: they set which optimizers and which
+policy entries the checkpoint holds."""
 
 
 def _find_isaac_env(env: Any) -> Any:
@@ -211,6 +216,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._step_acc = 0.0
         self.replay: SequenceReplay | None = None
         self._inference_loaded = False
+        self.actor_avg: ActorAverage | None = None
+        self.policy_avg: TensorDictModule | None = None
         self._rebar = CorrectionAverage(wm.rebar_ema_rate, wm.rebar_norm_cap) if wm.actor_estimator == "rebar" else None
         super().__init__(env=env, config=config, logger=logger, **kwargs)
 
@@ -224,6 +231,11 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         ).to(self.device)
         self.critic = Critic(t.critic_obs_dim, wm.critic_hidden, wm.critic_activation).to(self.device)
         self.policy_net = WMPolicy(t, self.actor, wm.bf16)
+        if wm.actor_ema > 0:
+            self.actor_avg = ActorAverage(self.actor, wm.actor_ema)
+            self.policy_avg = TensorDictModule(
+                WMPolicy(t, self.actor_avg.module, wm.bf16), in_keys=list(t.policy_in_keys), out_keys=["action"]
+            )
         return TensorDictModule(self.policy_net, in_keys=list(t.policy_in_keys), out_keys=["action"])
 
     def _construct_dynamics(self) -> nn.Module:
@@ -257,9 +269,16 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         return self.policy
 
     @property
+    def _deploys_average(self) -> bool:
+        """The average exists once the actor has updated; before that it would
+        hold stale normalizers, so the live actor is the deployed one."""
+        return self.actor_avg is not None and self.actor_avg.updates > 0
+
+    @property
     def collector_policy(self) -> TensorDictModule:
+        """The policy evaluators run. Collection during training uses ``actor``."""
         assert self.policy is not None
-        return self.policy
+        return self.policy_avg if self._deploys_average else self.policy  # type: ignore[return-value]
 
     def _construct_data_buffer(self) -> None:  # type: ignore[override]
         return None  # allocated lazily in train(): evaluation never needs it
@@ -289,8 +308,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
         x = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+        actor = self.actor_avg.module if self._deploys_average else self.actor  # type: ignore[union-attr]
         with torch.no_grad():
-            return self.actor(x, bf16=self.policy_net.bf16)
+            return actor(x, bf16=self.policy_net.bf16)
 
     # ------------------------------------------------------------ schedule
     def _lr_factor(self) -> float:
@@ -990,6 +1010,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         nn.utils.clip_grad_value_(params, wm.actor_grad_clip_value)
         if torch.isfinite(gn):
             self.actor_optim.step()
+        if self.actor_avg is not None:
+            self.actor_avg.update()
         metrics["actor/objective"].append(out.get("J", out["objective"].detach()).mean())
         metrics["actor/grad_norm"].append(gn.detach())
         if "advantages" in out:
@@ -1234,7 +1256,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         target = base if base.suffix == ".pt" else base / f"model_step_{frames}.pt"
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "policy_state_dict": self.policy.state_dict() if self.policy is not None else None,
+            "policy_state_dict": self.collector_policy.state_dict(),
             "policy_meta": self.policy_meta(),
             "dynamics_state_dict": self.dynamics.state_dict(),
             "critic_state_dict": self.critic.state_dict(),
@@ -1251,6 +1273,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         }
         if self._rebar is not None:
             payload["rebar"] = self._rebar.state_dict()
+        if self.actor_avg is not None:
+            payload["policy_live_state_dict"] = self.policy.state_dict()
+            payload["actor_ema_updates"] = self.actor_avg.updates
         tmp = target.with_name(target.name + ".tmp")
         torch.save(payload, tmp)
         tmp.replace(target)
@@ -1297,18 +1322,34 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self.policy_net.bf16 = bool(meta.get("bf16", (data.get("wm_config") or {}).get("bf16", self.policy_net.bf16)))
         if "sensor_noise" in meta and hasattr(self.task, "sensor_noise"):
             self.task.sensor_noise = bool(meta["sensor_noise"])
+        if self.actor_avg is not None:
+            self.actor_avg.updates = 0  # ``self.policy`` now holds what is deployed
         self._inference_loaded = True
 
     def load_model(self, path: str) -> None:
         """Resume load: every component, strictly. A checkpoint from another
         configuration or without the training state raises (see ``load_policy``)."""
         data = self._read_checkpoint(path, self.device)
-        missing = [key for key in ("dynamics_state_dict", "critic_state_dict", "optimizers") if data.get(key) is None]
+        wm = self.config.wm
+        required = ["dynamics_state_dict", "critic_state_dict", "optimizers"]
+        if wm.actor_ema > 0:
+            required += ["policy_live_state_dict", "actor_ema_updates"]
+        missing = [key for key in required if data.get(key) is None]
         if missing:
             msg = f"{path} has no {missing}: it cannot resume training. Use load_policy to score it."
             raise ValueError(msg)
+        saved = data.get("wm_config") or {}
+        for name, before_the_field in RESUME_MATCH.items():
+            if saved.get(name, before_the_field) != getattr(wm, name):
+                msg = f"wm.{name}={getattr(wm, name)!r} must match the checkpoint's {saved.get(name, before_the_field)!r} to resume."
+                raise ValueError(msg)
         assert self.policy is not None
-        self.policy.load_state_dict(data["policy_state_dict"], strict=True)
+        if self.actor_avg is not None:
+            self.policy.load_state_dict(data["policy_live_state_dict"], strict=True)
+            self.policy_avg.load_state_dict(data["policy_state_dict"], strict=True)  # type: ignore[union-attr]
+            self.actor_avg.updates = int(data["actor_ema_updates"])
+        else:
+            self.policy.load_state_dict(data["policy_state_dict"], strict=True)
         self.dynamics.load_state_dict(data["dynamics_state_dict"])
         self.critic.load_state_dict(data["critic_state_dict"])
         for name, opt in (("wm", self.wm_optim), ("actor", self.actor_optim), ("critic", self.critic_optim)):

@@ -155,6 +155,11 @@ class WMBPTTConfig:
     actor_grad_clip_value: float = 0.1
     actor_output_scale: float = 0.01
     """Gain on the actor's last-layer initialization."""
+    actor_ema: float = 0.0
+    """Decay of an exponential moving average of the actor, one step per actor
+    update; 0 is off. Collection and imagination use the live actor. The
+    checkpoint's ``policy_state_dict`` holds the average, which is what
+    evaluators score; ``policy_live_state_dict`` holds the live actor."""
 
     # -- critic -----------------------------------------------------------------
     critic_hidden: list[int] = field(default_factory=lambda: [512, 256])
@@ -203,6 +208,9 @@ def validate_options(config: WMBPTTRLOptConfig) -> None:
     config passes. Env-side pairs belong in ``ImitationG1V3EnvCfg``.
     """
     wm = config.wm
+    if not 0.0 <= wm.actor_ema < 1.0:
+        msg = f"wm.actor_ema must be in [0, 1), got {wm.actor_ema}."
+        raise ValueError(msg)
     for name in ("actor_source", "critic_source"):
         if getattr(wm, name) not in ("imagined", "real"):
             msg = f"wm.{name} must be 'imagined' or 'real', got {getattr(wm, name)!r}."

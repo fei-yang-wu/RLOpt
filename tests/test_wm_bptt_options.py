@@ -25,6 +25,8 @@ REFUSED = [
     ({"actor_estimator": "magic"}, "actor_estimator"),
     ({"actor_estimator": "rebar"}, "rebar"),
     ({"actor_estimator": "score_function", "actor_source": "real"}, "score_function"),
+    ({"actor_ema": -0.1}, "actor_ema"),
+    ({"actor_ema": 1.0}, "actor_ema"),
 ]
 
 
