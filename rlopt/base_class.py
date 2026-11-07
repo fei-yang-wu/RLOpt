@@ -34,6 +34,7 @@ from rlopt.config_base import (
     RLOptConfig,
 )
 from rlopt.config_utils import ObsKey
+from rlopt.gpu_telemetry import GpuTelemetry
 from rlopt.logging_utils import (
     ELAPSED_ENTRY,
     FRAMES_ENTRY,
@@ -229,6 +230,13 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             metrics["perf/cuda_max_memory_allocated_gib"] = (
                 torch.cuda.max_memory_allocated(self.device) / 2**30
             )
+            trainer = getattr(self.config, "trainer", None)
+            if bool(getattr(trainer, "gpu_telemetry", False)):
+                # NVML host query: the clocks a speed number ran at.
+                telemetry = getattr(self, "_gpu_telemetry", None)
+                if telemetry is None:
+                    telemetry = self._gpu_telemetry = GpuTelemetry(self.device)
+                metrics.update(telemetry.read())
         return metrics
 
     def _restore_train_clock(self, checkpoint: Mapping[str, Any]) -> None:
@@ -1653,6 +1661,21 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     def _compute_kl_after_update(
         self, kl_context: dict[str, Tensor], policy_op: TensorDictModule
     ) -> Tensor | None:
+        kl_approx = self._kl_after_update_tensor(kl_context, policy_op)
+        if not torch.isfinite(kl_approx):
+            return None
+        return kl_approx
+
+    def _kl_after_update_tensor(
+        self, kl_context: dict[str, Tensor], policy_op: TensorDictModule
+    ) -> Tensor:
+        """Post-update KL(old || new) as a device scalar, with no host sync.
+
+        :meth:`_compute_kl_after_update` adds the finiteness check (a host
+        sync); the captured update (``ppo.capture_update``) records this
+        tensor inside the CUDA graph and applies the same check on the host
+        once per iteration.
+        """
         with torch.no_grad():
             obs_td = kl_context["obs_td"].clone()
             obs_td = policy_op(obs_td)
@@ -1670,10 +1693,7 @@ class BaseAlgorithm(Generic[CfgT], ABC):
             )
             if kl.ndim > 0:
                 kl = kl.sum(dim=-1)
-            kl_approx = kl.mean()
-        if not torch.isfinite(kl_approx):
-            return None
-        return kl_approx
+            return kl.mean()
 
     def _record_kl_for_lr_adaptation(
         self, kl_approx: Tensor, schedule_cfg: Any

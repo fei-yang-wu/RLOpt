@@ -21,3 +21,35 @@ field axis have `action_dim + 1` entries. `forward_mu` requires source `s`
 for this mode even with target-only mu conditioning. This is an algebraic
 reassociation, not a new capacity setting; floating-point operation order
 can differ. The fixed coordinate is internal, not an extra policy command.
+
+### Distributed PPO qualification
+
+`rlopt.agent.ppo.distributed.DistributedPPO` uses an initialized PyTorch process
+group to average gradients before clipping and pool observation/advantage
+statistics and adaptive KL decisions. The caller creates one environment and
+agent per worker. `collector.frames_per_batch` and `loss.mini_batch_size` are
+local; `collector.total_frames`, checkpoint frame counts and save intervals are
+global. Shards and minibatches must be equal. The current path supports
+feed-forward PPO without compilation/CUDA graphs or critic-only extra steps;
+moving normalizers update once after each rollout. Only rank zero saves
+checkpoints. Resume preserves optimizer/scheduler state and counters, but
+restarts simulator and RNG streams.
+
+The parent IsaacLab-Imitation entrypoint exposes `--distributed` under
+`torchrun`; its environment count and minibatch CLI settings are global and
+are divided before constructing the worker agents. See the parent's
+`2026-09-15-distributed-ppo-qualification` campaign for the bounded ICE test.
+
+`DistributedIPMD` extends that path for a frozen `hl_skill` encoder and environment
+rewards, preserving IPMD checkpoint/encoder restoration. Learned rewards and
+auxiliary encoder/BC updates are rejected. Frozen input normalizers are supported.
+Before CUDA rollouts, distributed agents release unused PyTorch allocator cache
+so simulator allocators can reuse temporary update workspace memory.
+`trainer.max_train_seconds` is honoured and pooled: any rank whose clock runs
+out stops every rank after the same iteration (one MAX all-reduce per
+iteration); a stop by signal or `max_training_seconds` writes the health record
+and a final checkpoint the same way. Environment payloads and episode summaries
+are rank zero's own and carry a `rank0_env/` or `rank0/` prefix.
+
+`trainer.gpu_telemetry=true` adds `perf/gpu_*` readings (SM clock, temperature,
+power, slowdown flags) to every training row; it is off by default.

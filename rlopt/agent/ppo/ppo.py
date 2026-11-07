@@ -185,13 +185,16 @@ class RunningMeanStdCatInputs(torch.nn.Module):
         return torch.cat(inputs, dim=-1)
 
     @torch.no_grad()
-    def _update(self, value: Tensor) -> None:
+    def _update(self, value: Tensor, *, moments=None) -> None:
         flat = value.detach().reshape(-1, value.shape[-1]).to(torch.float32)
         if flat.shape[0] == 0:
             return
-        batch_mean = flat.mean(dim=0)
-        batch_var = flat.var(dim=0, correction=1 if flat.shape[0] > 1 else 0)
-        batch_count = float(flat.shape[0])
+        if moments is None:
+            batch_mean = flat.mean(dim=0)
+            batch_var = flat.var(dim=0, correction=1 if flat.shape[0] > 1 else 0)
+            batch_count = float(flat.shape[0])
+        else:
+            batch_mean, batch_var, batch_count = moments
         delta = batch_mean - self.running_mean
         total_count = self.count + batch_count
         new_mean = self.running_mean + delta * batch_count / total_count
@@ -333,6 +336,33 @@ class PPOConfig:
     a gradient scaler). Honoured by ``PPO.update`` and IPMD's PPO terms; an
     algorithm that overrides those without opting in raises at construction
     instead of ignoring the key.
+    """
+
+    capture_update: bool = False
+    """Run each PPO gradient step as one CUDA-graph replay (opt-in).
+
+    ``False`` (default) leaves the update exactly as before. ``True`` captures
+    the per-minibatch step -- loss forward, backward, gradient clipping, the
+    optimizer step and the post-update KL forward of the adaptive-LR rule --
+    once on static buffers, then per update gathers the sampled rows into
+    those buffers, writes the step's optimizer scalars (learning rate, bias
+    corrections) to device memory and replays it. Learning-rate changes need
+    no recapture. With ``capture_update_optimizer="exact"`` the result is
+    bit-identical to the eager update; the configurations it does not cover
+    (minibatches that do not divide the rollout, recurrent actors,
+    ``torch.compile``, critic-only extra steps, BC / reward-gradient terms
+    inside the step, ...) run eagerly and log why once. See
+    ``rlopt/agent/ppo/captured_update.py``.
+    """
+
+    capture_update_optimizer: str = "exact"
+    """Optimizer step inside the captured update (``capture_update=True``).
+
+    ``"exact"`` (default) replays the arithmetic of the eager foreach
+    Adam/AdamW step with the step's scalars read from device memory, so the
+    captured update is bit-identical to the eager one. ``"fused"`` runs
+    PyTorch's fused Adam/AdamW kernel with a device learning rate: fewer
+    kernels, NOT bit-identical (different rounding of the bias corrections).
     """
 
     actor_learning_rate: float | None = None
@@ -1427,6 +1457,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         self.optim.zero_grad(set_to_none=True)
         output_loss = self._backward_ppo_terms(batch)
 
+        self._synchronize_gradients()
         # Gradient clipping -- always call for a fixed graph
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
@@ -1449,6 +1480,82 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
         for key, value in extra_actor_metrics.items():
             output_loss.set(key, value.detach())
         return output_loss
+
+    def _update_output_constants(self) -> dict[str, float]:
+        """Constant metrics :meth:`update` sets after the step, in order."""
+        return {"alpha": 1.0}
+
+    def _synchronize_gradients(self) -> None:
+        """Distributed PPO averages gradients here, before clipping."""
+
+    def _normalize_rollout_advantage(self, advantage: Tensor) -> Tensor:
+        return _normalize_advantage_over_rollout(advantage)
+
+    def _should_stop_training(self, metadata: PPOTrainingMetadata) -> bool:
+        """Extra stop condition (distributed PPO pools the signal across ranks)."""
+        del metadata
+        return False
+
+    # ------------------------------------------------------------------
+    # Captured update (ppo.capture_update)
+    # ------------------------------------------------------------------
+
+    # Set in the body of every class that defines ``update``, ``iterate`` or
+    # ``_backward_ppo_terms`` once its captured path runs the same gradient
+    # computation as its eager one; otherwise the update runs eagerly.
+    _capture_update_aware = True
+
+    # ``iterate`` times each eager step under this timeit key; the captured
+    # replay keeps it.
+    _update_timeit_name = "training/update"
+
+    def _captured_update_backward(self, batch: TensorDict) -> TensorDict:
+        """Forward + backward of one captured step (grads are unset on entry).
+
+        ``_backward_ppo_terms`` is what :meth:`update` runs. IPMD's BC,
+        rollout-BC, BC-pretrain and HL-skill terms sit outside it and are
+        refused by :meth:`_captured_update_unsupported_reason`.
+        """
+        return self._backward_ppo_terms(batch)
+
+    def _captured_update_clip_gradients(self) -> Tensor:
+        return clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
+
+    def _captured_update_unsupported_reason(self) -> str | None:
+        """Algorithm-specific reason the captured update cannot run, if any."""
+        if float(self.config.ppo.lcp_coeff) > 0.0:
+            return "ppo.lcp_coeff > 0 (the LCP penalty is not covered)"
+        if int(self._update_cfg.critic_extra_epochs) > 0:
+            # These eager optimizer steps run between the iterations' replays
+            # and move the critic's step counters behind the graph, which the
+            # host mirror of device counters (a resumed run) treats as an error.
+            return (
+                f"{self._update_cfg_section}.critic_extra_epochs > 0 "
+                "(critic-only steps are not covered)"
+            )
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            # The distributed gradient sync checks unused parameters on the
+            # host and all-reduces between backward and clipping.
+            return "distributed training (the gradient all-reduce is not captured)"
+        return None
+
+    def _captured_update(self):
+        """The captured-update engine, or None when ``ppo.capture_update`` is off."""
+        if not bool(getattr(self.config.ppo, "capture_update", False)):
+            return None
+        engine = getattr(self, "_captured_update_engine", None)
+        if engine is None:
+            from rlopt.agent.ppo.captured_update import (  # noqa: PLC0415
+                CapturedUpdate,
+            )
+
+            engine = CapturedUpdate(self)
+            self._captured_update_engine = engine
+        return engine
 
     def _collector_iter(self) -> Iterator[TensorDict]:
         """Yield data from the collector while enforcing NaN guards per batch."""
@@ -1580,7 +1687,7 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                 advantage = rollout.get("advantage")
                 rollout.set(
                     "advantage",
-                    _normalize_advantage_over_rollout(advantage),
+                    self._normalize_rollout_advantage(advantage),
                 )
             if getattr(self.config.compile, "compile", False):
                 rollout = rollout.clone()
@@ -1701,7 +1808,13 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
             with self._profile_iteration_phase(
                 iteration.phase_times, "learn/policy_updates"
             ):
-                for epoch_idx in range(metadata.epochs_per_rollout):
+                captured = self._captured_update()
+                ran_captured = captured is not None and captured.run(
+                    iteration, metadata, losses
+                )
+                for epoch_idx in range(
+                    0 if ran_captured else metadata.epochs_per_rollout
+                ):
                     # Run PPO epochs over the rollout
                     for batch_idx, batch in enumerate(self.data_buffer):
                         kl_context = None
@@ -2090,6 +2203,8 @@ class PPO(BaseAlgorithm[PpoCfgT], Generic[PpoCfgT]):
                     self.record(iteration, metadata)
                 self._finish_iteration_profile(metadata, iteration)
                 if metadata.stop_after_iteration:
+                    break
+                if self._should_stop_training(metadata):
                     break
             if metadata.stop_after_iteration:
                 self._finish_train_time_budget(metadata)

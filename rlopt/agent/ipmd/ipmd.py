@@ -1041,6 +1041,9 @@ class IPMD(PPO):
     # `_update_loss_forward`, so `ppo.update_amp_dtype` applies to it. BC,
     # reward, latent-posterior and HL-skill terms stay float32.
     _update_amp_aware = True
+    # The captured step (`ppo.capture_update`) runs `_backward_ppo_terms`; what
+    # `update` adds to it is refused in `_captured_update_unsupported_reason`.
+    _capture_update_aware = True
 
     @staticmethod
     def _normalize_command_source(command_source: str) -> str:
@@ -1077,6 +1080,16 @@ class IPMD(PPO):
             msg = (
                 "IPMD reads its optimizer schedule from the `ipmd` section, not "
                 f"`ppo`; set {names} instead."
+            )
+            raise ValueError(msg)
+        if bool(getattr(self.config.ipmd, "capture_update", False)) or (
+            str(getattr(self.config.ipmd, "capture_update_optimizer", "exact"))
+            != "exact"
+        ):
+            msg = (
+                "ipmd.capture_update / ipmd.capture_update_optimizer are not "
+                "read; set ppo.capture_update (Hydra: "
+                "agent.ppo.capture_update=true) instead."
             )
             raise ValueError(msg)
         if getattr(self.config.ipmd, "update_amp_dtype", None) is not None:
@@ -2438,6 +2451,34 @@ class IPMD(PPO):
             )
         return output_loss
 
+    def _update_output_constants(self) -> dict[str, float]:
+        # `update` sets these after the step when no BC / HL-skill term runs.
+        return {"alpha": 1.0, "bc_pretrain_active": 0.0}
+
+    def _captured_update_unsupported_reason(self) -> str | None:
+        reason = super()._captured_update_unsupported_reason()
+        if reason is not None:
+            return reason
+        if self._bc_coeff > 0.0:
+            return "ipmd.bc_coef > 0 (expert BC batches are sampled per update)"
+        if self._bc_pretrain_updates > 0:
+            return "ipmd.bc_pretrain_updates > 0"
+        if self._rollout_bc_coeff > 0.0:
+            return "ipmd.rollout_bc_coef > 0"
+        if (
+            self._use_latent_command
+            and self._latent_learner is not None
+            and bool(self.config.ipmd.latent_learning.train_posterior_through_policy)
+        ):
+            return (
+                "the latent posterior trains through the policy loss "
+                "(ipmd.latent_learning.train_posterior_through_policy)"
+            )
+        sampler = self._hl_skill_command_sampler
+        if sampler is not None and bool(getattr(sampler, "finetune_enabled", False)):
+            return "the HL skill encoder is finetuned inside the update"
+        return None
+
     def _ppo_metrics_without_backward(self, batch: TensorDict) -> TensorDict:
         """Return PPO diagnostics without adding PPO gradients during BC pretraining."""
         with torch.no_grad():
@@ -3241,6 +3282,7 @@ class IPMD(PPO):
         bc_metrics = self._backward_bc_terms(expert_batch, has_expert)
         rollout_bc_metrics = self._backward_rollout_bc_terms(batch)
 
+        self._synchronize_gradients()
         # Gradient clipping — always call for a fixed graph
         grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 

@@ -502,6 +502,14 @@ class TrainerConfig:
     (``collector.total_frames``) still applies; whichever ends first stops the
     run. Only loops decorated with ``honours_train_time_budget`` read it."""
 
+    gpu_telemetry: bool = False
+    """Add ``perf/gpu_*`` readings (SM clock, temperature, power, slowdown flags)
+    to every training row, read through NVML on the host (opt-in).
+
+    A speed number is only interpretable beside the clocks it ran at: three ICE
+    H200s ran throttled on 2026-10-24. A distributed run reports rank zero's GPU.
+    See ``rlopt/gpu_telemetry.py``."""
+
 
 @dataclass
 class RLOptConfig:
