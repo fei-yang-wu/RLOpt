@@ -204,6 +204,15 @@ class WMBPTTConfig:
     compile: bool = False
     """``torch.compile`` the imagined control step (actor, model, reward)."""
     log_interval_iters: int = 50
+    ckpt_light: bool = False
+    """Periodic checkpoints (``save_interval``) hold only the deployed policy and
+    the counters, as ``policy_step_<frames>.pt``, written by a background
+    thread. They score but cannot resume. The run's end still writes the full
+    ``model_step_<frames>.pt``."""
+    last_every_min: float = 0.0
+    """With ``ckpt_light``: also write the full checkpoint, on the same thread,
+    at the next periodic checkpoint once this many training minutes have passed
+    since the last one, so a stopped run can resume. 0: only at the run's end."""
     eval_window: int = 32
     """Open-loop window used for the logged k-step prediction error."""
     eval_batch: int = 1024
@@ -232,6 +241,15 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     wm = config.wm
     if not 0.0 <= wm.actor_ema < 1.0:
         msg = f"wm.actor_ema must be in [0, 1), got {wm.actor_ema}."
+        raise ValueError(msg)
+    if wm.ckpt_light and int(config.save_interval) <= 0:
+        msg = "wm.ckpt_light changes the periodic checkpoints; set save_interval, or there are none."
+        raise ValueError(msg)
+    if wm.last_every_min < 0:
+        msg = f"wm.last_every_min must not be negative, got {wm.last_every_min}."
+        raise ValueError(msg)
+    if wm.last_every_min > 0 and not wm.ckpt_light:
+        msg = "wm.last_every_min needs wm.ckpt_light: without it every periodic checkpoint is already full."
         raise ValueError(msg)
     if wm.actor_lr_mult <= 0:
         msg = f"wm.actor_lr_mult must be positive, got {wm.actor_lr_mult}."

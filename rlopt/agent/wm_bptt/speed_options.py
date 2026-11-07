@@ -29,6 +29,8 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -141,3 +143,63 @@ class ActorLR:
                 msg = "wm.actor_lr_decay_return: the checkpoint has no trigger state (actor_lr_decay_at)."
                 raise ValueError(msg)
             self.decay_at = checkpoint["actor_lr_decay_at"]
+
+
+def atomic_save(payload: dict[str, Any], target: Path) -> None:
+    """``torch.save`` through a temporary name, so a reader never sees half a file."""
+    tmp = target.with_name(target.name + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(target)
+
+
+def cpu_snapshot(value: Any) -> Any:
+    """A copy of a nest with every tensor on the CPU, safe from later in-place updates."""
+    if isinstance(value, Tensor):
+        return value.detach().to("cpu", copy=True)
+    if isinstance(value, dict):
+        return {key: cpu_snapshot(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(cpu_snapshot(item) for item in value)
+    return value
+
+
+def full_checkpoint_due(elapsed: float, last: float, every_min: float) -> bool:
+    """``wm.last_every_min``: whether the periodic checkpoint at ``elapsed`` training
+    seconds also writes a full one, the previous one (or the run's start or resume
+    point) having been at ``last``. 0 means only the run's end writes one."""
+    return every_min > 0 and elapsed - last >= 60.0 * every_min
+
+
+class CheckpointWriter:
+    """``wm.ckpt_light``: writes checkpoints on one background thread.
+
+    At most two writes wait behind the running one, so a slow disk stalls the
+    loop rather than filling memory. A failed write raises in the loop, at the
+    next ``submit``, or at ``close``. Payloads must be ``cpu_snapshot`` copies.
+    """
+
+    MAX_QUEUED = 2
+
+    def __init__(self) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wm-checkpoint")
+        self._pending: list[Future[None]] = []
+
+    @staticmethod
+    def _write(payload: dict[str, Any], target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_save(payload, target)
+
+    def _collect(self, *, drain: bool = False) -> None:
+        while self._pending and (drain or self._pending[0].done() or len(self._pending) > self.MAX_QUEUED):
+            self._pending.pop(0).result()
+
+    def submit(self, payload: dict[str, Any], target: Path) -> None:
+        self._collect()
+        self._pending.append(self._pool.submit(self._write, payload, target))
+
+    def close(self) -> None:
+        """Finish every write; the first failure raises after the thread stops."""
+        try:
+            self._collect(drain=True)
+        finally:
+            self._pool.shutdown()

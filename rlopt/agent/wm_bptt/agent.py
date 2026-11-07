@@ -51,7 +51,15 @@ from rlopt.agent.wm_bptt.rebar import (
     shuffle_rows,
 )
 from rlopt.agent.wm_bptt.replay import SequenceReplay
-from rlopt.agent.wm_bptt.speed_options import ActorAverage, ActorLR, set_lr
+from rlopt.agent.wm_bptt.speed_options import (
+    ActorAverage,
+    ActorLR,
+    CheckpointWriter,
+    atomic_save,
+    cpu_snapshot,
+    full_checkpoint_due,
+    set_lr,
+)
 from rlopt.agent.wm_bptt.task import (
     WorldModelTask,
     history_proprio,
@@ -65,6 +73,15 @@ RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0, "fused_adam": False, "actor_op
 """``wm`` fields a resumed run must share with its checkpoint, with the value a
 checkpoint from before the field implies: they set which optimizers and which
 policy entries the checkpoint holds."""
+LIGHT_CHECKPOINT_KEYS = (
+    "policy_state_dict",
+    "policy_meta",
+    "wm_config",
+    "task",
+    "iteration",
+    "cumulative_env_frames",
+    "cumulative_train_seconds",
+)
 
 
 def _find_isaac_env(env: Any) -> Any:
@@ -1207,6 +1224,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         started = False
         last_log = time.monotonic()
         iters_since_log = 0
+        writer = CheckpointWriter() if wm.ckpt_light else None
+        self._last_full_seconds = self.train_elapsed_seconds()
         try:
             while True:
                 self._step_acc += wm.env_steps_per_iter
@@ -1266,7 +1285,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                             flushed.get("perf/actor_critic_s", float("nan")),
                         )
                 if self._should_save_checkpoint(frames_processed=self._frames_processed, frames_in_iteration=self._frames_processed - frames_before):
-                    self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+                    if writer is None:
+                        self.save_model(self._checkpoint_dir(), step=self._frames_processed)
+                    else:
+                        self._write_light_checkpoint(writer)
                 if stop:
                     meta.stop_after_iteration = True
                     break
@@ -1277,6 +1299,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         except KeyboardInterrupt:
             self.save_model(self._checkpoint_dir(), step=self._frames_processed)
             raise
+        finally:
+            if writer is not None:
+                writer.close()
 
     # ------------------------------------------------------------ checkpoint
     def policy_meta(self) -> dict[str, Any]:
@@ -1294,11 +1319,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             "goal_binding": _plain(t.goal_binding()) if hasattr(t, "goal_binding") else None,
         }
 
-    def save_model(self, path: str | Path | None = None, step: int | None = None) -> None:
-        base = Path(path) if path else self._checkpoint_dir()
-        frames = int(step if step is not None else self._frames_processed)
-        target = base if base.suffix == ".pt" else base / f"model_step_{frames}.pt"
-        target.parent.mkdir(parents=True, exist_ok=True)
+    def _checkpoint_payload(self, frames: int) -> dict[str, Any]:
         payload = {
             "policy_state_dict": self.collector_policy.state_dict(),
             "policy_meta": self.policy_meta(),
@@ -1321,9 +1342,27 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             payload["policy_live_state_dict"] = self.policy.state_dict()
             payload["actor_ema_updates"] = self.actor_avg.updates
         payload.update(self._actor_lr.state_dict())
-        tmp = target.with_name(target.name + ".tmp")
-        torch.save(payload, tmp)
-        tmp.replace(target)
+        return payload
+
+    def save_model(self, path: str | Path | None = None, step: int | None = None) -> None:
+        base = Path(path) if path else self._checkpoint_dir()
+        frames = int(step if step is not None else self._frames_processed)
+        target = base if base.suffix == ".pt" else base / f"model_step_{frames}.pt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_save(self._checkpoint_payload(frames), target)
+
+    def _write_light_checkpoint(self, writer: CheckpointWriter) -> None:
+        """``wm.ckpt_light``: the periodic checkpoint. The copy to the CPU blocks
+        the loop; the write to disk does not. ``policy_step_<frames>.pt`` is not
+        a name a resume looks for, and ``load_model`` refuses the file anyway."""
+        frames, directory = self._frames_processed, self._checkpoint_dir()
+        payload = self._checkpoint_payload(frames)
+        light = {key: payload[key] for key in LIGHT_CHECKPOINT_KEYS}
+        writer.submit(cpu_snapshot(light), directory / f"policy_step_{frames}.pt")
+        elapsed = self.train_elapsed_seconds()
+        if full_checkpoint_due(elapsed, self._last_full_seconds, self.config.wm.last_every_min):
+            writer.submit(cpu_snapshot(payload), directory / f"model_step_{frames}.pt")
+            self._last_full_seconds = elapsed
 
     def save(self, path: str | Path) -> None:
         self.save_model(path)

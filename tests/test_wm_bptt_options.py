@@ -47,6 +47,8 @@ REFUSED = [
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.0, "actor_lr_decay_len": 300}, "actor_lr_decay_return must be"),
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.75}, "actor_lr_decay_len"),
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.75, "actor_lr_decay_len": 300, "actor_lr_decay_by": 0}, "actor_lr_decay_by"),
+    ({"last_every_min": 5.0}, "needs wm.ckpt_light"),
+    ({"ckpt_light": True, "last_every_min": -1.0}, "last_every_min"),
 ]
 
 
@@ -54,6 +56,15 @@ REFUSED = [
 def test_refused_options(wm: dict[str, Any], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         validate_options(config(**wm), TASK)
+
+
+def test_ckpt_light_needs_periodic_checkpoints() -> None:
+    cfg = config(ckpt_light=True)
+    cfg.save_interval = 0
+    with pytest.raises(ValueError, match="save_interval"):
+        validate_options(cfg, TASK)
+    cfg.save_interval = 100
+    validate_options(cfg, TASK)
 
 
 def test_construction_validates() -> None:
