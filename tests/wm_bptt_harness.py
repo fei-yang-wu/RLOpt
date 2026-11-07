@@ -20,6 +20,7 @@ from torch import Tensor
 
 pytest.importorskip("imitation_experiments")
 
+from imitation_experiments.teleop.g1_kinematics import G1_ISAACLAB_JOINT_NAMES
 from imitation_experiments.world_model.g1_v3_math import (
     G1V3ReferenceLibrary,
     joint_limits,
@@ -48,6 +49,14 @@ SMALL = {
     "real_window_recent_steps": 8,
 }
 """Sizes only: every value picks how much work a code path does, not which path."""
+
+
+def action_scale(device: torch.device | str) -> Tensor:
+    """A left-right symmetric stand-in for the joint_pos action scale (the env's is
+    ``UNITREE_G1_29DOF_MIMIC_ACTION_SCALE``, which needs Isaac Lab to import)."""
+    sides = ("left_", "right_")
+    names = [next((n[len(s):] for s in sides if n.startswith(s)), n) for n in G1_ISAACLAB_JOINT_NAMES]
+    return torch.tensor([0.1 + 0.02 * len(name) for name in names], device=device)
 
 
 def synthetic_library(device: torch.device | str) -> G1V3ReferenceLibrary:
@@ -87,6 +96,8 @@ class FakeIsaacEnv:
             find_joints=lambda names, **_kwargs: (list(range(29)), names),
         )
         self.scene = {"robot": robot}
+        term = SimpleNamespace(_joint_names=list(G1_ISAACLAB_JOINT_NAMES), _scale=action_scale(self.device).expand(self.n, 29))
+        self.action_manager = SimpleNamespace(get_term=lambda name: {"joint_pos": term}[name])
 
     def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
         lib, n, dev = self.v3_library, self.n, self.device

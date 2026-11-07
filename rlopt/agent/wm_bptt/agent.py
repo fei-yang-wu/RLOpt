@@ -40,7 +40,11 @@ from tensordict.nn import TensorDictModule
 from torch import Tensor, nn
 from torchrl.envs import TransformedEnv
 
-from rlopt.agent.wm_bptt.config import WMBPTTRLOptConfig, validate_options
+from rlopt.agent.wm_bptt.config import (
+    WMBPTTRLOptConfig,
+    validate_options,
+    validate_residual,
+)
 from rlopt.agent.wm_bptt.diffsr_dynamics import DiffSRDynamics
 from rlopt.agent.wm_bptt.muon import MuonAdam
 from rlopt.agent.wm_bptt.networks import Actor, Critic, DynamicsModel, RunningNorm
@@ -75,10 +79,12 @@ from rlopt.agent.wm_bptt.task import (
 from rlopt.base_class import BaseAlgorithm, TrainingMetadata, honours_train_time_budget
 
 ARCH_TAG = "wmbptt-v1"
-RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0, "fused_adam": False, "actor_opt": "adam", "wm_opt": "adam"}
+RESUME_MATCH: dict[str, Any] = {
+    "actor_ema": 0.0, "fused_adam": False, "actor_opt": "adam", "wm_opt": "adam", "actor_residual": False,
+}
 """``wm`` fields a resumed run must share with its checkpoint, with the value a
 checkpoint from before the field implies: they set which optimizers and which
-policy entries the checkpoint holds."""
+policy entries the checkpoint holds, and what the actor's output means."""
 DEVICE_COUNTS = ("wm/nonfinite", "actor/nonfinite", "imagine/invalid_starts")
 """``wm.no_sync``: what the loop counts on the device, read at each log row."""
 LIGHT_CHECKPOINT_KEYS = (
@@ -228,17 +234,22 @@ def real_window_targets(
 
 
 class WMPolicy(nn.Module):
-    """Deployed policy: env observation tensors -> deterministic action."""
+    """Deployed policy: env observation tensors -> deterministic action.
+    ``residual`` (``wm.actor_residual``) adds the task's reference setpoint."""
 
-    def __init__(self, task: WorldModelTask, actor: Actor, bf16: bool) -> None:
+    def __init__(self, task: WorldModelTask, actor: Actor, bf16: bool, residual: bool = False) -> None:
         super().__init__()
         self.task = task
         self.actor = actor
         self.bf16 = bf16
+        self.residual = residual
 
     def forward(self, *tensors: Tensor) -> Tensor:
         obs = self.task.policy_obs_from_env(*tensors)
-        return self.actor(obs, bf16=self.bf16)
+        action = self.actor(obs, bf16=self.bf16)
+        if self.residual:
+            action = action + self.task.reference_setpoint(obs)  # type: ignore[attr-defined]
+        return action
 
 
 class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
@@ -252,6 +263,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     _unpublished_ends: Tensor | None = None
     _checkpoint_writer: CheckpointWriter | None = None
     _graphs: dict[str, GraphedUpdate] | None = None
+    _residual: bool = False
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -266,6 +278,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         validate_options(config, self.task)
         if wm.goal_table or wm.reference_body_table:
             self.task.build_reference_tables(goal=wm.goal_table, bodies=wm.reference_body_table)  # type: ignore[attr-defined]
+        self._residual = bool(wm.actor_residual)
+        if self._residual:
+            self.task.bind_reference_setpoint()  # type: ignore[attr-defined]
         self._isaac = _find_isaac_env(env)
         self._frames_processed = 0
         self._resume_frame_offset = 0
@@ -286,11 +301,11 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             t.policy_obs_dim, t.action_dim, wm.actor_hidden, wm.actor_output_scale, wm.actor_activation
         ).to(self.device)
         self.critic = Critic(t.critic_obs_dim, wm.critic_hidden, wm.critic_activation).to(self.device)
-        self.policy_net = WMPolicy(t, self.actor, wm.bf16)
+        self.policy_net = WMPolicy(t, self.actor, wm.bf16, self._residual)
         if wm.actor_ema > 0:
             self.actor_avg = ActorAverage(self.actor, wm.actor_ema)
             self.policy_avg = TensorDictModule(
-                WMPolicy(t, self.actor_avg.module, wm.bf16), in_keys=list(t.policy_in_keys), out_keys=["action"]
+                WMPolicy(t, self.actor_avg.module, wm.bf16, self._residual), in_keys=list(t.policy_in_keys), out_keys=["action"]
             )
         return TensorDictModule(self.policy_net, in_keys=list(t.policy_in_keys), out_keys=["action"])
 
@@ -432,10 +447,29 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         return (("wm/loss", "wm"), ("actor/objective", "J"), ("imagine/alive_H", "alive"))
 
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
+        """The deployed action for raw policy observations ``obs``."""
         x = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
         actor = self.actor_avg.module if self._deploys_average else self.actor  # type: ignore[union-attr]
         with torch.no_grad():
-            return actor(x, bf16=self.policy_net.bf16)
+            return self._act(actor, x, self.policy_net.bf16)
+
+    def _act(self, actor: nn.Module, obs: Tensor, bf16: bool) -> Tensor:
+        """The action of ``actor`` on raw policy observations: its output, plus the
+        reference setpoint with ``wm.actor_residual``."""
+        action = actor(obs, bf16=bf16)
+        if self._residual:
+            action = action + self.task.reference_setpoint(obs)  # type: ignore[attr-defined]
+        return action
+
+    def _set_residual(self, on: bool) -> None:
+        """The action semantics an inference load takes from its checkpoint."""
+        if on and not self._residual:
+            validate_residual(self.task)
+            self.task.bind_reference_setpoint()  # type: ignore[attr-defined]
+        self._residual = on
+        for policy in (self.policy, self.policy_avg):
+            if policy is not None:
+                policy.module.residual = on
 
     # ------------------------------------------------------------ schedule
     def _lr_factor(self) -> float:
@@ -476,7 +510,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         rows = self.task.read_obs(obs[self.task.obs_group])
         feat = self._policy_features(rows)
         self._update_norm(self.actor.obs_norm, feat)
-        mean_action = self.actor(feat, bf16=wm.bf16)
+        mean_action = self._act(self.actor, feat, wm.bf16)
         action = mean_action
         if wm.action_noise_std > 0:
             action = action + wm.action_noise_std * torch.randn_like(action)
@@ -734,7 +768,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         """
         t, wm = self.task, self.config.wm
         obs = t.policy_obs_from_parts(prop, state, rank, frame)
-        mu = self.actor(obs, bf16=wm.bf16)
+        mu = self._act(self.actor, obs, wm.bf16)
         action = mu + eps
         if detach_action:
             action = action.detach()
@@ -1625,6 +1659,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     # ------------------------------------------------------------ checkpoint
     def policy_meta(self) -> dict[str, Any]:
         t = self.task
+        # Only a residual policy records it: the default metadata stays the baseline's.
+        residual = {"actor_residual": True} if self._residual else {}
         return {
             "arch": ARCH_TAG,
             "in_keys": [list(k) for k in t.policy_in_keys],
@@ -1636,6 +1672,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             "sensor_noise": bool(self.config.wm.sensor_noise),
             "bf16": bool(self.config.wm.bf16),
             "goal_binding": _plain(t.goal_binding()) if hasattr(t, "goal_binding") else None,
+            **residual,
         }
 
     def _checkpoint_payload(self, frames: int) -> dict[str, Any]:
@@ -1728,6 +1765,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self.policy_net.bf16 = bool(meta.get("bf16", (data.get("wm_config") or {}).get("bf16", self.policy_net.bf16)))
         if "sensor_noise" in meta and hasattr(self.task, "sensor_noise"):
             self.task.sensor_noise = bool(meta["sensor_noise"])
+        # Checkpoints written before ``policy_meta["actor_residual"]`` output the action itself.
+        self._set_residual(bool(meta.get("actor_residual", False)))
         if self.actor_avg is not None:
             self.actor_avg.updates = 0  # ``self.policy`` now holds what is deployed
         self._inference_loaded = True

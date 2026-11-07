@@ -200,6 +200,16 @@ class WMBPTTConfig:
     actor_grad_clip_value: float = 0.1
     actor_output_scale: float = 0.01
     """Gain on the actor's last-layer initialization."""
+    actor_residual: bool = False
+    """The actor outputs an offset about the reference pose of frame f + 1 (NDM
+    Gym's ``--sm_residual``): the action is ``actor(obs) + task.reference_setpoint(obs)``,
+    with the reference read from the raw policy observation's goal. That sum is the
+    action everywhere: the simulator, the replay, the world model, the last-action
+    observation and the action-rate term; collection adds its noise and the clamp
+    after it. It applies in collection, imagination, the deployed policy and
+    ``predict``, and ``policy_meta`` records it, so an inference load acts as the run
+    did. Needs a task with ``reference_setpoint`` (G1-v3, explicit goal); refused
+    with latent goals, ``actor_source=real`` and ``rebar``."""
     actor_ema: float = 0.0
     """Decay of an exponential moving average of the actor, one step per actor
     update; 0 is off. Collection and imagination use the live actor. The
@@ -300,6 +310,18 @@ class WMBPTTRLOptConfig(RLOptConfig):
         self.value_function = None
 
 
+def validate_residual(task: Any, *, goal: str = "explicit", goal_encoder: str = "") -> None:
+    """``wm.actor_residual``, or an inference load of a residual checkpoint: the task
+    must read the reference pose from an explicit goal."""
+    if goal != "explicit" or goal_encoder:
+        msg = "wm.actor_residual reads the reference pose from the explicit goal; a latent goal does not hold it."
+        raise ValueError(msg)
+    for name in ("reference_setpoint", "bind_reference_setpoint"):
+        if getattr(task, name, None) is None:
+            msg = f"wm.actor_residual needs the task's {name} (G1V3TrackingTask)."
+            raise ValueError(msg)
+
+
 def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     """Refuse option values and combinations ``WMBPTT`` cannot honour.
 
@@ -369,6 +391,11 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     if wm.reference_body_table and getattr(task, "build_reference_tables", None) is None:
         msg = "wm.reference_body_table needs a task with a reference table (G1V3TrackingTask)."
         raise ValueError(msg)
+    if wm.actor_residual:
+        validate_residual(task, goal=str(wm.goal), goal_encoder=str(wm.goal_encoder))
+        if wm.actor_source == "real" or wm.actor_estimator == "rebar":
+            msg = "wm.actor_residual runs on imagined rollouts; real windows and rebar re-simulate the old actions without it."
+            raise ValueError(msg)
     for name in ("fit_terminal_transitions", "norm_from_collection"):
         if getattr(wm, name) and not getattr(task, "final_obs_is_post_step", False):
             msg = f"wm.{name} reads the true state after a step from final_obs, which this task's env does not hold."
