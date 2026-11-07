@@ -220,8 +220,9 @@ class ActorLR:
 
     From the log row where the training return first reaches ``decay_return``,
     or at iteration ``decay_by`` at the latest, the multiplier ramps linearly
-    to 1 over ``decay_len`` iterations. None disables a trigger. The defaults
-    are off: the multiplier is 1 at every iteration.
+    to 1 over ``decay_len`` iterations. None disables a trigger, and either
+    trigger alone is a schedule. The defaults are off: the multiplier is 1 at
+    every iteration.
     """
 
     def __init__(
@@ -242,6 +243,10 @@ class ActorLR:
     def watches_return(self) -> bool:
         return self.decay_return is not None
 
+    @property
+    def has_trigger(self) -> bool:
+        return self.decay_return is not None or self.decay_by is not None
+
     def at(self, iteration: int) -> float:
         """The multiplier at ``iteration``."""
         if self.decay_at is None:
@@ -250,11 +255,11 @@ class ActorLR:
 
     def observe(self, iteration: int, ret: float | None) -> str | None:
         """At a log row, ``iteration`` iterations done and the logged training
-        return ``ret`` (None: no episode ended, the deadline alone): the
+        return ``ret`` (None: no episode ended, or no return trigger): the
         trigger's message when it fires, which it does once, else None."""
-        if self.decay_return is None or self.decay_at is not None:
+        if not self.has_trigger or self.decay_at is not None:
             return None
-        reached = ret is not None and ret >= self.decay_return
+        reached = self.decay_return is not None and ret is not None and ret >= self.decay_return
         if not reached and not (self.decay_by is not None and iteration >= self.decay_by):
             return None
         self.decay_at = iteration
@@ -263,12 +268,12 @@ class ActorLR:
 
     def state_dict(self) -> dict[str, Any]:
         """The trigger's iteration for a checkpoint; nothing without a trigger."""
-        return {"actor_lr_decay_at": self.decay_at} if self.watches_return else {}
+        return {"actor_lr_decay_at": self.decay_at} if self.has_trigger else {}
 
     def load_state_dict(self, checkpoint: dict[str, Any]) -> None:
-        if self.watches_return:
+        if self.has_trigger:
             if "actor_lr_decay_at" not in checkpoint:
-                msg = "wm.actor_lr_decay_return: the checkpoint has no trigger state (actor_lr_decay_at)."
+                msg = "wm.actor_lr_decay_return, wm.actor_lr_decay_by: the checkpoint has no trigger state (actor_lr_decay_at)."
                 raise ValueError(msg)
             self.decay_at = checkpoint["actor_lr_decay_at"]
 

@@ -41,9 +41,10 @@ REFUSED = [
     ({"actor_opt": "muon", "actor_hidden": [64]}, "actor_hidden"),
     ({"actor_lr_mult": 0.0}, "actor_lr_mult"),
     ({"actor_lr_decay_return": 0.75, "actor_lr_decay_len": 300}, "which is 1"),
-    ({"actor_lr_decay_by": 1400}, "need wm.actor_lr_decay_return"),
-    ({"actor_lr_mult": 4.0, "actor_lr_decay_by": 1400, "actor_lr_decay_len": 300}, "need wm.actor_lr_decay_return"),
-    ({"actor_lr_decay_len": 300}, "need wm.actor_lr_decay_return"),
+    ({"actor_lr_decay_by": 1400, "actor_lr_decay_len": 300}, "which is 1"),
+    ({"actor_lr_mult": 4.0, "actor_lr_decay_by": 1400}, "actor_lr_decay_len"),
+    ({"actor_lr_mult": 4.0, "actor_lr_decay_by": 0, "actor_lr_decay_len": 300}, "actor_lr_decay_by"),
+    ({"actor_lr_decay_len": 300}, "needs a trigger"),
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.0, "actor_lr_decay_len": 300}, "actor_lr_decay_return must be"),
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.75}, "actor_lr_decay_len"),
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.75, "actor_lr_decay_len": 300, "actor_lr_decay_by": 0}, "actor_lr_decay_by"),
@@ -147,6 +148,32 @@ def test_the_deadline_fires_without_the_return() -> None:
     assert "deadline 1400 at iteration 1400" in lr.observe(1400, 0.1)
     late = recipe_schedule()
     assert "deadline" in late.observe(1450, None)
+
+
+def test_a_deadline_alone_is_a_schedule() -> None:
+    """NDM Gym's ``PolicyLR`` ramps at ``--lr_decay_by`` without a return trigger."""
+    lr = ActorLR(4.0, None, 300, 1400)
+    assert lr.on
+    assert not lr.watches_return
+    assert lr.observe(100, 0.99) is None  # no return trigger to reach
+    assert lr.observe(1350, None) is None
+    assert "deadline 1400 at iteration 1400" in lr.observe(1400, None)
+    assert (lr.at(1400), lr.at(1550), lr.at(1700)) == (4.0, 2.5, 1.0)
+
+
+def test_a_deadline_alone_keeps_its_trigger_state() -> None:
+    lr = ActorLR(4.0, None, 300, 1400)
+    assert lr.state_dict() == {"actor_lr_decay_at": None}
+    lr.observe(1450, None)
+    resumed = ActorLR(4.0, None, 300, 1400)
+    resumed.load_state_dict(lr.state_dict())
+    assert resumed.decay_at == 1450
+    with pytest.raises(ValueError, match="actor_lr_decay_at"):
+        ActorLR(4.0, None, 300, 1400).load_state_dict({})
+
+
+def test_a_deadline_alone_needs_no_return_scale() -> None:
+    validate_options(config(actor_lr_mult=4.0, actor_lr_decay_by=1400, actor_lr_decay_len=300), SimpleNamespace())
 
 
 def test_a_missing_return_does_not_fire_the_trigger() -> None:
@@ -261,6 +288,25 @@ def test_resume_restores_the_trigger(tmp_path: Path) -> None:
     resumed = harness.make_agent(**wm)
     resumed.load_model(str(path))
     assert resumed._actor_lr.decay_at == trained._actor_lr.decay_at == 2
+
+
+def test_a_deadline_alone_fires_in_a_run_and_resumes(tmp_path: Path) -> None:
+    wm = {"actor_lr_mult": 4.0, "actor_lr_decay_by": 3, "actor_lr_decay_len": 3, "log_interval_iters": 2}
+    trained = harness.make_agent(frames=harness.frames_for(6), **wm)
+    trained.train()
+    assert trained._actor_lr.decay_at == 4  # the first log row at or after iteration 3
+    assert not hasattr(trained, "_return_sums")
+    path = tmp_path / "a.pt"
+    trained.save_model(path)
+    resumed = harness.make_agent(**wm)
+    resumed.load_model(str(path))
+    assert resumed._actor_lr.decay_at == 4
+    assert resumed._actor_lr.at(trained._iteration) == trained._actor_lr.at(trained._iteration)
+    agent = harness.make_agent(**wm)
+    plain = tmp_path / "plain.pt"
+    harness.make_agent().save_model(plain)
+    with pytest.raises(ValueError, match="actor_lr_decay_at"):
+        agent.load_model(str(plain))
 
 
 def test_resume_refuses_a_checkpoint_without_trigger_state(tmp_path: Path) -> None:

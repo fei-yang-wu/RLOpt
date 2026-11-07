@@ -191,7 +191,9 @@ class WMBPTTConfig:
     actor_lr_decay_len: int = 0
     """Length of that ramp in iterations."""
     actor_lr_decay_by: int | None = None
-    """The ramp starts at this iteration at the latest."""
+    """The ramp starts at the first log row at or after this iteration, at the
+    latest. Without ``actor_lr_decay_return`` it is the only trigger, which NDM
+    Gym's ``PolicyLR`` permits (its train_muscles uses it)."""
     actor_grad_clip_norm: float = 1.0
     actor_grad_clip_value: float = 0.1
     actor_output_scale: float = 0.01
@@ -298,16 +300,13 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     if wm.actor_lr_mult <= 0:
         msg = f"wm.actor_lr_mult must be positive, got {wm.actor_lr_mult}."
         raise ValueError(msg)
-    if wm.actor_lr_decay_return is None:
-        if wm.actor_lr_decay_by is not None or wm.actor_lr_decay_len != 0:
-            msg = "wm.actor_lr_decay_by and wm.actor_lr_decay_len need wm.actor_lr_decay_return."
+    if wm.actor_lr_decay_return is None and wm.actor_lr_decay_by is None:
+        if wm.actor_lr_decay_len != 0:
+            msg = "wm.actor_lr_decay_len needs a trigger: wm.actor_lr_decay_return or wm.actor_lr_decay_by."
             raise ValueError(msg)
     else:
         if wm.actor_lr_mult == 1:
-            msg = "wm.actor_lr_decay_return decays wm.actor_lr_mult, which is 1."
-            raise ValueError(msg)
-        if wm.actor_lr_decay_return <= 0:
-            msg = f"wm.actor_lr_decay_return must be positive, got {wm.actor_lr_decay_return}."
+            msg = "wm.actor_lr_decay_return and wm.actor_lr_decay_by decay wm.actor_lr_mult, which is 1."
             raise ValueError(msg)
         if wm.actor_lr_decay_len < 1:
             msg = f"wm.actor_lr_decay_len must be at least 1 with a trigger, got {wm.actor_lr_decay_len}."
@@ -315,9 +314,13 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         if wm.actor_lr_decay_by is not None and wm.actor_lr_decay_by < 1:
             msg = f"wm.actor_lr_decay_by must be at least 1, got {wm.actor_lr_decay_by}."
             raise ValueError(msg)
-        if getattr(task, "max_step_reward", None) is None:
-            msg = "wm.actor_lr_decay_return needs the task's max_step_reward, which scales the training return."
-            raise ValueError(msg)
+        if wm.actor_lr_decay_return is not None:
+            if wm.actor_lr_decay_return <= 0:
+                msg = f"wm.actor_lr_decay_return must be positive, got {wm.actor_lr_decay_return}."
+                raise ValueError(msg)
+            if getattr(task, "max_step_reward", None) is None:
+                msg = "wm.actor_lr_decay_return needs the task's max_step_reward, which scales the training return."
+                raise ValueError(msg)
     for name in ("actor_opt", "wm_opt"):
         if getattr(wm, name) not in ("adam", "muon"):
             msg = f"wm.{name} must be 'adam' or 'muon', got {getattr(wm, name)!r}."
