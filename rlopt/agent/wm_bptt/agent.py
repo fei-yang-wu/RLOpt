@@ -210,6 +210,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._iteration = 0
         self._step_acc = 0.0
         self.replay: SequenceReplay | None = None
+        self._inference_loaded = False
         self._rebar = CorrectionAverage(wm.rebar_ema_rate, wm.rebar_norm_cap) if wm.actor_estimator == "rebar" else None
         super().__init__(env=env, config=config, logger=logger, **kwargs)
 
@@ -289,7 +290,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def predict(self, obs: Tensor | np.ndarray) -> Tensor:  # type: ignore[override]
         x = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
         with torch.no_grad():
-            return self.actor(x, bf16=self.config.wm.bf16)
+            return self.actor(x, bf16=self.policy_net.bf16)
 
     # ------------------------------------------------------------ schedule
     def _lr_factor(self) -> float:
@@ -1124,6 +1125,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     @honours_train_time_budget
     def train(self) -> None:  # type: ignore[override]
+        if self._inference_loaded:
+            msg = "load_policy restores a policy for inference; resume training with load_model."
+            raise RuntimeError(msg)
         wm = self.config.wm
         t = self.task
         self.ensure_replay()
@@ -1220,6 +1224,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             "actor_activation": str(self.config.wm.actor_activation).lower(),
             "task_model": str(self.config.wm.task_model),
             "sensor_noise": bool(self.config.wm.sensor_noise),
+            "bf16": bool(self.config.wm.bf16),
             "goal_binding": _plain(t.goal_binding()) if hasattr(t, "goal_binding") else None,
         }
 
@@ -1253,8 +1258,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def save(self, path: str | Path) -> None:
         self.save_model(path)
 
-    def load_model(self, path: str) -> None:
-        data = torch.load(path, map_location=self.device, weights_only=False)
+    def _read_checkpoint(self, path: str, map_location: torch.device | str) -> dict[str, Any]:
+        """A checkpoint whose policy interface matches this agent."""
+        data = torch.load(path, map_location=map_location, weights_only=False)
         meta = data.get("policy_meta") or {}
         if meta.get("arch") != ARCH_TAG:
             msg = f"{path} is not a {ARCH_TAG} checkpoint (arch={meta.get('arch')!r})."
@@ -1272,16 +1278,41 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             if meta.get(key) != mine[key]:
                 msg = f"checkpoint policy_meta[{key!r}]={meta.get(key)!r} != agent {mine[key]!r}"
                 raise ValueError(msg)
+        return data
+
+    def load_policy(self, path: str) -> None:
+        """Inference load: ``policy_state_dict`` and ``policy_meta``, nothing else.
+
+        The checkpoint's world model, critic and optimizers do not matter here,
+        so a run with other sizes or optimizers scores on an agent built from
+        the task's default config. How the policy acts comes from the
+        checkpoint, not from that default config. An agent loaded this way
+        refuses to train: use ``load_model`` to resume.
+        """
+        data = self._read_checkpoint(path, "cpu")
+        meta = data["policy_meta"]
         assert self.policy is not None
         self.policy.load_state_dict(data["policy_state_dict"], strict=True)
-        if data.get("dynamics_state_dict") is not None:
-            self.dynamics.load_state_dict(data["dynamics_state_dict"])
-        if data.get("critic_state_dict") is not None:
-            self.critic.load_state_dict(data["critic_state_dict"])
-        opts = data.get("optimizers") or {}
+        # Checkpoints written before ``policy_meta["bf16"]`` keep it in ``wm_config``.
+        self.policy_net.bf16 = bool(meta.get("bf16", (data.get("wm_config") or {}).get("bf16", self.policy_net.bf16)))
+        if "sensor_noise" in meta and hasattr(self.task, "sensor_noise"):
+            self.task.sensor_noise = bool(meta["sensor_noise"])
+        self._inference_loaded = True
+
+    def load_model(self, path: str) -> None:
+        """Resume load: every component, strictly. A checkpoint from another
+        configuration or without the training state raises (see ``load_policy``)."""
+        data = self._read_checkpoint(path, self.device)
+        missing = [key for key in ("dynamics_state_dict", "critic_state_dict", "optimizers") if data.get(key) is None]
+        if missing:
+            msg = f"{path} has no {missing}: it cannot resume training. Use load_policy to score it."
+            raise ValueError(msg)
+        assert self.policy is not None
+        self.policy.load_state_dict(data["policy_state_dict"], strict=True)
+        self.dynamics.load_state_dict(data["dynamics_state_dict"])
+        self.critic.load_state_dict(data["critic_state_dict"])
         for name, opt in (("wm", self.wm_optim), ("actor", self.actor_optim), ("critic", self.critic_optim)):
-            if name in opts:
-                opt.load_state_dict(opts[name])
+            opt.load_state_dict(data["optimizers"][name])
         if self._rebar is not None and "rebar" in data:
             self._rebar.load_state_dict(data["rebar"])
         self._iteration = int(data.get("iteration", 0))
