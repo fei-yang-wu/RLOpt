@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -65,9 +66,9 @@ def table_entry() -> Any:
 
 
 def check_default() -> dict[str, Any]:
-    """A default agent leaves the process's compiler state alone."""
+    """A default agent leaves the process's compiler state alone, also when it collects."""
     entry = table_entry()
-    harness.make_agent()
+    harness.make_agent().ensure_replay()
     return {
         "same_entry": table_entry() is entry,
         "tag": torch.compiler.config.cache_key_tag,
@@ -89,23 +90,48 @@ def check_patch() -> dict[str, Any]:
     }
 
 
-def check_agent_applies() -> dict[str, Any]:
-    harness.make_agent(compile=True, elementwise_3x3=True, combo_kernels=True)
+def process_state(agent: Any) -> dict[str, Any]:
     return {
         "patched": getattr(table_entry(), "elementwise_3x3", False),
         "combo": torch._inductor.config.combo_kernels,
-        "limit": torch._dynamo.config.recompile_limit,
+        "compiled_reward": agent.task.mdp._compiled_measured_reward is not None,
     }
+
+
+def check_agent_applies() -> dict[str, Any]:
+    """Construction sets the recompile limit only; the first collection applies the rest."""
+    agent = harness.make_agent(compile=True, elementwise_3x3=True, combo_kernels=True, compile_eager=True)
+    built = process_state(agent)
+    agent.ensure_replay()
+    return {"built": built, "collecting": process_state(agent), "limit": torch._dynamo.config.recompile_limit}
 
 
 def check_entrypoint_order() -> dict[str, Any]:
     """The entrypoint applies the options, then the env's helpers compile, then the
-    agent is built: its own call must change nothing and refuse nothing."""
+    agent is built and collects: its own call must change nothing and refuse nothing."""
     apply_compile_options(WMBPTTConfig(compile=True, elementwise_3x3=True))
     patched = table_entry()
     torch.compile(lambda x: x + 1, backend="eager")(torch.ones(2))
-    harness.make_agent(compile=True, elementwise_3x3=True)
+    harness.make_agent(compile=True, elementwise_3x3=True).ensure_replay()
     return {"same_entry": table_entry() is patched}
+
+
+def check_scoring_after_a_compile() -> dict[str, Any]:
+    """An evaluator builds its env first, and env setup compiles; it then builds the
+    agent from the arm's config and loads a policy. The agent changes nothing in the
+    process. An agent that would train in that process refuses at its first collection."""
+    path = Path(tempfile.mkdtemp(prefix="wm_bptt_score_")) / "policy.pt"
+    harness.make_agent().save_model(path)
+    torch.compile(lambda x: x + 1, backend="eager")(torch.ones(2))
+    options = {"compile": True, "elementwise_3x3": True, "combo_kernels": True, "compile_eager": True}
+    scorer = harness.make_agent(**options)
+    scorer.load_policy(str(path))
+    out: dict[str, Any] = {"scoring": process_state(scorer), "refused": ""}
+    try:
+        harness.make_agent(**options).ensure_replay()
+    except RuntimeError as error:
+        out["refused"] = str(error)
+    return out
 
 
 def check_late_patch() -> dict[str, Any]:
@@ -236,6 +262,7 @@ CHECKS = {
     "patch": check_patch,
     "agent_applies": check_agent_applies,
     "entrypoint_order": check_entrypoint_order,
+    "scoring_after_a_compile": check_scoring_after_a_compile,
     "late_patch": check_late_patch,
     "products": check_products,
     "cache": check_cache,
@@ -256,12 +283,22 @@ def test_the_patch_applies_once_and_keeps_a_tag() -> None:
     assert got["tag"] == "mine:rlopt:elementwise_3x3"
 
 
-def test_construction_applies_the_process_options() -> None:
-    assert run("agent_applies") == {"patched": True, "combo": True, "limit": 64}
+def test_the_first_collection_applies_the_process_options() -> None:
+    assert run("agent_applies") == {
+        "built": {"patched": False, "combo": False, "compiled_reward": False},
+        "collecting": {"patched": True, "combo": True, "compiled_reward": True},
+        "limit": 64,
+    }
 
 
 def test_an_entrypoint_may_apply_the_options_before_the_env_compiles() -> None:
     assert run("entrypoint_order") == {"same_entry": True}
+
+
+def test_an_evaluator_scores_an_arm_after_its_env_compiled() -> None:
+    got = run("scoring_after_a_compile")
+    assert got["scoring"] == {"patched": False, "combo": False, "compiled_reward": False}
+    assert "before the first compile" in got["refused"]
 
 
 def test_the_patch_refuses_a_process_that_has_compiled() -> None:

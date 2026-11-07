@@ -90,9 +90,9 @@ def combo_kernels() -> None:
 
 
 def apply_compile_options(wm: Any) -> None:
-    """The options of ``wm`` that act on the whole process. An entrypoint calls this before
-    it builds the env, because env code can compile. The agent calls it again at construction,
-    where it then changes nothing."""
+    """The options of ``wm`` that act on the whole process. A training entrypoint calls this
+    before it builds the env, because env code can compile. The agent calls it again at its
+    first collection, where it then changes nothing; an agent that only scores never does."""
     if wm.elementwise_3x3:
         elementwise_3x3_products()
     if wm.combo_kernels:

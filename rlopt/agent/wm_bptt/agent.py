@@ -343,6 +343,19 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             # The two compiled steps have a handful of guard variants (train vs
             # eval mode, first call); a low limit silently falls back to eager.
             torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+
+    def _apply_training_compile_options(self) -> None:
+        """The options that change the process or the env, at the first collection
+        (``ensure_replay``), not at construction.
+
+        An agent built only to score (``load_policy``) then changes nothing: an
+        evaluator builds its env first, env setup compiles, and a late
+        ``wm.elementwise_3x3`` would refuse the agent. The env reward stays eager,
+        so a board scores every arm with the same rounding. A training entrypoint
+        applies the options before its env (``apply_compile_options``); here they
+        then change nothing, or refuse a process that compiled without them.
+        """
+        wm = self.config.wm
         apply_compile_options(wm)
         if wm.compile_eager:
             self.task.compile_collection_reward()  # type: ignore[attr-defined]
@@ -1310,6 +1323,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         """Allocate the per-env replay on first use (training, or an offline
         probe that collects with ``_collect_step``)."""
         if self.replay is None:
+            self._apply_training_compile_options()
             wm, t = self.config.wm, self.task
             self.replay = SequenceReplay(self._num_envs, wm.replay_steps, t.state_dim, t.action_dim, t.context_dim, self.device)
             # Collection draws its sensor noise as a function of (seed, env,
