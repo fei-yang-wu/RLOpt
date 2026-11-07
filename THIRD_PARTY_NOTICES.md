@@ -12,6 +12,7 @@ MIT License below. Each ported file carries the notice.
 | file here | source in NDM Gym |
 |---|---|
 | `rlopt/agent/wm_bptt/muon.py` | `ndm_gym/core/muon.py`, without its RigidFormer `matrices` argument |
+| `rlopt/agent/wm_bptt/replay.py` (`set_terminal`, `rollout_mask`) | the row's true `s1` and the window mask of `ReplayBuffer` in `ndm_gym/buffer.py` |
 | `rlopt/agent/wm_bptt/speed_options.py` | adapted parts of `ndm_gym/algos/common.py`, `ndm_gym/algos/blinkmimic.py`, `ndm_gym/core/normalizer.py`, `ndm_gym/train.py` |
 
 ```

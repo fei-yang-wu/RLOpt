@@ -82,6 +82,14 @@ class WMBPTTConfig:
     """Steps per env in the replay before the first world-model update."""
     norm_freeze_samples: float = 2.0e8
     """Stop updating the input/increment normalizers after this many samples."""
+    fit_terminal_transitions: bool = False
+    """Fit each episode's last transition too, into the true state the step reached,
+    as NDM Gym does. The next replay row cannot hold that state, because the env has
+    reset, so the agent reads it from the env's batched ``final_obs`` into one more
+    ring (284 B per env row: 1.16 GB at 1000 rows and 4096 envs). Windows stop after
+    it. A non-finite or pushed final state is not fit (``wm/terminal_nonfinite``
+    counts the first kind per step with an ended episode), and real windows
+    (``actor_source``, ``critic_source``) keep their own episode masks."""
 
     # -- imagination / actor --------------------------------------------------
     horizon: int = 32
@@ -327,6 +335,9 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         raise ValueError(msg)
     if wm.reference_body_table and getattr(task, "build_reference_tables", None) is None:
         msg = "wm.reference_body_table needs a task with a reference table (G1V3TrackingTask)."
+        raise ValueError(msg)
+    if wm.fit_terminal_transitions and not getattr(task, "final_obs_is_post_step", False):
+        msg = "wm.fit_terminal_transitions reads the true state after a step from final_obs, which this task's env does not hold."
         raise ValueError(msg)
     if wm.no_sync:
         if not wm.fused_adam:

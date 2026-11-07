@@ -138,6 +138,42 @@ class FakeIsaacEnv:
         return self._obs(), reward, failed & ~clip_end, clip_end, {}
 
 
+class FinalObsFakeEnv(FakeIsaacEnv):
+    """Publishes ``final_obs`` as ``G1V3RLEnv`` does: the true post-step rows of every
+    ended episode, batched, before the reset. A failed episode ends ``FALL`` below its
+    reference, so its last state is no reset row and no reference row."""
+
+    FALL = 0.25
+
+    def step(self, action: Tensor) -> tuple[dict[str, Any], Tensor, Tensor, Tensor, dict[str, Any]]:
+        lib, n, dev = self.v3_library, self.n, self.device
+        self.frame = self.frame + 1
+        self.episode = self.episode + 1
+        clip_end = self.frame >= lib.length[self.rank] - 2
+        failed = (torch.rand(n, device=dev) < 0.02) & ~clip_end
+        done = clip_end | failed
+        state = lib.ref_state(self.rank, self.frame)
+        state = state + 0.01 * torch.randn_like(state)
+        state[:, 3:7] = state[:, 3:7] / state[:, 3:7].norm(dim=-1, keepdim=True)
+        state[:, 2] -= self.FALL * failed.float()
+        self.hist_state = torch.cat((self.hist_state[:, 1:], state[:, None]), 1)
+        self.hist_action = torch.cat((self.hist_action[:, 1:], action[:, None]), 1)
+        extras: dict[str, Any] = {}
+        ids = done.nonzero().squeeze(-1)
+        if ids.numel():
+            wm = {key: value[ids] for key, value in self._obs()["wm"].items()}
+            extras["final_obs"] = {"_env_ids": ids, "obs": {"wm": wm}}
+        self.rank = torch.where(done, torch.randint(0, lib.length.numel(), (n,), device=dev), self.rank)
+        fresh = (torch.rand(n, device=dev) * (lib.length[self.rank] - 40).float()).long()
+        self.frame = torch.where(done, fresh, self.frame)
+        self.episode = torch.where(done, torch.zeros_like(self.episode), self.episode)
+        start = lib.ref_state(self.rank, self.frame)
+        self.hist_state[done] = start[done][:, None]
+        self.hist_action[done] = 0
+        reward = 0.05 + 0.02 * torch.cos(self.frame.float() * 0.1) - 0.001 * action.square().mean(-1)
+        return self._obs(), reward, failed, clip_end, extras
+
+
 def make_agent(
     *,
     device: str = "cpu",
@@ -147,6 +183,7 @@ def make_agent(
     save_interval: int = 0,
     log_dir: str | Path | None = None,
     small: bool = True,
+    env_cls: type[FakeIsaacEnv] = FakeIsaacEnv,
     **wm: Any,
 ) -> WMBPTT:
     """A real agent. ``wm`` overrides ``WMBPTTConfig`` (after ``SMALL``)."""
@@ -161,7 +198,7 @@ def make_agent(
     config.trainer.progress_bar = False
     config.logger.backend = ""
     config.logger.log_dir = str(log_dir or tempfile.mkdtemp(prefix="wm_bptt_"))
-    return WMBPTT(env=FakeIsaacEnv(num_envs, device), config=config)  # type: ignore[arg-type]
+    return WMBPTT(env=env_cls(num_envs, device), config=config)  # type: ignore[arg-type]
 
 
 def frames_for(iterations: int, *, num_envs: int = 8, wm: WMBPTTConfig | None = None) -> int:

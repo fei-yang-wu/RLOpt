@@ -51,7 +51,7 @@ from rlopt.agent.wm_bptt.rebar import (
     masked_center,
     shuffle_rows,
 )
-from rlopt.agent.wm_bptt.replay import SequenceReplay
+from rlopt.agent.wm_bptt.replay import SequenceReplay, rollout_mask
 from rlopt.agent.wm_bptt.speed_options import (
     ActorAverage,
     ActorLR,
@@ -228,6 +228,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     policy_avg: TensorDictModule | None = None
     _actor_lr: ActorLR = ActorLR()
     _device_counts: Tensor | None = None
+    _unpublished_ends: Tensor | None = None
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -408,7 +409,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         )
         obs, reward, terminated, truncated, extras = self._isaac.step(action)
         self.replay.set_outcome(reward.reshape(-1), terminated.reshape(-1).bool())
-        self._track_episodes(reward.reshape(-1), (terminated | truncated).reshape(-1).bool())
+        done = (terminated | truncated).reshape(-1).bool()
+        self._track_episodes(reward.reshape(-1), done)
+        if self._unpublished_ends is not None:
+            self._read_final_obs(extras, done, stats)
         stats["env_reward"].append(reward.mean())
         log = extras.get("log") if isinstance(extras, dict) else None
         if log:
@@ -419,6 +423,20 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 stats[k].append(value if wm.no_sync else torch.as_tensor(value, device=self.device, dtype=torch.float32))
         self._frames_processed += self._num_envs
         return obs
+
+    def _read_final_obs(self, extras: Any, done: Tensor, stats: dict[str, list]) -> None:
+        """The true post-step rows of the episodes this step ended. The env publishes
+        them batched, before the reset that overwrites them; the rows of the next
+        observation are already the next episodes'."""
+        final = extras.get("final_obs") if isinstance(extras, dict) else None
+        if final is None:
+            self._unpublished_ends += done.sum()
+            return
+        ids = final["_env_ids"].long()
+        end = self.task.read_obs(final["obs"][self.task.obs_group])
+        finite = torch.isfinite(end["state"]).all(-1)
+        stats["wm/terminal_nonfinite"].append((~finite).sum().float())
+        self.replay.set_terminal(ids, end["state"], finite & ~end["push"])
 
     @torch.no_grad()
     def _track_episodes(self, reward: Tensor, done: Tensor) -> None:
@@ -460,7 +478,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     def _wm_rollout(self, win: dict[str, Tensor], k: int, *, grad: bool) -> tuple[Tensor, Tensor]:
         """Open-loop rollout on logged actions; per-step errors (B, k, D) and
-        the window mask (B, k) (all transitions up to j valid)."""
+        the window mask (B, k) (``rollout_mask``)."""
         state = win["state"][:, 0]
         ctx = win["context"][:, 0]
         if grad:
@@ -468,12 +486,11 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         errs = []
         step = self._wm_step_fn() if grad else self._wm_step
         for j in range(k):
-            state, err = step(state, win["action"][:, j], ctx, win["state"][:, j + 1])
+            state, err = step(state, win["action"][:, j], ctx, win["next_state"][:, j])
             errs.append(err)
             if not grad:
                 state = state.detach()
-        mask = torch.cumprod(win["valid"][:, :k].float(), dim=1)
-        return torch.stack(errs, 1), mask
+        return torch.stack(errs, 1), rollout_mask(win, k)
 
     def _update_world_model(self, metrics: dict[str, list]) -> None:
         wm = self.config.wm
@@ -511,6 +528,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             metrics["wm/loss"].append(loss.detach())
             metrics["wm/grad_norm"].append(gn.detach())
             metrics["wm/valid_window_frac"].append(mask[:, -1].mean())
+            if wm.fit_terminal_transitions:
+                metrics["wm/terminal_frac"].append((mask * win["ended"][:, :k]).sum() / mask.sum().clamp_min(1.0))
         if wm.no_sync:
             full = self.dynamics.out_norm.count >= wm.norm_freeze_samples
             self.dynamics.in_norm.frozen.logical_or_(full)
@@ -531,7 +550,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     @staticmethod
     def _first_transition(win: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        return win["state"][:, 0], win["state"][:, 1], win["action"][:, 0], win["context"][:, 0]
+        return win["state"][:, 0], win["next_state"][:, 0], win["action"][:, 0], win["context"][:, 0]
 
     def _norm_features(self, state: Tensor, next_state: Tensor, action: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor]:
         """What the world model's input and increment normalizers fit."""
@@ -567,7 +586,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         t, wm = self.task, self.config.wm
         B = win["state"].shape[0]
         s0 = win["state"][:, :k].reshape(B * k, -1)
-        s1 = win["state"][:, 1 : k + 1].reshape(B * k, -1)
+        s1 = win["next_state"][:, :k].reshape(B * k, -1)
         ctx = win["context"][:, :1].expand(B, k, -1).reshape(B * k, -1)
         x = t.wm_input(s0, win["action"][:, :k].reshape(B * k, -1), ctx)
         loss, _ = self.dynamics.denoising_loss(x, t.increment(s0, s1), win["valid"][:, :k].reshape(-1), bf16=wm.bf16)
@@ -1255,6 +1274,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 out[name] = float(torch.stack(values).mean())
             src.clear()
         out.update(self._wm_eval())
+        if self._unpublished_ends is not None:
+            self._check_final_obs()
         out["train/lr_factor"] = self._lr_factor()
         if self._actor_lr.on:
             self._observe_actor_lr(out)
@@ -1269,6 +1290,16 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             out["episode/length"] = length / count
             out["episode/return"] = reward / count
         return out
+
+    def _check_final_obs(self) -> None:
+        """At a log row: an env without ``final_obs`` must not turn the option off quietly."""
+        missing = int(self._unpublished_ends)
+        if missing:
+            msg = (
+                f"wm.fit_terminal_transitions: {missing} episodes ended since the last log row with no "
+                "final_obs, so their true last state is lost. This env does not publish it."
+            )
+            raise RuntimeError(msg)
 
     def _read_device_counts(self, row: dict[str, float]) -> None:
         """``wm.no_sync``: at a log row, the only host read of the device counts."""
@@ -1311,7 +1342,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         probe that collects with ``_collect_step``)."""
         if self.replay is None:
             wm, t = self.config.wm, self.task
-            self.replay = SequenceReplay(self._num_envs, wm.replay_steps, t.state_dim, t.action_dim, t.context_dim, self.device)
+            self.replay = SequenceReplay(
+                self._num_envs, wm.replay_steps, t.state_dim, t.action_dim, t.context_dim, self.device,
+                terminal_states=wm.fit_terminal_transitions,
+            )
             # Collection draws its sensor noise as a function of (seed, env,
             # replay row), so a real-window re-simulation sees the same noise.
             self._noise_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
@@ -1323,6 +1357,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 self._return_sums = torch.zeros(2, device=self.device)
             if wm.no_sync:
                 self._device_counts = torch.zeros(len(DEVICE_COUNTS), device=self.device)
+            if wm.fit_terminal_transitions:
+                self._unpublished_ends = torch.zeros((), dtype=torch.long, device=self.device)
         return self.replay
 
     @honours_train_time_budget

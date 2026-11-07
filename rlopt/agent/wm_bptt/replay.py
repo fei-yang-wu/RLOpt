@@ -1,3 +1,29 @@
+# ``set_terminal`` and ``rollout_mask`` are adapted from NDM Gym (https://github.com/Frank-ZY-Dou/ndm-gym @ 05ea9f3:
+# ndm_gym/buffer.py), which ports it from BlinkMimic (https://github.com/fuyichen0725/blinkmimic @ d264658), under the
+# MIT License:
+#
+# Copyright (c) 2026 NDM Gym Contributors
+# Copyright (c) 2026 ETH Zurich, Chong Zhang
+# Copyright (c) 2026 Fuyi Chen
+# Copyright (c) 2026 Huy-Quang-Dao (InstantTrack, from which this software is derived)
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """Per-env ring of simulator rows for the world-model agent.
 
 All envs write one row per vectorized step, so a row is addressed by
@@ -6,6 +32,10 @@ episode-step counter: rows tau and tau + 1 of one env are a transition iff
 ``episode_step[tau + 1] == episode_step[tau] + 1``. A terminal transition
 (the env resets) therefore never counts, and neither does anything across
 the ring's write head.
+
+``terminal_states`` (``wm.fit_terminal_transitions``) keeps what row tau + 1
+cannot hold: the true state after an episode's last transition, which the env's
+reset overwrote. A window then fits that transition and stops after it.
 """
 
 from __future__ import annotations
@@ -23,6 +53,8 @@ class SequenceReplay:
         action_dim: int,
         context_dim: int,
         device: torch.device,
+        *,
+        terminal_states: bool = False,
     ) -> None:
         self.num_envs = int(num_envs)
         self.capacity = int(capacity)
@@ -42,6 +74,10 @@ class SequenceReplay:
         # Outcome of the transition out of each row (set after the env step).
         self.env_reward = torch.zeros(T, N, **f)
         self.terminated = torch.zeros(T, N, dtype=torch.bool, **f)
+        # ``wm.fit_terminal_transitions``: the true post-step state of a row whose
+        # transition ended its episode; ``has_terminal`` says which rows hold one.
+        self.terminal_state = torch.zeros(T, N, state_dim, **f) if terminal_states else None
+        self.has_terminal = torch.zeros(T, N, dtype=torch.bool, **f) if terminal_states else None
         self.steps = 0  # absolute steps written
 
     def add(
@@ -68,6 +104,8 @@ class SequenceReplay:
         self.push[i] = push
         self.env_reward[i] = 0.0
         self.terminated[i] = False
+        if self.has_terminal is not None:
+            self.has_terminal[i] = False
         self.steps += 1
 
     def set_outcome(self, env_reward: Tensor, terminated: Tensor) -> None:
@@ -76,6 +114,14 @@ class SequenceReplay:
         i = (self.steps - 1) % self.capacity
         self.env_reward[i] = env_reward
         self.terminated[i] = terminated
+
+    def set_terminal(self, env_ids: Tensor, state: Tensor, keep: Tensor) -> None:
+        """Record the true post-step ``state`` (k, S) of the ``env_ids`` (k,) whose
+        episode ended on the step from the newest row. Rows ``keep`` (k,) leaves
+        out stay what they are without this: no fit target."""
+        i = (self.steps - 1) % self.capacity
+        self.terminal_state[i, env_ids] = state
+        self.has_terminal[i, env_ids] = keep
 
     @property
     def oldest(self) -> int:
@@ -96,8 +142,11 @@ class SequenceReplay:
         return tau, env
 
     def window(self, tau: Tensor, env: Tensor, length: int) -> dict[str, Tensor]:
-        """Rows tau .. tau + length - 1, (B, L, ...), with transition validity
-        ``valid`` (B, L - 1): row j -> j + 1 is one episode with no push."""
+        """Rows tau .. tau + length - 1, (B, L, ...), with each transition's
+        ``next_state`` and its validity ``valid`` (B, L - 1): row j -> j + 1 is one
+        episode with no push. With ``terminal_states``, an episode's last
+        transition is also valid, ``next_state`` holds its true state and
+        ``ended`` (B, L - 1) marks it; see ``rollout_mask``."""
         steps = tau.unsqueeze(1) + torch.arange(length, device=self.device)
         slot = self._slot(steps)
         e = env.unsqueeze(1).expand_as(slot)
@@ -116,6 +165,14 @@ class SequenceReplay:
         }
         es = out["episode_step"]
         out["valid"] = (es[:, 1:] == es[:, :-1] + 1) & ~out["push"][:, 1:]
+        out["next_state"] = out["state"][:, 1:]
+        if self.terminal_state is not None:
+            rows, cols = slot[:, :-1], e[:, :-1]
+            ended = self.has_terminal[rows, cols]
+            # A row without a stored state keeps the next row, which is finite and masked.
+            out["next_state"] = torch.where(ended.unsqueeze(-1), self.terminal_state[rows, cols], out["next_state"])
+            out["valid"] = out["valid"] | ended
+            out["ended"] = ended
         return out
 
     def history(self, tau: Tensor, env: Tensor, length: int) -> dict[str, Tensor]:
@@ -136,3 +193,14 @@ class SequenceReplay:
             "frame": self.frame[self._slot(tau), env],
             "episode_step": es_now,
         }
+
+
+def rollout_mask(win: dict[str, Tensor], k: int) -> Tensor:
+    """(B, k): which transitions of an open-loop rollout on ``win`` count. The first
+    invalid transition stops the rollout, and so does the step after an episode's
+    last transition, which itself counts. Past that the rollout would cross a reset."""
+    valid = win["valid"][:, :k].float()
+    if "ended" not in win:
+        return torch.cumprod(valid, dim=1)
+    went_on = valid * (1 - win["ended"][:, :k].float())
+    return valid * torch.cat((torch.ones_like(valid[:, :1]), torch.cumprod(went_on[:, :-1], dim=1)), 1)
