@@ -275,6 +275,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         task_kwargs = dict(wm.task_kwargs)
         if wm.goal != "explicit" or wm.goal_encoder:
             task_kwargs.update(goal_mode=str(wm.goal), skill_encoder=str(wm.goal_encoder) or None)
+        if wm.contact_reward > 0:  # only when on, so a task without the keyword still loads by default
+            task_kwargs.update(contact_reward=float(wm.contact_reward), ref_contact_fix=bool(wm.ref_contact_fix))
         self.task: WorldModelTask = load_task(
             wm.task_model, env, device, sensor_noise=wm.sensor_noise, **task_kwargs
         )

@@ -37,6 +37,18 @@ class WMBPTTConfig:
     sensor_noise: bool = True
     """Add the task's sensor noise to policy features (collection, imagination
     and the deployed policy alike)."""
+    contact_reward: float = 0.0
+    """Weight of a foot-contact term in the world model's reward only (NDM Gym's
+    ``--contact_reward``, from InstantTrack): imagination and the critic's targets
+    see it; the env's reward, the training return and evaluation do not. Passed to
+    the task model as its ``contact_reward`` keyword only when positive: a plain
+    field, because Hydra cannot override entries of ``task_kwargs``. Needs a task
+    that takes it (G1-v3); refused with real windows, whose rewards are the env's
+    or the task's ``reward`` without it. 0 is off."""
+    ref_contact_fix: bool = False
+    """With ``contact_reward``: the reference's foot contact from each clip's own
+    floor instead of a fixed height (NDM Gym's ``--ref_contact_fix``, from
+    BlinkMimic). Passed to the task with ``contact_reward``."""
     goal_table: bool = False
     """Compute the policy goal of every reference frame once and read its row, in
     the env and the model alike. Outside compiled code, the numbers of the
@@ -453,6 +465,20 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
             raise ValueError(msg)
         if wm.actor_source == "real":
             msg = "wm.imag_start_perturb kicks imagined starts; actor_source=real runs the actor on recorded windows."
+            raise ValueError(msg)
+    if wm.contact_reward < 0:
+        msg = f"wm.contact_reward is a weight, at least 0; got {wm.contact_reward}."
+        raise ValueError(msg)
+    if wm.ref_contact_fix and wm.contact_reward == 0:
+        msg = "wm.ref_contact_fix calibrates wm.contact_reward's reference; set wm.contact_reward."
+        raise ValueError(msg)
+    if wm.contact_reward > 0:
+        taken = (getattr(task, "contact_reward", None), getattr(task, "ref_contact_fix", None))
+        if taken != (wm.contact_reward, wm.ref_contact_fix):
+            msg = f"wm.contact_reward needs a task that takes it (G1V3TrackingTask); this one holds {taken}."
+            raise ValueError(msg)
+        if "real" in (wm.actor_source, wm.critic_source):
+            msg = "wm.contact_reward is a term of imagined rewards; real windows score the env's (actor_source, critic_source)."
             raise ValueError(msg)
     for name in ("fit_terminal_transitions", "norm_from_collection"):
         if getattr(wm, name) and not getattr(task, "final_obs_is_post_step", False):
