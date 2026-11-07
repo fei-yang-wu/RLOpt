@@ -91,8 +91,10 @@ def recipe_schedule() -> ActorLR:
 
 def test_the_multiplier_holds_then_ramps_to_one_once() -> None:
     lr = recipe_schedule()
-    assert lr.on and lr.at(0) == 4.0
-    assert lr.observe(50, 0.5) is None and lr.at(100) == 4.0
+    assert lr.on
+    assert lr.at(0) == 4.0
+    assert lr.observe(50, 0.5) is None
+    assert lr.at(100) == 4.0
     assert "training return 0.800 >= 0.75 at iteration 100" in lr.observe(100, 0.8)
     assert lr.observe(150, 0.9) is None
     assert (lr.at(100), lr.at(250), lr.at(400), lr.at(5000)) == (4.0, 2.5, 1.0, 1.0)
@@ -108,7 +110,9 @@ def test_the_deadline_fires_without_the_return() -> None:
 
 def test_a_missing_return_does_not_fire_the_trigger() -> None:
     lr = recipe_schedule()
-    assert lr.observe(100, None) is None and lr.observe(200, float("nan")) is None and lr.decay_at is None
+    assert lr.observe(100, None) is None
+    assert lr.observe(200, float("nan")) is None
+    assert lr.decay_at is None
 
 
 def test_the_trigger_state_round_trips_and_is_required() -> None:
@@ -123,14 +127,20 @@ def test_the_trigger_state_round_trips_and_is_required() -> None:
 
 def test_off_is_one_at_every_iteration_and_saves_nothing() -> None:
     lr = ActorLR()
-    assert not lr.on and not lr.watches_return and lr.at(10**6) == 1.0
-    assert lr.observe(1400, 0.9) is None and lr.state_dict() == {}
+    assert not lr.on
+    assert not lr.watches_return
+    assert lr.at(10**6) == 1.0
+    assert lr.observe(1400, 0.9) is None
+    assert lr.state_dict() == {}
     lr.load_state_dict({})
 
 
 def test_a_constant_multiplier_has_no_trigger_state() -> None:
     lr = ActorLR(2.0)
-    assert lr.on and not lr.watches_return and lr.at(5000) == 2.0 and lr.state_dict() == {}
+    assert lr.on
+    assert not lr.watches_return
+    assert lr.at(5000) == 2.0
+    assert lr.state_dict() == {}
 
 
 def actor_lrs(agent: Any) -> list[float]:
@@ -173,7 +183,8 @@ def test_the_return_is_the_mean_of_per_episode_ratios_averaged_over_steps() -> N
     # Step 4 ends env 0 (0.16 over 2 steps) and env 2 (0.08 over 4 steps).
     second = (0.16 / (2 * scale) + 0.08 / (4 * scale)) / 2
     total, steps = agent._return_sums.tolist()
-    assert steps == 2 and total == pytest.approx(first + second, rel=1e-5)
+    assert steps == 2
+    assert total == pytest.approx(first + second, rel=1e-5)
     row: dict[str, float] = {}
     agent._observe_actor_lr(row)
     assert row["train/normalized_return"] == pytest.approx((first + second) / 2, rel=1e-5)
@@ -185,7 +196,8 @@ def test_a_log_row_without_an_ended_episode_reports_no_return() -> None:
     track(agent, [[0.1, 0.1]], [[False, False]])
     row: dict[str, float] = {}
     agent._observe_actor_lr(row)
-    assert "train/normalized_return" not in row and row["train/actor_lr_mult"] == 4.0
+    assert "train/normalized_return" not in row
+    assert row["train/actor_lr_mult"] == 4.0
 
 
 def test_the_return_trigger_fires_in_a_run_and_the_ramp_lowers_the_lr() -> None:

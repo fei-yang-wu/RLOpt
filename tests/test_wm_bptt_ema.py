@@ -45,7 +45,8 @@ def test_first_update_copies_and_later_ones_follow_the_formula() -> None:
         torch.testing.assert_close(state[name], old[name] + (1 - DECAY) * (live[name] - old[name]), rtol=1e-6, atol=1e-7)
     assert state["obs_norm.count"] == live["obs_norm.count"]
     assert state["obs_norm.frozen"] == live["obs_norm.frozen"]
-    assert state["obs_norm.count"].dtype == torch.float64 and state["obs_norm.frozen"].dtype == torch.bool
+    assert state["obs_norm.count"].dtype == torch.float64
+    assert state["obs_norm.frozen"].dtype == torch.bool
 
 
 def test_the_average_equals_torch_averaged_model_bit_for_bit() -> None:
@@ -78,7 +79,8 @@ def test_the_average_changes_nothing_in_training() -> None:
 def trained(tmp_path: Path, name: str = "ema.pt"):
     agent = harness.make_agent(actor_ema=DECAY, **RUN)
     agent.train()
-    assert agent.actor_avg is not None and agent.actor_avg.updates > 1
+    assert agent.actor_avg is not None
+    assert agent.actor_avg.updates > 1
     path = tmp_path / name
     agent.save_model(path)
     return agent, path
@@ -148,7 +150,7 @@ def test_resume_refuses_another_ema(tmp_path: Path, saved: float, resuming: floa
     agent.train()
     path = tmp_path / "a.pt"
     agent.save_model(path)
-    with pytest.raises(ValueError, match="(actor_ema|policy_live_state_dict)"):
+    with pytest.raises(ValueError, match=r"(actor_ema|policy_live_state_dict)"):
         harness.make_agent(actor_ema=resuming).load_model(str(path))
 
 
@@ -169,8 +171,10 @@ def test_off_adds_nothing(tmp_path: Path) -> None:
     path = tmp_path / "off.pt"
     agent.save_model(path)
     data = torch.load(path, weights_only=False)
-    assert agent.actor_avg is None and agent.policy_avg is None
-    assert "policy_live_state_dict" not in data and "actor_ema_updates" not in data
+    assert agent.actor_avg is None
+    assert agent.policy_avg is None
+    assert "policy_live_state_dict" not in data
+    assert "actor_ema_updates" not in data
     assert agent.collector_policy is agent.policy
 
 

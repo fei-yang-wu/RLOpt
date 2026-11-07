@@ -12,7 +12,11 @@ import torch
 import wm_bptt_harness as harness
 
 from rlopt.agent.wm_bptt.agent import LIGHT_CHECKPOINT_KEYS
-from rlopt.agent.wm_bptt.speed_options import CheckpointWriter, cpu_snapshot, full_checkpoint_due
+from rlopt.agent.wm_bptt.speed_options import (
+    CheckpointWriter,
+    cpu_snapshot,
+    full_checkpoint_due,
+)
 
 ITERATIONS = 8
 FRAMES = harness.frames_for(ITERATIONS)
@@ -105,9 +109,11 @@ def test_due_logic() -> None:
                 last = wall
         return out
 
-    assert not full_checkpoint_due(119.9, 0.0, 2.0) and full_checkpoint_due(120.0, 0.0, 2.0)
+    assert not full_checkpoint_due(119.9, 0.0, 2.0)
+    assert full_checkpoint_due(120.0, 0.0, 2.0)
     walls = [50.0 * k for k in range(1, 13)]
-    assert full(0.0, walls, 0.0) == [] and full(0.0, walls, 2.0) == [150.0, 300.0, 450.0, 600.0]
+    assert full(0.0, walls, 0.0) == []
+    assert full(0.0, walls, 2.0) == [150.0, 300.0, 450.0, 600.0]
     assert full(330.0, [330.0 + 50.0 * k for k in range(1, 6)], 2.0) == [480.0]
 
 
@@ -162,7 +168,8 @@ def test_a_snapshot_is_not_moved_by_later_updates() -> None:
     weight.add_(1.0)
     assert snapshot["a"].tolist() == [1.0, 1.0, 1.0]
     assert snapshot["b"][1][0].tolist() == [1.0, 1.0, 1.0]
-    assert snapshot["b"][1][1] == 2 and snapshot["c"] == "text"
+    assert snapshot["b"][1][1] == 2
+    assert snapshot["c"] == "text"
 
 
 def test_the_writer_writes_atomically_and_in_order(tmp_path: Path) -> None:
@@ -178,7 +185,7 @@ def test_a_failed_write_raises_at_close(tmp_path: Path) -> None:
     (tmp_path / "file").write_text("not a directory")
     writer = CheckpointWriter()
     writer.submit({"i": 0}, tmp_path / "file" / "a.pt")
-    with pytest.raises(OSError):
+    with pytest.raises(FileExistsError):
         writer.close()
 
 
@@ -189,14 +196,15 @@ def test_a_failed_write_raises_in_the_loop(tmp_path: Path) -> None:
     deadline = time.monotonic() + 10
     while not writer._pending[0].done() and time.monotonic() < deadline:
         time.sleep(0.01)
-    with pytest.raises(OSError):
+    with pytest.raises(FileExistsError):
         writer.submit({"i": 1}, tmp_path / "b.pt")
     writer.close()
 
 
 def test_a_failed_write_stops_the_training_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(_payload: dict[str, Any], _target: Path) -> None:
-        raise OSError("disk full")
+        msg = "disk full"
+        raise OSError(msg)
 
     monkeypatch.setattr(CheckpointWriter, "_write", staticmethod(fail))
     with pytest.raises(OSError, match="disk full"):

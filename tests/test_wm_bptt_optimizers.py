@@ -34,7 +34,8 @@ def adam_settings(agent: Any, setting: str) -> list[Any]:
 def test_default_optimizers_are_unfused() -> None:
     agent = harness.make_agent()
     assert type(agent.wm_optim) is torch.optim.AdamW
-    assert type(agent.actor_optim) is torch.optim.Adam and type(agent.critic_optim) is torch.optim.Adam
+    assert type(agent.actor_optim) is torch.optim.Adam
+    assert type(agent.critic_optim) is torch.optim.Adam
     assert not any(adam_settings(agent, "fused"))
 
 
@@ -116,7 +117,8 @@ def test_muon_takes_exactly_the_hidden_matrices() -> None:
     assert muon_ids(opt) == {id(m.weight) for m in linears(net)[1:-1]}
     assert not muon_ids(opt) & adam_ids(opt)
     assert muon_ids(opt) | adam_ids(opt) == {id(p) for p in net.parameters()}
-    assert opt.muon.defaults["adjust_lr_fn"] == "match_rms_adamw" and opt.muon.defaults["weight_decay"] == 0
+    assert opt.muon.defaults["adjust_lr_fn"] == "match_rms_adamw"
+    assert opt.muon.defaults["weight_decay"] == 0
     assert opt.adam.defaults["betas"] == (0.9, 0.95)
 
 
@@ -140,7 +142,8 @@ def test_set_lr_reaches_float_and_tensor_learning_rates() -> None:
     lr = torch.tensor(1.0)
     opt.adam.param_groups[0]["lr"] = lr
     set_lr(opt, 2e-4)
-    assert opt.adam.param_groups[0]["lr"] is lr and lr.item() == pytest.approx(2e-4)
+    assert opt.adam.param_groups[0]["lr"] is lr
+    assert lr.item() == pytest.approx(2e-4)
 
 
 def test_a_restored_muon_steps_as_the_original() -> None:
@@ -213,7 +216,8 @@ def test_capturable_muon_replays_in_a_cuda_graph_and_reads_the_filled_lr() -> No
     x = torch.randn(32, 6, device="cuda")
     net = small_net().cuda()
     opt = MuonAdam(net, [net], lr=1e-2, capturable=True)
-    assert opt.adam.defaults["capturable"] and opt.adam.defaults["fused"]
+    assert opt.adam.defaults["capturable"]
+    assert opt.adam.defaults["fused"]
     for _ in range(2):  # warm up the state tensors before capture
         step_on(net, opt, x)
     side = torch.cuda.Stream()
@@ -238,7 +242,8 @@ def test_capturable_muon_replays_in_a_cuda_graph_and_reads_the_filled_lr() -> No
     set_lr(opt, 1e-2)
     full = change_after_replay()
     set_lr(opt, 0.0)
-    assert full > 0 and change_after_replay() == 0.0
+    assert full > 0
+    assert change_after_replay() == 0.0
 
 
 @cuda
@@ -294,7 +299,7 @@ def test_a_muon_checkpoint_of_other_sizes_with_an_average_scores_on_a_default_ag
     evaluator = harness.make_agent()
     evaluator.load_policy(str(path))
     assert harness.state_equal(evaluator.actor.state_dict(), trained.actor_avg.module.state_dict())
-    with pytest.raises(ValueError, match="(actor_ema|policy_live|actor_opt|wm_opt)"):
+    with pytest.raises(ValueError, match=r"(actor_ema|policy_live|actor_opt|wm_opt)"):
         harness.make_agent().load_model(str(path))
 
 

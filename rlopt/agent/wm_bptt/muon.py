@@ -64,9 +64,11 @@ class MuonAdam:
         muon = [p for p in model.parameters() if id(p) in hidden]
         adam = [p for p in model.parameters() if id(p) not in hidden]
         if len(muon) != len(hidden):
-            raise ValueError("Muon's matrices must be parameters of the model")
+            msg = "Muon's matrices must be parameters of the model"
+            raise ValueError(msg)
         if not muon:
-            raise ValueError("MuonAdam: no matrices for Muon")
+            msg = "MuonAdam: no matrices for Muon"
+            raise ValueError(msg)
         self.capturable = capturable
         if capturable:
             dev = muon[0].device
@@ -90,11 +92,16 @@ class MuonAdam:
     @torch.no_grad()
     def _muon_step_tensor_lr(self, ok: Tensor | None = None) -> None:
         """``torch.optim.Muon``'s step with each group's 0-dim device learning rate; ``ok`` as in ``step``."""
-        from torch.optim._muon import _adjust_lr, _zeropower_via_newtonschulz
+        # Private torch API, needed only here: a torch without it still builds plain MuonAdam.
+        from torch.optim._muon import (  # noqa: PLC0415
+            _adjust_lr,
+            _zeropower_via_newtonschulz,
+        )
 
         for g in self.muon.param_groups:
             if g["weight_decay"] != 0.0:
-                raise ValueError("MuonAdam's tensor-lr step has no weight decay")
+                msg = "MuonAdam's tensor-lr step has no weight decay"
+                raise ValueError(msg)
             for p in g["params"]:
                 if p.grad is None:
                     continue
@@ -129,7 +136,8 @@ class MuonAdam:
                 for t, k in zip(ps + bufs, keep, strict=True):
                     t.copy_(torch.where(ok, t, k))
             if not self.adam.defaults.get("fused"):
-                raise ValueError("a gated MuonAdam step needs the fused Adam (wm.fused_adam)")
+                msg = "a gated MuonAdam step needs the fused Adam (wm.fused_adam)"
+                raise ValueError(msg)
             self.adam.found_inf = (~ok).float()  # the fused kernel skips the step and undoes its step count
             try:
                 self.adam.step()

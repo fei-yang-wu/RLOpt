@@ -54,15 +54,18 @@ def test_inference_load_reads_only_the_policy_entries(tmp_path: Path) -> None:
     evaluator = harness.make_agent()
     evaluator.load_policy(str(stripped))
     assert_same_policy(evaluator, trained)
-    assert evaluator._iteration == 0 and evaluator._resume_frame_offset == 0
+    assert evaluator._iteration == 0
+    assert evaluator._resume_frame_offset == 0
 
 
 def test_inference_load_takes_action_semantics_from_the_checkpoint(tmp_path: Path) -> None:
     _, path = trained_checkpoint(tmp_path, bf16=False, sensor_noise=False)
     evaluator = harness.make_agent()
-    assert evaluator.policy_net.bf16 and evaluator.task.sensor_noise
+    assert evaluator.policy_net.bf16
+    assert evaluator.task.sensor_noise
     evaluator.load_policy(str(path))
-    assert not evaluator.policy_net.bf16 and not evaluator.task.sensor_noise
+    assert not evaluator.policy_net.bf16
+    assert not evaluator.task.sensor_noise
 
 
 def test_inference_load_of_an_older_checkpoint_reads_bf16_from_its_config(tmp_path: Path) -> None:

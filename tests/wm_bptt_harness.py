@@ -20,13 +20,13 @@ from torch import Tensor
 
 pytest.importorskip("imitation_experiments")
 
-from imitation_experiments.world_model.g1_v3_math import (  # noqa: E402
+from imitation_experiments.world_model.g1_v3_math import (
     G1V3ReferenceLibrary,
     joint_limits,
 )
 
-from rlopt.agent.wm_bptt.agent import WMBPTT  # noqa: E402
-from rlopt.agent.wm_bptt.config import WMBPTTConfig, WMBPTTRLOptConfig  # noqa: E402
+from rlopt.agent.wm_bptt.agent import WMBPTT
+from rlopt.agent.wm_bptt.config import WMBPTTConfig, WMBPTTRLOptConfig
 
 G1_V3_TASK = "imitation_experiments.world_model.g1_v3_task:G1V3TrackingTask"
 SMALL = {
@@ -84,7 +84,7 @@ class FakeIsaacEnv:
         q0 = joint_limits("cpu").mean(-1).to(self.device).unsqueeze(0)
         robot = SimpleNamespace(
             data=SimpleNamespace(default_joint_pos=q0),
-            find_joints=lambda names, preserve_order: (list(range(29)), names),
+            find_joints=lambda names, **_kwargs: (list(range(29)), names),
         )
         self.scene = {"robot": robot}
 
