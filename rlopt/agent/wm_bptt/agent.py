@@ -60,7 +60,7 @@ from rlopt.agent.wm_bptt.task import (
 from rlopt.base_class import BaseAlgorithm, TrainingMetadata, honours_train_time_budget
 
 ARCH_TAG = "wmbptt-v1"
-RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0}
+RESUME_MATCH: dict[str, Any] = {"actor_ema": 0.0, "fused_adam": False}
 """``wm`` fields a resumed run must share with its checkpoint, with the value a
 checkpoint from before the field implies: they set which optimizers and which
 policy entries the checkpoint holds."""
@@ -291,9 +291,10 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     def _configure_optimizers(self):  # type: ignore[override]
         wm = self.config.wm
-        self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=wm.wm_lr, weight_decay=wm.wm_weight_decay)
-        self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=wm.actor_lr, betas=tuple(wm.actor_betas))
-        self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=wm.critic_lr)
+        adam_kw = {"fused": True} if wm.fused_adam else {}
+        self.wm_optim = torch.optim.AdamW(self._dynamics_parameters(), lr=wm.wm_lr, weight_decay=wm.wm_weight_decay, **adam_kw)
+        self.actor_optim = torch.optim.Adam(self.actor.net.parameters(), lr=wm.actor_lr, betas=tuple(wm.actor_betas), **adam_kw)
+        self.critic_optim = torch.optim.Adam(self.critic.net.parameters(), lr=wm.critic_lr, **adam_kw)
         self.lr_scheduler = None
 
     def _compile_components(self) -> None:

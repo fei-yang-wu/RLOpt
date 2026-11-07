@@ -175,6 +175,9 @@ class WMBPTTConfig:
     critic_grad_clip_norm: float = 1.0
 
     # -- schedule ---------------------------------------------------------------
+    fused_adam: bool = False
+    """Fused Adam kernels for every optimizer: one launch per step. Changes
+    rounding, so a resumed run must match its checkpoint."""
     lr_cosine_iters: int = 250_000
     lr_final_ratio: float = 0.03
     bf16: bool = True
