@@ -100,7 +100,8 @@ class WorldModelTask(Protocol):
     # once per iteration, outside compiled code, when it exists.
     # Optional: ``final_obs_is_post_step = True`` says the env's batched
     # ``extras["final_obs"]`` holds each ended episode's state after its last
-    # step, before the reset; ``wm.fit_terminal_transitions`` needs it.
+    # step, before the reset; ``wm.fit_terminal_transitions`` and
+    # ``wm.norm_from_collection`` need it.
     # Optional: ``goal_binding()`` returns a JSON-able record of what produces
     # the policy's goal input (for example a frozen encoder's weight hash);
     # checkpoints store it and loading refuses a mismatch.

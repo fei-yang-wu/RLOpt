@@ -412,7 +412,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         done = (terminated | truncated).reshape(-1).bool()
         self._track_episodes(reward.reshape(-1), done)
         if self._unpublished_ends is not None:
-            self._read_final_obs(extras, done, stats)
+            self._read_true_outcome(rows, action, obs, extras, done, stats)
         stats["env_reward"].append(reward.mean())
         log = extras.get("log") if isinstance(extras, dict) else None
         if log:
@@ -424,19 +424,32 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._frames_processed += self._num_envs
         return obs
 
-    def _read_final_obs(self, extras: Any, done: Tensor, stats: dict[str, list]) -> None:
-        """The true post-step rows of the episodes this step ended. The env publishes
-        them batched, before the reset that overwrites them; the rows of the next
-        observation are already the next episodes'."""
+    def _read_true_outcome(
+        self, rows: dict[str, Tensor], action: Tensor, obs: dict[str, Any], extras: Any, done: Tensor, stats: dict[str, list]
+    ) -> None:
+        """What the step really reached. Where an episode ended, the rows of ``obs``
+        are already the next episode's, so the env publishes the true post-step rows
+        in ``final_obs``, batched, before the reset overwrites them."""
+        wm = self.config.wm
         final = extras.get("final_obs") if isinstance(extras, dict) else None
+        ended = None
         if final is None:
             self._unpublished_ends += done.sum()
-            return
-        ids = final["_env_ids"].long()
-        end = self.task.read_obs(final["obs"][self.task.obs_group])
-        finite = torch.isfinite(end["state"]).all(-1)
-        stats["wm/terminal_nonfinite"].append((~finite).sum().float())
-        self.replay.set_terminal(ids, end["state"], finite & ~end["push"])
+        else:
+            ids = final["_env_ids"].long()
+            ended = self.task.read_obs(final["obs"][self.task.obs_group])
+            if wm.fit_terminal_transitions:
+                finite = torch.isfinite(ended["state"]).all(-1)
+                stats["wm/terminal_nonfinite"].append((~finite).sum().float())
+                self.replay.set_terminal(ids, ended["state"], finite & ~ended["push"])
+        if wm.norm_from_collection:
+            after = self.task.read_obs(obs[self.task.obs_group])
+            state, push = after["state"].contiguous(), after["push"]  # one layout, for the compiled features
+            if ended is not None:
+                state = state.index_copy(0, ids, ended["state"])
+                push = push.index_copy(0, ids, ended["push"])
+            keep = ~push & torch.isfinite(state).all(-1) & torch.isfinite(rows["state"]).all(-1)
+            self._update_wm_norms((rows["state"], state, action, rows["context"]), keep)
 
     @torch.no_grad()
     def _track_episodes(self, reward: Tensor, done: Tensor) -> None:
@@ -500,15 +513,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         for _ in range(wm.wm_batches_per_iter):
             tau, env = self.replay.sample_starts(wm.wm_batch_size, k)
             win = self.replay.window(tau, env, k + 1)
-            if wm.no_sync:
-                self._update_wm_norms_on_device(win)
-                scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
-            elif self.dynamics.out_norm.count < wm.norm_freeze_samples:
-                v = win["valid"][:, 0]
-                if v.any():
-                    x, inc = self._valid_norm_features(win, v)
-                    self.dynamics.in_norm.update(x)
-                    self.dynamics.out_norm.update(inc)
+            if not wm.norm_from_collection:
+                self._update_wm_norms(self._first_transition(win), win["valid"][:, 0])
                 scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
             errs, mask = self._wm_rollout(win, k, grad=True)
             per = (errs / scale).square().mean(-1)  # (B, k)
@@ -538,15 +544,20 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self.dynamics.in_norm.frozen.fill_(True)
             self.dynamics.out_norm.frozen.fill_(True)
 
-    def _update_wm_norms_on_device(self, win: dict[str, Tensor]) -> None:
-        """``wm.no_sync``: the world model's normalizers on a batch's first
-        transitions, the invalid ones masked, until they hold enough samples."""
+    def _update_wm_norms(self, rows: tuple[Tensor, Tensor, Tensor, Tensor], valid: Tensor) -> None:
+        """The world model's normalizers on the ``valid`` transitions of ``rows``
+        (state, next state, action, context), until they hold enough samples.
+        ``wm.no_sync``: the invalid rows are masked, with no host read."""
         wm, d = self.config.wm, self.dynamics
-        live = d.out_norm.count < wm.norm_freeze_samples
-        valid = win["valid"][:, 0]
-        x, inc = self._norm_features_fn()(*self._first_transition(win))
-        update_norm_on_device(d.in_norm, x, valid, live)
-        update_norm_on_device(d.out_norm, inc, valid, live)
+        if wm.no_sync:
+            live = d.out_norm.count < wm.norm_freeze_samples
+            x, inc = self._norm_features_fn()(*rows)
+            update_norm_on_device(d.in_norm, x, valid, live)
+            update_norm_on_device(d.out_norm, inc, valid, live)
+        elif d.out_norm.count < wm.norm_freeze_samples and valid.any():
+            x, inc = self._valid_norm_features(rows, valid)
+            d.in_norm.update(x)
+            d.out_norm.update(inc)
 
     @staticmethod
     def _first_transition(win: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -563,9 +574,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self._compiled_norm_features = fn
         return fn
 
-    def _valid_norm_features(self, win: dict[str, Tensor], v: Tensor) -> tuple[Tensor, Tensor]:
-        """The normalizers' features of the first transitions ``v`` keeps."""
-        rows = self._first_transition(win)
+    def _valid_norm_features(self, rows: tuple[Tensor, Tensor, Tensor, Tensor], v: Tensor) -> tuple[Tensor, Tensor]:
+        """The normalizers' features of the transitions ``v`` keeps."""
         if self.config.wm.compile_eager:
             # Every row, so the compiled function sees one shape; features are per row.
             x, inc = self._norm_features_fn()(*rows)
@@ -1296,8 +1306,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         missing = int(self._unpublished_ends)
         if missing:
             msg = (
-                f"wm.fit_terminal_transitions: {missing} episodes ended since the last log row with no "
-                "final_obs, so their true last state is lost. This env does not publish it."
+                f"wm.fit_terminal_transitions and wm.norm_from_collection read the true last state of an episode, "
+                f"and {missing} episodes ended since the last log row with no final_obs. This env does not publish it."
             )
             raise RuntimeError(msg)
 
@@ -1357,7 +1367,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 self._return_sums = torch.zeros(2, device=self.device)
             if wm.no_sync:
                 self._device_counts = torch.zeros(len(DEVICE_COUNTS), device=self.device)
-            if wm.fit_terminal_transitions:
+            if wm.fit_terminal_transitions or wm.norm_from_collection:
                 self._unpublished_ends = torch.zeros((), dtype=torch.long, device=self.device)
         return self.replay
 

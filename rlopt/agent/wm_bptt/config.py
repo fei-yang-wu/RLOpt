@@ -90,6 +90,12 @@ class WMBPTTConfig:
     it. A non-finite or pushed final state is not fit (``wm/terminal_nonfinite``
     counts the first kind per step with an ended episode), and real windows
     (``actor_source``, ``critic_source``) keep their own episode masks."""
+    norm_from_collection: bool = False
+    """Fit the input and increment normalizers on every collected transition of
+    every env, as NDM Gym does, not on the first transitions of the sampled windows.
+    An episode's last transition counts, from the true state in ``final_obs``, with
+    or without ``fit_terminal_transitions``. Pushed and non-finite rows do not count.
+    ``norm_freeze_samples`` then counts collected transitions."""
 
     # -- imagination / actor --------------------------------------------------
     horizon: int = 32
@@ -336,9 +342,10 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     if wm.reference_body_table and getattr(task, "build_reference_tables", None) is None:
         msg = "wm.reference_body_table needs a task with a reference table (G1V3TrackingTask)."
         raise ValueError(msg)
-    if wm.fit_terminal_transitions and not getattr(task, "final_obs_is_post_step", False):
-        msg = "wm.fit_terminal_transitions reads the true state after a step from final_obs, which this task's env does not hold."
-        raise ValueError(msg)
+    for name in ("fit_terminal_transitions", "norm_from_collection"):
+        if getattr(wm, name) and not getattr(task, "final_obs_is_post_step", False):
+            msg = f"wm.{name} reads the true state after a step from final_obs, which this task's env does not hold."
+            raise ValueError(msg)
     if wm.no_sync:
         if not wm.fused_adam:
             msg = "wm.no_sync skips a non-finite step with the fused Adam; set wm.fused_adam."

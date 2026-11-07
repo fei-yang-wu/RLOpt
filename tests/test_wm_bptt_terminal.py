@@ -300,23 +300,8 @@ def test_the_option_stays_out_of_resume_matching(tmp_path: Any) -> None:
 
 
 # ------------------------------------------------------------------ recipes run on the GPU
-class SyncFreeFinalObsEnv(harness.FakeIsaacEnv):
-    """Every step ends the first four envs, with no host read of its own."""
-
-    def step(self, _action: Tensor) -> tuple[dict[str, Any], Tensor, Tensor, Tensor, dict[str, Any]]:
-        zeros = torch.zeros(self.n, device=self.device)
-        done = torch.arange(self.n, device=self.device) < 4
-        self.frame = self.frame + 1
-        self.episode = self.episode + 1
-        ids = torch.arange(4, device=self.device)
-        wm = {key: value[ids] for key, value in self._obs()["wm"].items()}
-        self.frame = torch.where(done | (self.frame >= self.v3_library.length[self.rank] - 2), 0, self.frame)
-        self.episode = torch.where(done, 0, self.episode)
-        return self._obs(), zeros, done, zeros.bool(), {"final_obs": {"_env_ids": ids, "obs": {"wm": wm}}}
-
-
 def census(**wm: Any) -> tuple[Any, dict[str, Any], dict[str, list]]:
-    agent = harness.make_agent(device="cuda:0", num_envs=64, env_cls=SyncFreeFinalObsEnv, **ON, **NO_SYNC, **wm)
+    agent = harness.make_agent(device="cuda:0", num_envs=64, env_cls=harness.SyncFreeFinalObsEnv, **ON, **NO_SYNC, **wm)
     agent.ensure_replay()
     obs, _ = agent._isaac.reset()
     stats: dict[str, list] = defaultdict(list)

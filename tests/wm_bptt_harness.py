@@ -156,6 +156,7 @@ class FinalObsFakeEnv(FakeIsaacEnv):
         state = state + 0.01 * torch.randn_like(state)
         state[:, 3:7] = state[:, 3:7] / state[:, 3:7].norm(dim=-1, keepdim=True)
         state[:, 2] -= self.FALL * failed.float()
+        self.true_next_state = state  # what a test compares against
         self.hist_state = torch.cat((self.hist_state[:, 1:], state[:, None]), 1)
         self.hist_action = torch.cat((self.hist_action[:, 1:], action[:, None]), 1)
         extras: dict[str, Any] = {}
@@ -172,6 +173,31 @@ class FinalObsFakeEnv(FakeIsaacEnv):
         self.hist_action[done] = 0
         reward = 0.05 + 0.02 * torch.cos(self.frame.float() * 0.1) - 0.001 * action.square().mean(-1)
         return self._obs(), reward, failed, clip_end, extras
+
+
+class SyncFreeFinalObsEnv(FakeIsaacEnv):
+    """Ends the first four envs on every second step, with no host read of its own.
+    The agent's reads are then the only ones a sync census sees."""
+
+    def __init__(self, num_envs: int, device: torch.device | str) -> None:
+        super().__init__(num_envs, device)
+        self.steps = 0
+
+    def step(self, _action: Tensor) -> tuple[dict[str, Any], Tensor, Tensor, Tensor, dict[str, Any]]:
+        zeros = torch.zeros(self.n, device=self.device)
+        self.steps += 1
+        self.frame = self.frame + 1
+        self.episode = self.episode + 1
+        extras: dict[str, Any] = {}
+        done = zeros.bool()
+        if self.steps % 2 == 0:
+            done = torch.arange(self.n, device=self.device) < 4
+            ids = torch.arange(4, device=self.device)
+            wm = {key: value[ids] for key, value in self._obs()["wm"].items()}
+            extras["final_obs"] = {"_env_ids": ids, "obs": {"wm": wm}}
+        self.frame = torch.where(done | (self.frame >= self.v3_library.length[self.rank] - 2), 0, self.frame)
+        self.episode = torch.where(done, 0, self.episode)
+        return self._obs(), zeros, done, zeros.bool(), extras
 
 
 def make_agent(
