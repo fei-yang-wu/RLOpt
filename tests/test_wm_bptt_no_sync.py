@@ -28,7 +28,11 @@ from rlopt.agent.wm_bptt.config import WMBPTTConfig
 from rlopt.agent.wm_bptt.muon import MuonAdam
 from rlopt.agent.wm_bptt.networks import RunningNorm
 from rlopt.agent.wm_bptt.replay import SequenceReplay
-from rlopt.agent.wm_bptt.speed_options import gated_step, update_norm_on_device, zero_nonfinite_grads
+from rlopt.agent.wm_bptt.speed_options import (
+    gated_step,
+    update_norm_on_device,
+    zero_nonfinite_grads,
+)
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 DEVICES = ["cpu", pytest.param("cuda:0", marks=cuda)]
@@ -188,8 +192,8 @@ def fix_starts(agent: WMBPTT, starts: tuple[Tensor, Tensor]) -> None:
 
 
 def assert_close_nest(got: dict[str, Any], want: dict[str, Any], **tolerance: float) -> None:
-    for name in want:
-        for key, value in want[name].items():
+    for name, state in want.items():
+        for key, value in state.items():
             if isinstance(value, Tensor) and value.is_floating_point():
                 torch.testing.assert_close(got[name][key], value, **tolerance)
 
@@ -269,7 +273,8 @@ def test_normalizers_freeze_at_the_same_sample_count() -> None:
         torch.manual_seed(3)
         for _ in range(3):
             agent._update_world_model(defaultdict(list))
-        assert bool(agent.dynamics.out_norm.frozen) and bool(agent.dynamics.in_norm.frozen)
+        assert bool(agent.dynamics.out_norm.frozen)
+        assert bool(agent.dynamics.in_norm.frozen)
     assert host.dynamics.out_norm.count.item() == on_device.dynamics.out_norm.count.item()
 
 
@@ -406,7 +411,8 @@ def test_device_starts_follow_the_rejection_sampler() -> None:
     n = batch * draws
     cells = len(exact)
     bound = cells + 5 * math.sqrt(2 * cells)
-    assert set(fast) <= set(exact) and set(slow) <= set(exact)
+    assert set(fast) <= set(exact)
+    assert set(slow) <= set(exact)
     for counts in (fast, slow):
         chi2 = sum((counts[c] - n * e / total) ** 2 / (n * e / total) for c, e in exact.items())
         assert chi2 < bound, (chi2, bound)
@@ -415,7 +421,7 @@ def test_device_starts_follow_the_rejection_sampler() -> None:
 
 
 class MostlyInvalidTask(StartTask):
-    def valid_imagination_start(self, rank: Tensor, frame: Tensor, horizon: int) -> Tensor:
+    def valid_imagination_start(self, _rank: Tensor, frame: Tensor, _horizon: int) -> Tensor:
         return frame == 0
 
 
@@ -446,19 +452,24 @@ def test_a_no_sync_run_trains_and_resumes(tmp_path: Path) -> None:
     agent.train()
     assert all(torch.isfinite(p).all() for p in agent.actor.parameters())
     assert not harness.state_equal(before, agent.actor.state_dict())
-    assert rows and all(row["wm/nonfinite"] == 0 and row["actor/nonfinite"] == 0 for row in rows)
+    assert rows
+    assert all(row["wm/nonfinite"] == 0 for row in rows)
+    assert all(row["actor/nonfinite"] == 0 for row in rows)
     path = tmp_path / "run.pt"
     agent.save_model(path)
     resumed = harness.make_agent(frames=harness.frames_for(6), **ON)
     resumed.load_model(str(path))
     assert harness.state_equal(agent.actor.state_dict(), resumed.actor.state_dict())
     resumed.train()
+    scorer = harness.make_agent()  # what the evaluator builds: the task's default config
+    scorer.load_policy(str(path))
+    assert harness.state_equal(agent.actor.state_dict(), scorer.actor.state_dict())
 
 
 def test_the_default_run_has_no_device_counts() -> None:
     agent = harness.make_agent(frames=harness.frames_for(2))
     agent.train()
-    assert not hasattr(agent, "_device_counts")
+    assert agent._device_counts is None
 
 
 # ------------------------------------------------------------------ host reads
@@ -474,7 +485,7 @@ def loop(agent: WMBPTT, obs: dict[str, Any], stats: dict[str, list]) -> dict[str
 class SyncFreeEnv(harness.FakeIsaacEnv):
     """The stand-in's ``step`` reads the host itself; the agent's reads are the census."""
 
-    def step(self, action: Tensor) -> tuple[dict[str, Any], Tensor, Tensor, Tensor, dict[str, Any]]:
+    def step(self, _action: Tensor) -> tuple[dict[str, Any], Tensor, Tensor, Tensor, dict[str, Any]]:
         zeros = torch.zeros(self.n, device=self.device)
         self.frame = self.frame + 1
         self.episode = self.episode + 1

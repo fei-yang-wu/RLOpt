@@ -227,6 +227,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     actor_avg: ActorAverage | None = None
     policy_avg: TensorDictModule | None = None
     _actor_lr: ActorLR = ActorLR()
+    _device_counts: Tensor | None = None
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -1257,7 +1258,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         out["train/lr_factor"] = self._lr_factor()
         if self._actor_lr.on:
             self._observe_actor_lr(out)
-        if self.config.wm.no_sync:
+        if self._device_counts is not None:
             self._read_device_counts(out)
         out["perf/iteration_s"] = it_time
         if "env/env_reward" in out:

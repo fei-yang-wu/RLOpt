@@ -18,12 +18,19 @@ from typing import Any
 import pytest
 import torch
 import wm_bptt_harness as harness
-from imitation_experiments.teleop.g1_kinematics import G1_TRACKED_BODY_NAMES, G1Kinematics
+from imitation_experiments.teleop.g1_kinematics import (
+    G1_TRACKED_BODY_NAMES,
+    G1Kinematics,
+)
 from imitation_experiments.world_model.g1_v3_math import rotate
 from torch import Tensor
 
 from rlopt.agent.wm_bptt.config import WMBPTTConfig
-from rlopt.agent.wm_bptt.speed_options import apply_compile_options, combo_kernels, elementwise_3x3_products
+from rlopt.agent.wm_bptt.speed_options import (
+    apply_compile_options,
+    combo_kernels,
+    elementwise_3x3_products,
+)
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 DEVICE = "cuda:0"
@@ -52,7 +59,7 @@ def run(*args: str, env: dict[str, str] | None = None) -> dict[str, Any]:
 
 # ------------------------------------------------------------------ the checks
 def table_entry() -> Any:
-    from torch._inductor import decomposition  # noqa: PLC0415
+    from torch._inductor import decomposition
 
     return decomposition.decompositions[torch.ops.aten.bmm.default]
 
@@ -122,7 +129,7 @@ def fk_inputs() -> tuple[Tensor, ...]:
 def check_products(on: str) -> dict[str, Any]:
     """Rotations and FK, compiled at matmul precision ``high`` as training runs them,
     against fp32 eager."""
-    from torch._inductor.utils import run_and_get_code  # noqa: PLC0415
+    from torch._inductor.utils import run_and_get_code
 
     if on == "on":
         elementwise_3x3_products()
@@ -148,7 +155,7 @@ def check_products(on: str) -> dict[str, Any]:
 
 def check_cache(on: str) -> dict[str, Any]:
     """One compile, reporting the FX graph cache's verdict."""
-    from torch._dynamo.utils import counters  # noqa: PLC0415
+    from torch._dynamo.utils import counters
 
     if on == "on":
         elementwise_3x3_products()
@@ -244,7 +251,8 @@ def test_a_default_agent_changes_no_compiler_state() -> None:
 
 def test_the_patch_applies_once_and_keeps_a_tag() -> None:
     got = run("patch")
-    assert got["patched"] and got["second_call_changes_nothing"]
+    assert got["patched"]
+    assert got["second_call_changes_nothing"]
     assert got["tag"] == "mine:rlopt:elementwise_3x3"
 
 

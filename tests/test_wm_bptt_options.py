@@ -88,7 +88,8 @@ def test_a_run_with_reference_tables_is_bit_identical_to_one_without(device: str
         agent = harness.make_agent(device=device, num_envs=64, frames=frames, **wm)
         agent.train()
         runs.append(harness.fingerprint(agent))
-    assert agent.task.library.goal_table is not None and agent.task.library.body_table is not None
+    assert agent.task.library.goal_table is not None
+    assert agent.task.library.body_table is not None
     assert runs[0] == runs[1]
 
 
