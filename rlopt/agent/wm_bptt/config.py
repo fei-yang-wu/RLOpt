@@ -203,6 +203,19 @@ class WMBPTTConfig:
     """bf16 autocast for the MLP matmuls (integration, FK, reward stay fp32)."""
     compile: bool = False
     """``torch.compile`` the imagined control step (actor, model, reward)."""
+    elementwise_3x3: bool = False
+    """Float32 batched matrix products with every dimension at most 3 become
+    fused elementwise products inside compiled functions, instead of a cuBLAS
+    call each. Patches inductor for the whole process, before the first compile:
+    any other agent in the process gets it too. Changes rounding."""
+    compile_eager: bool = False
+    """Also compile what runs eagerly around the compiled steps: the critic's
+    input, the features of the world-model normalizers and the env's collection
+    reward, each with ``dynamic=False``. Changes rounding."""
+    combo_kernels: bool = False
+    """Inductor launches independent kernels of a compiled graph together.
+    Process-wide. Slower on an RTX A4500 at the default sizes (693 against 668 ms
+    per iteration), so measure it on the target GPU."""
     no_sync: bool = False
     """No host read in the update loop. The normalizers freeze on the device, and
     a window's valid rows are masked rather than indexed. A non-finite world-model
@@ -293,6 +306,13 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         if wm.wm_weight_decay != 0:
             msg = "wm.wm_opt=muon has no weight decay; set wm.wm_weight_decay to 0."
             raise ValueError(msg)
+    for name in ("elementwise_3x3", "compile_eager", "combo_kernels"):
+        if getattr(wm, name) and not wm.compile:
+            msg = f"wm.{name} acts inside compiled functions; set wm.compile."
+            raise ValueError(msg)
+    if wm.compile_eager and getattr(task, "compile_collection_reward", None) is None:
+        msg = "wm.compile_eager compiles the collection reward, which this task cannot reach."
+        raise ValueError(msg)
     if wm.no_sync:
         if not wm.fused_adam:
             msg = "wm.no_sync skips a non-finite step with the fused Adam; set wm.fused_adam."

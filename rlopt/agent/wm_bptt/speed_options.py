@@ -41,6 +41,51 @@ from rlopt.agent.wm_bptt.muon import MuonAdam
 from rlopt.agent.wm_bptt.networks import RunningNorm
 
 
+def elementwise_3x3_products() -> None:
+    """``wm.elementwise_3x3``: inside compiled functions, inductor decomposes the batched
+    matrix products whose dimensions are all at most 3 (rotation matrices, 3-vectors) into
+    fp32 elementwise products and sums, which it fuses with their neighbours, instead of one
+    cuBLAS call each. Under TF32, cuBLAS runs some of them as tensor-core GEMMs (relative
+    error 6e-4), so results change by more than rounding order.
+
+    This patches inductor's decomposition table for the whole process, so it must run before
+    the first compile. The compile caches do not key on that table, and a graph cached
+    without the patch would keep the cuBLAS products, so the patch also sets a cache tag.
+    """
+    import torch.compiler.config  # noqa: PLC0415
+    from torch._dynamo.utils import counters  # noqa: PLC0415
+    from torch._inductor import decomposition  # noqa: PLC0415
+
+    default = decomposition.decompositions[torch.ops.aten.bmm.default]
+    if getattr(default, "elementwise_3x3", False):
+        return  # this process has the patch: a second agent, for example
+    if counters["frames"]["total"] > 0:
+        msg = "wm.elementwise_3x3 must apply before the first compile: this process has compiled already."
+        raise RuntimeError(msg)
+    if not hasattr(torch.compiler.config, "cache_key_tag"):
+        msg = "wm.elementwise_3x3 needs torch.compiler.config.cache_key_tag, or a cached graph would bypass it."
+        raise RuntimeError(msg)
+
+    def bmm(a: Tensor, b: Tensor, out_dtype: torch.dtype | None = None) -> Tensor:
+        if out_dtype is None and a.dtype == torch.float32 and max(a.shape[1], a.shape[2], b.shape[2]) <= 3:
+            return (a.unsqueeze(-1) * b.unsqueeze(1)).sum(2)
+        return default(a, b, out_dtype)
+
+    bmm.elementwise_3x3 = True  # type: ignore[attr-defined]
+    decomposition.decompositions[torch.ops.aten.bmm.default] = bmm
+    decomposition.fast_random_decomps.cache_clear()
+    tag = torch.compiler.config.cache_key_tag
+    torch.compiler.config.cache_key_tag = f"{tag}:rlopt:elementwise_3x3" if tag else "rlopt:elementwise_3x3"
+
+
+def combo_kernels() -> None:
+    """``wm.combo_kernels``: inside compiled functions, inductor runs independent kernels of
+    a graph as one launch. Process-wide. The compile caches key on this setting."""
+    import torch._inductor.config  # noqa: PLC0415
+
+    torch._inductor.config.combo_kernels = True
+
+
 def set_lr(optimizer: Any, lr: float) -> None:
     """Every group's learning rate; a tensor one (a capturable optimizer's) is
     written in place, for the CUDA graph that reads it."""

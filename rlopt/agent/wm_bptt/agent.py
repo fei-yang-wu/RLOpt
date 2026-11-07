@@ -57,7 +57,9 @@ from rlopt.agent.wm_bptt.speed_options import (
     ActorLR,
     CheckpointWriter,
     atomic_save,
+    combo_kernels,
     cpu_snapshot,
+    elementwise_3x3_products,
     full_checkpoint_due,
     gated_step,
     set_lr,
@@ -334,10 +336,17 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     def _compile_components(self) -> None:
         self.compile_mode = None
-        if self.config.wm.compile:
+        wm = self.config.wm
+        if wm.compile:
             # The two compiled steps have a handful of guard variants (train vs
             # eval mode, first call); a low limit silently falls back to eager.
             torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+        if wm.elementwise_3x3:
+            elementwise_3x3_products()
+        if wm.combo_kernels:
+            combo_kernels()
+        if wm.compile_eager:
+            self.task.compile_collection_reward()  # type: ignore[attr-defined]
 
     def _progress_summary_fields(self) -> tuple[tuple[str, str], ...]:
         return (("wm/loss", "wm"), ("actor/objective", "J"), ("imagine/alive_H", "alive"))
@@ -481,9 +490,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             elif self.dynamics.out_norm.count < wm.norm_freeze_samples:
                 v = win["valid"][:, 0]
                 if v.any():
-                    s0, s1 = win["state"][v, 0], win["state"][v, 1]
-                    self.dynamics.in_norm.update(self.task.wm_input(s0, win["action"][v, 0], win["context"][v, 0]))
-                    self.dynamics.out_norm.update(self.task.increment(s0, s1))
+                    x, inc = self._valid_norm_features(win, v)
+                    self.dynamics.in_norm.update(x)
+                    self.dynamics.out_norm.update(inc)
                 scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
             errs, mask = self._wm_rollout(win, k, grad=True)
             per = (errs / scale).square().mean(-1)  # (B, k)
@@ -517,9 +526,33 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         wm, d = self.config.wm, self.dynamics
         live = d.out_norm.count < wm.norm_freeze_samples
         valid = win["valid"][:, 0]
-        s0, s1 = win["state"][:, 0], win["state"][:, 1]
-        update_norm_on_device(d.in_norm, self.task.wm_input(s0, win["action"][:, 0], win["context"][:, 0]), valid, live)
-        update_norm_on_device(d.out_norm, self.task.increment(s0, s1), valid, live)
+        x, inc = self._norm_features_fn()(*self._first_transition(win))
+        update_norm_on_device(d.in_norm, x, valid, live)
+        update_norm_on_device(d.out_norm, inc, valid, live)
+
+    @staticmethod
+    def _first_transition(win: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        return win["state"][:, 0], win["state"][:, 1], win["action"][:, 0], win["context"][:, 0]
+
+    def _norm_features(self, state: Tensor, next_state: Tensor, action: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor]:
+        """What the world model's input and increment normalizers fit."""
+        return self.task.wm_input(state, action, ctx), self.task.increment(state, next_state)
+
+    def _norm_features_fn(self):
+        fn = getattr(self, "_compiled_norm_features", None)
+        if fn is None:
+            fn = torch.compile(self._norm_features, dynamic=False) if self.config.wm.compile_eager else self._norm_features
+            self._compiled_norm_features = fn
+        return fn
+
+    def _valid_norm_features(self, win: dict[str, Tensor], v: Tensor) -> tuple[Tensor, Tensor]:
+        """The normalizers' features of the first transitions ``v`` keeps."""
+        rows = self._first_transition(win)
+        if self.config.wm.compile_eager:
+            # Every row, so the compiled function sees one shape; features are per row.
+            x, inc = self._norm_features_fn()(*rows)
+            return x[v], inc[v]
+        return self._norm_features(*(row[v] for row in rows))
 
     def _step_if_finite(self, optimizer: Any, params: Iterable[Tensor], grad_norm: Tensor, count: str) -> None:
         """``wm.no_sync``: ``optimizer``'s step unless ``grad_norm`` is non-finite,
@@ -782,7 +815,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                 # unchanged (no recompile).
                 if not sf and step + 1 == actor_h:
                     if wm.critic_bootstrap:
-                        v_a = self.critic(t.critic_obs(state, ctx, rank, frame), bf16=wm.bf16)
+                        v_a = self.critic(self._critic_obs_fn()(state, ctx, rank, frame), bf16=wm.bf16)
                         actor_objective = ret + (wm.gamma**actor_h) * alive * v_a
                     else:
                         actor_objective = ret
@@ -790,7 +823,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
                     x.detach().contiguous().requires_grad_(True) for x in (state, prop, prev_action)
                 )
         if wm.critic_bootstrap:
-            v_last = self.critic(t.critic_obs(state, ctx, rank, frame), bf16=wm.bf16)
+            v_last = self.critic(self._critic_obs_fn()(state, ctx, rank, frame), bf16=wm.bf16)
             objective = ret + (wm.gamma**H) * alive * v_last
         else:
             objective = ret
@@ -996,6 +1029,15 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             out["objective"] = objective
         return out
 
+    def _critic_obs_fn(self):
+        fn = getattr(self, "_compiled_critic_obs", None)
+        if fn is None:
+            fn = self.task.critic_obs
+            if self.config.wm.compile_eager:
+                fn = torch.compile(fn, dynamic=False)
+            self._compiled_critic_obs = fn
+        return fn
+
     def _critic_obs_seq(self, out: dict[str, Tensor]) -> Tensor:
         """Critic inputs (B * (H + 1), D) of a rollout's states."""
         states = out["states"]
@@ -1003,7 +1045,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         frames = out["frame0"].unsqueeze(1) + torch.arange(H1, device=self.device)
         rank = out["rank"].unsqueeze(1).expand(B, H1)
         ctx = out["ctx"].unsqueeze(1).expand(B, H1, out["ctx"].shape[-1])
-        return self.task.critic_obs(states.reshape(B * H1, S), ctx.reshape(B * H1, -1), rank.reshape(-1), frames.reshape(-1))
+        return self._critic_obs_fn()(states.reshape(B * H1, S), ctx.reshape(B * H1, -1), rank.reshape(-1), frames.reshape(-1))
 
     def _critic_values(self, out: dict[str, Tensor]) -> Tensor:
         B, H1 = out["states"].shape[:2]
@@ -1164,7 +1206,6 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     def _update_critic(self, out: dict[str, Tensor], metrics: dict[str, list]) -> None:
         wm = self.config.wm
-        t = self.task
         with torch.no_grad():
             states = out["states"].detach()  # (B, H+1, S)
             B, H1, S = states.shape
@@ -1172,7 +1213,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             frames = out["frame0"].unsqueeze(1) + torch.arange(H1, device=self.device)
             rank = out["rank"].unsqueeze(1).expand(B, H1)
             ctx = out["ctx"].unsqueeze(1).expand(B, H1, out["ctx"].shape[-1])
-            cobs = t.critic_obs(states.reshape(B * H1, S), ctx.reshape(B * H1, -1), rank.reshape(-1), frames.reshape(-1))
+            cobs = self._critic_obs_fn()(states.reshape(B * H1, S), ctx.reshape(B * H1, -1), rank.reshape(-1), frames.reshape(-1))
             self._update_norm(self.critic.obs_norm, cobs)
             values = self.critic(cobs, bf16=wm.bf16).reshape(B, H1)
             notdone = (1 - out["dones"].detach()) * out["cont"].detach()

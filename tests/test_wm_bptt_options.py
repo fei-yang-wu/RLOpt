@@ -49,6 +49,9 @@ REFUSED = [
     ({"actor_lr_mult": 4.0, "actor_lr_decay_return": 0.75, "actor_lr_decay_len": 300, "actor_lr_decay_by": 0}, "actor_lr_decay_by"),
     ({"last_every_min": 5.0}, "needs wm.ckpt_light"),
     ({"ckpt_light": True, "last_every_min": -1.0}, "last_every_min"),
+    ({"elementwise_3x3": True}, "set wm.compile"),
+    ({"compile_eager": True}, "set wm.compile"),
+    ({"combo_kernels": True}, "set wm.compile"),
     ({"no_sync": True}, "fused_adam"),
     ({"no_sync": True, "fused_adam": True, "actor_source": "real"}, "real windows"),
     ({"no_sync": True, "fused_adam": True, "critic_source": "real"}, "real windows"),
@@ -73,6 +76,13 @@ def test_ckpt_light_needs_periodic_checkpoints() -> None:
 def test_construction_validates() -> None:
     with pytest.raises(ValueError, match="actor_source"):
         harness.make_agent(actor_source="dream")
+
+
+def test_compile_eager_needs_a_task_that_reaches_the_collection_reward() -> None:
+    wm = {"compile": True, "compile_eager": True}
+    validate_options(config(**wm), SimpleNamespace(compile_collection_reward=lambda: None))
+    with pytest.raises(ValueError, match="collection reward"):
+        validate_options(config(**wm), TASK)
 
 
 def test_a_return_trigger_needs_a_task_that_scales_the_return() -> None:
