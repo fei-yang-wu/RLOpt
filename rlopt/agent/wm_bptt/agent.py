@@ -121,6 +121,18 @@ def _plain(value: Any) -> Any:
     return value
 
 
+def _read_scalars(values: dict[str, Any]) -> dict[str, float]:
+    """``{name: float(value)}`` in the same order, with one host read for all
+    device tensors instead of one each. A float32 value reaches float64 exactly
+    either way, so the numbers are ``float``'s."""
+    on_device = [k for k, v in values.items() if isinstance(v, Tensor) and v.device.type != "cpu"]
+    read: dict[str, float] = {}
+    if on_device:
+        stacked = torch.stack([values[k].detach().reshape(()).double() for k in on_device])
+        read = dict(zip(on_device, stacked.tolist(), strict=True))
+    return {k: read[k] if k in read else float(v) for k, v in values.items()}
+
+
 def _stacked(update: Callable[[dict[str, list]], None]) -> dict[str, Tensor]:
     """``update``'s metrics, one stacked device tensor per name: the outputs a
     captured update returns (``wm.update_graphs``)."""
@@ -681,23 +693,25 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         tau, env = self.replay.sample_starts(wm.eval_batch, L)
         win = self.replay.window(tau, env, L + 1)
         errs, mask = self._wm_rollout(win, L, grad=False)
-        out: dict[str, float] = {}
+        # Device values, read together: one host read per horizon (the selection's
+        # size) and one for all values, rather than one per value.
+        out: dict[str, Tensor] = {}
         scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
         for k in (1, 8, 32):
             if k > L:
                 continue
             m = mask[:, k - 1] > 0
-            if not m.any():
-                continue
             e = errs[m, k - 1]
-            out[f"wm_eval/k{k}_root_pos_mm"] = float(e[:, 0:3].norm(dim=-1).mean() * 1000)
-            out[f"wm_eval/k{k}_root_rot_deg"] = float(e[:, 3:6].norm(dim=-1).mean() * 180 / math.pi)
-            out[f"wm_eval/k{k}_root_lin_vel"] = float(e[:, 6:9].norm(dim=-1).mean())
-            out[f"wm_eval/k{k}_joint_pos_deg"] = float(e[:, 12:41].abs().mean() * 180 / math.pi)
-            out[f"wm_eval/k{k}_joint_vel"] = float(e[:, 41:70].abs().mean())
-            out[f"wm_eval/k{k}_normalized"] = float((e / scale).square().mean())
-            out[f"wm_eval/k{k}_windows"] = float(m.float().sum())
-        return out
+            if e.shape[0] == 0:
+                continue
+            out[f"wm_eval/k{k}_root_pos_mm"] = e[:, 0:3].norm(dim=-1).mean() * 1000
+            out[f"wm_eval/k{k}_root_rot_deg"] = e[:, 3:6].norm(dim=-1).mean() * 180 / math.pi
+            out[f"wm_eval/k{k}_root_lin_vel"] = e[:, 6:9].norm(dim=-1).mean()
+            out[f"wm_eval/k{k}_joint_pos_deg"] = e[:, 12:41].abs().mean() * 180 / math.pi
+            out[f"wm_eval/k{k}_joint_vel"] = e[:, 41:70].abs().mean()
+            out[f"wm_eval/k{k}_normalized"] = (e / scale).square().mean()
+            out[f"wm_eval/k{k}_windows"] = m.float().sum()
+        return _read_scalars(out)
 
     # ------------------------------------------------------------ imagination
     def _imagine_step(
@@ -1348,15 +1362,16 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
 
     # ------------------------------------------------------------ loop
     def _flush(self, metrics: dict[str, list], stats: dict[str, list], it_time: float) -> dict[str, float]:
-        out: dict[str, float] = {}
+        means: dict[str, Tensor] = {}
         for src in (metrics, stats):
             for k, vals in src.items():
                 if not vals:
                     continue
                 name = k if "/" in k else f"env/{k}"
                 values = [torch.as_tensor(v, device=self.device, dtype=torch.float32) for v in vals]
-                out[name] = float(torch.stack(values).mean())
+                means[name] = torch.stack(values).mean()
             src.clear()
+        out = _read_scalars(means)  # one host read for every mean
         out.update(self._wm_eval())
         if self._unpublished_ends is not None:
             self._check_final_obs()
@@ -1416,7 +1431,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         reader = self._env_attribute("live_log_metrics", None)
         if not callable(reader):
             return {}
-        return {key: float(value) for key, value in reader().items()}
+        return _read_scalars(reader())
 
     def _checkpoint_dir(self) -> Path:
         return self.log_dir / self.config.logger.save_path
