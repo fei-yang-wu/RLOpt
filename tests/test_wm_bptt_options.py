@@ -225,3 +225,24 @@ def test_the_off_path_allocates_nothing_and_logs_nothing() -> None:
     agent.train()
     assert not hasattr(agent, "_return_sums")
     assert agent._actor_lr.state_dict() == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_per_step_option_paths_do_not_synchronize() -> None:
+    """Contract 6: the return sums and the average stay on the device."""
+    agent = harness.make_agent(
+        device="cuda:0", num_envs=4, actor_ema=0.9, actor_lr_mult=4.0, actor_lr_decay_return=0.75, actor_lr_decay_len=3
+    )
+    agent.ensure_replay()
+    reward = torch.full((4,), 0.05, device="cuda:0")
+    done = torch.tensor([True, False, True, False], device="cuda:0")
+    agent.actor_avg.update()  # the copying call
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        agent._track_episodes(reward, done)
+        agent.actor_avg.update()
+        agent._set_lrs()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert agent._return_sums.tolist()[1] == 1.0

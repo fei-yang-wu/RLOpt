@@ -151,12 +151,12 @@ def test_a_restored_muon_steps_as_the_original() -> None:
     before = [p.detach().clone() for p in net.parameters()]
     step_on(net, opt, x)
     assert all(not torch.equal(a, b) for a, b in zip(before, net.parameters(), strict=True))
-    twin = copy.deepcopy(net)
-    restored = MuonAdam(twin, [twin], lr=1e-3)
+    other = copy.deepcopy(net)
+    restored = MuonAdam(other, [other], lr=1e-3)
     restored.load_state_dict(copy.deepcopy(opt.state_dict()))
     step_on(net, opt, x)
-    step_on(twin, restored, x)
-    assert harness.state_equal(net.state_dict(), twin.state_dict())
+    step_on(other, restored, x)
+    assert harness.state_equal(net.state_dict(), other.state_dict())
 
 
 def test_the_gated_step_skips_entirely_or_equals_the_plain_step() -> None:
@@ -296,3 +296,26 @@ def test_a_muon_checkpoint_of_other_sizes_with_an_average_scores_on_a_default_ag
     assert harness.state_equal(evaluator.actor.state_dict(), trained.actor_avg.module.state_dict())
     with pytest.raises(ValueError, match="(actor_ema|policy_live|actor_opt|wm_opt)"):
         harness.make_agent().load_model(str(path))
+
+
+@cuda
+def test_every_option_of_this_stage_trains_on_the_gpu_under_bf16(tmp_path: Path) -> None:
+    """Muon on both networks, fused Adam, the average and the multiplier together, then
+    the end file resumes and scores."""
+    wm = {
+        "actor_opt": "muon", "wm_opt": "muon", "fused_adam": True, "actor_ema": 0.99, "actor_lr_mult": 2.0,
+        "actor_lr_decay_return": 0.05, "actor_lr_decay_len": 3, "ckpt_light": True, "last_every_min": 1e-9,
+    }  # fmt: skip
+    agent = harness.make_agent(device="cuda:0", frames=harness.frames_for(8), save_interval=40, log_dir=tmp_path, **wm)
+    assert agent.config.wm.bf16
+    before = {k: v.clone() for k, v in agent.actor.state_dict().items()}
+    agent.train()
+    assert all(torch.isfinite(p).all() for m in (agent.actor, agent.dynamics, agent.critic) for p in m.parameters())
+    assert not harness.state_equal(before, agent.actor.state_dict())
+    final = agent._checkpoint_dir() / f"model_step_{agent._frames_processed}.pt"
+    resumed = harness.make_agent(device="cuda:0", save_interval=40, **wm)
+    resumed.load_model(str(final))
+    assert harness.state_equal(resumed.actor_avg.module.state_dict(), agent.actor_avg.module.state_dict())
+    evaluator = harness.make_agent(device="cuda:0")
+    evaluator.load_policy(str(final))
+    assert harness.state_equal(evaluator.actor.state_dict(), agent.actor_avg.module.state_dict())

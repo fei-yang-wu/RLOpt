@@ -166,7 +166,7 @@ def make_agent(
 
 def frames_for(iterations: int, *, num_envs: int = 8, wm: WMBPTTConfig | None = None) -> int:
     """``collector.total_frames`` of a run of exactly ``iterations`` iterations."""
-    wm = wm or WMBPTTConfig(**{k: v for k, v in SMALL.items() if k == "min_replay_steps"})
+    wm = wm or WMBPTTConfig(min_replay_steps=SMALL["min_replay_steps"])
     acc, steps = 0.0, 0
     for i in range(iterations):
         acc += wm.env_steps_per_iter
