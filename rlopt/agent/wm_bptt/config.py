@@ -92,6 +92,16 @@ class WMBPTTConfig:
     it. A non-finite or pushed final state is not fit (``wm/terminal_nonfinite``
     counts the first kind per step with an ended episode), and real windows
     (``actor_source``, ``critic_source``) keep their own episode masks."""
+    wm_structured: bool = False
+    """Semi-implicit world model (NDM Gym's ``--wm_structured``, from BlinkMimic): the
+    network outputs the velocity increments and, for the positions, corrections on top
+    of the drift dt ((1 - c) v + c v') that the old and new velocities imply, with
+    c = (n + 1) / (2 n) for the env's n physics substeps per control step (0.625 on
+    G1-v3). The output normalizer fits these targets; a third normalizer fits the plain
+    increments, whose scale divides the state error in the fit and in ``wm_eval``. The
+    increment layout and the state error are unchanged. Needs a task with
+    ``structured_targets`` (G1-v3) and the MLP model; refused with ``actor_source=real``,
+    whose model residuals are plain increments."""
     norm_from_collection: bool = False
     """Fit the input and increment normalizers on every collected transition of
     every env, as NDM Gym does, not on the first transitions of the sampled windows.
@@ -391,6 +401,17 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     if wm.reference_body_table and getattr(task, "build_reference_tables", None) is None:
         msg = "wm.reference_body_table needs a task with a reference table (G1V3TrackingTask)."
         raise ValueError(msg)
+    if wm.wm_structured:
+        for name in ("structured_targets", "structured_integrate", "bind_structured"):
+            if getattr(task, name, None) is None:
+                msg = f"wm.wm_structured needs the task's {name} (G1V3TrackingTask)."
+                raise ValueError(msg)
+        if wm.dynamics_model != "mlp":
+            msg = f"wm.wm_structured is the MLP world model's output layout, not dynamics_model={wm.dynamics_model!r}."
+            raise ValueError(msg)
+        if wm.actor_source == "real":
+            msg = "wm.wm_structured: real windows re-simulate with plain-increment residuals (actor_source=real)."
+            raise ValueError(msg)
     if wm.actor_residual:
         validate_residual(task, goal=str(wm.goal), goal_encoder=str(wm.goal_encoder))
         if wm.actor_source == "real" or wm.actor_estimator == "rebar":

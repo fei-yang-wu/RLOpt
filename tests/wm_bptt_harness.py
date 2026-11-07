@@ -98,6 +98,8 @@ class FakeIsaacEnv:
         self.scene = {"robot": robot}
         term = SimpleNamespace(_joint_names=list(G1_ISAACLAB_JOINT_NAMES), _scale=action_scale(self.device).expand(self.n, 29))
         self.action_manager = SimpleNamespace(get_term=lambda name: {"joint_pos": term}[name])
+        # G1-v3's physics: one 0.02 s control step of four Newton substeps.
+        self.cfg = SimpleNamespace(sim=SimpleNamespace(physics=SimpleNamespace(num_substeps=4)), decimation=1)
 
     def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
         lib, n, dev = self.v3_library, self.n, self.device

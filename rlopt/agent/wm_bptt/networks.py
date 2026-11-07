@@ -101,13 +101,22 @@ class DynamicsModel(nn.Module):
 
     Inputs and increments are scaled by running normalizers; the last layer is
     zero, so the untrained model predicts the mean increment.
+
+    ``structured`` (``wm.wm_structured``): the outputs are the task's semi-implicit
+    targets, which ``out_norm`` fits, and ``inc_norm`` fits the plain increments,
+    whose scale divides the fit's state error (NDM Gym's
+    ``SemiImplicitIncrementWorldModel``). Only then is ``inc_norm`` a buffer, so a
+    default model keeps its ``state_dict`` keys.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, hidden: Sequence[int]) -> None:
+    def __init__(self, in_dim: int, out_dim: int, hidden: Sequence[int], *, structured: bool = False) -> None:
         super().__init__()
         self.in_norm = RunningNorm(in_dim, eps=1e-2)
         self.out_norm = RunningNorm(out_dim, eps=1e-4)
         self.net = mlp(in_dim, hidden, out_dim, layer_norm=True, zero_out=True)
+        self.structured = bool(structured)
+        if self.structured:
+            self.inc_norm = RunningNorm(out_dim, eps=1e-4)
 
     def forward(self, x: Tensor, *, bf16: bool = False) -> Tensor:
         """Denormalized increment."""

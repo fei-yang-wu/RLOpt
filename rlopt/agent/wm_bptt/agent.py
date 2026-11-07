@@ -81,6 +81,7 @@ from rlopt.base_class import BaseAlgorithm, TrainingMetadata, honours_train_time
 ARCH_TAG = "wmbptt-v1"
 RESUME_MATCH: dict[str, Any] = {
     "actor_ema": 0.0, "fused_adam": False, "actor_opt": "adam", "wm_opt": "adam", "actor_residual": False,
+    "wm_structured": False,
 }
 """``wm`` fields a resumed run must share with its checkpoint, with the value a
 checkpoint from before the field implies: they set which optimizers and which
@@ -264,6 +265,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     _checkpoint_writer: CheckpointWriter | None = None
     _graphs: dict[str, GraphedUpdate] | None = None
     _residual: bool = False
+    _structured: bool = False
 
     def __init__(self, env: TransformedEnv, config: WMBPTTRLOptConfig, logger: Any = None, **kwargs: Any) -> None:
         self._num_envs = int(env.batch_size.numel()) if len(env.batch_size) else 1
@@ -281,6 +283,9 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._residual = bool(wm.actor_residual)
         if self._residual:
             self.task.bind_reference_setpoint()  # type: ignore[attr-defined]
+        self._structured = bool(wm.wm_structured)
+        if self._structured:
+            self.task.bind_structured()  # type: ignore[attr-defined]
         self._isaac = _find_isaac_env(env)
         self._frames_processed = 0
         self._resume_frame_offset = 0
@@ -312,7 +317,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
     def _construct_dynamics(self) -> nn.Module:
         wm, t = self.config.wm, self.task
         if wm.dynamics_model == "mlp":
-            return DynamicsModel(t.wm_input_dim, t.increment_dim, wm.wm_hidden)
+            return DynamicsModel(t.wm_input_dim, t.increment_dim, wm.wm_hidden, structured=self._structured)
         if wm.dynamics_model != "diffsr":
             msg = f"wm.dynamics_model must be 'mlp' or 'diffsr', got {wm.dynamics_model!r}."
             raise ValueError(msg)
@@ -591,9 +596,20 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         self._return_sums += torch.stack((step_mean, (ended > 0).float()))
 
     # ------------------------------------------------------------ world model
+    def _next_state(self, state: Tensor, out: Tensor) -> Tensor:
+        """The state the world model's denormalized output ``out`` predicts from ``state``."""
+        if self._structured:
+            return self.task.structured_integrate(state, out)  # type: ignore[attr-defined]
+        return self.task.integrate(state, out)
+
+    def _error_scale(self) -> Tensor:
+        """What divides the state error: the increments' std, floored."""
+        norm = self.dynamics.inc_norm if self._structured else self.dynamics.out_norm
+        return torch.maximum(norm.std(), self.task.increment_floor)
+
     def _wm_step(self, state: Tensor, action: Tensor, ctx: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
         inc = self.dynamics(self.task.wm_input(state, action, ctx), bf16=self.config.wm.bf16)
-        nxt = self.task.integrate(state, inc)
+        nxt = self._next_state(state, inc)
         return nxt, self.task.state_error(nxt, target)
 
     def _wm_step_fn(self):
@@ -623,13 +639,13 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         wm = self.config.wm
         k = wm.wm_window
         assert self.replay is not None
-        scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
+        scale = self._error_scale()
         for _ in range(wm.wm_batches_per_iter):
             tau, env = self.replay.sample_starts(wm.wm_batch_size, k)
             win = self.replay.window(tau, env, k + 1)
             if not wm.norm_from_collection:
                 self._update_wm_norms(self._first_transition(win), win["valid"][:, 0])
-                scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
+                scale = self._error_scale()
             errs, mask = self._wm_rollout(win, k, grad=True)
             per = (errs / scale).square().mean(-1)  # (B, k)
             loss = (per * mask).sum() / mask[:, 0].sum().clamp_min(1.0)
@@ -650,13 +666,19 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             metrics["wm/valid_window_frac"].append(mask[:, -1].mean())
             if wm.fit_terminal_transitions:
                 metrics["wm/terminal_frac"].append((mask * win["ended"][:, :k]).sum() / mask.sum().clamp_min(1.0))
+        norms = self._wm_norms()
         if wm.no_sync:
             full = self.dynamics.out_norm.count >= wm.norm_freeze_samples
-            self.dynamics.in_norm.frozen.logical_or_(full)
-            self.dynamics.out_norm.frozen.logical_or_(full)
+            for norm in norms:
+                norm.frozen.logical_or_(full)
         elif self.dynamics.out_norm.count >= wm.norm_freeze_samples:
-            self.dynamics.in_norm.frozen.fill_(True)
-            self.dynamics.out_norm.frozen.fill_(True)
+            for norm in norms:
+                norm.frozen.fill_(True)
+
+    def _wm_norms(self) -> tuple[RunningNorm, ...]:
+        """The world model's normalizers, in the order of ``_norm_features``."""
+        d = self.dynamics
+        return (d.in_norm, d.out_norm, d.inc_norm) if self._structured else (d.in_norm, d.out_norm)
 
     def _update_wm_norms(self, rows: tuple[Tensor, Tensor, Tensor, Tensor], valid: Tensor) -> None:
         """The world model's normalizers on the ``valid`` transitions of ``rows``
@@ -665,21 +687,25 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         wm, d = self.config.wm, self.dynamics
         if wm.no_sync:
             live = d.out_norm.count < wm.norm_freeze_samples
-            x, inc = self._norm_features_fn()(*rows)
-            update_norm_on_device(d.in_norm, x, valid, live)
-            update_norm_on_device(d.out_norm, inc, valid, live)
+            features = self._norm_features_fn()(*rows)
+            for norm, x in zip(self._wm_norms(), features, strict=True):
+                update_norm_on_device(norm, x, valid, live)
         elif d.out_norm.count < wm.norm_freeze_samples and valid.any():
-            x, inc = self._valid_norm_features(rows, valid)
-            d.in_norm.update(x)
-            d.out_norm.update(inc)
+            features = self._valid_norm_features(rows, valid)
+            for norm, x in zip(self._wm_norms(), features, strict=True):
+                norm.update(x)
 
     @staticmethod
     def _first_transition(win: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         return win["state"][:, 0], win["next_state"][:, 0], win["action"][:, 0], win["context"][:, 0]
 
-    def _norm_features(self, state: Tensor, next_state: Tensor, action: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor]:
-        """What the world model's input and increment normalizers fit."""
-        return self.task.wm_input(state, action, ctx), self.task.increment(state, next_state)
+    def _norm_features(self, state: Tensor, next_state: Tensor, action: Tensor, ctx: Tensor) -> tuple[Tensor, ...]:
+        """What the world model's normalizers fit (``_wm_norms``): its input and its
+        output, and with ``wm.wm_structured`` also the plain increments."""
+        inc = self.task.increment(state, next_state)
+        if self._structured:
+            return self.task.wm_input(state, action, ctx), self.task.structured_targets(state, next_state), inc  # type: ignore[attr-defined]
+        return self.task.wm_input(state, action, ctx), inc
 
     def _norm_features_fn(self):
         fn = getattr(self, "_compiled_norm_features", None)
@@ -688,12 +714,11 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             self._compiled_norm_features = fn
         return fn
 
-    def _valid_norm_features(self, rows: tuple[Tensor, Tensor, Tensor, Tensor], v: Tensor) -> tuple[Tensor, Tensor]:
+    def _valid_norm_features(self, rows: tuple[Tensor, Tensor, Tensor, Tensor], v: Tensor) -> tuple[Tensor, ...]:
         """The normalizers' features of the transitions ``v`` keeps."""
         if self.config.wm.compile_eager:
             # Every row, so the compiled function sees one shape; features are per row.
-            x, inc = self._norm_features_fn()(*rows)
-            return x[v], inc[v]
+            return tuple(x[v] for x in self._norm_features_fn()(*rows))
         return self._norm_features(*(row[v] for row in rows))
 
     def _step_if_finite(self, optimizer: Any, params: Iterable[Tensor], grad_norm: Tensor, count: str) -> None:
@@ -730,7 +755,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         # Device values, read together: one host read per horizon (the selection's
         # size) and one for all values, rather than one per value.
         out: dict[str, Tensor] = {}
-        scale = torch.maximum(self.dynamics.out_norm.std(), self.task.increment_floor)
+        scale = self._error_scale()
         for k in (1, 8, 32):
             if k > L:
                 continue
@@ -773,7 +798,7 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if detach_action:
             action = action.detach()
         inc = self.dynamics(t.wm_input(state, action, ctx), bf16=wm.bf16)
-        nxt = t.integrate(state, inc)
+        nxt = self._next_state(state, inc)
         r, d = t.reward_and_termination(nxt, action, prev_action, ctx, rank, frame)
         new_prop = task_proprio(t, nxt, action, ctx, rank, frame + 1, getattr(t, "sensor_noise", True))
         prop = torch.cat((prop[:, 1:], new_prop.unsqueeze(1)), 1)
