@@ -240,6 +240,8 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             wm.task_model, env, device, sensor_noise=wm.sensor_noise, **task_kwargs
         )
         validate_options(config, self.task)
+        if wm.goal_table or wm.reference_body_table:
+            self.task.build_reference_tables(goal=wm.goal_table, bodies=wm.reference_body_table)  # type: ignore[attr-defined]
         self._isaac = _find_isaac_env(env)
         self._frames_processed = 0
         self._resume_frame_offset = 0

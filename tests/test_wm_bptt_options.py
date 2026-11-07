@@ -78,6 +78,33 @@ def test_construction_validates() -> None:
         harness.make_agent(actor_source="dream")
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"))])
+def test_a_run_with_reference_tables_is_bit_identical_to_one_without(device: str) -> None:
+    """Eager, at these shapes. A table row is the direct result at the build's batch
+    shape, which can round differently from another shape on another platform."""
+    frames = harness.frames_for(4, num_envs=64)
+    runs = []
+    for wm in ({}, {"goal_table": True, "reference_body_table": True}):
+        agent = harness.make_agent(device=device, num_envs=64, frames=frames, **wm)
+        agent.train()
+        runs.append(harness.fingerprint(agent))
+    assert agent.task.library.goal_table is not None and agent.task.library.body_table is not None
+    assert runs[0] == runs[1]
+
+
+def test_a_goal_table_needs_a_goal_of_the_frame_alone() -> None:
+    validate_options(config(goal_table=True), SimpleNamespace(goal_depends_on_state=False))
+    for task in (TASK, SimpleNamespace(goal_depends_on_state=True)):
+        with pytest.raises(ValueError, match="function of the reference frame"):
+            validate_options(config(goal_table=True), task)
+
+
+def test_a_body_table_needs_a_task_that_builds_it() -> None:
+    validate_options(config(reference_body_table=True), SimpleNamespace(build_reference_tables=lambda: None))
+    with pytest.raises(ValueError, match="reference_body_table"):
+        validate_options(config(reference_body_table=True), TASK)
+
+
 def test_compile_eager_needs_a_task_that_reaches_the_collection_reward() -> None:
     wm = {"compile": True, "compile_eager": True}
     validate_options(config(**wm), SimpleNamespace(compile_collection_reward=lambda: None))

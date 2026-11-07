@@ -31,6 +31,8 @@ ALL_ON = {
     "compile_eager": True,
     "elementwise_3x3": True,
     "fused_adam": True,
+    "goal_table": True,
+    "reference_body_table": True,
 }
 
 

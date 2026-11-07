@@ -35,6 +35,14 @@ class WMBPTTConfig:
     sensor_noise: bool = True
     """Add the task's sensor noise to policy features (collection, imagination
     and the deployed policy alike)."""
+    goal_table: bool = False
+    """Compute the policy goal of every reference frame once and read its row, in
+    the env and the model alike. Outside compiled code, the numbers of the
+    computation it replaces, up to that computation's own rounding across batch
+    shapes. 2.9 kB per frame: 1.2 GiB for LAFAN1."""
+    reference_body_table: bool = False
+    """The same for the reference body poses and twists, which FK would compute
+    at every read. 1 kB per frame: 0.41 GiB for LAFAN1."""
 
     # -- data collection ----------------------------------------------------
     env_steps_per_iter: float = 2.5
@@ -312,6 +320,12 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
             raise ValueError(msg)
     if wm.compile_eager and getattr(task, "compile_collection_reward", None) is None:
         msg = "wm.compile_eager compiles the collection reward, which this task cannot reach."
+        raise ValueError(msg)
+    if wm.goal_table and getattr(task, "goal_depends_on_state", True):
+        msg = "wm.goal_table needs a task whose goal is a function of the reference frame alone."
+        raise ValueError(msg)
+    if wm.reference_body_table and getattr(task, "build_reference_tables", None) is None:
+        msg = "wm.reference_body_table needs a task with a reference table (G1V3TrackingTask)."
         raise ValueError(msg)
     if wm.no_sync:
         if not wm.fused_adam:
