@@ -61,6 +61,14 @@ class WMBPTTConfig:
     goal_encoder: str = ""
     """Frozen skill-encoder checkpoint for ``goal="z"`` (task kwarg
     ``skill_encoder``)."""
+    skill_bf16: bool = False
+    """With a latent goal: the frozen skill encoder's matmuls under bf16 autocast
+    wherever the task computes z (collection, imagination, critic inputs); its
+    LayerNorms stay fp32. The actor's own ``bf16`` autocast already rounds z to
+    bf16 at its first matmul, so the policy input changes at that scale; the env's
+    deployed encoder stays fp32. Passed to the task as ``skill_bf16`` only when
+    on; needs a task that takes it (G1-v3 latent). Recorded in the checkpoint's
+    goal binding."""
     sensor_noise: bool = True
     """Add the task's sensor noise to policy features (collection, imagination
     and the deployed policy alike)."""
@@ -584,6 +592,9 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         if wm.actor_source == "real":
             msg = "wm.imag_start_perturb kicks imagined starts; actor_source=real runs the actor on recorded windows."
             raise ValueError(msg)
+    if wm.skill_bf16 and getattr(task, "skill_bf16", None) is not True:
+        msg = "wm.skill_bf16 needs a latent-goal task that takes it (G1V3LatentTrackingTask: wm.goal=z)."
+        raise ValueError(msg)
     if wm.contact_reward < 0:
         msg = f"wm.contact_reward is a weight, at least 0; got {wm.contact_reward}."
         raise ValueError(msg)
