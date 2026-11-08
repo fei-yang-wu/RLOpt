@@ -294,6 +294,15 @@ class WMBPTTConfig:
     the critic of ``actor_source=real``) are not kicked. Needs a task with
     ``perturb_start`` (G1-v3); refused with ``actor_source=real``, whose actor runs
     on recorded windows. 0 is off and draws no random number."""
+    reference_window: bool = False
+    """Gather the reference rows of each imagined rollout once, at its start: the
+    rows from the start frame through ``horizon`` steps plus the goal look-ahead, in
+    one gather, which every read of the rollout (goals, rewards, terminations, the
+    critic's inputs) then uses in place of a gather from the bank per step and per
+    goal frame (``task.library.open_window``). The values read are the same; on a
+    host-mapped bank (``env.v3_library_host_mapped``) the per-step reads crossed
+    PCIe. Needs a task whose library has ``open_window`` (G1V3TrackingTask); refused
+    with ``actor_source=real`` and ``rebar``, whose rollouts read the bank by rank."""
     actor_ema: float = 0.0
     """Decay of an exponential moving average of the actor, one step per actor
     update; 0 is off. Collection and imagination use the live actor. The
@@ -546,6 +555,13 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
     for name in ("elementwise_3x3", "compile_eager", "combo_kernels"):
         if getattr(wm, name) and not wm.compile:
             msg = f"wm.{name} acts inside compiled functions; set wm.compile."
+            raise ValueError(msg)
+    if wm.reference_window:
+        if getattr(getattr(task, "library", None), "open_window", None) is None:
+            msg = "wm.reference_window needs a task whose library has open_window (G1V3TrackingTask)."
+            raise ValueError(msg)
+        if wm.actor_source == "real" or str(wm.actor_estimator) == "rebar":
+            msg = "wm.reference_window serves imagined rollouts; refused with actor_source=real and rebar."
             raise ValueError(msg)
     if wm.compile_eager and getattr(task, "compile_collection_reward", None) is None:
         msg = "wm.compile_eager compiles the collection reward, which this task cannot reach."

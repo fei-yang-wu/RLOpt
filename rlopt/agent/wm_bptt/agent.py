@@ -1027,6 +1027,15 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
         if start_perturb > 0:
             # After ``prop``: the history stays the recorded one, as in NDM Gym.
             state = t.perturb_start(state, start_perturb, generator)  # type: ignore[attr-defined]
+        if wm.reference_window:
+            # After ``prop``, which read the history's frames by bank rank. From here
+            # ``rank`` is the rollout's window slot; the window spans the start frame,
+            # H steps and the goal's look-ahead. ``_update_actor_critic`` closes it.
+            lib = t.library  # type: ignore[attr-defined]
+            if lib.win_active:
+                lib.close_window()
+            look = max(int(getattr(t, "goal_frames", 0) or 0), int(getattr(getattr(t, "skill", None), "frames", 0) or 0))
+            rank = lib.open_window(rank, frame, H + 1 + look)
         if grad:
             # Every step then sees the same requires_grad pattern; otherwise the
             # compiled step recompiles between step 0 and the rest.
@@ -1442,12 +1451,17 @@ class WMBPTT(BaseAlgorithm[WMBPTTRLOptConfig]):
             metrics["imagine/alive_H"].append(out["alive_H"].detach().mean())
             metrics["imagine/reward_mean"].append(out["rewards"].detach().mean())
             metrics["imagine/done_mean"].append(out["dones"].detach().mean())
-        if wm.critic_fit and self._iteration % max(1, wm.critic_update_every) == 0:
-            if wm.critic_source == "real":
-                # The recorded states, not the actor's re-simulated ones.
-                self._update_critic_real(self._real_rollout(wm.imagine_batch, grad=False), metrics)
-            else:
-                self._update_critic(self._imagine(wm.imagine_batch, grad=False) if real_actor else out, metrics)
+        try:
+            if wm.critic_fit and self._iteration % max(1, wm.critic_update_every) == 0:
+                if wm.critic_source == "real":
+                    # The recorded states, not the actor's re-simulated ones.
+                    self._update_critic_real(self._real_rollout(wm.imagine_batch, grad=False), metrics)
+                else:
+                    self._update_critic(self._imagine(wm.imagine_batch, grad=False) if real_actor else out, metrics)
+        finally:
+            if wm.reference_window:
+                # The critic read the rollout's rows by window slot; bank ranks again.
+                self.task.library.close_window()  # type: ignore[attr-defined]
 
     def _update_critic_real(self, out: dict[str, Tensor], metrics: dict[str, list]) -> None:
         wm = self.config.wm
