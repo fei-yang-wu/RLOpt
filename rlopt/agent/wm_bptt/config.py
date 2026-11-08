@@ -67,8 +67,9 @@ class WMBPTTConfig:
     LayerNorms stay fp32. The actor's own ``bf16`` autocast already rounds z to
     bf16 at its first matmul, so the policy input changes at that scale; the env's
     deployed encoder stays fp32. Passed to the task as ``skill_bf16`` only when
-    on; needs a task that takes it (G1-v3 latent). Recorded in the checkpoint's
-    goal binding."""
+    on; needs a task that takes it (G1-v3 latent). Recorded in the task's
+    description, not its goal binding: the policy is evaluated and deployed with
+    the fp32 encoder."""
     sensor_noise: bool = True
     """Add the task's sensor noise to policy features (collection, imagination
     and the deployed policy alike)."""
