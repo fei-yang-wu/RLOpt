@@ -216,6 +216,11 @@ class GraphedUpdate:
             self.calls += 1
             if self.calls <= self.warmup:
                 if self._side is None:
+                    # The allocator caches blocks per stream: the side stream gets its own,
+                    # so give the eager phase's inactive blocks back first, or the two sets
+                    # stack (a 3.3 GiB spike on the 4096-env G1-v3 recipe).
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
                     self._side = torch.cuda.Stream()
                 self._side.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._side):
