@@ -59,7 +59,12 @@ class StubProbe:
         return {"eprobe/sweeps": float(len(self.payloads))}
 
     def state_dict(self) -> dict[str, Any]:
-        return {"eprobe_fail": torch.arange(3.0), "eprobe_focus": None, "eprobe_focus_share": 0.0, "ticks": len(self.ticks)}
+        return {
+            "eprobe_fail": torch.arange(3.0),
+            "eprobe_focus": None,
+            "eprobe_focus_share": 0.0,
+            "ticks": len(self.ticks),
+        }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self.loaded = state
@@ -89,14 +94,21 @@ class ProbeEnv(harness.FakeIsaacEnv):
 
 def agent_on(tmp_path: Path, iterations: int, *, save_interval: int = 0, **wm: Any) -> Any:
     agent = harness.make_agent(
-        frames=harness.frames_for(iterations), log_dir=tmp_path, env_cls=ProbeEnv, save_interval=save_interval, **{**ON, **wm}
+        frames=harness.frames_for(iterations),
+        log_dir=tmp_path,
+        env_cls=ProbeEnv,
+        save_interval=save_interval,
+        **{**ON, **wm},
     )
     agent._isaac.agent = agent
     return agent
 
 
 def last_full(agent: Any) -> Path:
-    return max(agent._checkpoint_dir().glob("model_step_*.pt"), key=lambda p: int(p.stem.split("_")[-1]))
+    return max(
+        agent._checkpoint_dir().glob("model_step_*.pt"),
+        key=lambda p: int(p.stem.split("_")[-1]),
+    )
 
 
 # ------------------------------------------------------------------ off
@@ -141,7 +153,9 @@ def test_the_log_row_has_the_probes_numbers(tmp_path: Path) -> None:
     assert all("eprobe/sweeps" in row for row in rows)
 
 
-def test_full_checkpoints_hold_the_probe_state_and_a_resume_restores_it(tmp_path: Path) -> None:
+def test_full_checkpoints_hold_the_probe_state_and_a_resume_restores_it(
+    tmp_path: Path,
+) -> None:
     agent = agent_on(tmp_path, 6)
     agent.train()
     path = last_full(agent)
@@ -183,7 +197,12 @@ def policy_td(obs: dict[str, Any], n: int) -> TensorDict:
 
 @pytest.mark.parametrize(
     "wm",
-    [{}, {"actor_ema": 0.9}, {"actor_ema": 0.9, "actor_residual": True}, {"actor_arch": "enc_dec", "actor_hidden": [64, 48, 32], "actor_residual": True}],
+    [
+        {},
+        {"actor_ema": 0.9},
+        {"actor_ema": 0.9, "actor_residual": True},
+        {"actor_arch": "enc_dec", "actor_hidden": [64, 48, 32], "actor_residual": True},
+    ],
 )
 def test_deployed_policy_is_what_load_policy_deploys(tmp_path: Path, wm: dict[str, Any]) -> None:
     source = harness.make_agent(frames=harness.frames_for(4), log_dir=tmp_path, **wm)
@@ -212,7 +231,11 @@ def test_a_later_sweep_reloads_the_weights_only(tmp_path: Path) -> None:
     obs, _ = source._isaac.reset()
     td = policy_td(obs, source._num_envs)
     with torch.no_grad():
-        torch.testing.assert_close(policy(td.clone())["action"], source.collector_policy(td.clone())["action"], **EXACT)
+        torch.testing.assert_close(
+            policy(td.clone())["action"],
+            source.collector_policy(td.clone())["action"],
+            **EXACT,
+        )
 
 
 def test_deployed_policy_refuses_another_interface() -> None:
@@ -232,7 +255,15 @@ def config(**wm: Any) -> WMBPTTRLOptConfig:
 
 
 TASK = SimpleNamespace(isaac_env=SimpleNamespace(make_eval_probe=lambda *_: None))
-PRESET = {"eprobe_share": 0.15, "eprobe_start": 1000, "eprobe_every": 125, "eprobe_decay": 0.7, "eprobe_graph": True, "eprobe_async": 20, "actor_ema": 0.995}
+PRESET = {
+    "eprobe_share": 0.15,
+    "eprobe_start": 1000,
+    "eprobe_every": 125,
+    "eprobe_decay": 0.7,
+    "eprobe_graph": True,
+    "eprobe_async": 20,
+    "actor_ema": 0.995,
+}
 
 
 @pytest.mark.parametrize(
@@ -248,6 +279,9 @@ PRESET = {"eprobe_share": 0.15, "eprobe_start": 1000, "eprobe_every": 125, "epro
         ({**PRESET, "eprobe_decay": 1.5}, TASK, "eprobe_decay"),
         ({**PRESET, "eprobe_every": 0}, TASK, "eprobe_every"),
         ({**PRESET, "eprobe_start": -1}, TASK, "eprobe_start"),
+        ({**PRESET, "eprobe_max_worlds": -1}, TASK, "eprobe_max_worlds"),
+        ({**PRESET, "eprobe_max_worlds": 1.5}, TASK, "eprobe_max_worlds"),
+        ({**PRESET, "eprobe_max_worlds": 256}, TASK, "eprobe_async=0"),
         ({**PRESET, "goal": "z"}, TASK, "explicit"),
         (PRESET, SimpleNamespace(isaac_env=SimpleNamespace()), "make_eval_probe"),
         ({"eprobe_graph": True}, TASK, "eprobe_graph"),
@@ -262,6 +296,7 @@ def test_refused(wm: dict[str, Any], task: Any, match: str) -> None:
 
 
 def test_allowed() -> None:
+    validate_options(config(**{**PRESET, "eprobe_max_worlds": 256, "eprobe_async": 0}), TASK)
     validate_options(config(**PRESET), TASK)  # BlinkMimic's PRESET[main]
     validate_options(config(**{**PRESET, "eprobe_graph": False, "eprobe_async": 0}), TASK)  # synchronous eager sweeps
     validate_options(config(), SimpleNamespace())  # off, on any task

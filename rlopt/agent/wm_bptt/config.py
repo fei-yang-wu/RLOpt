@@ -294,6 +294,15 @@ class WMBPTTConfig:
     the critic of ``actor_source=real``) are not kicked. Needs a task with
     ``perturb_start`` (G1-v3); refused with ``actor_source=real``, whose actor runs
     on recorded windows. 0 is off and draws no random number."""
+    reference_window: bool = False
+    """Gather the reference rows of each imagined rollout once, at its start: the
+    rows from the start frame through ``horizon`` steps plus the goal look-ahead, in
+    one gather, which every read of the rollout (goals, rewards, terminations, the
+    critic's inputs) then uses in place of a gather from the bank per step and per
+    goal frame (``task.library.open_window``). The values read are the same; on a
+    host-mapped bank (``env.v3_library_host_mapped``) the per-step reads crossed
+    PCIe. Needs a task whose library has ``open_window`` (G1V3TrackingTask); refused
+    with ``actor_source=real`` and ``rebar``, whose rollouts read the bank by rank."""
     actor_ema: float = 0.0
     """Decay of an exponential moving average of the actor, one step per actor
     update; 0 is off. Collection and imagination use the live actor. The
@@ -394,6 +403,12 @@ class WMBPTTConfig:
     count and the next ``eprobe_win`` bins of its clip. Needs ``actor_ema``. Training
     and evaluation share the clips, so evaluation outcomes on them feed the resets."""
     eprobe_tile: int = 300
+    eprobe_max_worlds: int = 0
+    """0 preserves the full sweep. Positive caps the worker's worlds and rotates
+    shuffled training tiles without replacement. Only observed bins update their
+    failure-rate EMA; unobserved bins retain their statistics. No evaluation-board
+    membership enters the sampling. Geometry and RNG state survive full checkpoints.
+    Sampled mode requires eprobe_async=0 until overlapping execution is qualified."""
     eprobe_lead_min: int = 200
     eprobe_lead_max: int = 450
     eprobe_every: int = 250
@@ -413,8 +428,16 @@ class WMBPTTConfig:
 
 #: ``wm.eprobe_*`` fields that only ``eprobe_share`` > 0 reads.
 EPROBE_FIELDS = (
-    "eprobe_tile", "eprobe_lead_min", "eprobe_lead_max", "eprobe_every", "eprobe_start",
-    "eprobe_win", "eprobe_decay", "eprobe_graph", "eprobe_async",
+    "eprobe_tile",
+    "eprobe_max_worlds",
+    "eprobe_lead_min",
+    "eprobe_lead_max",
+    "eprobe_every",
+    "eprobe_start",
+    "eprobe_win",
+    "eprobe_decay",
+    "eprobe_graph",
+    "eprobe_async",
 )
 
 
@@ -439,7 +462,22 @@ def validate_eprobe(wm: WMBPTTConfig, task: Any) -> None:
     if wm.actor_ema <= 0:
         msg = "wm.eprobe_share sweeps the policy average: set wm.actor_ema."
         raise ValueError(msg)
-    if wm.eprobe_tile < 1 or wm.eprobe_every < 1 or wm.eprobe_win < 0 or not 0 <= wm.eprobe_lead_min <= wm.eprobe_lead_max:
+    if (
+        not isinstance(wm.eprobe_max_worlds, int)
+        or isinstance(wm.eprobe_max_worlds, bool)
+        or wm.eprobe_max_worlds < 0
+    ):
+        msg = "wm.eprobe_max_worlds must be an integer at least 0."
+        raise ValueError(msg)
+    if wm.eprobe_max_worlds and wm.eprobe_async:
+        msg = "sampled probes require wm.eprobe_async=0; overlapping execution is not qualified."
+        raise ValueError(msg)
+    if (
+        wm.eprobe_tile < 1
+        or wm.eprobe_every < 1
+        or wm.eprobe_win < 0
+        or not 0 <= wm.eprobe_lead_min <= wm.eprobe_lead_max
+    ):
         msg = "wm.eprobe_tile >= 1, wm.eprobe_every >= 1, wm.eprobe_win >= 0, 0 <= wm.eprobe_lead_min <= wm.eprobe_lead_max."
         raise ValueError(msg)
     if wm.eprobe_start < 0:
@@ -451,7 +489,11 @@ def validate_eprobe(wm: WMBPTTConfig, task: Any) -> None:
     if wm.eprobe_async < 0 or (wm.eprobe_async and not wm.eprobe_graph):
         msg = "wm.eprobe_async needs wm.eprobe_graph."
         raise ValueError(msg)
-    if wm.eprobe_async and math.ceil((wm.eprobe_lead_max + wm.eprobe_tile) / wm.eprobe_async) >= wm.eprobe_every:
+    if (
+        wm.eprobe_async
+        and math.ceil((wm.eprobe_lead_max + wm.eprobe_tile) / wm.eprobe_async)
+        >= wm.eprobe_every
+    ):
         msg = "wm.eprobe_async too small: a sweep would not apply before the next one starts."
         raise ValueError(msg)
     if str(wm.goal) != "explicit" or str(wm.goal_encoder):
@@ -523,7 +565,9 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
             msg = f"wm.actor_lr_decay_len must be at least 1 with a trigger, got {wm.actor_lr_decay_len}."
             raise ValueError(msg)
         if wm.actor_lr_decay_by is not None and wm.actor_lr_decay_by < 1:
-            msg = f"wm.actor_lr_decay_by must be at least 1, got {wm.actor_lr_decay_by}."
+            msg = (
+                f"wm.actor_lr_decay_by must be at least 1, got {wm.actor_lr_decay_by}."
+            )
             raise ValueError(msg)
         if wm.actor_lr_decay_return is not None:
             if wm.actor_lr_decay_return <= 0:
@@ -547,13 +591,23 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         if getattr(wm, name) and not wm.compile:
             msg = f"wm.{name} acts inside compiled functions; set wm.compile."
             raise ValueError(msg)
+    if wm.reference_window:
+        if getattr(getattr(task, "library", None), "open_window", None) is None:
+            msg = "wm.reference_window needs a task whose library has open_window (G1V3TrackingTask)."
+            raise ValueError(msg)
+        if wm.actor_source == "real" or str(wm.actor_estimator) == "rebar":
+            msg = "wm.reference_window serves imagined rollouts; refused with actor_source=real and rebar."
+            raise ValueError(msg)
     if wm.compile_eager and getattr(task, "compile_collection_reward", None) is None:
         msg = "wm.compile_eager compiles the collection reward, which this task cannot reach."
         raise ValueError(msg)
     if wm.goal_table and getattr(task, "goal_depends_on_state", True):
         msg = "wm.goal_table needs a task whose goal is a function of the reference frame alone."
         raise ValueError(msg)
-    if wm.reference_body_table and getattr(task, "build_reference_tables", None) is None:
+    if (
+        wm.reference_body_table
+        and getattr(task, "build_reference_tables", None) is None
+    ):
         msg = "wm.reference_body_table needs a task with a reference table (G1V3TrackingTask)."
         raise ValueError(msg)
     if not 0.0 <= wm.wm_mirror <= 1.0:
@@ -603,7 +657,10 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         msg = "wm.ref_contact_fix calibrates wm.contact_reward's reference; set wm.contact_reward."
         raise ValueError(msg)
     if wm.contact_reward > 0:
-        taken = (getattr(task, "contact_reward", None), getattr(task, "ref_contact_fix", None))
+        taken = (
+            getattr(task, "contact_reward", None),
+            getattr(task, "ref_contact_fix", None),
+        )
         if taken != (wm.contact_reward, wm.ref_contact_fix):
             msg = f"wm.contact_reward needs a task that takes it (G1V3TrackingTask); this one holds {taken}."
             raise ValueError(msg)
@@ -622,7 +679,9 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
             msg = "wm.no_sync covers imagined rollouts: real windows select rows on the host (actor_source, critic_source)."
             raise ValueError(msg)
     if wm.graph_early and not wm.update_graphs:
-        msg = "wm.graph_early sets when wm.update_graphs captures; set wm.update_graphs."
+        msg = (
+            "wm.graph_early sets when wm.update_graphs captures; set wm.update_graphs."
+        )
         raise ValueError(msg)
     if wm.update_graphs:
         if not (wm.no_sync and wm.fused_adam):
@@ -660,7 +719,10 @@ def validate_options(config: WMBPTTRLOptConfig, task: Any) -> None:
         raise ValueError(msg)
     validate_eprobe(wm, task)
     # Muon skips each MLP's first and last Linear: one hidden layer leaves it nothing.
-    for name, hidden, opt in (("wm_hidden", wm.wm_hidden, wm.wm_opt), ("actor_hidden", wm.actor_hidden, wm.actor_opt)):
+    for name, hidden, opt in (
+        ("wm_hidden", wm.wm_hidden, wm.wm_opt),
+        ("actor_hidden", wm.actor_hidden, wm.actor_opt),
+    ):
         if opt == "muon" and len(hidden) < 2:
             msg = f"Muon needs a hidden weight matrix: wm.{name} must have at least two layers, got {list(hidden)}."
             raise ValueError(msg)
